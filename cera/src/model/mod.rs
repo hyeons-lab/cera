@@ -1284,7 +1284,7 @@ fn reject_bidirectional_lfm2(
 /// and the Hexagon loader lets it through where it refuses every other bidirectional LFM2.
 #[cfg(feature = "hexagon")]
 pub(crate) fn is_encoder_trunk(gguf: &GgufFile) -> bool {
-    crate::d1::public::is_omni(gguf) || crate::d1::head::Head::is_present(gguf)
+    crate::d1::public::is_head_based_omni(gguf) || crate::d1::head::Head::is_present(gguf)
 }
 
 /// Load a model with GPU acceleration.

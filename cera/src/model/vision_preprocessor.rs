@@ -1790,6 +1790,29 @@ mod tests {
         }
     }
 
+    /// 1024x771 gives the same size under `smart_resize` and under the LFM2 aspect-preserving rule, so
+    /// it cannot tell them apart. 1040x200 can: 1040/32 is exactly 32.5, which Python's `round`
+    /// (what the reference `smart_resize` uses) takes to the even 32, not 33.
+    #[test]
+    fn lfm3_resize_follows_the_reference_rounding_on_a_tie() {
+        for proj in [
+            crate::model::vision_encoder::VisionProjectorType::Lfm3Vl,
+            crate::model::vision_encoder::VisionProjectorType::Lfm3O,
+        ] {
+            let cfg = VisionEncoderConfig {
+                projector_type: proj,
+                ..lfm2_cfg()
+            };
+            let rgb = vec![128u8; 1040 * 200 * 3];
+            let PreprocessedLayout::Single(img) =
+                preprocess_layout_rgb8(&rgb, 1040, 200, &cfg, None).unwrap()
+            else {
+                panic!("{proj:?} must not tile");
+            };
+            assert_eq!((img.target_w, img.target_h), (1024, 192), "{proj:?}");
+        }
+    }
+
     #[test]
     #[should_panic(expected = "align_size must be strictly positive")]
     fn smart_resize_video_rejects_zero_align_size() {

@@ -326,6 +326,18 @@ impl HfModelConfig {
             .filter(|&v| v > 0)
     }
 
+    /// The number of leading dense (non-routed) blocks the metadata advertises
+    /// (`lfm3.leading_dense_block_count`): the first of `num_dense_layers` /
+    /// `first_k_dense_replace` / `leading_dense_block_count` present, when it is an integer. One
+    /// lookup for the writer and the completeness check.
+    pub(crate) fn leading_dense_blocks(&self) -> Option<usize> {
+        self.hparam("num_dense_layers")
+            .or_else(|| self.hparam("first_k_dense_replace"))
+            .or_else(|| self.hparam("leading_dense_block_count"))
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+    }
+
     /// The config keys the expert count is read from, in order.
     const LFM3_EXPERT_COUNT_KEYS: [&'static str; 2] = ["num_experts", "n_routed_experts"];
 
@@ -335,6 +347,23 @@ impl HfModelConfig {
     /// is honoured) and `conv_bias`. Ignoring any of them would write a file that loads
     /// and produces plausible, wrong text.
     fn lfm3_unhonoured_member(&self) -> Option<String> {
+        // The shared layout reader accepts any `*attention` type (llama.cpp treats every non-conv
+        // layer as attention), but lfm3 only knows two: anything else would be written as a global
+        // layer with the wrong window and RoPE.
+        if let Some(types) = self.hparam("layer_types").and_then(Value::as_array) {
+            for (i, t) in types.iter().enumerate() {
+                if let Some(t) = t.as_str()
+                    && t != "conv"
+                    && t != "sliding_attention"
+                    && t != "full_attention"
+                {
+                    return Some(format!(
+                        "`layer_types[{i}]` is `{t}`; lfm3 supports `conv`, `sliding_attention` and \
+                         `full_attention`"
+                    ));
+                }
+            }
+        }
         if self.hparam("conv_bias").and_then(Value::as_bool) == Some(true) {
             return Some("`conv_bias` is true; lfm3 short convolutions here have no bias".into());
         }
@@ -476,10 +505,7 @@ impl HfModelConfig {
             writer.add_u32("lfm3.expert_used_count", n_used);
         }
         if let Some(lead_dense) = self
-            .hparam("num_dense_layers")
-            .or_else(|| self.hparam("first_k_dense_replace"))
-            .or_else(|| self.hparam("leading_dense_block_count"))
-            .and_then(Value::as_u64)
+            .leading_dense_blocks()
             .and_then(|v| u32::try_from(v).ok())
         {
             writer.add_u32("lfm3.leading_dense_block_count", lead_dense);
@@ -2873,6 +2899,31 @@ mod tests {
     }
 
     /// Members the converter does not honour are refused rather than dropped.
+    #[test]
+    fn lfm3_unknown_attention_layer_types_are_refused() {
+        let mut cfg = valid_lfm3();
+        let first_attention = cfg["layer_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|t| t != "conv")
+            .expect("the base config has an attention layer");
+        for kind in ["chunked_attention", "local_attention", "attention"] {
+            cfg["layer_types"][first_attention] = json!(kind);
+            let err = refusal_of(cfg.clone()).unwrap_or_default();
+            assert!(
+                err.contains(kind) && err.contains("layer_types"),
+                "{kind}: {err}"
+            );
+        }
+        // a sliding layer needs its window
+        cfg["sliding_window"] = json!(128);
+        for kind in ["sliding_attention", "full_attention"] {
+            cfg["layer_types"][first_attention] = json!(kind);
+            assert_eq!(refusal_of(cfg.clone()), None, "{kind}");
+        }
+    }
+
     #[test]
     fn lfm3_unhonoured_members_are_refused() {
         let params = |v: serde_json::Value| {

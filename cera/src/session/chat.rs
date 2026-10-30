@@ -21,7 +21,7 @@ use crate::tokenizer::{
     BpeTokenizer, ChatMessage, apply_chat_template, apply_chat_template_with_tools,
 };
 use crate::tools::{
-    ToolCall, ToolChatMessage, ToolDef, ToolFormat, format_tool_def, parse_tool_calls_with_tools,
+    ToolCall, ToolChatMessage, ToolDef, ToolFormat, format_tool_def, parse_tool_calls_in_context,
     tool_grammar,
 };
 
@@ -1588,7 +1588,7 @@ impl<E: Execution> Chat<E> {
         let summary = report.result.map_err(CompleteError::Execution)?;
         let text = self.profile.tokenizer.decode(&collector.0);
         let tool_calls =
-            parse_tool_calls_with_tools(&text, self.tool_format, &self.tools).unwrap_or_default();
+            parsed_tool_calls(&text, self.tool_format, &self.tools, self.prefilled_think);
         Ok(TurnResult {
             text,
             tokens: collector.0,
@@ -1667,8 +1667,12 @@ impl<E: Execution> Chat<E> {
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
         let full_text = self.profile.tokenizer.decode(&collector.tokens);
-        let tool_calls = parse_tool_calls_with_tools(&full_text, self.tool_format, &self.tools)
-            .unwrap_or_default();
+        let tool_calls = parsed_tool_calls(
+            &full_text,
+            self.tool_format,
+            &self.tools,
+            self.prefilled_think,
+        );
         Ok(TurnResult {
             text: full_text,
             tokens: collector.tokens,
@@ -2013,6 +2017,27 @@ mod contract_tests;
 #[cfg(test)]
 #[path = "../../tests/api_chat/fixtures.rs"]
 mod fixtures;
+
+/// The tool calls in a finished turn (`think_prefilled`: the prompt opened the reasoning block). A call section the parser cannot read is not a turn that
+/// failed: the text stands and there are no calls, but the reason is logged, so a model whose
+/// calls keep coming back empty can be told apart from one that made none.
+fn parsed_tool_calls(
+    text: &str,
+    format: ToolFormat,
+    tools: &[ToolDef],
+    think_prefilled: bool,
+) -> Vec<ToolCall> {
+    match parse_tool_calls_in_context(text, format, tools, think_prefilled) {
+        Ok(calls) => calls,
+        Err(_) => {
+            tracing::warn!(
+                target: "cera::tools",
+                "the turn contains a tool call section that could not be parsed; returning no tool calls"
+            );
+            Vec::new()
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

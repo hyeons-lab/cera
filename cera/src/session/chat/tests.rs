@@ -1,4 +1,22 @@
 use super::*;
+
+#[test]
+fn malformed_tool_call_warning_does_not_include_generated_text() {
+    let text = "<tool_call><function=lookup>PRIVATE_MARKER</function></tool_call>";
+    let warnings = crate::audio_profile::tests::warnings_of(|| {
+        assert!(parsed_tool_calls(text, ToolFormat::Lfm3Xml, &[], false).is_empty());
+    });
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("could not be parsed"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.contains("PRIVATE_MARKER"))
+    );
+}
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
 use crate::model::ModelConfig;
 use crate::session::{FinishReason, ModalityCapabilities, RecoveryOutcome, SessionConfig};

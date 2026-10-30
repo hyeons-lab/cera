@@ -1068,6 +1068,9 @@ pub fn detect_tool_format(architecture: &str) -> Option<ToolFormat> {
 /// Parse tool calls out of generated model text. Returns a JSON string
 /// encoding an array of `ToolCall` (`[{name, arguments}]`) — `JSON.parse` it.
 /// An empty array means the reply had no tool call.
+// The text is read as a reply that starts outside a reasoning block (replies from
+// a chat session are parsed with the session's own context). A plain comment, to
+// match `cera-ffi`, whose doc comments feed committed generated bindings.
 #[wasm_bindgen(js_name = parseToolCalls)]
 pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<String, JsError> {
     let calls = cera::tools::parse_tool_calls(text, format.into()).map_err(map_err)?;

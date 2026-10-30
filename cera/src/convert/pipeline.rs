@@ -26,7 +26,7 @@ use crate::convert::config::HfModelConfig;
 use crate::convert::d1;
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
-    SafeTensorsHeader, decode_safetensor_to_f32_into, gguf_tensor_dims,
+    SafeTensorsHeader, check_disjoint_spans, decode_safetensor_to_f32_into, gguf_tensor_dims,
 };
 use crate::convert::tensor_map::{TensorAction, classify_tensor, stack_expert_tensors};
 #[cfg(test)]
@@ -831,6 +831,10 @@ struct SourceRef {
     data_end: usize,
 }
 
+/// One expert's index, shape, and source, and the experts collected per `(block, GGUF name)`.
+type ExpertSliceEntry = (usize, Vec<usize>, SourceRef);
+type StackedExperts = std::collections::BTreeMap<(usize, String), Vec<ExpertSliceEntry>>;
+
 /// Deferred source action for materializing a planned GGUF tensor on demand during the write pass.
 #[derive(Clone, Debug)]
 enum LocalSourceAction {
@@ -890,6 +894,105 @@ struct LocalPendingTensor {
 }
 
 type PlannedSlice = (String, Vec<usize>, usize, LocalSourceAction);
+
+/// Whether the stacked expert groups found in a checkpoint are complete: every block that has
+/// one of `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps` has all three, a config that declares
+/// experts has some (unless its dense prefix covers every layer), and a config that declares none
+/// has none. With the dense prefix and layer count known, the routed blocks are exactly
+/// `dense_lead..n_layers`: one missing a group, or a dense block holding one, is refused too.
+/// Anything else converts to a file the loader refuses (or, worse, mis-reads), so it is refused
+/// here with the block named. Only `lfm3` checkpoints are checked this way.
+fn check_expert_groups_complete<'a>(
+    groups: impl Iterator<Item = (usize, &'a str)>,
+    expected_experts: Option<usize>,
+    dense_lead: Option<usize>,
+    n_layers: Option<usize>,
+    lfm3: bool,
+) -> Result<(), CeraError> {
+    const KINDS: [&str; 3] = [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ];
+    let mut blocks: std::collections::BTreeMap<usize, [bool; 3]> =
+        std::collections::BTreeMap::new();
+    for (block, name) in groups {
+        let seen = blocks.entry(block).or_default();
+        if let Some(k) = KINDS.iter().position(|kind| name.ends_with(kind)) {
+            seen[k] = true;
+        }
+    }
+    let declared = expected_experts.is_some_and(|n| n > 0);
+    // an explicit dense prefix as long as the model: the experts the config counts are unused
+    let all_dense = matches!((dense_lead, n_layers), (Some(lead), Some(n)) if lead >= n);
+    if declared && lfm3 && blocks.is_empty() && !all_dense {
+        return Err(CeraError::Backend(format!(
+            "the config declares {} experts but the checkpoint holds no per-expert tensors \
+             (fused expert tensors are not supported)",
+            expected_experts.unwrap_or(0)
+        )));
+    }
+    if lfm3 && !blocks.is_empty() {
+        if !declared {
+            return Err(CeraError::Backend(
+                "the checkpoint holds per-expert tensors but the config declares no expert count"
+                    .into(),
+            ));
+        }
+        if all_dense {
+            return Err(CeraError::Backend(
+                "the checkpoint holds per-expert tensors but the config's dense prefix covers \
+                 every layer"
+                    .into(),
+            ));
+        }
+    }
+    for (block, seen) in &blocks {
+        if let Some(missing) = seen.iter().position(|s| !s) {
+            return Err(CeraError::Backend(format!(
+                "block {block} has stacked experts but no `{}` group",
+                KINDS[missing]
+            )));
+        }
+    }
+    if let (true, true, Some(lead), Some(n)) = (lfm3, declared, dense_lead, n_layers) {
+        if let Some(block) = (lead..n).find(|b| !blocks.contains_key(b)) {
+            return Err(CeraError::Backend(format!(
+                "block {block} is a routed layer (the first {lead} are dense) but the checkpoint \
+                 holds no stacked experts for it"
+            )));
+        }
+        if let Some(block) = blocks.keys().find(|&&b| b < lead) {
+            return Err(CeraError::Backend(format!(
+                "block {block} holds stacked experts but the config makes the first {lead} \
+                 blocks dense"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse expert tensors whose byte spans overlap within a shard. Each expert's length is checked
+/// against its shape, but correctly sized spans can still alias one matrix: stacking would then
+/// read and keep that matrix once per expert, expanding a small file into a large one built from
+/// duplicated weights.
+fn check_expert_spans_disjoint(stacked: &StackedExperts) -> Result<(), CeraError> {
+    let mut by_shard: std::collections::BTreeMap<usize, Vec<(usize, usize, String)>> =
+        std::collections::BTreeMap::new();
+    for ((_, gguf_name), experts) in stacked {
+        for (expert_idx, _, source) in experts {
+            by_shard.entry(source.file_idx).or_default().push((
+                source.data_start,
+                source.data_end,
+                format!("`{gguf_name}` expert {expert_idx}"),
+            ));
+        }
+    }
+    for (file_idx, spans) in by_shard {
+        check_disjoint_spans(spans, &format!("shard {file_idx}"))?;
+    }
+    Ok(())
+}
 
 fn expected_expert_count(config: &HfModelConfig) -> Option<usize> {
     config.expert_count()
@@ -1076,6 +1179,25 @@ fn plan_stacked_experts(
     ))
 }
 
+/// Register a planned tensor with the writer, sized from its element count. The count comes from
+/// an untrusted shape, so a size (or a running file offset) that overflows is a refusal naming
+/// the tensor, not a wrapped header.
+fn add_planned_tensor(
+    writer: &mut GgufWriter,
+    name: &str,
+    dims: Vec<u64>,
+    ggml_type: u32,
+    num_elements: usize,
+) -> Result<(), CeraError> {
+    let bytes = TargetQuant::checked_tensor_bytes(ggml_type, num_elements).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "tensor `{name}` declares {num_elements} elements; its GGUF size overflows"
+        ))
+    })?;
+    writer.try_add_tensor(name, dims, ggml_type, bytes)?;
+    Ok(())
+}
+
 fn plan_pending_tensors<'a>(
     shard_headers: impl IntoIterator<Item = (usize, &'a SafeTensorsHeader)>,
     config: &HfModelConfig,
@@ -1092,9 +1214,7 @@ fn plan_pending_tensors<'a>(
         std::collections::BTreeMap<d1::BatchNormStat, (SourceRef, usize)>,
     > = std::collections::BTreeMap::new();
     // per-expert tensors of an LFM3-MoE checkpoint, grouped by (block_idx, gguf_name) and stacked after the scan
-    type ExpertSliceEntry = (usize, Vec<usize>, SourceRef);
-    let mut stacked_experts: std::collections::BTreeMap<(usize, String), Vec<ExpertSliceEntry>> =
-        std::collections::BTreeMap::new();
+    let mut stacked_experts = StackedExperts::new();
 
     for (file_idx, header) in shard_headers {
         for (raw_name, tensor_info) in &header.tensors {
@@ -1146,12 +1266,7 @@ fn plan_pending_tensors<'a>(
                                 overrides,
                             );
                             let dims = gguf_tensor_dims(&gguf_name, &slice_shape);
-                            writer.add_tensor(
-                                &gguf_name,
-                                dims,
-                                ggml_type,
-                                TargetQuant::compute_tensor_bytes(ggml_type, n_elems),
-                            );
+                            add_planned_tensor(writer, &gguf_name, dims, ggml_type, n_elems)?;
                             pending_tensors.push(LocalPendingTensor {
                                 expected_elements: n_elems,
                                 ggml_type,
@@ -1173,12 +1288,7 @@ fn plan_pending_tensors<'a>(
                                 overrides,
                             );
                             let dims = gguf_tensor_dims(&gguf_name, &slice_shape);
-                            writer.add_tensor(
-                                &gguf_name,
-                                dims,
-                                ggml_type,
-                                TargetQuant::compute_tensor_bytes(ggml_type, n_elems),
-                            );
+                            add_planned_tensor(writer, &gguf_name, dims, ggml_type, n_elems)?;
                             pending_tensors.push(LocalPendingTensor {
                                 expected_elements: n_elems,
                                 ggml_type,
@@ -1206,8 +1316,7 @@ fn plan_pending_tensors<'a>(
                             overrides,
                         );
                         let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
-                        let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
-                        writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
+                        add_planned_tensor(writer, &gguf_name, dims, ggml_type, num_elements)?;
                         pending_tensors.push(LocalPendingTensor {
                             expected_elements: num_elements,
                             ggml_type,
@@ -1251,9 +1360,7 @@ fn plan_pending_tensors<'a>(
             };
 
             let dims = d1::tensor_dims(&gguf_name, &tensor_info.shape);
-            let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
-
-            writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
+            add_planned_tensor(writer, &gguf_name, dims, ggml_type, num_elements)?;
 
             pending_tensors.push(LocalPendingTensor {
                 expected_elements: num_elements,
@@ -1265,6 +1372,16 @@ fn plan_pending_tensors<'a>(
     }
 
     let expected_experts = expected_expert_count(config);
+    check_expert_groups_complete(
+        stacked_experts
+            .keys()
+            .map(|(block, name)| (*block, name.as_str())),
+        expected_experts,
+        config.leading_dense_blocks(),
+        config.num_hidden_layers,
+        arch.starts_with("lfm3"),
+    )?;
+    check_expert_spans_disjoint(&stacked_experts)?;
     for ((_block_idx, gguf_name), expert_refs) in stacked_experts {
         let (stacked_shape, n_elems, action) =
             plan_stacked_experts(expert_refs, expected_experts, &gguf_name)?;
@@ -1276,12 +1393,7 @@ fn plan_pending_tensors<'a>(
             overrides,
         );
         let dims = gguf_tensor_dims(&gguf_name, &stacked_shape);
-        writer.add_tensor(
-            &gguf_name,
-            dims,
-            ggml_type,
-            TargetQuant::compute_tensor_bytes(ggml_type, n_elems),
-        );
+        add_planned_tensor(writer, &gguf_name, dims, ggml_type, n_elems)?;
         pending_tensors.push(LocalPendingTensor {
             expected_elements: n_elems,
             ggml_type,
@@ -1312,12 +1424,7 @@ fn plan_pending_tensors<'a>(
         for (name, kind) in [("weight", d1::Fold::Scale), ("bias", d1::Fold::Shift)] {
             let gguf_name = format!("a.blk.{layer}.conv_norm.{name}");
             let ggml_type = crate::convert::writer::GGML_TYPE_F32;
-            writer.add_tensor(
-                &gguf_name,
-                vec![n as u64],
-                ggml_type,
-                TargetQuant::compute_tensor_bytes(ggml_type, n),
-            );
+            add_planned_tensor(writer, &gguf_name, vec![n as u64], ggml_type, n)?;
             pending_tensors.push(LocalPendingTensor {
                 expected_elements: n,
                 ggml_type,
@@ -1340,12 +1447,13 @@ fn plan_pending_tensors<'a>(
             row_len,
             overrides,
         );
-        writer.add_tensor(
+        add_planned_tensor(
+            writer,
             &generated.name,
             generated.dims,
             ggml_type,
-            TargetQuant::compute_tensor_bytes(ggml_type, num_elements),
-        );
+            num_elements,
+        )?;
         pending_tensors.push(LocalPendingTensor {
             expected_elements: num_elements,
             ggml_type,
@@ -1464,10 +1572,22 @@ where
             rows,
             cols,
         } => {
+            let slice_len = rows.checked_mul(*cols).ok_or_else(|| {
+                CeraError::Backend(format!("`{}` expert dimensions overflow", pt.gguf_name))
+            })?;
             let mut decoded_experts = Vec::with_capacity(experts.len());
             for (exp_idx, src) in experts {
                 let mut values = Vec::new();
                 read_source(src, &mut values)?;
+                // check each expert as it is read: spans that alias one large range would
+                // otherwise all be held decoded before the first length check
+                if values.len() != slice_len {
+                    return Err(CeraError::Backend(format!(
+                        "`{}` expert {exp_idx} decoded to {} elements, expected {slice_len} ([{rows}, {cols}])",
+                        pt.gguf_name,
+                        values.len()
+                    )));
+                }
                 decoded_experts.push((*exp_idx, vec![*rows, *cols], values));
             }
             let (_, stacked_data) =
@@ -2002,6 +2122,153 @@ pub(crate) fn is_auxiliary_shard(lower: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Every expert's decoded length is checked as it is read, not after all of them are: experts
+    /// whose byte spans alias the same large range would otherwise be held in memory at once, one
+    /// full decode per expert, before the first length check ran.
+    #[test]
+    fn a_stacked_expert_that_decodes_to_the_wrong_length_stops_the_read_at_once() {
+        let src = SourceRef {
+            file_idx: 0,
+            dtype: "F32".into(),
+            data_start: 0,
+            data_end: 0,
+        };
+        let pt = LocalPendingTensor {
+            expected_elements: 3 * 2 * 2,
+            ggml_type: crate::convert::writer::GGML_TYPE_F32,
+            gguf_name: "blk.0.ffn_gate_exps.weight".into(),
+            action: LocalSourceAction::StackExperts {
+                experts: (0..3).map(|i| (i, src.clone())).collect(),
+                rows: 2,
+                cols: 2,
+            },
+        };
+        let mut reads = 0usize;
+        let mut out = Vec::new();
+        let err = materialize_pending_tensor_f32(&pt, Some(3), &mut None, &mut out, |_, v| {
+            reads += 1;
+            v.clear();
+            v.extend(std::iter::repeat_n(0.0f32, 1000)); // an alias of a large range
+            Ok(())
+        })
+        .expect_err("a wrong-sized expert was accepted");
+        assert!(err.to_string().contains("expert 0"), "{err}");
+        assert_eq!(
+            reads, 1,
+            "the remaining experts were read after the first mismatch"
+        );
+    }
+
+    #[test]
+    fn expert_groups_must_be_complete_per_block_and_match_the_config() {
+        let g = |b: usize, n: &'static str| (b, n);
+        let all = |b: usize| {
+            vec![
+                g(b, "blk.1.ffn_gate_exps.weight"),
+                g(b, "blk.1.ffn_up_exps.weight"),
+                g(b, "blk.1.ffn_down_exps.weight"),
+            ]
+        };
+        // complete, in two blocks
+        let ok: Vec<_> = all(1).into_iter().chain(all(2)).collect();
+        assert!(
+            check_expert_groups_complete(ok.iter().copied(), Some(4), None, None, true).is_ok()
+        );
+        // a dense model with no expert count and no expert tensors
+        assert!(check_expert_groups_complete(std::iter::empty(), None, None, None, true).is_ok());
+        assert!(
+            check_expert_groups_complete(std::iter::empty(), Some(0), None, None, true).is_ok()
+        );
+        // experts declared, none found (fused expert tensors)
+        let err = check_expert_groups_complete(std::iter::empty(), Some(4), None, None, true)
+            .unwrap_err();
+        assert!(err.to_string().contains("no per-expert tensors"), "{err}");
+        // a block missing the down group
+        let partial: Vec<_> = all(1).into_iter().take(2).collect();
+        let err = check_expert_groups_complete(partial.iter().copied(), Some(4), None, None, true)
+            .unwrap_err();
+        assert!(err.to_string().contains("ffn_down_exps"), "{err}");
+        // per-expert tensors but no expert count
+        let err =
+            check_expert_groups_complete(all(1).into_iter(), None, None, None, true).unwrap_err();
+        assert!(err.to_string().contains("no expert count"), "{err}");
+    }
+
+    /// Correctly sized expert spans can still alias one matrix; stacking would then keep a copy
+    /// per expert. Spans must be disjoint within a shard (touching is fine, other shards are
+    /// independent).
+    #[test]
+    fn expert_tensors_that_share_bytes_are_refused() {
+        let experts = |spans: &[(usize, usize, usize)]| {
+            let entries: Vec<_> = spans
+                .iter()
+                .enumerate()
+                .map(|(i, &(file_idx, data_start, data_end))| {
+                    let source = SourceRef {
+                        file_idx,
+                        dtype: "F32".into(),
+                        data_start,
+                        data_end,
+                    };
+                    (i, vec![1usize, 1], source)
+                })
+                .collect();
+            std::collections::BTreeMap::from([(
+                (1usize, "blk.1.ffn_gate_exps.weight".to_string()),
+                entries,
+            )])
+        };
+        assert!(check_expert_spans_disjoint(&experts(&[(0, 0, 4), (0, 4, 8), (0, 8, 12)])).is_ok());
+        assert!(check_expert_spans_disjoint(&experts(&[(0, 0, 4), (1, 0, 4)])).is_ok());
+        for alias in [[(0, 0, 4), (0, 0, 4)], [(0, 0, 8), (0, 4, 12)]] {
+            let err = check_expert_spans_disjoint(&experts(&alias)).unwrap_err();
+            assert!(err.to_string().contains("overlap"), "{alias:?}: {err}");
+            assert!(err.to_string().contains("expert 1"), "{err}");
+        }
+    }
+
+    /// With the dense prefix and layer count in the config, the routed layers are known: a
+    /// prefix as long as the model needs no experts (the count is unused), and otherwise every
+    /// layer from the prefix on must hold all three groups and none before it may.
+    #[test]
+    fn the_dense_prefix_decides_which_layers_need_experts() {
+        let all = |b: usize| {
+            ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|k| (b, format!("{k}.weight")))
+        };
+        let check = |blocks: &[usize], lead, layers| {
+            let names: Vec<(usize, String)> = blocks.iter().flat_map(|&b| all(b)).collect();
+            check_expert_groups_complete(
+                names.iter().map(|(b, n)| (*b, n.as_str())),
+                Some(4),
+                lead,
+                layers,
+                true,
+            )
+        };
+        // every layer dense: no experts needed, and none allowed
+        assert!(check(&[], Some(2), Some(2)).is_ok());
+        let err = check(&[1], Some(2), Some(2)).unwrap_err();
+        assert!(
+            err.to_string().contains("dense prefix covers every layer"),
+            "{err}"
+        );
+        // dense prefix of 1 in 3 layers: layers 1 and 2 are routed
+        assert!(check(&[1, 2], Some(1), Some(3)).is_ok());
+        let err = check(&[1], Some(1), Some(3)).unwrap_err();
+        assert!(
+            err.to_string().contains("block 2 is a routed layer"),
+            "{err}"
+        );
+        let err = check(&[0, 1, 2], Some(1), Some(3)).unwrap_err();
+        assert!(
+            err.to_string().contains("block 0 holds stacked experts"),
+            "{err}"
+        );
+        // without the layout the old rules stand: experts are required, none are placed
+        assert!(check(&[], None, None).is_err());
+        assert!(check(&[1], Some(1), None).is_ok());
+    }
+
     #[test]
     fn a_source_span_past_the_end_of_its_shard_is_refused_before_allocating() {
         let dir = tempfile::tempdir().unwrap();
@@ -2268,6 +2535,47 @@ mod tests {
             err.to_string().contains("blk.0.ffn"),
             "unexpected message: {err}"
         );
+    }
+
+    /// A shape whose element count fits `usize` can still have a byte size that does not: planning
+    /// refuses it with the tensor named, instead of wrapping the size (a 0-byte tensor in a release
+    /// build, a panic in a debug one) and writing a header that points at the wrong bytes.
+    #[test]
+    fn a_declared_shape_whose_byte_size_overflows_is_refused_at_planning() {
+        let config = HfModelConfig::from_json_str(
+            &serde_json::json!({
+                "model_type": "lfm3", "hidden_size": 8, "num_hidden_layers": 2,
+                "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 2,
+                "intermediate_size": 3, "vocab_size": 16, "max_position_embeddings": 128,
+                "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // the smallest element count whose f32 byte size overflows `usize` (at any pointer width):
+        // the count fits, but its size does not
+        let elements = (usize::MAX / 4 + 1) as u64;
+        let header_json = serde_json::json!({
+            "model.embed_tokens.weight": {
+                "dtype": "F32", "shape": [elements, 1u64], "data_offsets": [0, 4],
+            }
+        })
+        .to_string();
+        let header =
+            SafeTensorsHeader::parse_from_json_str(&header_json, 8 + header_json.len()).unwrap();
+        let mut writer = GgufWriter::new();
+        let err = plan_pending_tensors(
+            [(0usize, &header)],
+            &config,
+            "lfm3",
+            false,
+            TargetQuant::F32,
+            &[],
+            &mut writer,
+        )
+        .expect_err("an overflowing size was planned");
+        assert!(err.to_string().contains("token_embd"), "{err}");
+        assert!(err.to_string().contains("overflows"), "{err}");
     }
 
     #[test]

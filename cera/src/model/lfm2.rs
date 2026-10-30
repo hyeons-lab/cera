@@ -443,7 +443,7 @@ fn describe_cache_tag(tag: &str) -> String {
 /// metadata, so every downstream consumer can trust it.
 ///
 /// The GPU short-conv kernels stage a channel's weights and rolling state in
-/// fixed-size registers sized for `kernel_size <= 4`
+/// fixed-size registers sized for `kernel_size <= 8`
 /// (`conv1d_fused_batch.{wgsl,metal,slang}`), and `d_conv = kernel_size - 1`
 /// underflows for 0. Both used to be handled per-kernel: the batched shader
 /// silently returned on out-of-range params, which turned a malformed model into
@@ -453,8 +453,9 @@ fn describe_cache_tag(tag: &str) -> String {
 ///
 /// `max` is [`GPU_CONV_KERNEL_MAX`] for `lfm2` / `lfm2moe`, whose files the GPU
 /// loaders also read through this parser. `lfm3` uses [`CPU_CONV_KERNEL_MAX`]:
-/// its checkpoint has `l_cache = 7`, the CPU conv loops are generic in the tap
-/// count, and the GPU loaders refuse the arch before they get here.
+/// its checkpoint has `l_cache = 7` and the CPU conv loops are generic in the tap
+/// count. The GPU loaders accept `lfm3` too, but only up to the kernels' 8 taps:
+/// `gpu_unsupported_reason` refuses a wider file (the CPU runs it).
 ///
 /// Every shipped LFM2 GGUF sets `l_cache = 3`.
 fn validate_conv_kernel_size(
@@ -489,7 +490,9 @@ pub(crate) fn gguf_is_causal(gguf: &GgufFile, prefix: &str) -> bool {
     }
 }
 
-/// Widest short-conv kernel the GPU kernels' fixed registers hold.
+/// Widest short-conv kernel an `lfm2` / `lfm2moe` file may declare for the GPU path (shipped files
+/// use 3). The GPU kernels' fixed registers hold up to 8 taps, which is what lets `lfm3` (7 taps)
+/// run there: `gpu_unsupported_reason` refuses an `lfm3` file wider than 8.
 const GPU_CONV_KERNEL_MAX: usize = 4;
 
 /// Widest short-conv kernel the CPU path accepts (a sanity bound, not a limit of

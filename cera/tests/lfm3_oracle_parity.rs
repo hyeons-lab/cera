@@ -40,8 +40,9 @@
 //!     4 GB bf16 file is optional and its absence is reported, not fatal.
 //!   * `lfm3_prefill_matches_decode`: needs only the Q8_0 GGUF; opt-in like the
 //!     two above (`CERA_ORACLE=1`, `--ignored`, since a debug build over the real
-//!     checkpoints takes 20+ minutes); skips when the GGUF is absent unless
-//!     `CERA_REQUIRE_MODEL` is set.
+//!     checkpoints takes 20+ minutes). It resolves its files the way the first test
+//!     does: an absent GGUF of the first model set is a hard failure, the other sets
+//!     skip unless `CERA_REQUIRE_MODEL` is set.
 //!
 //! Run:
 //!   CERA_ORACLE=1 CERA_ORACLE_MODELS_DIR=~/.leap/models \

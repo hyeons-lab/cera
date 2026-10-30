@@ -207,6 +207,21 @@ impl TargetQuant {
             _ => num_elements * 4,
         }
     }
+
+    /// [`Self::compute_tensor_bytes`] for an element count that comes from an untrusted shape:
+    /// `None` when the size overflows `usize`.
+    pub fn checked_tensor_bytes(ggml_type: u32, num_elements: usize) -> Option<usize> {
+        match ggml_type {
+            GGML_TYPE_F32 => num_elements.checked_mul(4),
+            GGML_TYPE_F16 | GGML_TYPE_BF16 => num_elements.checked_mul(2),
+            GGML_TYPE_Q8_0 => num_elements.div_ceil(32).checked_mul(34),
+            GGML_TYPE_Q4_0 => num_elements.div_ceil(32).checked_mul(18),
+            GGML_TYPE_Q4_K => num_elements.div_ceil(256).checked_mul(144),
+            GGML_TYPE_Q5_K => num_elements.div_ceil(256).checked_mul(176),
+            GGML_TYPE_Q6_K => num_elements.div_ceil(256).checked_mul(210),
+            _ => num_elements.checked_mul(4),
+        }
+    }
 }
 
 /// Quantization optimization strategy.
@@ -1196,6 +1211,39 @@ pub fn quantize_q6_k(input: &[f32], output: &mut [u8]) -> Result<(), CeraError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The checked size agrees with the plain one wherever the plain one cannot overflow, and is
+    /// `None` where it would.
+    #[test]
+    fn checked_tensor_bytes_matches_the_plain_size_and_refuses_overflow() {
+        for ty in [
+            GGML_TYPE_F32,
+            GGML_TYPE_F16,
+            GGML_TYPE_BF16,
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q4_0,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+        ] {
+            for n in [0usize, 1, 31, 32, 255, 256, 1 << 20] {
+                assert_eq!(
+                    TargetQuant::checked_tensor_bytes(ty, n),
+                    Some(TargetQuant::compute_tensor_bytes(ty, n)),
+                    "type {ty} n {n}"
+                );
+            }
+        }
+        // the smallest element count whose f32 byte size overflows `usize`, at any pointer width
+        assert_eq!(
+            TargetQuant::checked_tensor_bytes(GGML_TYPE_F32, usize::MAX / 4 + 1),
+            None
+        );
+        assert_eq!(
+            TargetQuant::checked_tensor_bytes(GGML_TYPE_F16, usize::MAX),
+            None
+        );
+    }
     use crate::quant::{dequantize_q4_0_matrix, dequantize_q8_0_matrix};
 
     /// A NaN or infinity in a block poisons the whole block (non-finite scale, zero

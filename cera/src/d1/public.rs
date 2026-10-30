@@ -70,6 +70,13 @@ pub fn is_omni(gguf: &GgufFile) -> bool {
     matches!(decision_type(gguf), Some(OMNI_TYPE | LFM3_OMNI_TYPE))
 }
 
+/// Whether `gguf` is the head-based public `lfm2-d1-omni` file: an encoder trunk with a d1 head
+/// and no language-model head. Unlike `lfm3-d1-omni`, which is prompt-based and scores logits.
+#[cfg(feature = "hexagon")]
+pub(crate) fn is_head_based_omni(gguf: &GgufFile) -> bool {
+    decision_type(gguf) == Some(OMNI_TYPE)
+}
+
 /// Whether `gguf` is a public LFM3 d1 model file (`lfm3-d1` or `lfm3-d1-omni`).
 pub fn is_lfm3_d1(gguf: &GgufFile) -> bool {
     matches!(decision_type(gguf), Some(LFM3_CAUSAL_TYPE | LFM3_OMNI_TYPE))
@@ -149,6 +156,27 @@ fn bucket_key(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::gguf::GgufBuilder;
+
+    /// Only the head-based `lfm2-d1-omni` trunk is an encoder without a language-model head. The
+    /// `lfm3-d1-omni` file is prompt-based and scores next-token logits, so its head must be planned.
+    #[cfg(feature = "hexagon")]
+    #[test]
+    fn only_the_lfm2_omni_file_is_an_encoder_trunk() {
+        let file = |key: &str, ty: &str| GgufBuilder::new().kv_str(key, ty).build();
+        assert!(crate::model::is_encoder_trunk(&file(TYPE_KEY, OMNI_TYPE)));
+        assert!(!crate::model::is_encoder_trunk(&file(
+            LFM3_TYPE_KEY,
+            LFM3_OMNI_TYPE
+        )));
+        assert!(!crate::model::is_encoder_trunk(&file(
+            TYPE_KEY,
+            CAUSAL_TYPE
+        )));
+        assert!(!crate::model::is_encoder_trunk(&file(
+            LFM3_TYPE_KEY,
+            LFM3_CAUSAL_TYPE
+        )));
+    }
 
     #[test]
     fn buckets_are_spelled_the_converted_way() {

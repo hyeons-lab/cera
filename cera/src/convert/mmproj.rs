@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
-    SafeTensorsHeader, decode_safetensor_to_f32_into, gguf_tensor_dims,
+    SafeTensorsHeader, check_disjoint_spans, decode_safetensor_to_f32_into, gguf_tensor_dims,
 };
 use crate::convert::writer::{GGML_TYPE_F16, GGML_TYPE_F32, GgufWriter};
 use crate::session::CeraError;
@@ -39,6 +39,13 @@ impl MmprojTensor {
 
 /// Validate that `shape` product does not overflow `usize` and equals `data.len()`.
 fn validate_tensor_buffer(name: &str, shape: &[usize], data: &[f32]) -> Result<(), CeraError> {
+    // a zero extent makes the product 0 whatever the other extents are, so `[2^60, 0]` matches
+    // an empty buffer and then drives loops over the huge extent
+    if shape.contains(&0) {
+        return Err(CeraError::Backend(format!(
+            "`{name}` has a zero extent in its shape {shape:?}"
+        )));
+    }
     let expected = shape
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
@@ -84,9 +91,11 @@ pub fn convert_mmproj(
     let config_bytes = fs::read(&config_path).map_err(|e| {
         CeraError::Backend(format!("failed to read `{}`: {e}", config_path.display()))
     })?;
-    let root_cfg: Value = serde_json::from_slice(&config_bytes).map_err(|e| {
-        CeraError::Backend(format!("failed to parse `{}`: {e}", config_path.display()))
-    })?;
+    let root_cfg: Value = serde_json::from_slice(&config_bytes)
+        .map(|v: Value| without_nulls(&v))
+        .map_err(|e| {
+            CeraError::Backend(format!("failed to parse `{}`: {e}", config_path.display()))
+        })?;
 
     let preproc_cfg = read_preprocessor_config(&dir)?;
     let detok_cfg = match read_optional_json(&dir.join("audio_detokenizer").join("config.json"))? {
@@ -156,7 +165,64 @@ pub fn convert_mmproj(
         }
     };
 
+    check_loader_contract(&writer, kind)?;
     write_mmproj_gguf(output_gguf_path, &mut writer, &tensors, quant)
+}
+
+/// Refuse a projector whose metadata the cera loaders would refuse. The metadata functions check
+/// each value's type and sign; this checks what the loaders check across values (divisibility,
+/// ranges, array lengths) by running the vision loader's own validator on the header about to be
+/// written and mirroring the audio encoder's range checks, so a malformed config fails here, naming
+/// the problem, and not later on the device that loads the file.
+fn check_loader_contract(writer: &GgufWriter, kind: MmprojKind) -> Result<(), CeraError> {
+    let refuse = |what: &str, why: String| {
+        CeraError::Backend(format!(
+            "the converted {what} metadata would be refused by the loader: {why}"
+        ))
+    };
+    if matches!(kind, MmprojKind::Vision | MmprojKind::Omni) {
+        let mut header = Vec::new();
+        writer.write_header_and_tensor_info(&mut header)?;
+        let gguf = crate::gguf::GgufFile::from_bytes(std::sync::Arc::from(header))
+            .map_err(|e| refuse("vision", format!("{e:#}")))?;
+        crate::model::vision_encoder::VisionEncoderConfig::from_gguf(&std::sync::Arc::new(gguf))
+            .map_err(|e| refuse("vision", format!("{e:#}")))?;
+    }
+    if matches!(kind, MmprojKind::Audio | MmprojKind::Omni) {
+        use crate::convert::writer::MetadataValue;
+        let get = |key: &str| match writer.get_metadata(key) {
+            Some(MetadataValue::Uint32(v)) => *v as usize,
+            _ => 0,
+        };
+        let (layers, width) = (
+            get("clip.audio.block_count"),
+            get("clip.audio.embedding_length"),
+        );
+        let (heads, kv_heads) = (
+            get("clip.audio.attention.head_count"),
+            get("clip.audio.attention.head_count_kv"),
+        );
+        let mel = get("clip.audio.num_mel_bins");
+        let problem = if layers == 0 {
+            Some("the audio encoder must have at least 1 layer".to_string())
+        } else if width == 0 {
+            Some("the audio encoder has no width".to_string())
+        } else if heads == 0 || width % heads != 0 {
+            Some(format!("{heads} heads do not divide the width {width}"))
+        } else if kv_heads == 0 || heads % kv_heads != 0 {
+            Some(format!(
+                "{kv_heads} key/value heads do not divide the {heads} heads"
+            ))
+        } else if mel == 0 {
+            Some("the audio encoder has no mel bins".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = problem {
+            return Err(refuse("audio", why));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +233,8 @@ pub enum MmprojKind {
 }
 
 pub fn detect_mmproj_kind(root_cfg: &Value) -> Result<MmprojKind, CeraError> {
+    // a null `vision_config` is an unset one: it must not count as a vision tower
+    let root_cfg = &without_nulls(root_cfg);
     let model_type = root_cfg
         .get("model_type")
         .and_then(Value::as_str)
@@ -224,6 +292,9 @@ fn apply_lfm3_vl_mmproj_metadata_inner(
     model_name: &str,
     is_omni: bool,
 ) -> Result<(), CeraError> {
+    let root_cfg = &without_nulls(root_cfg);
+    let preproc_owned = preproc_cfg.map(without_nulls);
+    let preproc_cfg = preproc_owned.as_ref();
     let vcfg = root_cfg
         .get("vision_config")
         .or_else(|| root_cfg.get("vision_tower"))
@@ -283,13 +354,15 @@ fn apply_lfm3_vl_mmproj_metadata_inner(
             .or_else(|| vcfg.get("num_key_value_heads")),
         heads,
     )?;
-    let rope_theta = vcfg
-        .get("rope_parameters")
-        .and_then(|rp| rp.get("rope_theta").or_else(|| rp.get("theta")))
-        .and_then(Value::as_f64)
-        .map(|v| v as f32)
-        .unwrap_or_else(|| f32_or(vcfg, &["rope_theta", "vision_rope_theta"], 1_000_000.0));
-    let eps = f32_or(vcfg, &["layer_norm_eps", "rms_norm_eps", "norm_eps"], 1e-5);
+    let rope_theta = match positive_float_opt(
+        "rope_theta",
+        vcfg.get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta").or_else(|| rp.get("theta"))),
+    )? {
+        Some(theta) => theta,
+        None => f32_or(vcfg, &["rope_theta", "vision_rope_theta"], 1_000_000.0)?,
+    };
+    let eps = f32_or(vcfg, &["layer_norm_eps", "rms_norm_eps", "norm_eps"], 1e-5)?;
     let proj_dim = narrowed(
         "hidden_size",
         tcfg.get("hidden_size")
@@ -320,8 +393,8 @@ fn apply_lfm3_vl_mmproj_metadata_inner(
     let ip_cfg = preproc_cfg
         .and_then(|p| p.get("image_processor").or(Some(p)))
         .unwrap_or(vcfg);
-    let mean = f32_vec_or(ip_cfg, "image_mean", &[0.5, 0.5, 0.5]);
-    let std = f32_vec_or(ip_cfg, "image_std", &[0.5, 0.5, 0.5]);
+    let mean = f32_vec_or(ip_cfg, "image_mean", &[0.5, 0.5, 0.5])?;
+    let std = f32_vec_or(ip_cfg, "image_std", &[0.5, 0.5, 0.5])?;
     writer.add_f32_array("clip.vision.image_mean", mean);
     writer.add_f32_array("clip.vision.image_std", std);
 
@@ -390,6 +463,7 @@ pub fn build_lfm3_vl_mmproj_tensors(
     root_cfg: &Value,
     raw_tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>,
 ) -> Result<Vec<MmprojTensor>, CeraError> {
+    let root_cfg = &without_nulls(root_cfg);
     let vcfg = root_cfg
         .get("vision_config")
         .or_else(|| root_cfg.get("vision_tower"))
@@ -778,7 +852,17 @@ fn compute_lfm_ffn_dim(cfg: &Value, default: u32) -> Result<u32, CeraError> {
     let base = narrowed("intermediate_size", cfg.get("intermediate_size"), default)?;
     if cfg.get("block_auto_adjust_ff_dim").and_then(Value::as_bool) == Some(true) {
         let mut dim = (2 * base as usize) / 3;
-        if let Some(mult) = cfg.get("block_ffn_dim_multiplier").and_then(Value::as_f64) {
+        if let Some(mult) = cfg
+            .get("block_ffn_dim_multiplier")
+            .map(|v| {
+                v.as_f64().ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "mmproj config `block_ffn_dim_multiplier` must be a number, got {v}"
+                    ))
+                })
+            })
+            .transpose()?
+        {
             if !mult.is_finite() || mult <= 0.0 {
                 return Err(CeraError::Backend(format!(
                     "mmproj config `block_ffn_dim_multiplier` must be finite and positive, got {mult}"
@@ -817,6 +901,9 @@ pub fn apply_lfm3_audio_mmproj_metadata(
     writer: &mut GgufWriter,
     model_name: &str,
 ) -> Result<(), CeraError> {
+    let root_cfg = &without_nulls(root_cfg);
+    let detok_owned = detok_cfg.map(without_nulls);
+    let detok_cfg = detok_owned.as_ref();
     let enc_outer = root_cfg
         .get("encoder")
         .or_else(|| root_cfg.get("audio_encoder_config"))
@@ -871,7 +958,7 @@ pub fn apply_lfm3_audio_mmproj_metadata(
         enc_cfg,
         &["norm_eps", "rms_norm_eps", "layer_norm_eps"],
         1e-5,
-    );
+    )?;
     let enc_l_cache = narrowed("conv_L_cache", enc_cfg.get("conv_L_cache"), 7)?;
     let enc_window = narrowed(
         "sliding_window",
@@ -906,13 +993,15 @@ pub fn apply_lfm3_audio_mmproj_metadata(
     writer.add_u32("clip.audio.shortconv.l_cache", enc_l_cache);
     writer.add_u32("clip.audio.window_size", enc_window);
     writer.add_u32("clip.audio.rope.dimension_count", enc_head_dim);
-    let enc_theta = enc_cfg
-        .get("rope_parameters")
-        .and_then(|p| p.get("full_attention").or(Some(p)))
-        .and_then(|p| p.get("rope_theta").or_else(|| p.get("theta")))
-        .or_else(|| enc_cfg.get("rope_theta"))
-        .and_then(Value::as_f64)
-        .unwrap_or(1_000_000.0) as f32;
+    let enc_theta = positive_float_opt(
+        "rope_theta",
+        enc_cfg
+            .get("rope_parameters")
+            .and_then(|p| p.get("full_attention").or(Some(p)))
+            .and_then(|p| p.get("rope_theta").or_else(|| p.get("theta")))
+            .or_else(|| enc_cfg.get("rope_theta")),
+    )?
+    .unwrap_or(1_000_000.0);
     writer.add_f32("clip.audio.rope.freq_base", enc_theta);
 
     // Code generator / depthformer metadata (both `clip.audio_gen.code.*` for runtime loader
@@ -954,14 +1043,16 @@ pub fn apply_lfm3_audio_mmproj_metadata(
         depth_cfg,
         &["norm_eps", "rms_norm_eps", "layer_norm_eps"],
         1e-5,
-    );
-    let depth_theta = depth_cfg
-        .get("rope_parameters")
-        .and_then(|p| p.get("full_attention").or(Some(p)))
-        .and_then(|p| p.get("rope_theta").or_else(|| p.get("theta")))
-        .or_else(|| depth_cfg.get("rope_theta"))
-        .and_then(Value::as_f64)
-        .unwrap_or(1_000_000.0) as f32;
+    )?;
+    let depth_theta = positive_float_opt(
+        "rope_theta",
+        depth_cfg
+            .get("rope_parameters")
+            .and_then(|p| p.get("full_attention").or(Some(p)))
+            .and_then(|p| p.get("rope_theta").or_else(|| p.get("theta")))
+            .or_else(|| depth_cfg.get("rope_theta")),
+    )?
+    .unwrap_or(1_000_000.0);
     let codebooks = narrowed(
         "num_codebooks",
         root_cfg
@@ -1045,7 +1136,7 @@ pub fn apply_lfm3_audio_mmproj_metadata(
         )?;
         let d_head_dim = narrowed_opt("head_dim", dlfm.get("head_dim"))?
             .unwrap_or_else(|| d_hidden / d_heads.max(1));
-        let d_eps = f32_or(dlfm, &["norm_eps", "rms_norm_eps"], 1e-5);
+        let d_eps = f32_or(dlfm, &["norm_eps", "rms_norm_eps"], 1e-5)?;
         let d_l_cache = narrowed("conv_L_cache", dlfm.get("conv_L_cache"), 7)?;
         let d_window = narrowed(
             "decoder_window",
@@ -1053,7 +1144,8 @@ pub fn apply_lfm3_audio_mmproj_metadata(
                 .or_else(|| dlfm.get("sliding_window")),
             30,
         )?;
-        let d_theta =
+        let d_theta = positive_float_opt(
+            "rope_theta",
             dlfm.get("rope_parameters")
                 .and_then(|p| {
                     p.get("sliding_attention")
@@ -1061,9 +1153,9 @@ pub fn apply_lfm3_audio_mmproj_metadata(
                         .or(Some(p))
                 })
                 .and_then(|p| p.get("rope_theta").or_else(|| p.get("theta")))
-                .or_else(|| dlfm.get("rope_theta"))
-                .and_then(Value::as_f64)
-                .unwrap_or(if is_codec_cfg { 1_000_000.0 } else { 10_000.0 }) as f32;
+                .or_else(|| dlfm.get("rope_theta")),
+        )?
+        .unwrap_or(if is_codec_cfg { 1_000_000.0 } else { 10_000.0 });
         let d_n_fft = narrowed(
             "stft_n_fft",
             dcfg.get("stft_n_fft").or_else(|| dcfg.get("n_fft")),
@@ -1298,6 +1390,9 @@ pub fn build_lfm3_audio_mmproj_tensors(
     detok_cfg: Option<&Value>,
     raw_tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>,
 ) -> Result<Vec<MmprojTensor>, CeraError> {
+    let root_cfg = &without_nulls(root_cfg);
+    let detok_owned = detok_cfg.map(without_nulls);
+    let detok_cfg = detok_owned.as_ref();
     let mut out = Vec::new();
 
     // Collect indexed embeddings for concatenation:
@@ -1815,22 +1910,38 @@ fn concat_indexed_tensors(
     Ok((out_shape, combined))
 }
 
-/// A config number as `u32`: absent (or not a number) gives `None`, and a number that does not
-/// fit is an error naming the key, not a wrapped width written into the GGUF.
+/// `v` with every null object member removed, recursively. Processors and configs serialize an
+/// unset attribute as null, and `Option::or_else` chains over spellings (`vision_hidden_size`, then
+/// `hidden_size`) treat a null as present and stop there: reading the cleaned copy makes an unset
+/// attribute absent everywhere, so the next spelling (or the documented default) applies.
+fn without_nulls(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), without_nulls(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
+/// A config number as `u32`: absent (or null) gives `None`; a value of another type, or a number
+/// that does not fit, is an error naming the key, not a default or a wrapped width written into
+/// the GGUF.
 fn narrowed_opt(key: &str, v: Option<&Value>) -> Result<Option<u32>, CeraError> {
-    if let Some(i) = v.and_then(Value::as_i64)
-        && i < 0
-    {
-        return Err(CeraError::Backend(format!(
-            "mmproj config `{key}` ({i}) does not fit in u32"
-        )));
-    }
-    match v.and_then(Value::as_u64) {
-        None => Ok(None),
-        Some(n) => u32::try_from(n).map(Some).map_err(|_| {
-            CeraError::Backend(format!("mmproj config `{key}` ({n}) does not fit in u32"))
-        }),
-    }
+    let n = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(x) => x.as_u64().ok_or_else(|| {
+            CeraError::Backend(format!(
+                "mmproj config `{key}` must be a non-negative integer, got {x}"
+            ))
+        })?,
+    };
+    u32::try_from(n)
+        .map(Some)
+        .map_err(|_| CeraError::Backend(format!("mmproj config `{key}` ({n}) does not fit in u32")))
 }
 
 /// [`narrowed_opt`] with a default for an absent key.
@@ -1838,24 +1949,70 @@ fn narrowed(key: &str, v: Option<&Value>, default: u32) -> Result<u32, CeraError
     Ok(narrowed_opt(key, v)?.unwrap_or(default))
 }
 
-fn f32_or(cfg: &Value, keys: &[&str], default: f32) -> f32 {
-    keys.iter()
-        .find_map(|k| cfg.get(*k).and_then(Value::as_f64))
-        .map(|v| v as f32)
-        .unwrap_or(default)
+/// A config float as `f32`: absent (or null) gives `None`; a value that is not a number, or whose
+/// `f32` is not finite (`1e39` rounds to infinity), is an error naming the key, like
+/// [`narrowed_opt`], not a default or an infinity written into the GGUF.
+fn float_opt(key: &str, v: Option<&Value>) -> Result<Option<f32>, CeraError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x
+            .as_f64()
+            .map(|f| f as f32)
+            .filter(|f| f.is_finite())
+            .map(Some)
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "mmproj config `{key}` must be a finite number, got {x}"
+                ))
+            }),
+    }
 }
 
-fn f32_vec_or(cfg: &Value, key: &str, default: &[f32]) -> Vec<f32> {
-    cfg.get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_f64)
-                .map(|v| v as f32)
-                .collect::<Vec<f32>>()
+/// [`float_opt`] for a value that must be positive (an epsilon, a rope base): zero, a negative
+/// number, or one that underflows `f32` to zero is an error.
+fn positive_float_opt(key: &str, v: Option<&Value>) -> Result<Option<f32>, CeraError> {
+    match float_opt(key, v)? {
+        Some(f) if f <= 0.0 => Err(CeraError::Backend(format!(
+            "mmproj config `{key}` must be positive, got {}",
+            v.map_or_else(String::new, ToString::to_string)
+        ))),
+        other => Ok(other),
+    }
+}
+
+/// The first of `keys` present in `cfg` as a positive float (every caller reads an epsilon), else
+/// `default`; a present key of the wrong type or sign is an error ([`positive_float_opt`]).
+fn f32_or(cfg: &Value, keys: &[&str], default: f32) -> Result<f32, CeraError> {
+    for key in keys {
+        if let Some(v) = positive_float_opt(key, cfg.get(*key))? {
+            return Ok(v);
+        }
+    }
+    Ok(default)
+}
+
+/// A float array (`image_mean`, `image_std`), or `default` when absent or empty; an element that
+/// is not a finite number, or a value that is not an array, is an error naming the key.
+fn f32_vec_or(cfg: &Value, key: &str, default: &[f32]) -> Result<Vec<f32>, CeraError> {
+    let Some(v) = cfg.get(key).filter(|v| !v.is_null()) else {
+        return Ok(default.to_vec());
+    };
+    let items = v.as_array().ok_or_else(|| {
+        CeraError::Backend(format!("mmproj config `{key}` must be an array, got {v}"))
+    })?;
+    let out = items
+        .iter()
+        .map(|item| {
+            float_opt(key, Some(item))?.ok_or_else(|| {
+                CeraError::Backend(format!("mmproj config `{key}` holds a null entry"))
+            })
         })
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_vec())
+        .collect::<Result<Vec<f32>, CeraError>>()?;
+    Ok(if out.is_empty() {
+        default.to_vec()
+    } else {
+        out
+    })
 }
 
 /// The image preprocessing config of a checkpoint directory: `processor_config.json` when it
@@ -1894,9 +2051,11 @@ fn read_optional_json(path: &Path) -> Result<Option<Value>, CeraError> {
     }
     let bytes = fs::read(path)
         .map_err(|e| CeraError::Backend(format!("failed to read `{}`: {e}", path.display())))?;
-    let val = serde_json::from_slice(&bytes)
+    // an unset attribute is serialized as null: it reads as absent (see `without_nulls`), so
+    // it neither counts as present when a config is chosen nor hides a later spelling
+    let val: Value = serde_json::from_slice(&bytes)
         .map_err(|e| CeraError::Backend(format!("failed to parse `{}`: {e}", path.display())))?;
-    Ok(Some(val))
+    Ok(Some(without_nulls(&val)))
 }
 
 type TensorMap = BTreeMap<String, (Vec<usize>, Vec<f32>)>;
@@ -1964,6 +2123,8 @@ fn load_safetensors_file(path: &Path, keep: &dyn Fn(&str) -> bool) -> Result<Ten
         .map_err(|e| CeraError::Backend(format!("failed to stat `{}`: {e}", path.display())))?
         .len();
     let mut out = BTreeMap::new();
+    // the kept tensors' spans, each bounded by the file before a buffer is sized from it
+    let mut spans = Vec::new();
     for (name, info) in header.tensors.iter().filter(|(name, _)| keep(name)) {
         let start = header
             .header_size_bytes
@@ -1979,12 +2140,19 @@ fn load_safetensors_file(path: &Path, keep: &dyn Fn(&str) -> bool) -> Result<Ten
                 info.data_offsets.0, info.data_offsets.1
             )));
         }
-        // the span comes from the file's own header: bound it before sizing a buffer from it
         if end as u64 > file_len {
             return Err(CeraError::Backend(format!(
                 "`{name}` data range {start}..{end} extends past the end of its {file_len}-byte file"
             )));
         }
+        spans.push((start, end, format!("`{name}`")));
+    }
+    // SafeTensors spans are disjoint; aliasing ones would decode one small range into many
+    // buffers, far larger than the file, so they are refused before anything is read
+    check_disjoint_spans(spans, &format!("`{}`", path.display()))?;
+    for (name, info) in header.tensors.iter().filter(|(name, _)| keep(name)) {
+        let start = header.header_size_bytes + info.data_offsets.0;
+        let end = header.header_size_bytes + info.data_offsets.1;
         file.seek(SeekFrom::Start(start as u64))
             .map_err(|e| CeraError::Backend(format!("seek failed: {e}")))?;
         let mut raw = vec![0u8; end - start];
@@ -2138,6 +2306,109 @@ mod tests {
 
     /// A width that does not fit `u32` used to wrap (`as u32`) into a plausible small number in
     /// the written GGUF; it is refused with the key named.
+    /// A zero extent next to a huge one multiplies to 0, so it matched an empty buffer and then
+    /// drove loops over the huge extent (`[2^60, 0]` ran for years).
+    /// A present config number of the wrong type used to read as absent, so the default was
+    /// written into the file instead of the converter saying the config is malformed.
+    /// The float readers follow the integer ones: a present value of the wrong type is an error
+    /// naming the key, not the default written into the GGUF.
+    #[test]
+    fn a_mistyped_config_float_is_an_error_not_the_default() {
+        use serde_json::json;
+        let write = |vision: Value, preproc: Value| {
+            let mut cfg = vl_cfg();
+            for (k, v) in vision.as_object().unwrap() {
+                cfg["vision_config"][k] = v.clone();
+            }
+            let mut writer = GgufWriter::new();
+            apply_lfm3_vl_mmproj_metadata(&cfg, Some(&preproc), &mut writer, "m")
+        };
+        assert!(write(json!({"layer_norm_eps": 1e-6}), json!({})).is_ok());
+        assert!(write(json!({"rope_theta": 100000}), json!({})).is_ok());
+        for (vision, preproc, key) in [
+            (
+                json!({"layer_norm_eps": "1e-6"}),
+                json!({}),
+                "layer_norm_eps",
+            ),
+            (json!({"rope_theta": "10000"}), json!({}), "rope_theta"),
+            (json!({"rope_theta": true}), json!({}), "rope_theta"),
+            (json!({}), json!({"image_mean": 0.5}), "image_mean"),
+            (
+                json!({}),
+                json!({"image_std": [0.5, "x", 0.5]}),
+                "image_std",
+            ),
+            (
+                json!({}),
+                json!({"image_std": [0.5, null, 0.5]}),
+                "image_std",
+            ),
+            // a double that is finite but not as an f32 (infinity, or underflow to zero) is
+            // refused, and an epsilon or rope base must be positive
+            (json!({"layer_norm_eps": 1e39}), json!({}), "layer_norm_eps"),
+            (
+                json!({"layer_norm_eps": 1e-50}),
+                json!({}),
+                "layer_norm_eps",
+            ),
+            (json!({"layer_norm_eps": 0}), json!({}), "layer_norm_eps"),
+            (
+                json!({"layer_norm_eps": -1e-5}),
+                json!({}),
+                "layer_norm_eps",
+            ),
+            (json!({"rope_theta": 0}), json!({}), "rope_theta"),
+            (json!({"rope_theta": -10000.0}), json!({}), "rope_theta"),
+            (
+                json!({}),
+                json!({"image_mean": [1e39, 0.5, 0.5]}),
+                "image_mean",
+            ),
+        ] {
+            let err = write(vision, preproc.clone()).expect_err(key);
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+        // an empty array is still "unset"
+        assert!(write(json!({}), json!({"image_mean": []})).is_ok());
+    }
+
+    #[test]
+    fn a_mistyped_config_number_is_an_error_not_the_default() {
+        use serde_json::json;
+        assert_eq!(narrowed_opt("k", None).unwrap(), None);
+        assert_eq!(narrowed_opt("k", Some(&json!(null))).unwrap(), None);
+        assert_eq!(narrowed_opt("k", Some(&json!(7))).unwrap(), Some(7));
+        for bad in [
+            json!("7"),
+            json!(1.5),
+            json!(-1),
+            json!(true),
+            json!([7]),
+            json!({}),
+        ] {
+            let err = narrowed_opt("k", Some(&bad)).expect_err(&format!("{bad} was accepted"));
+            assert!(err.to_string().contains("`k`"), "{bad}: {err}");
+        }
+        assert_eq!(narrowed("k", Some(&json!(null)), 9).unwrap(), 9);
+        assert!(narrowed("k", Some(&json!("x")), 9).is_err());
+    }
+
+    #[test]
+    fn a_shape_with_a_zero_extent_is_refused() {
+        for shape in [
+            vec![usize::MAX, 0],
+            vec![3, 0],
+            vec![0],
+            vec![0, usize::MAX, 7],
+        ] {
+            let err = validate_tensor_buffer("t", &shape, &[])
+                .expect_err(&format!("{shape:?} was accepted"));
+            assert!(err.to_string().contains("zero"), "{shape:?}: {err}");
+        }
+        assert!(validate_tensor_buffer("t", &[2, 3], &[0.0; 6]).is_ok());
+    }
+
     #[test]
     fn an_audio_config_number_that_does_not_fit_u32_is_refused() {
         let too_big = serde_json::json!(u64::from(u32::MAX) + 7);
@@ -2308,6 +2579,101 @@ mod tests {
         DetokenizerWeights::from_gguf(&gguf).expect("audio detokenizer half");
     }
 
+    /// A config whose values have the right types and signs but break what the loaders check across
+    /// values (divisibility, ranges, array lengths) must fail the conversion, naming the problem,
+    /// and leave no file behind: the loader would refuse the file only later, on the device.
+    #[test]
+    fn a_config_the_loaders_would_refuse_fails_the_conversion() {
+        let convert = |mutate: &dyn Fn(&mut Value, &mut Value)| -> (Result<(), CeraError>, bool) {
+            let (vl_cfg, mut preproc, vl_raw) = vl_roundtrip_fixture();
+            let (mut cfg, detok, audio_raw) = audio_roundtrip_fixture();
+            cfg["model_type"] = json!("lfm3_omni");
+            cfg["architectures"] = json!(["Lfm3OmniForConditionalGeneration"]);
+            cfg["vision_config"] = vl_cfg["vision_config"].clone();
+            cfg["text_config"] = vl_cfg["text_config"].clone();
+            mutate(&mut cfg, &mut preproc);
+            let mut raw = vl_raw;
+            raw.extend(audio_raw);
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+            std::fs::write(
+                dir.path().join("preprocessor_config.json"),
+                preproc.to_string(),
+            )
+            .unwrap();
+            std::fs::create_dir(dir.path().join("audio_detokenizer")).unwrap();
+            std::fs::write(
+                dir.path().join("audio_detokenizer").join("config.json"),
+                detok.to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("model.safetensors"),
+                safetensors_bytes(&raw),
+            )
+            .unwrap();
+            let out = dir.path().join("mmproj.gguf");
+            let result = convert_mmproj(dir.path(), &out, TargetQuant::F32);
+            (result, out.exists())
+        };
+        // the fixture itself converts
+        let (ok, written) = convert(&|_, _| {});
+        ok.unwrap();
+        assert!(written);
+        for (what, expect, mutate) in [
+            (
+                "image_mean of one entry",
+                "image_mean",
+                (&|_: &mut Value, p: &mut Value| p["image_mean"] = json!([0.5]))
+                    as &dyn Fn(&mut Value, &mut Value),
+            ),
+            (
+                "downsample_factor 0",
+                "scale_factor",
+                &|_: &mut Value, p: &mut Value| p["downsample_factor"] = json!(0),
+            ),
+            (
+                "heads that do not divide the vision width",
+                "n_head",
+                &|c: &mut Value, _: &mut Value| {
+                    c["vision_config"]["num_attention_heads"] = json!(3)
+                },
+            ),
+            (
+                "an image size that is not a multiple of the patch",
+                "patch_size",
+                &|c: &mut Value, _: &mut Value| c["vision_config"]["image_size"] = json!(7),
+            ),
+            (
+                "an empty pixel band",
+                "image_min_pixels",
+                &|_: &mut Value, p: &mut Value| {
+                    p["min_pixels"] = json!(1000);
+                    p["max_pixels"] = json!(10);
+                },
+            ),
+            (
+                "audio heads that do not divide the width",
+                "heads do not divide",
+                &|c: &mut Value, _: &mut Value| {
+                    c["encoder"]["lfm"]["num_attention_heads"] = json!(3);
+                },
+            ),
+            (
+                "an audio encoder with no layers",
+                "at least 1 layer",
+                &|c: &mut Value, _: &mut Value| {
+                    c["encoder"]["lfm"]["num_hidden_layers"] = json!(0);
+                },
+            ),
+        ] {
+            let (result, written) = convert(mutate);
+            let err = result.expect_err(what);
+            assert!(err.to_string().contains(expect), "{what}: {err}");
+            assert!(!written, "{what}: a refused conversion left a file");
+        }
+    }
+
     /// Values, not shapes: the two patchifier spellings store the temporal pair differently.
     /// `patchifier.weight` is `[n_embd, channels, 2, p, p]` (the two time slices sit inside
     /// each channel); `patchifier.proj.weight` is `[n_embd, 2 * channels * p * p]` with the
@@ -2354,6 +2720,50 @@ mod tests {
         let err = write_mmproj_gguf(&out, &mut writer, &dup, TargetQuant::F32).unwrap_err();
         assert!(err.to_string().contains("a.x"), "{err}");
         assert!(!out.exists(), "nothing is written for a refused set");
+    }
+
+    /// Each tensor's span is bounded by the file length, but spans may overlap: many tensors naming
+    /// the same bytes would decode into memory far larger than the file. SafeTensors spans are
+    /// disjoint, so their total can never exceed the file.
+    #[test]
+    fn tensors_that_alias_the_same_bytes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let mut entries = Vec::new();
+        for i in 0..50 {
+            entries.push(format!(
+                r#""vision_tower.t{i}.weight":{{"dtype":"F32","shape":[16],"data_offsets":[0,64]}}"#
+            ));
+        }
+        let header = format!("{{{}}}", entries.join(","));
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, bytes).unwrap();
+        let err = load_safetensors_file(&path, &|_| true).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    /// The data region is larger than the two spans together, so a total-size bound lets two
+    /// tensors name the same bytes; only comparing the spans catches it.
+    #[test]
+    fn tensors_that_share_bytes_in_a_larger_data_region_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let header = r#"{"vision_tower.a.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"vision_tower.b.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, bytes).unwrap();
+        let err = load_safetensors_file(&path, &|_| true).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
+        // the same two tensors side by side load
+        let header = r#"{"vision_tower.a.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"vision_tower.b.weight":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(load_safetensors_file(&path, &|_| true).unwrap().len(), 2);
     }
 
     #[test]
@@ -2448,6 +2858,134 @@ mod tests {
                 .expect_err(key);
             assert!(err.to_string().contains(key), "{key}: {err}");
         }
+    }
+
+    /// A null in an earlier spelling must not hide a later spelling (or its default): the
+    /// `or_else` chains over `vision_hidden_size` / `hidden_size`, `downsample_factor` /
+    /// `merge_size`, and the config sections themselves all read an unset attribute as absent.
+    #[test]
+    fn a_null_config_attribute_reads_as_absent_in_every_spelling_chain() {
+        use serde_json::json;
+        let metadata = |root: Value, preproc: Value, key: &str| {
+            let mut writer = GgufWriter::new();
+            apply_lfm3_vl_mmproj_metadata(&root, Some(&preproc), &mut writer, "m").unwrap();
+            writer.get_metadata(key).cloned()
+        };
+        let want = |n: u32| Some(crate::convert::writer::MetadataValue::Uint32(n));
+        // a later spelling is used when the earlier one is null
+        let mut root = vl_cfg();
+        root["vision_config"]["vision_hidden_size"] = json!(null);
+        root["vision_config"]["hidden_size"] = json!(1024);
+        assert_eq!(
+            metadata(root, json!({}), "clip.vision.embedding_length"),
+            want(1024)
+        );
+        // the downsample chain: preprocessor null, root value
+        let mut root = vl_cfg();
+        root["downsample_factor"] = json!(3);
+        assert_eq!(
+            metadata(
+                root.clone(),
+                json!({"downsample_factor": null}),
+                "clip.vision.spatial_merge_size"
+            ),
+            want(3)
+        );
+        assert_eq!(
+            metadata(root, json!({}), "clip.vision.spatial_merge_size"),
+            want(3)
+        );
+        // a null section does not hide the next one
+        let mut root = vl_cfg();
+        root["vision_tower"] = root["vision_config"].clone();
+        root["vision_tower"]["hidden_size"] = json!(1024);
+        root["vision_config"] = json!(null);
+        assert_eq!(
+            metadata(root, json!({}), "clip.vision.embedding_length"),
+            want(1024)
+        );
+    }
+
+    /// Every reader of a config sees an unset (null) attribute as absent: the kind dispatch, the
+    /// audio detokenizer config, and the choice between processor and preprocessor config files.
+    #[test]
+    fn a_null_attribute_is_absent_for_kind_detection_the_detokenizer_and_config_choice() {
+        use serde_json::json;
+        // an audio config that serializes its unset vision section as null is still audio
+        let (mut audio, detok, _) = audio_roundtrip_fixture();
+        assert_eq!(detect_mmproj_kind(&audio).unwrap(), MmprojKind::Audio);
+        audio["vision_config"] = json!(null);
+        audio["vision_tower"] = json!(null);
+        assert_eq!(detect_mmproj_kind(&audio).unwrap(), MmprojKind::Audio);
+        // and a vision config with a null audio section is still vision
+        let mut vision = vl_cfg();
+        vision["encoder"] = json!(null);
+        vision["audio_tower"] = json!(null);
+        assert_eq!(detect_mmproj_kind(&vision).unwrap(), MmprojKind::Vision);
+
+        // a null spelling in the detokenizer config does not hide the next one
+        let metadata = |detok: &Value| {
+            let mut writer = GgufWriter::new();
+            apply_lfm3_audio_mmproj_metadata(&audio, Some(detok), true, &mut writer, "m").unwrap();
+            [
+                "clip.audio_gen.wav.n_fft",
+                "clip.audio_gen.wav.hop_length",
+                "clip.audio_gen.wav.block_count",
+            ]
+            .map(|k| writer.get_metadata(k).cloned())
+        };
+        let mut nulled = detok.clone();
+        nulled["stft_n_fft"] = json!(null);
+        nulled["stft_hop_length"] = json!(null);
+        nulled["decoder_lfm_config"] = json!(null);
+        assert_eq!(metadata(&nulled), metadata(&detok));
+
+        // a processor_config.json of nulls does not hide the preprocessor_config.json
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("processor_config.json"),
+            r#"{"image_processor": null, "min_pixels": null}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("preprocessor_config.json"),
+            r#"{"downsample_factor": 3}"#,
+        )
+        .unwrap();
+        let cfg = read_preprocessor_config(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg["downsample_factor"], 3);
+    }
+
+    /// Processors serialize an unset attribute as null: a null `min_pixels` / `max_pixels` (or size
+    /// edge) next to a real token budget must not hide that budget.
+    #[test]
+    fn a_null_pixel_bound_does_not_hide_the_token_budget() {
+        use serde_json::json;
+        let metadata = |preproc: Value| {
+            let mut writer = GgufWriter::new();
+            apply_lfm3_vl_mmproj_metadata(&vl_cfg(), Some(&preproc), &mut writer, "m").unwrap();
+            [
+                writer.get_metadata("clip.vision.image_min_pixels").cloned(),
+                writer.get_metadata("clip.vision.image_max_pixels").cloned(),
+            ]
+        };
+        let budget = json!({"min_image_tokens": 64, "max_image_tokens": 256});
+        let want = metadata(budget.clone());
+        assert!(want.iter().all(Option::is_some), "{want:?}");
+        for nulls in [
+            json!({"min_pixels": null, "max_pixels": null}),
+            json!({"size": {"shortest_edge": null, "longest_edge": null}}),
+        ] {
+            let mut cfg = budget.clone();
+            cfg.as_object_mut()
+                .unwrap()
+                .extend(nulls.as_object().unwrap().clone());
+            assert_eq!(metadata(cfg), want, "{nulls}");
+        }
+        // a real direct bound still wins over the token budget
+        let mut cfg = budget;
+        cfg["min_pixels"] = json!(1000);
+        assert_ne!(metadata(cfg)[0], want[0]);
     }
 
     #[test]

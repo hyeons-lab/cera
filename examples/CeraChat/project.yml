@@ -23,7 +23,7 @@ options:
 packages:
   Cera:
     url: https://github.com/hyeons-lab/cera
-    from: "0.7.2"
+    from: "0.7.3"
 
 targets:
   CeraChat:

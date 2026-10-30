@@ -353,6 +353,11 @@ impl AudioDecoderWeights {
         let n_layer = gguf
             .get_u32("depthformer_n_layer")
             .context("missing depthformer_n_layer")? as usize;
+        // sizes a `Vec::with_capacity` below: bound it like the lfm3a loaders bound theirs
+        anyhow::ensure!(
+            (1..=256).contains(&n_layer),
+            "depthformer_n_layer ({n_layer}) must be in 1..=256"
+        );
         let n_embd = gguf
             .get_u32("depthformer_n_embd")
             .context("missing depthformer_n_embd")? as usize;
@@ -362,19 +367,34 @@ impl AudioDecoderWeights {
         let qkv = MmapWeight::from_gguf(gguf, "depthformer.layers.0.operator.qkv_proj.weight")?;
         let q_norm_w =
             gguf.get_tensor("depthformer.layers.0.operator.attention.q_layernorm.weight")?;
-        let n_embd_head = q_norm_w.shape()[0]; // head_dim from q_norm shape
+        // head_dim from q_norm shape
+        let n_embd_head = q_norm_w
+            .shape()
+            .first()
+            .copied()
+            .filter(|&d| d > 0)
+            .context("depthformer q_layernorm has no usable shape")?;
         let qkv_out = qkv.rows; // (n_head + 2*n_head_kv) * head_dim
         let n_head = 32; // hardcoded per decoder.cpp config
         let n_head_kv = 8;
-        assert_eq!(
-            qkv_out,
-            (n_head + 2 * n_head_kv) * n_embd_head,
-            "qkv_proj shape mismatch"
+        anyhow::ensure!(
+            qkv_out == (n_head + 2 * n_head_kv) * n_embd_head,
+            "depthformer qkv_proj has {qkv_out} rows, expected {} for {n_head} heads and \
+             {n_head_kv} kv heads of width {n_embd_head}",
+            (n_head + 2 * n_head_kv) * n_embd_head
         );
 
         // FFN dim from w1 shape.
         let w1_0 = MmapWeight::from_gguf(gguf, "depthformer.layers.0.feed_forward.w1.weight")?;
         let ffn_dim = w1_0.rows;
+        // the declared width must be the width the weights read, or the forward asserts on the
+        // first frame (the lfm3a_gen loader ties it the same way)
+        anyhow::ensure!(
+            n_embd > 0 && qkv.cols == n_embd && w1_0.cols == n_embd,
+            "depthformer_n_embd ({n_embd}) disagrees with qkv_proj ({} columns) / w1 ({} columns)",
+            qkv.cols,
+            w1_0.cols
+        );
 
         let depthformer_config = DepthformerConfig {
             n_layer,
@@ -411,11 +431,40 @@ impl AudioDecoderWeights {
                 w2: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
                 w3: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
             });
+            // every layer reads the same widths as layer 0, or the first frame asserts
+            let l = &depthformer_layers[i];
+            anyhow::ensure!(
+                l.wqkv.rows == qkv_out
+                    && l.wqkv.cols == n_embd
+                    && l.wo.rows == n_embd
+                    && l.wo.cols == n_head * n_embd_head
+                    && l.w1.rows == ffn_dim
+                    && l.w1.cols == n_embd
+                    && l.w3.rows == ffn_dim
+                    && l.w3.cols == n_embd
+                    && l.w2.rows == n_embd
+                    && l.w2.cols == ffn_dim
+                    && l.operator_norm.len() == n_embd
+                    && l.ffn_norm.len() == n_embd
+                    && l.q_norm.len() == n_embd_head
+                    && l.k_norm.len() == n_embd_head,
+                "depthformer layer {i} shapes disagree with n_embd={n_embd}, \
+                 head_dim={n_embd_head}, ffn_dim={ffn_dim}"
+            );
         }
 
         // Decoder model weights.
         let depth_linear_w = MmapWeight::from_gguf(gguf, "depth_linear.weight")?;
         let depth_linear_b = gguf.get_tensor("depth_linear.bias")?.try_to_f32_vec()?;
+        // one `n_embd`-wide slice per codebook, and a bias for every row
+        anyhow::ensure!(
+            depth_linear_w.rows == 8 * n_embd && depth_linear_b.len() == depth_linear_w.rows,
+            "depth_linear is {} rows with a {}-entry bias; expected {} rows (8 codebooks of \
+             depthformer_n_embd {n_embd}) and a bias of the same length",
+            depth_linear_w.rows,
+            depth_linear_b.len(),
+            8 * n_embd
+        );
 
         let n_codebook = 8;
         let mut depth_embeddings = Vec::with_capacity(n_codebook);
@@ -437,6 +486,36 @@ impl AudioDecoderWeights {
                 .try_to_f32_vec()?,
             to_logits: MmapWeight::from_gguf(gguf, "audio_embedding.to_logits.weight")?,
         };
+        // each depth codebook embeds, normalizes and projects at the depthformer width, the audio
+        // codebook at the LLM width `depth_linear` reads, and the depth codebooks all emit the
+        // same vocabulary
+        let n_vocab_depth = depth_embeddings[0].to_logits.rows;
+        for (name, book, width) in depth_embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (format!("depth_embeddings.{i}"), b, n_embd))
+            .chain(std::iter::once((
+                "audio_embedding".to_string(),
+                &audio_embedding,
+                depth_linear_w.cols,
+            )))
+        {
+            anyhow::ensure!(
+                book.embedding.cols == width
+                    && book.norm.len() == width
+                    && book.to_logits.cols == width,
+                "{name} widths ({}, {}, {}) disagree with the expected width {width}",
+                book.embedding.cols,
+                book.norm.len(),
+                book.to_logits.cols
+            );
+        }
+        anyhow::ensure!(
+            depth_embeddings
+                .iter()
+                .all(|b| b.to_logits.rows == n_vocab_depth),
+            "the depth codebooks disagree on their vocabulary size"
+        );
 
         // Derive decoder config from weight shapes.
         let n_embd_llm = depth_linear_w.cols; // LLM embedding dim (2048)
@@ -975,9 +1054,16 @@ impl AudioDecoderWeights {
                 None
             };
             let cb_elems = n_vocab * n_embd;
+            // exactly the table, not at least: a vocab or width that disagrees with the tensor
+            // (the published file stores `[n_embd, n_vocab, n_codebook]`) would otherwise shift
+            // every codebook's slice and the mask row without an error
             anyhow::ensure!(
-                tok_all.len() >= n_codebook * cb_elems && out_all.len() >= n_codebook * cb_elems,
-                "a.gen.code.tok_embd / out_proj smaller than {n_codebook} * {n_vocab} * {n_embd}"
+                tok_all.len() == n_codebook * cb_elems && out_all.len() == n_codebook * cb_elems,
+                "a.gen.code.tok_embd / out_proj hold {} / {} values, expected {n_codebook} * \
+                 {n_vocab} * {n_embd} = {}",
+                tok_all.len(),
+                out_all.len(),
+                n_codebook * cb_elems
             );
             for j in 0..n_codebook {
                 let mut slice_tok = tok_all[j * cb_elems..(j + 1) * cb_elems].to_vec();
@@ -2198,7 +2284,8 @@ impl DetokenizerWeights {
             "lfm.layers.2.self_attn.q_layernorm.weight",
             "blk.2.attn_q_norm.weight",
         )?;
-        let n_embd_head = q_norm_w.shape()[0];
+        // an empty shape is the corrupt case the guard below names; indexing it would panic first
+        let n_embd_head = q_norm_w.shape().first().copied().unwrap_or(0);
         // Guard against a corrupt vocoder GGUF reporting an empty
         // q_layernorm shape; both `n_head` and `n_head_kv` are
         // derived from this dim and would div-by-zero panic
@@ -3919,6 +4006,196 @@ impl IstftStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The legacy loader sizes a `Vec::with_capacity` from `depthformer_n_layer`, so an absurd
+    /// file value must be an error, not an allocation.
+    #[test]
+    fn the_legacy_decoder_loader_bounds_its_layer_count() {
+        for bad in [0u32, 1 << 30] {
+            let gguf = crate::gguf::GgufBuilder::new()
+                .kv_u32("depthformer_n_layer", bad)
+                .kv_u32("depthformer_n_embd", 8)
+                .build();
+            let err = AudioDecoderWeights::from_gguf(&std::sync::Arc::new(gguf))
+                .err()
+                .unwrap_or_else(|| panic!("n_layer {bad} was accepted"));
+            assert!(
+                err.to_string().contains("depthformer_n_layer"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// The declared `depthformer_n_embd` must be the width the first layer's weights read: the
+    /// loader derives everything else from the tensors, and a lying width would only surface as a
+    /// shape assertion on the first frame.
+    #[test]
+    fn the_legacy_decoder_loader_ties_its_declared_width_to_the_weights() {
+        let build = |n_embd: u32| {
+            let mut w = crate::convert::writer::GgufWriter::new();
+            w.add_u32("depthformer_n_layer", 1);
+            w.add_u32("depthformer_n_embd", n_embd);
+            // GGUF dims are [cols, rows]: qkv_proj reads 8 inputs for (32 + 2 * 8) heads of width 1
+            let tensors = [
+                (
+                    "depthformer.layers.0.operator.qkv_proj.weight",
+                    vec![8u64, 48],
+                ),
+                (
+                    "depthformer.layers.0.operator.attention.q_layernorm.weight",
+                    vec![1],
+                ),
+                ("depthformer.layers.0.feed_forward.w1.weight", vec![8, 4]),
+            ];
+            for (name, dims) in &tensors {
+                w.add_tensor(
+                    *name,
+                    dims.clone(),
+                    0,
+                    dims.iter().product::<u64>() as usize * 4,
+                );
+            }
+            let mut bytes = Vec::new();
+            w.write_header_and_tensor_info(&mut bytes).unwrap();
+            for (_, dims) in &tensors {
+                let zeros = vec![0u8; dims.iter().product::<u64>() as usize * 4];
+                w.write_tensor_data(&mut bytes, &zeros).unwrap();
+            }
+            let gguf = Arc::new(GgufFile::from_bytes(Arc::from(bytes)).unwrap());
+            format!("{:#}", AudioDecoderWeights::from_gguf(&gguf).err().unwrap())
+        };
+        // 8 matches the weights: the loader gets past the width check (and fails on a later,
+        // absent tensor)
+        assert!(!build(8).contains("disagrees"), "{}", build(8));
+        for wrong in [0u32, 4, 4_000_000_000] {
+            let err = build(wrong);
+            assert!(err.contains("depthformer_n_embd"), "{wrong}: {err}");
+            assert!(err.contains("disagrees"), "{wrong}: {err}");
+        }
+    }
+
+    /// A complete legacy vocoder (one layer, width 8, head width 2, FFN 16, 8 codebooks over a
+    /// vocabulary of 4), with `dims_for` free to replace any tensor's GGUF dims (`[cols, rows]`).
+    /// Returns the loader's error text, or an empty string when the file loads.
+    fn legacy_vocoder_error(dims_for: &dyn Fn(&str) -> Option<Vec<u64>>) -> String {
+        let mut tensors: Vec<(String, Vec<u64>)> = Vec::new();
+        let l = "depthformer.layers.0";
+        for (name, dims) in [
+            (format!("{l}.operator_norm.weight"), vec![8u64]),
+            (format!("{l}.operator.qkv_proj.weight"), vec![8, 96]),
+            (
+                format!("{l}.operator.attention.q_layernorm.weight"),
+                vec![2],
+            ),
+            (
+                format!("{l}.operator.attention.k_layernorm.weight"),
+                vec![2],
+            ),
+            (format!("{l}.operator.out_proj.weight"), vec![64, 8]),
+            (format!("{l}.ffn_norm.weight"), vec![8]),
+            (format!("{l}.feed_forward.w1.weight"), vec![8, 16]),
+            (format!("{l}.feed_forward.w2.weight"), vec![16, 8]),
+            (format!("{l}.feed_forward.w3.weight"), vec![8, 16]),
+            ("depth_linear.weight".to_string(), vec![6, 64]),
+            ("depth_linear.bias".to_string(), vec![64]),
+        ] {
+            tensors.push((name.clone(), dims_for(&name).unwrap_or(dims)));
+        }
+        // the depth codebooks are at the depthformer width (8), the audio codebook at the LLM width
+        // `depth_linear` reads (6)
+        let books = (0..8)
+            .map(|i| (format!("depth_embeddings.{i}"), 8u64))
+            .chain([("audio_embedding".to_string(), 6u64)]);
+        for (book, width) in books {
+            for (suffix, dims) in [
+                ("embedding.weight", vec![width, 4u64]),
+                ("embedding_norm.weight", vec![width]),
+                ("to_logits.weight", vec![width, 4]),
+            ] {
+                let name = format!("{book}.{suffix}");
+                let dims = dims_for(&name).unwrap_or(dims);
+                tensors.push((name, dims));
+            }
+        }
+        let mut w = crate::convert::writer::GgufWriter::new();
+        w.add_u32("depthformer_n_layer", 1);
+        w.add_u32("depthformer_n_embd", 8);
+        for (name, dims) in &tensors {
+            w.add_tensor(
+                name,
+                dims.clone(),
+                0,
+                dims.iter().product::<u64>() as usize * 4,
+            );
+        }
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        for (_, dims) in &tensors {
+            let zeros = vec![0u8; dims.iter().product::<u64>() as usize * 4];
+            w.write_tensor_data(&mut bytes, &zeros).unwrap();
+        }
+        let gguf = Arc::new(GgufFile::from_bytes(Arc::from(bytes)).unwrap());
+        match AudioDecoderWeights::from_gguf(&gguf) {
+            Ok(_) => String::new(),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    /// Every tensor the first frame multiplies must have the width the file declares: a loader that
+    /// checks only the first layer's projections accepts a file whose other tensors panic the
+    /// forward (an index past a short bias, an assertion on a column count).
+    #[test]
+    fn the_legacy_decoder_loader_pins_every_layer_projection_and_codebook_shape() {
+        assert_eq!(legacy_vocoder_error(&|_| None), "");
+        let l = "depthformer.layers.0";
+        for (name, dims, expect) in [
+            ("depth_linear.bias", vec![8u64], "depth_linear"),
+            ("depth_linear.weight", vec![6, 32], "depth_linear"),
+            (
+                &format!("{l}.operator.out_proj.weight")[..],
+                vec![8, 8],
+                "layer 0 shapes",
+            ),
+            (
+                &format!("{l}.feed_forward.w2.weight")[..],
+                vec![8, 8],
+                "layer 0 shapes",
+            ),
+            (
+                &format!("{l}.feed_forward.w3.weight")[..],
+                vec![4, 16],
+                "layer 0 shapes",
+            ),
+            (
+                &format!("{l}.ffn_norm.weight")[..],
+                vec![4],
+                "layer 0 shapes",
+            ),
+            (
+                "depth_embeddings.3.embedding_norm.weight",
+                vec![4],
+                "depth_embeddings.3",
+            ),
+            (
+                "depth_embeddings.0.embedding.weight",
+                vec![4, 4],
+                "depth_embeddings.0",
+            ),
+            (
+                "audio_embedding.to_logits.weight",
+                vec![8, 4],
+                "audio_embedding",
+            ),
+            (
+                "depth_embeddings.5.to_logits.weight",
+                vec![8, 2],
+                "vocabulary",
+            ),
+        ] {
+            let err = legacy_vocoder_error(&|n| (n == name).then(|| dims.clone()));
+            assert!(err.contains(expect), "{name} -> {dims:?}: {err:?}");
+        }
+    }
 
     /// A GGUF holding just a tensor named `name` (one f32).
     fn gguf_with_tensor(name: &str) -> Arc<GgufFile> {

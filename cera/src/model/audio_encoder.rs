@@ -413,11 +413,36 @@ impl AudioEncoderWeights {
         let stem_indices = [0u32, 2, 3, 5, 6];
         let mut stem_layers = Vec::with_capacity(stem_indices.len());
         for idx in stem_indices {
-            stem_layers.push(load_conv_layer(gguf, idx)?);
+            let layer = load_conv_layer(gguf, idx)?;
+            check_stem_layer_extent(&layer)?;
+            stem_layers.push(layer);
         }
+        // the same five-layer stem the lfm3a loader checks: the shapes must chain from the mel
+        // bins to the width `pre_encode.out` reads, or the forward asserts on the first clip
+        let stem_shapes: Vec<&[usize]> = stem_layers.iter().map(|l| l.shape.as_slice()).collect();
+        let (stem_ch, stem_f) = stem_geometry(&stem_shapes, n_mel_bins, 0)?;
         let pre_encode_out_w = MmapWeight::from_gguf(gguf, "a.pre_encode.out.weight")
             .context("loading a.pre_encode.out.weight")?;
+        anyhow::ensure!(
+            pre_encode_out_w.cols == stem_ch * stem_f,
+            "a.pre_encode.out.weight has {} columns but the conv stem produces {stem_ch} channels \
+             x {stem_f} frequency bins = {}",
+            pre_encode_out_w.cols,
+            stem_ch * stem_f
+        );
+        // its rows are the encoder width every later stage runs at, and the bias is added row by
+        // row: a short one would be silently truncated, a wrong row count asserts on the first clip
+        anyhow::ensure!(
+            pre_encode_out_w.rows == n_embd,
+            "a.pre_encode.out.weight has {} rows but the encoder width is {n_embd}",
+            pre_encode_out_w.rows
+        );
         let pre_encode_out_b = load_vec_f32(gguf, "a.pre_encode.out.bias")?;
+        anyhow::ensure!(
+            pre_encode_out_b.len() == n_embd,
+            "a.pre_encode.out.bias has {} entries but the encoder width is {n_embd}",
+            pre_encode_out_b.len()
+        );
 
         let conv_stem = ConvStemWeights {
             layers: stem_layers,
@@ -611,6 +636,15 @@ fn check_stem_layer_extent(layer: &ConvLayerWeights) -> Result<()> {
 /// by `kw` (`conv_stem_forward_lfm3a`), so this follows `kh`; the 5-layer stem alternates
 /// full and depthwise convolutions, the 3-layer one is stride 2 throughout.
 fn lfm3a_stem_geometry(layer_shapes: &[&[usize]], n_mel_bins: usize) -> Result<(usize, usize)> {
+    stem_geometry(layer_shapes, n_mel_bins, 1)
+}
+
+/// The legacy stem uses shape[0] for frequency; LFM3A uses shape[1].
+fn stem_geometry(
+    layer_shapes: &[&[usize]],
+    n_mel_bins: usize,
+    frequency_axis: usize,
+) -> Result<(usize, usize)> {
     let mut cur_ch = 1usize;
     let mut cur_f = n_mel_bins;
     for (pos, shape) in layer_shapes.iter().enumerate() {
@@ -618,7 +652,7 @@ fn lfm3a_stem_geometry(layer_shapes: &[&[usize]], n_mel_bins: usize) -> Result<(
             shape.len() == 4,
             "lfm3a conv stem layer {pos}: expected 4D weight shape, got {shape:?}"
         );
-        let (kh, in_per_group, out_ch) = (shape[1], shape[2], shape[3]);
+        let (kernel_f, in_per_group, out_ch) = (shape[frequency_axis], shape[2], shape[3]);
         anyhow::ensure!(
             shape.iter().all(|&d| d > 0),
             "lfm3a conv stem layer {pos}: non-positive shape {shape:?}"
@@ -641,15 +675,26 @@ fn lfm3a_stem_geometry(layer_shapes: &[&[usize]], n_mel_bins: usize) -> Result<(
             (groups, 2, 1)
         };
         anyhow::ensure!(
+            out_ch % groups == 0,
+            "lfm3a conv stem layer {pos}: out channels ({out_ch}) not divisible by groups ({groups})"
+        );
+        anyhow::ensure!(
             in_per_group * groups == cur_ch,
             "lfm3a conv stem layer {pos}: in_per_group ({in_per_group}) * groups ({groups}) != cur_ch ({cur_ch})"
         );
         let padded_f = cur_f + 2 * pad;
         anyhow::ensure!(
-            padded_f >= kh,
-            "lfm3a conv stem layer {pos}: frequency kernel kh ({kh}) > padded mel width ({padded_f})"
+            padded_f >= kernel_f,
+            "conv stem layer {pos}: frequency kernel ({kernel_f}) > padded mel width ({padded_f})"
         );
-        cur_f = (padded_f - kh) / stride + 1;
+        // the forward asserts the time kernel fits a one-frame clip padded by `pad`
+        let kernel_t = shape[1 - frequency_axis];
+        anyhow::ensure!(
+            kernel_t <= 1 + 2 * pad,
+            "conv stem layer {pos}: time kernel ({kernel_t}) is wider than a one-frame clip padded \
+             by {pad}"
+        );
+        cur_f = (padded_f - kernel_f) / stride + 1;
         cur_ch = out_ch;
     }
     Ok((cur_ch, cur_f))
@@ -3051,6 +3096,145 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_stem_uses_its_frequency_axis_for_rectangular_kernels() {
+        let shapes: [&[usize]; 5] = [
+            &[13, 3, 1, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+        ];
+        let (channels, bins) = stem_geometry(&shapes, 16, 0).unwrap();
+        assert_eq!(channels * bins, 2);
+        // read with the other layout, shape[0] (13) is the time kernel, which no clip pads to fit
+        let err = lfm3a_stem_geometry(&shapes, 16).unwrap_err().to_string();
+        assert!(err.contains("time kernel"), "{err}");
+
+        let layers = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, shape)| ConvLayerWeights {
+                name: format!("stem-{i}"),
+                weight: vec![0.0; shape.iter().product()],
+                bias: vec![0.0; shape[3]],
+                shape: shape.to_vec(),
+            })
+            .collect();
+        let stem = ConvStemWeights {
+            layers,
+            pre_encode_out_w: MmapWeight::from_owned_f32(vec![0.0; 8], 4, 2),
+            pre_encode_out_b: vec![0.0; 4],
+        };
+        let cfg = AudioEncoderConfig {
+            n_layer: 1,
+            n_embd: 4,
+            n_ff: 4,
+            n_head: 1,
+            eps: 1e-5,
+            n_mel_bins: 16,
+            llm_hidden_size: 4,
+        };
+        let (output, _) = conv_stem_forward(&vec![0.0; 16 * 32], 32, &stem, &cfg);
+        assert!(!output.is_empty());
+
+        let load_error = |cols: u64, rows: u64, bias: u64| {
+            let mut writer = crate::convert::writer::GgufWriter::new();
+            writer.add_u32("clip.audio.block_count", 1);
+            writer.add_u32("clip.audio.embedding_length", 4);
+            writer.add_u32("clip.audio.attention.head_count", 1);
+            writer.add_f32("clip.audio.attention.layer_norm_epsilon", 1e-5);
+            writer.add_u32("clip.audio.num_mel_bins", 16);
+            let mut tensors = Vec::new();
+            for (index, shape) in [0, 2, 3, 5, 6].into_iter().zip(shapes) {
+                tensors.push((
+                    format!("a.conv1d.{index}.weight"),
+                    shape.iter().map(|&n| n as u64).collect::<Vec<_>>(),
+                ));
+                tensors.push((format!("a.conv1d.{index}.bias"), vec![2]));
+            }
+            tensors.push(("a.pre_encode.out.weight".into(), vec![cols, rows]));
+            tensors.push(("a.pre_encode.out.bias".into(), vec![bias]));
+            for (name, dims) in &tensors {
+                writer.add_tensor(
+                    name,
+                    dims.clone(),
+                    0,
+                    dims.iter().product::<u64>() as usize * 4,
+                );
+            }
+            let mut bytes = Vec::new();
+            writer.write_header_and_tensor_info(&mut bytes).unwrap();
+            for (_, dims) in &tensors {
+                writer
+                    .write_tensor_data(
+                        &mut bytes,
+                        &vec![0; dims.iter().product::<u64>() as usize * 4],
+                    )
+                    .unwrap();
+            }
+            let file =
+                std::sync::Arc::new(crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap());
+            format!("{:#}", AudioEncoderWeights::from_gguf(&file).err().unwrap())
+        };
+        // the encoder is 4 wide: only (2 columns, 4 rows, 4 bias entries) passes the stem checks
+        let stem_ok = load_error(2, 4, 4);
+        assert!(
+            !stem_ok.contains("conv stem produces") && !stem_ok.contains("pre_encode.out"),
+            "{stem_ok}"
+        );
+        assert!(load_error(4, 4, 4).contains("conv stem produces"));
+        assert!(load_error(2, 3, 4).contains("a.pre_encode.out.weight has 3 rows"));
+        assert!(load_error(2, 4, 3).contains("a.pre_encode.out.bias has 3 entries"));
+    }
+
+    /// The real LFM2.5-Audio mmproj, when it is on this machine: its five-layer stem must pass the
+    /// geometry check the legacy loader now applies (128 mel bins -> 256 channels x 16 bins =
+    /// the 4096 columns of `pre_encode.out`). Skips without the file; `CERA_REQUIRE_MODEL=1` makes
+    /// a missing file a failure.
+    #[cfg(all(feature = "std-fs", feature = "mmap"))]
+    #[test]
+    fn the_real_legacy_audio_stem_passes_the_geometry_check() {
+        let require = std::env::var("CERA_REQUIRE_MODEL").as_deref() == Ok("1");
+        let Some(dir) = std::env::var_os("CERA_ORACLE_MODELS_DIR") else {
+            assert!(
+                !require,
+                "CERA_REQUIRE_MODEL=1 but CERA_ORACLE_MODELS_DIR is not set"
+            );
+            eprintln!("SKIP: CERA_ORACLE_MODELS_DIR is not set");
+            return;
+        };
+        let path = std::path::Path::new(&dir)
+            .join("LFM2.5-Audio-1.5B-Q4_0/mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+        if !path.exists() {
+            assert!(
+                !require,
+                "CERA_REQUIRE_MODEL=1 but {} is absent",
+                path.display()
+            );
+            eprintln!("SKIP (absent): {}", path.display());
+            return;
+        }
+        let gguf = std::sync::Arc::new(crate::gguf::GgufFile::open(&path).unwrap());
+        let weights = AudioEncoderWeights::from_gguf(&gguf)
+            .unwrap_or_else(|e| panic!("the real legacy audio encoder is refused: {e:#}"));
+        assert_eq!(weights.conv_stem.layers.len(), 5);
+        assert_eq!(weights.conv_stem.pre_encode_out_w.cols, 256 * 16);
+    }
+
+    /// A grouped conv needs `out % groups == 0`; the conv kernel only debug-asserts it, so a file
+    /// with an uneven stem used to load and then read past the weights in a release build.
+    #[test]
+    fn a_stem_layer_whose_outputs_do_not_divide_into_groups_is_refused() {
+        // 3-layer stem: layer 1 is depthwise (in_per_group 1 over 8 channels, so 8 groups)
+        let ok: [&[usize]; 3] = [&[3, 3, 1, 8], &[3, 3, 1, 16], &[1, 1, 16, 16]];
+        // layer 1 with 12 outputs over 8 groups does not divide
+        let bad: [&[usize]; 3] = [&[3, 3, 1, 8], &[3, 3, 1, 12], &[1, 1, 12, 16]];
+        assert!(lfm3a_stem_geometry(&ok, 32).is_ok());
+        let err = lfm3a_stem_geometry(&bad, 32).unwrap_err().to_string();
+        assert!(err.contains("groups"), "{err}");
+    }
+
+    #[test]
     fn kv_heads_are_read_from_every_stored_shape() {
         use crate::gguf::GgufValue as V;
         assert_eq!(kv_heads_from_metadata(None), None);
@@ -3234,6 +3418,42 @@ mod tests {
         let (out, t_out) = conv_stem_forward_lfm3a(&mel, n_frames, &stem, &cfg);
         assert!(t_out > 0);
         assert_eq!(out.len(), t_out * n_embd);
+    }
+
+    /// The forward asserts the time kernel fits a one-frame clip once padded, so a stem whose time
+    /// kernel is wider is refused at load on either axis layout.
+    #[test]
+    fn a_stem_time_kernel_wider_than_a_padded_clip_is_refused() {
+        // legacy layout: shape[0] is frequency, shape[1] is time
+        let legacy: [&[usize]; 5] = [
+            &[3, 100_000, 1, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+        ];
+        let err = stem_geometry(&legacy, 16, 0).unwrap_err().to_string();
+        assert!(err.contains("time kernel"), "{err}");
+        // lfm3a layout: shape[1] is frequency, shape[0] is time
+        let lfm3a: [&[usize]; 5] = [
+            &[100_000, 3, 1, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+        ];
+        let err = lfm3a_stem_geometry(&lfm3a, 16).unwrap_err().to_string();
+        assert!(err.contains("time kernel"), "{err}");
+        // ordinary 3-tap time kernels, in both layouts, are fine
+        let ok: [&[usize]; 5] = [
+            &[3, 3, 1, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+            &[3, 3, 1, 2],
+            &[1, 1, 2, 2],
+        ];
+        assert!(stem_geometry(&ok, 16, 0).is_ok());
+        assert!(lfm3a_stem_geometry(&ok, 16).is_ok());
     }
 
     #[test]

@@ -224,6 +224,14 @@ pub fn render_options(q: &Question, media: Media) -> Vec<String> {
     }
 }
 
+/// The tokens of text the caller supplied: `<|name|>` shapes are escaped and every other
+/// delimiter-shaped special spelling the vocabulary registers (`<image>`) is defused, so the only
+/// special tokens in a prompt are the delimiters inserted by id. Words the vocabulary registers
+/// (`python`) encode as the vocabulary encodes them.
+fn encode_caller_text(tok: &BpeTokenizer, text: &str) -> Vec<u32> {
+    tok.encode(&tok.defuse_special_tokens(&escape(text)))
+}
+
 /// `<|name|>` becomes `<¦name¦>`, so caller text cannot emit a delimiter or marker token.
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -307,7 +315,7 @@ pub(crate) const MIN_OPTION_BUDGET: usize = 96;
 /// options leave, instead of re-running BPE over the whole state per question.
 pub(crate) fn encode_state(tok: &BpeTokenizer, ids: &PromptTokens, state: &Json) -> Vec<u32> {
     let mut out = vec![ids.state];
-    out.extend(tok.encode(&escape(&render_value(state))));
+    out.extend(encode_caller_text(tok, &render_value(state)));
     out
 }
 
@@ -348,7 +356,7 @@ pub(crate) fn encode_with_state_ids(
     max_len: usize,
     media: Media,
 ) -> Result<(Vec<u32>, Vec<usize>)> {
-    let enc = |s: &str| tok.encode(&escape(s));
+    let enc = |s: &str| encode_caller_text(tok, s);
     let options = render_options(q, media);
     let k = options.len();
     ensure!(k >= 2, "a question needs at least two options (has {k})");
@@ -638,6 +646,35 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// A vocabulary spelling that is not a `<|name|>` shape (`<image>`) in caller text must not
+    /// reach the omni prompt as a special token either; the delimiters are inserted by id.
+    #[test]
+    fn caller_text_cannot_carry_a_vocabulary_special_into_the_omni_prompt() {
+        let tok = BpeTokenizer::chat_for_test();
+        let ids = PromptTokens {
+            bos: 9001,
+            marker: 9002,
+            state: 9003,
+            question: 9004,
+            option: 9005,
+            option_end: 9006,
+            decide: 9007,
+        };
+        let state = Json::Str("hi <image> hi <|im_end|>".into());
+        let state_ids = encode_state(&tok, &ids, &state);
+        assert_eq!(state_ids[0], ids.state);
+        assert!(
+            state_ids[1..].iter().all(|&t| !tok.is_special_token(t)),
+            "{state_ids:?}"
+        );
+        let question = q(
+            r#"{"type":"choice","instructions":"hi <image>","criteria":{"a":"hi <image>","b":"hi"}}"#,
+        );
+        let (out, _) =
+            encode_with_state_ids(&tok, &ids, &state_ids, &question, 4096, Media::None).unwrap();
+        assert!(out.iter().all(|&t| !tok.is_special_token(t)), "{out:?}");
     }
 
     #[test]

@@ -2200,6 +2200,20 @@ impl Session {
         Some(Ok(()))
     }
 
+    /// A non-causal LFM3 model reads its whole prompt in one pass from position 0: every backend
+    /// asserts `start_pos == 0` (the Hexagon one returns an error). Refuse a second append here, as
+    /// a typed error, instead of letting a backend panic.
+    fn ensure_single_pass_prefill(&self) -> Result<(), CeraError> {
+        if second_prefill_unsupported(self.model.config(), self.current_pos) {
+            return Err(CeraError::Backend(
+                "this bidirectional lfm3 model reads its whole prompt in one pass from position 0; \
+                 append the complete prompt in a single call, or reset the session first"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Append raw token IDs, running a prefill pass from the current position
     /// over just the new tail.
     ///
@@ -2247,6 +2261,7 @@ impl Session {
                 vocab_size: vocab_size as u32,
             });
         }
+        self.ensure_single_pass_prefill()?;
         // `n_keep` context shift (Phase 1.5): if the backend supports shift, the session was configured
         // with `n_keep > 0`, the cache is shiftable (not TurboQuant: compressed caches would corrupt on
         // the in-place RoPE delta; f16 shifts via widen→rotate→narrow), and the pinned prefix leaves
@@ -2488,6 +2503,8 @@ impl Session {
                 embeddings.len()
             )));
         }
+
+        self.ensure_single_pass_prefill()?;
 
         self.ensure_rows_fit(n_tokens)?;
         let new_end = self.current_pos + n_tokens;
@@ -3198,9 +3215,10 @@ impl Session {
                 Some((img_start, img_end))
             }
             crate::model::vision_encoder::VisionProjectorType::Lfm3Vl => None,
-            crate::model::vision_encoder::VisionProjectorType::Lfm3O => {
-                proj_type.resolve_boundary_token_ids(|tok| self.tokenizer.special_token_id(tok))
-            }
+            crate::model::vision_encoder::VisionProjectorType::Lfm3O => lfm3o_boundary_ids(
+                self.tokenizer.special_token_id("<|vision_start|>"),
+                self.tokenizer.special_token_id("<|vision_end|>"),
+            )?,
         };
         let boundary_overhead = if boundary_ids.is_some() { 2 } else { 0 };
 
@@ -4123,6 +4141,12 @@ impl Session {
                 pending.push(token);
                 generated += 1;
                 modality_budget = modality_budget.saturating_sub(1);
+            } else if !is_audio_transition {
+                // a control token that emits no text (`<|mixed_start|>`, `<|audio_end|>`) is still a
+                // sampled token: without counting it a run of them is bounded only by the context,
+                // not by `max_tokens` (the standalone driver counts them through its common path).
+                // The transitions enter the audio block below, which has its own bound.
+                generated += 1;
             }
 
             if let Some(ref mut dec) = decoder
@@ -4819,9 +4843,104 @@ impl std::fmt::Debug for Session {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Whether appending to a session already at `current_pos` would be a second prefill pass of a
+/// non-causal LFM3 model, which no backend supports.
+fn second_prefill_unsupported(config: &crate::model::ModelConfig, current_pos: usize) -> bool {
+    !config.is_causal && config.architecture == "lfm3" && current_pos > 0
+}
+
+/// The `<|vision_start|>` / `<|vision_end|>` envelope of an LFM3-Omni image: both, or neither.
+/// One without the other is a broken vocabulary, the same refusal `Chat` makes.
+#[cfg(any(feature = "vl-preprocess", test))]
+fn lfm3o_boundary_ids(
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<Option<(u32, u32)>, CeraError> {
+    match (start, end) {
+        (Some(s), Some(e)) => Ok(Some((s, e))),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(CeraError::Backend(
+            "tokenizer has `<|vision_end|>` but no `<|vision_start|>` special token".into(),
+        )),
+        (Some(_), None) => Err(CeraError::Backend(
+            "tokenizer has `<|vision_start|>` but no `<|vision_end|>` special token".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lfm3o_image_envelope_is_both_tokens_or_neither() {
+        assert_eq!(lfm3o_boundary_ids(Some(7), Some(8)).unwrap(), Some((7, 8)));
+        assert_eq!(lfm3o_boundary_ids(None, None).unwrap(), None);
+        for (s, e) in [(Some(7), None), (None, Some(8))] {
+            let err = lfm3o_boundary_ids(s, e).unwrap_err().to_string();
+            assert!(err.contains("vision_"), "{err}");
+        }
+    }
+
+    /// Only a non-causal LFM3 model past position 0 refuses another append; every other model, and
+    /// the first append of that one, goes through.
+    #[test]
+    fn a_second_prefill_of_a_non_causal_lfm3_model_is_refused() {
+        let mut cfg = mock_config();
+        for (arch, causal, pos, refused) in [
+            ("lfm3", false, 5, true),
+            ("lfm3", false, 0, false),
+            ("lfm3", true, 5, false),
+            ("lfm2", false, 5, false),
+        ] {
+            cfg.architecture = arch.to_string();
+            cfg.is_causal = causal;
+            assert_eq!(
+                second_prefill_unsupported(&cfg, pos),
+                refused,
+                "{arch} causal={causal} pos={pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn second_prefill_preserves_input_errors_on_both_entry_points() {
+        let mut config = mock_config();
+        config.architecture = "lfm3".into();
+        config.is_causal = false;
+        config.hidden_size = 8;
+        let model = Arc::new(MockTestModel::new(config));
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        let mut session = Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap();
+        session.append_tokens(&[1]).unwrap();
+        assert!(matches!(
+            session.append_tokens(&[]),
+            Err(CeraError::EmptyInput)
+        ));
+        assert!(matches!(
+            session.append_tokens(&[100]),
+            Err(CeraError::InvalidToken { .. })
+        ));
+        assert!(matches!(
+            session.append_embeddings(&[], 0),
+            Err(CeraError::EmptyInput)
+        ));
+        assert!(matches!(
+            session.append_tokens(&[2]),
+            Err(CeraError::Backend(_))
+        ));
+        assert!(matches!(
+            session.append_embeddings(&[0.0; 8], 1),
+            Err(CeraError::Backend(_))
+        ));
+        assert_eq!(session.position(), 1);
+    }
 
     /// The modality-control ban applies to a copy: the original logits can become the seed of
     /// the next `generate()`, where the same ids must still be available.
@@ -5882,6 +6001,53 @@ mod tests {
         )
         .unwrap();
         (model, session)
+    }
+
+    /// Always predicts one token (a vocoder control token an audio model can emit).
+    struct RepeatTokenModel(crate::model::ModelConfig, u32);
+
+    impl Model for RepeatTokenModel {
+        fn config(&self) -> &crate::model::ModelConfig {
+            &self.0
+        }
+        fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+            state.seq_len += tokens.len();
+            let mut logits = vec![0.0; self.0.vocab_size];
+            logits[self.1 as usize] = 1.0;
+            logits
+        }
+    }
+
+    /// `<|mixed_start|>` and `<|audio_end|>` are control tokens that emit no text, but each is
+    /// still a sampled token: a model that keeps predicting one must stop at `max_tokens`, not run
+    /// to the context limit.
+    #[test]
+    fn a_run_of_text_free_control_tokens_stops_at_max_tokens() {
+        for token in [
+            crate::audio_engine::TOKEN_MIXED_START,
+            crate::audio_engine::TOKEN_AUDIO_END,
+        ] {
+            let mut config = mock_config();
+            config.vocab_size = 132;
+            config.max_seq_len = 64;
+            let mut session = Session::new(
+                Arc::new(RepeatTokenModel(config, token)),
+                Arc::new(BpeTokenizer::empty_for_test()),
+                ModalityCapabilities::text_only(),
+                SessionConfig::default(),
+            )
+            .unwrap();
+            let (decoder, detok) = crate::audio_engine::tests::empty_vocoder_weights();
+            session.attach_vocoder(Arc::new(decoder), Arc::new(detok));
+            session.append_tokens(&[1, 2, 3]).unwrap();
+            let mut sink = RecordingSink::default();
+            let summary = session.generate(&greedy_opts(3), &mut sink).unwrap();
+            assert_eq!(
+                summary.finish_reason,
+                FinishReason::MaxTokens,
+                "token {token}"
+            );
+        }
     }
 
     fn greedy_opts(max_tokens: u32) -> GenerateOpts {
