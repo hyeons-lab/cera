@@ -2,7 +2,6 @@
 
 ## 0.7.3
 
-- Add `CeraEngine::from_files` and `from_files_async`: load a model GGUF and a multimodal projector from disk by memory-mapping both, so a vision-language bundle larger than the host's heap limit can load where `from_parts` could not. Pass `inference_type` explicitly for a VL bundle (`"llama.cpp/image-to-text"`): `None` decides from the model architecture alone and never looks at the projector.
 - Harden the LFM3 GGUF and safetensors converters and the mmproj loaders: zero-extent shapes, incomplete expert groups, truncated per-expert data, oversized tensor spans and inconsistent audio stem or attention geometry are refused with an error instead of panicking or allocating.
 - Fix tool-call parsing and masking for LFM3: closing tags inside argument values, lone `\r` after value delimiters, union-typed parameters and enum literals now round-trip through the parser.
 - Fix LFM3 runtime edge cases: Hexagon greedy fallback uses the shared argmax, `<|mixed_start|>` counts as a generated token, audio input is only accepted for omni models, and prompts for causal d1 models escape embedded JSON strings and the media marker.
