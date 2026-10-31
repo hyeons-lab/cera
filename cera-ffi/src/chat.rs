@@ -558,6 +558,7 @@ impl ChatSession {
     /// completion. To start a multi-turn conversation with a system prompt, supply both
     /// messages via [`ChatSession::ingest_messages`].
     pub fn ingest(&self, message: Message) -> Result<IngestSummary, FfiError> {
+        let _pin = crate::CallerPinScope;
         let core_msg = cera::session::chat::Message::from(message);
         self.with_chat(|chat| match chat.ingest(&core_msg) {
             Ok(summary) => {
@@ -580,6 +581,7 @@ impl ChatSession {
 
     /// Ingest a batch of messages into the chat context.
     pub fn ingest_messages(&self, messages: Vec<Message>) -> Result<IngestSummary, FfiError> {
+        let _pin = crate::CallerPinScope;
         let core_msgs: Vec<cera::session::chat::Message> =
             messages.into_iter().map(Into::into).collect();
         self.with_chat(|chat| match chat.ingest_messages(&core_msgs) {
@@ -603,6 +605,7 @@ impl ChatSession {
 
     /// Replace conversational history with a fresh message batch.
     pub fn replace_messages(&self, messages: Vec<Message>) -> Result<IngestSummary, FfiError> {
+        let _pin = crate::CallerPinScope;
         let core_msgs: Vec<cera::session::chat::Message> =
             messages.into_iter().map(Into::into).collect();
         self.with_chat(|chat| match chat.replace_messages(&core_msgs) {
@@ -626,6 +629,7 @@ impl ChatSession {
 
     /// Complete generation synchronously and return the assistant response.
     pub fn complete(&self, opts: GenerateOpts) -> Result<TurnResult, FfiError> {
+        let _pin = crate::CallerPinScope;
         let core_opts = cera::GenerateOpts::try_from(opts)?;
         self.with_chat(|chat| {
             let result = chat.complete(&core_opts).map_err(|err| match err {
@@ -642,6 +646,7 @@ impl ChatSession {
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
+        let _pin = crate::CallerPinScope;
         let core = match cera::GenerateOpts::try_from(opts) {
             Ok(core) => core,
             Err(err) => {
@@ -795,6 +800,7 @@ impl ChatSession {
         name: String,
         content: String,
     ) -> Result<IngestSummary, FfiError> {
+        let _pin = crate::CallerPinScope;
         self.with_chat(|chat| match chat.ingest_tool_response(&name, &content) {
             Ok(summary) => {
                 self.set_last_ingest_recovery(None);

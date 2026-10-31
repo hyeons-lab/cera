@@ -8,6 +8,15 @@ pub mod simd;
 pub mod threadpool;
 
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub use threadpool::release_caller_pin;
+
+/// Give back the CPU pin the calling thread took while it ran the engine; see
+/// `threadpool::release_caller_pin`. A no-op where there is no row pool (no `parallel` feature,
+/// or wasm32), so a host can call it unconditionally.
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+pub fn release_caller_pin() {}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub(crate) mod calibrate;
 
 #[cfg(has_blas)]

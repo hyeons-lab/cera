@@ -1174,6 +1174,27 @@ impl cera::bundle::DownloadProgress for DownloadProgressAdapter {
 // CeraEngine
 // ---------------------------------------------------------------------------
 
+/// Held for the length of an FFI call that runs model compute on the calling thread.
+///
+/// The engine pins the thread that dispatches its CPU work to the pool's fastest core, and used
+/// to keep that pin until the thread exited. A foreign host recycles its threads (a Kotlin
+/// dispatcher, a Dart isolate's worker), so that thread then ran unrelated jobs confined to one
+/// core, and any native thread pool such a job started, for instance a ggml compute pool,
+/// inherited the one-core mask and ran all its threads there. Measured on a phone: a 17 ms
+/// embedding took 5.5 s after the engine had captioned one photo on the same worker.
+///
+/// Dropping this releases the pin when the call returns, so it is held only while the engine is
+/// actually computing; the next call that dispatches pins again, at the cost of a few syscalls.
+/// Callbacks into the host (a streaming sink) run inside the call, on the pinned thread. Methods
+/// that only delegate to another scoped method do not need their own.
+pub(crate) struct CallerPinScope;
+
+impl Drop for CallerPinScope {
+    fn drop(&mut self) {
+        cera::backend::release_caller_pin();
+    }
+}
+
 /// Owning handle to a loaded model. Mirrors [`cera::CeraEngine`];
 /// `#[uniffi::Object]` requires `Arc<Self>` wrapping which matches how
 /// the underlying engine is already used internally.
@@ -1433,6 +1454,7 @@ impl CeraEngine {
     /// Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
     /// `spawn_blocking` / its equivalent.
     pub fn transcribe(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<String, FfiError> {
+        let _pin = CallerPinScope;
         Ok(self.inner.transcribe(&pcm, sample_rate)?)
     }
 
@@ -1656,6 +1678,7 @@ impl CeraEngine {
 
     /// Detect PII entity spans in text using the loaded token classification model.
     pub fn detect_pii(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError> {
+        let _pin = CallerPinScope;
         let spans = self.inner.detect_pii(&text)?;
         Ok(spans.into_iter().map(Into::into).collect())
     }
@@ -2647,6 +2670,7 @@ impl Session {
     /// Append raw text to the context, running a prefill over just
     /// the new tokens. `EmptyInput` error if `text` is empty.
     pub fn append_text(&self, text: String) -> Result<(), FfiError> {
+        let _pin = CallerPinScope;
         self.lock_inner()?.append_text(&text)?;
         Ok(())
     }
@@ -2654,6 +2678,7 @@ impl Session {
     /// Append pre-tokenized IDs. Useful when the caller has its own
     /// tokenizer + chat-template pipeline.
     pub fn append_tokens(&self, tokens: Vec<u32>) -> Result<(), FfiError> {
+        let _pin = CallerPinScope;
         self.lock_inner()?.append_tokens(&tokens)?;
         Ok(())
     }
@@ -2702,6 +2727,7 @@ impl Session {
     ///   underlying prefill (a backend fault recorded mid-prefill surfaces
     ///   as `Backend`, not `Cancelled`).
     pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError> {
+        let _pin = CallerPinScope;
         if samples.is_empty() {
             return Err(FfiError::EmptyInput);
         }
@@ -2736,6 +2762,7 @@ impl Session {
     /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
     /// `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
     pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError> {
+        let _pin = CallerPinScope;
         let hs = self.lock_inner()?.hidden_states_for_tokens(&tokens)?;
         Ok(f32_vec_to_le_bytes(&hs))
     }
@@ -2743,6 +2770,7 @@ impl Session {
     /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
     /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
     pub fn hidden_states_for_text(&self, text: String) -> Result<Vec<u8>, FfiError> {
+        let _pin = CallerPinScope;
         let hs = self.lock_inner()?.hidden_states_for_text(&text)?;
         Ok(f32_vec_to_le_bytes(&hs))
     }
@@ -2751,6 +2779,7 @@ impl Session {
     /// classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
     /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
     pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError> {
+        let _pin = CallerPinScope;
         Ok(self.lock_inner()?.hidden_states_mean_pooled(&tokens)?)
     }
 
@@ -2768,6 +2797,7 @@ impl Session {
         tokens: Vec<u32>,
         adapters: Vec<LoraAdapterEntry>,
     ) -> Result<Vec<u8>, FfiError> {
+        let _pin = CallerPinScope;
         let adapter = compose_stack(adapters)?;
         let hs = self
             .lock_inner()?
@@ -2782,6 +2812,7 @@ impl Session {
         text: String,
         adapters: Vec<LoraAdapterEntry>,
     ) -> Result<Vec<u8>, FfiError> {
+        let _pin = CallerPinScope;
         let adapter = compose_stack(adapters)?;
         let hs = self
             .lock_inner()?
@@ -2796,6 +2827,7 @@ impl Session {
         tokens: Vec<u32>,
         adapters: Vec<LoraAdapterEntry>,
     ) -> Result<Vec<f32>, FfiError> {
+        let _pin = CallerPinScope;
         let adapter = compose_stack(adapters)?;
         Ok(self
             .lock_inner()?
@@ -2922,6 +2954,7 @@ impl Session {
     ///   underlying prefill (a backend fault recorded mid-prefill surfaces
     ///   as `Backend`, not `Cancelled`).
     pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError> {
+        let _pin = CallerPinScope;
         // Delegate to the core methods (rather than always calling
         // `append_image_with_opts`) so the session default stays
         // reachable through FFI and core's capability-before-empty error
@@ -2975,6 +3008,7 @@ impl Session {
         format: PixelFormat,
         max_long_size: Option<u32>,
     ) -> Result<(), FfiError> {
+        let _pin = CallerPinScope;
         let mut inner = self.lock_inner()?;
         match max_long_size {
             None => inner.append_raw_image(&pixels, width, height, format.into()),
@@ -3011,6 +3045,7 @@ impl Session {
     /// summary. Synchronous: the call blocks until the decode loop exits
     /// (`max_tokens`, EOS, `cancel()`, or error).
     pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError> {
+        let _pin = CallerPinScope;
         let mut sink = TokenCollectSink(Vec::new());
         // Compile the grammar (if any) before taking the session lock so a
         // malformed GBNF fails fast with `FfiError::GrammarParse`.
@@ -3061,6 +3096,7 @@ impl Session {
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
+        let _pin = CallerPinScope;
         let outcome = match cera::GenerateOpts::try_from(opts) {
             Ok(core) => match self.lock_inner() {
                 Ok(mut guard) => {
@@ -3115,6 +3151,7 @@ impl Session {
     /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
     #[allow(deprecated)]
     pub fn send_message(&self, message: UserMessage) -> Result<(), FfiError> {
+        let _pin = CallerPinScope;
         let mut guard = self.lock_inner()?;
         let core_msg: cera::tokenizer::UserMessage = message.into();
         guard.append_user_message(&core_msg).map_err(FfiError::from)
@@ -3131,6 +3168,7 @@ impl Session {
         message: UserMessage,
         opts: GenerateOpts,
     ) -> Result<GenerateOutput, FfiError> {
+        let _pin = CallerPinScope;
         let core_opts: cera::GenerateOpts = opts.try_into()?;
         let core_msg: cera::tokenizer::UserMessage = message.into();
         let mut guard = self.lock_inner()?;
@@ -3158,6 +3196,7 @@ impl Session {
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
+        let _pin = CallerPinScope;
         let core_opts: cera::GenerateOpts = match opts.try_into() {
             Ok(o) => o,
             Err(err) => {
@@ -4434,6 +4473,7 @@ impl FfiWhisperModel {
         pcm: Vec<f32>,
         opts: Option<FfiWhisperTranscribeOpts>,
     ) -> Result<String, FfiError> {
+        let _pin = CallerPinScope;
         let cera_opts: cera::WhisperTranscribeOpts = opts.unwrap_or_default().into();
         self.model
             .transcribe(&self.tokenizer, &pcm, &cera_opts)
@@ -4492,6 +4532,7 @@ impl FfiWhisperModel {
         }
 
         let handle = tokio::task::spawn_blocking(move || {
+            let _pin = CallerPinScope;
             self.model
                 .transcribe(&self.tokenizer, &pcm, &cera_opts)
                 .map_err(|e| {
@@ -4601,6 +4642,7 @@ impl PiiClassifier {
 
     /// Detect PII entities in the input text.
     pub fn detect(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError> {
+        let _pin = CallerPinScope;
         let spans = self
             .engine
             .inner
