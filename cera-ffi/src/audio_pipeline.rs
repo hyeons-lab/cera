@@ -610,6 +610,7 @@ impl FfiAudioPipeline {
 
     /// Process a streaming chunk of 16 kHz mono PCM audio samples.
     pub fn process_chunk(&self, chunk: Vec<f32>) -> Result<Vec<FfiAudioPipelineEvent>, FfiError> {
+        let _pin = crate::CallerPinScope;
         let mut pipeline = self.lock_inner()?;
         let events = pipeline
             .process_chunk(&chunk)
@@ -639,6 +640,7 @@ impl FfiAudioPipeline {
 
     /// Flush any in-flight speech segment at the end of the audio stream.
     pub fn flush(&self) -> Result<Vec<FfiAudioPipelineEvent>, FfiError> {
+        let _pin = crate::CallerPinScope;
         let mut pipeline = self.lock_inner()?;
         let events = pipeline.flush().map_err(|e| FfiError::Backend {
             detail: format!("failed to flush audio pipeline: {e}"),
@@ -683,6 +685,7 @@ impl FfiAudioPipeline {
 
     /// Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
     pub fn transcribe_pcm(&self, pcm: Vec<f32>) -> Result<String, FfiError> {
+        let _pin = crate::CallerPinScope;
         let pipeline = self.lock_inner()?;
         pipeline
             .transcribe_pcm(&pcm)
@@ -730,6 +733,7 @@ impl FfiAudioPipeline {
         start_ms: f32,
         end_ms: f32,
     ) -> Result<bool, FfiError> {
+        let _pin = crate::CallerPinScope;
         let mut pipeline = self.lock_inner()?;
         Ok(pipeline.add_utterance(text, start_ms, end_ms))
     }

@@ -99,6 +99,7 @@ impl DecisionEngine {
         mmproj_path: Option<String>,
         backend: BackendPreference,
     ) -> Result<Arc<Self>, FfiError> {
+        let _pin = crate::CallerPinScope;
         Self::build(&model_path, mmproj_path.as_deref(), backend)
     }
 
@@ -109,6 +110,7 @@ impl DecisionEngine {
     /// Blocks for the duration of the forward passes. An invalid request is a
     /// [`FfiError::Backend`] whose detail says what is wrong.
     pub fn decide_json(&self, request_json: String) -> Result<String, FfiError> {
+        let _pin = crate::CallerPinScope;
         self.inner.decide_json(&request_json).map_err(to_ffi)
     }
 
@@ -166,6 +168,7 @@ impl DecisionEngine {
         backend: BackendPreference,
     ) -> Result<Arc<Self>, FfiError> {
         spawn_blocking_guarded("decision_open_async", move || {
+            let _pin = crate::CallerPinScope;
             Self::build(&model_path, mmproj_path.as_deref(), backend)
         })
         .await
@@ -183,6 +186,7 @@ impl DecisionEngine {
             armed: true,
         };
         let result = spawn_blocking_guarded("decide_json_async", move || {
+            let _pin = crate::CallerPinScope;
             self.inner
                 .decide_json_cancellable(&request_json, &cancel)
                 .map_err(to_ffi)

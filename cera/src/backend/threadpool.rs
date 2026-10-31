@@ -1270,6 +1270,47 @@ pub(crate) fn thread_self_pinned(tid: libc::pid_t) -> bool {
     count == 1 && found
 }
 
+/// Test-only: make the calling thread hold a claim guard for `tid` that remembers `saved`, as
+/// `pin_caller_once` leaves it after a successful pin (without the pin itself, and without
+/// touching the process-wide claim statics: pair it with [`debug_set_caller_pin_for_test`]).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn debug_install_claim_guard_for_test(tid: i64, saved: Option<libc::cpu_set_t>) {
+    CLAIM.with(|c| {
+        let mut claim = c.borrow_mut();
+        claim.guard = Some(ClaimGuard { tid, saved });
+        claim.retry_cooldown = PIN_RETRY_BACKOFF;
+    });
+}
+
+/// Test-only: run one real dispatch from the calling thread on a private two-worker pool whose
+/// caller pin is `core`, so `pin_caller_once` takes (or takes over) the process-wide claim for this
+/// thread through the production path. The pool is dropped on return; the claim stays with the
+/// thread until it is released.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn debug_dispatch_with_caller_pin_for_test(core: usize) {
+    let pool = RowPool::build(2, &[core], &[], &[], true);
+    pool.dispatch_range(8, 1, |_, _| {});
+}
+
+/// Test-only: put the process-wide claim statics back to "unclaimed". The injector below restores
+/// only the owner and the core, so a test that needs a clean slate (and holds the affinity lock)
+/// calls this first.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn debug_reset_caller_claim_for_test() {
+    CALLER_PIN_OWNER.store(-1, Ordering::Release);
+    CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+    CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+}
+
+/// Test-only: whether the calling thread holds a claim guard, and its retry cooldown.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn debug_claim_state_for_test() -> (bool, u32) {
+    CLAIM.with(|c| {
+        let claim = c.borrow();
+        (claim.guard.is_some(), claim.retry_cooldown)
+    })
+}
+
 /// Test-only injector for the caller-pin claim statics: pretend thread
 /// `owner` holds a pin to `core`. The live-mask half of detection still
 /// reads the real mask, so tests pin real threads and only fake the claim.
@@ -1290,6 +1331,116 @@ pub(crate) fn debug_set_caller_pin_for_test(owner: i64, core: usize) -> impl Dro
     Restore
 }
 
+/// The caller-pin claim one thread holds. Dropping it releases the claim (if the thread still
+/// owns it) and, on Linux and Android, puts back the affinity mask the thread had before it was
+/// pinned, provided the thread's mask is still exactly our pin. That happens when the thread
+/// exits or when [`release_caller_pin`] is called. A thread whose pin another thread took over
+/// was already widened by the taker, and is left alone.
+struct ClaimGuard {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    tid: i64,
+    /// The thread's mask from before the pin, or `None` if it could not be read. Without this a
+    /// host thread that dispatched once keeps a one-core mask for as long as it lives, and
+    /// whatever it runs afterwards, including threads that code spawns, inherits that mask.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    saved: Option<libc::cpu_set_t>,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Put the mask back first, while the claim still describes it: the allowance probe
+            // trusts a leader mask only when no claim explains it, so freeing the claim first
+            // would leave a gap where our one-core mask reads as an outside restriction. And
+            // only while the live mask is still exactly our pin (`thread_self_pinned` also
+            // checks that this thread owns the claim): a cpuset migration or the host may have
+            // rewritten it since, and that is not ours to undo. A guard is only ever dropped by
+            // the thread that holds it, so "the calling thread" is the pinned one.
+            if thread_self_pinned(self.tid as libc::pid_t) {
+                let restored = self
+                    .saved
+                    .as_ref()
+                    .is_some_and(restore_current_thread_affinity);
+                if !restored {
+                    // The mask could not be read when the pin was taken, or the kernel refused
+                    // it now (the cpuset moved). Widen to the pool's cores, as a takeover does,
+                    // rather than leave the thread on one.
+                    let _ = set_current_thread_affinity(pinned_cores());
+                }
+            }
+            if CALLER_PIN_OWNER
+                .compare_exchange(self.tid, -1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+                CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct CallerClaim {
+    guard: Option<ClaimGuard>,
+    /// Dispatches to skip before re-attempting a refused pin.
+    retry_cooldown: u32,
+}
+
+thread_local! {
+    static CLAIM: std::cell::RefCell<CallerClaim> = const {
+        std::cell::RefCell::new(CallerClaim {
+            guard: None,
+            retry_cooldown: 0,
+        })
+    };
+}
+
+/// Give back the caller pin the calling thread holds, if it holds one: the process-wide claim is
+/// freed for another thread, and the thread's affinity mask returns to what it was before the pin
+/// as long as the mask is still exactly the pin. A mask a cpuset migration or the host rewrote
+/// since is left as it is, and so is a pin another thread took over. The next dispatch from this
+/// thread claims the pin again, so calling it between bursts of work costs one re-pin.
+///
+/// A host that calls into the engine from threads it recycles (a coroutine dispatcher, a
+/// `spawn_blocking` pool) should call this when the engine call returns. Otherwise the thread
+/// stays confined to one core until it exits, and any native code a later job runs on it, such as
+/// a ggml compute pool, starts its threads from that mask and runs them all on that core. Cheap
+/// and safe when nothing is held, and safe to call from a thread that never dispatched.
+pub fn release_caller_pin() {
+    // `try_with` and `try_borrow_mut`: during thread teardown the slot may already be gone, and
+    // a call from inside a dispatch must not panic on the borrow `pin_caller_once` holds.
+    let _ = CLAIM.try_with(|c| {
+        if let Ok(mut claim) = c.try_borrow_mut() {
+            claim.guard = None;
+            claim.retry_cooldown = 0;
+        }
+    });
+}
+
+/// The calling thread's affinity mask, or `None` if the kernel would not say.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn current_thread_affinity() -> Option<libc::cpu_set_t> {
+    // SAFETY: `cpu_set_t` is a plain bitmask, so all-zero is a valid value, and the size/pointer
+    // pair describes `set` exactly. The return value is checked.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then_some(set)
+    }
+}
+
+/// Set the calling thread's affinity mask to `set`, and say whether the kernel took it. A mask the
+/// thread's cpuset no longer allows is refused and the thread keeps what it has.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn restore_current_thread_affinity(set: &libc::cpu_set_t) -> bool {
+    // SAFETY: the size/pointer pair describes `set` exactly; `0` is the calling thread.
+    unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) == 0 }
+}
+
 impl RowPool {
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
@@ -1297,11 +1448,13 @@ impl RowPool {
     /// the *same* core (both pools share `pin_cores[0]`), so two concurrent
     /// sessions would timeshare one core for all their serial work; a
     /// concurrent second caller just stays floating instead. The claim is
-    /// RELEASED when the holding thread exits (thread-local guard `Drop`) and
-    /// unclaimed callers retry on later dispatches — a host running inference
-    /// from a recycled thread pool (e.g. tokio `spawn_blocking`) would
-    /// otherwise lose the caller pin forever the first time a claiming thread
-    /// got reaped. A REFUSED pin (restricted cpuset, offline core) backs off
+    /// RELEASED when the holding thread exits (thread-local guard `Drop`) or
+    /// when the host calls [`release_caller_pin`], which also puts the
+    /// thread's mask back. Unclaimed callers retry on later dispatches: a
+    /// host running inference from a recycled thread pool (e.g. tokio
+    /// `spawn_blocking`) would otherwise lose the caller pin forever the
+    /// first time a claiming thread got reaped. A REFUSED pin (restricted
+    /// cpuset, offline core) backs off
     /// for [`PIN_RETRY_BACKOFF`] dispatches before retrying, and a HELD pin
     /// is re-asserted on the same cadence — cpuset cgroup migrations
     /// (Android background ↔ foreground) overwrite per-thread masks, silently
@@ -1309,42 +1462,8 @@ impl RowPool {
     /// (plus one relaxed load while another thread holds the claim). No-op
     /// when the platform has no affinity (`caller_pin == None`).
     fn pin_caller_once(&self) {
-        /// Releases the claim when the holding thread exits, if it still owns the pin.
-        struct ClaimGuard {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            tid: i64,
-        }
-        impl Drop for ClaimGuard {
-            fn drop(&mut self) {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                {
-                    if CALLER_PIN_OWNER
-                        .compare_exchange(self.tid, -1, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
-                        CALLER_PIN_CLAIMED.store(false, Ordering::Release);
-                    }
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                {
-                    CALLER_PIN_CLAIMED.store(false, Ordering::Release);
-                }
-            }
-        }
-        struct CallerClaim {
-            guard: Option<ClaimGuard>,
-            /// Dispatches to skip before re-attempting a refused pin.
-            retry_cooldown: u32,
-        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         thread_local! {
-            static CLAIM: std::cell::RefCell<CallerClaim> = const {
-                std::cell::RefCell::new(CallerClaim {
-                    guard: None,
-                    retry_cooldown: 0,
-                })
-            };
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
             static QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1377,7 +1496,17 @@ impl RowPool {
                 // migrations (background <-> foreground) overwrite per-thread
                 // affinity masks wholesale, silently revoking it. One ~us
                 // syscall per PIN_RETRY_BACKOFF dispatches (~10 tokens).
-                let _ = pin_current_thread_to_core(core);
+                if pin_current_thread_to_core(core) {
+                    // The pool dispatching now may start from a different core than the one that
+                    // claimed (after a pool rebuild). Keep the recorded core equal to the live
+                    // mask, which `thread_self_pinned` and the release gate compare.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if let Some(g) = &claim.guard
+                        && CALLER_PIN_OWNER.load(Ordering::Acquire) == g.tid
+                    {
+                        CALLER_PIN_CORE.store(core, Ordering::Release);
+                    }
+                }
                 claim.retry_cooldown = PIN_RETRY_BACKOFF;
                 return;
             }
@@ -1386,12 +1515,16 @@ impl RowPool {
                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let saved = current_thread_affinity();
                 if pin_current_thread_to_core(core) {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let tid = unsafe { libc::gettid() } as i64;
                     claim.guard = Some(ClaimGuard {
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         tid,
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        saved,
                     });
                     // Record the claim for the allowance probe (see
                     // `thread_self_pinned`): the pinning thread's tid and
@@ -1432,10 +1565,11 @@ impl RowPool {
                     {
                         let _ =
                             set_thread_affinity_for_tid(old_owner as libc::pid_t, pinned_cores());
+                        let saved = current_thread_affinity();
                         if pin_current_thread_to_core(core) {
                             CALLER_PIN_CORE.store(core, Ordering::Release);
                             CALLER_PIN_CLAIMED.store(true, Ordering::Release);
-                            claim.guard = Some(ClaimGuard { tid: my_tid });
+                            claim.guard = Some(ClaimGuard { tid: my_tid, saved });
                             claim.retry_cooldown = PIN_RETRY_BACKOFF;
                         } else {
                             CALLER_PIN_OWNER.store(-1, Ordering::Release);

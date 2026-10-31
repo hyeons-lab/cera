@@ -1914,6 +1914,228 @@ mod tests {
         assert!(!thread_self_pinned(me));
     }
 
+    /// The CPUs thread `tid` may run on, ascending.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
+    fn mask_cpus(tid: libc::pid_t) -> Vec<usize> {
+        // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the size/pointer pair describes `set` exactly.
+        let ok = unsafe {
+            libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
+        };
+        assert_eq!(ok, 0);
+        let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+        // SAFETY: `cpu` is bounded by the set's own bit capacity.
+        (0..capacity)
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect()
+    }
+
+    /// `release_caller_pin` puts the calling thread's own mask back and frees the claim. This is
+    /// the leak measured on-device: a host thread that had dispatched once stayed confined to the
+    /// pinned core for its whole life, and a ggml thread pool started from it (the embedder, in
+    /// the app) ran every thread on that core. The claim half is faked with the injectors, since
+    /// a real dispatch would race other pool tests for the process-wide claim. Linux/Android
+    /// only, skipped under Miri.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
+    #[test]
+    fn release_caller_pin_restores_the_mask_and_frees_the_claim() {
+        use crate::backend::threadpool::{
+            debug_claim_state_for_test, debug_install_claim_guard_for_test,
+            debug_set_caller_pin_for_test, release_caller_pin, thread_self_pinned,
+        };
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
+        // SAFETY: `gettid` is always valid.
+        let me = unsafe { libc::gettid() };
+        let before = mask_cpus(me);
+        if before.len() <= 1 {
+            eprintln!("skip: 1-CPU mask cannot discriminate");
+            return;
+        }
+        let (restore, cpu) = pin_thread_to_single_cpu(me);
+        let _inject = debug_set_caller_pin_for_test(me as i64, cpu);
+        debug_install_claim_guard_for_test(me as i64, Some(*restore.saved()));
+        assert_eq!(mask_cpus(me), vec![cpu]);
+        assert!(thread_self_pinned(me));
+        assert!(debug_claim_state_for_test().0, "the thread holds a guard");
+
+        release_caller_pin();
+        assert_eq!(mask_cpus(me), before, "the thread got its own mask back");
+        assert!(!thread_self_pinned(me), "the claim was freed");
+        assert_eq!(
+            debug_claim_state_for_test(),
+            (false, 0),
+            "no guard left, and no retry cooldown holding off the next pin"
+        );
+
+        // Nothing held any more: a second call changes nothing.
+        release_caller_pin();
+        assert_eq!(mask_cpus(me), before);
+    }
+
+    /// A guard whose thread lost the claim (another thread took the pin over, and widened this
+    /// one) is dropped without touching the mask or the new owner's claim. Linux/Android only,
+    /// skipped under Miri.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
+    #[test]
+    fn release_caller_pin_after_losing_the_claim_leaves_the_mask_alone() {
+        use crate::backend::threadpool::{
+            debug_claim_state_for_test, debug_install_claim_guard_for_test,
+            debug_set_caller_pin_for_test, release_caller_pin,
+        };
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
+        // SAFETY: `gettid` is always valid.
+        let me = unsafe { libc::gettid() };
+        if mask_cpus(me).len() <= 1 {
+            eprintln!("skip: 1-CPU mask cannot discriminate");
+            return;
+        }
+        let (restore, cpu) = pin_thread_to_single_cpu(me);
+        // Someone else owns the claim; this thread's guard is stale.
+        let _inject = debug_set_caller_pin_for_test(1 << 30, cpu);
+        debug_install_claim_guard_for_test(me as i64, Some(*restore.saved()));
+
+        release_caller_pin();
+        assert_eq!(debug_claim_state_for_test(), (false, 0));
+        assert_eq!(
+            mask_cpus(me),
+            vec![cpu],
+            "not the owner, so the mask is not ours to change"
+        );
+    }
+
+    /// The production path, not the injectors: a real dispatch takes the caller pin, and
+    /// `release_caller_pin` puts back the mask the thread had BEFORE it. This pins down where
+    /// `pin_caller_once` captures the mask (capturing after the pin would store the one-core mask
+    /// and "restore" nothing, which the injector-based tests cannot see). It holds the affinity
+    /// lock because the injectors overwrite the process-wide claim owner, and runs on a fresh
+    /// thread so a pin cannot outlive it. Linux/Android only, skipped under Miri.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
+    #[test]
+    fn a_real_dispatch_pins_the_caller_and_release_restores_its_own_mask() {
+        use crate::backend::threadpool::{
+            debug_dispatch_with_caller_pin_for_test, debug_reset_caller_claim_for_test,
+            release_caller_pin, thread_self_pinned,
+        };
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
+        // An injector test that ran earlier restores the owner but not the claimed flag, which a
+        // pool test's exited thread may have left set. Start from a clean slate.
+        debug_reset_caller_claim_for_test();
+        std::thread::spawn(|| {
+            // SAFETY: `gettid` is always valid.
+            let me = unsafe { libc::gettid() };
+            let allowed = mask_cpus(me);
+            if allowed.len() <= 1 {
+                eprintln!("skip: 1-CPU mask cannot discriminate");
+                return;
+            }
+            let core = *allowed.last().expect("non-empty");
+            debug_dispatch_with_caller_pin_for_test(core);
+            assert!(
+                thread_self_pinned(me),
+                "the dispatch took the caller pin (is the cpuset refusing it?)"
+            );
+            assert_eq!(mask_cpus(me), vec![core], "the dispatch pinned the caller");
+
+            release_caller_pin();
+            assert_eq!(mask_cpus(me), allowed, "its own mask came back");
+            assert!(!thread_self_pinned(me), "and the claim was freed");
+
+            // The next dispatch takes the pin again at once: the cooldown was reset.
+            debug_dispatch_with_caller_pin_for_test(core);
+            assert!(thread_self_pinned(me), "the next dispatch re-pins");
+            release_caller_pin();
+        })
+        .join()
+        .expect("the test thread finished");
+    }
+
+    /// A mask that is no longer exactly our pin is not ours to undo: a cpuset migration (or the
+    /// host) rewrote it after the claim, so `release_caller_pin` frees the claim and leaves the
+    /// mask as it is. Linux/Android only, skipped under Miri.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
+    #[test]
+    fn release_caller_pin_leaves_a_rewritten_mask_alone() {
+        use crate::backend::threadpool::{
+            debug_claim_state_for_test, debug_install_claim_guard_for_test,
+            debug_set_caller_pin_for_test, release_caller_pin,
+        };
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
+        // SAFETY: `gettid` is always valid.
+        let me = unsafe { libc::gettid() };
+        let allowed = mask_cpus(me);
+        if allowed.len() <= 2 {
+            eprintln!("skip: needs three CPUs to tell a pin from a rewritten mask");
+            return;
+        }
+        let (restore, cpu) = pin_thread_to_single_cpu(me);
+        let _inject = debug_set_caller_pin_for_test(me as i64, cpu);
+        debug_install_claim_guard_for_test(me as i64, Some(*restore.saved()));
+        // The mask is rewritten to two CPUs: the claim still says `cpu`, the live mask says more.
+        let other = *allowed.iter().find(|&&c| c != cpu).expect("a second CPU");
+        // SAFETY: all-zero is a valid `cpu_set_t`, `CPU_SET` is given in-bounds indices, and the
+        // size/pointer pair describes `rewritten` exactly.
+        let ok = unsafe {
+            let mut rewritten: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut rewritten);
+            libc::CPU_SET(other, &mut rewritten);
+            libc::sched_setaffinity(me, std::mem::size_of::<libc::cpu_set_t>(), &rewritten)
+        };
+        assert_eq!(ok, 0);
+        let rewritten_cpus = mask_cpus(me);
+        assert_eq!(rewritten_cpus.len(), 2);
+
+        release_caller_pin();
+        assert_eq!(debug_claim_state_for_test(), (false, 0));
+        assert_eq!(
+            mask_cpus(me),
+            rewritten_cpus,
+            "a rewritten mask is left alone"
+        );
+    }
+
+    /// With nothing held, `release_caller_pin` is a no-op, on a thread that never dispatched.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
+    #[test]
+    fn release_caller_pin_without_a_claim_is_a_no_op() {
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
+        // SAFETY: `gettid` is always valid.
+        let me = unsafe { libc::gettid() };
+        let before = mask_cpus(me);
+        crate::backend::release_caller_pin();
+        assert_eq!(mask_cpus(me), before);
+    }
+
     /// Tier-2 reading: the leader's live mask set, or `None` while the
     /// leader holds our caller-pin. The pin half is faked with the test
     /// injector (see above); the mask half is a real leader pin, restored
