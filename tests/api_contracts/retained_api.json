@@ -181,6 +181,8 @@
         "from_bundle_id_async": "pub async fn from_bundle_id_async( bundle_id: String, quant: String, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
         "from_bytes": "pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError>",
         "from_bytes_async": "pub async fn from_bytes_async( bytes: Vec<u8>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_files": "pub fn from_files( model_path: String, multimodal_projector_path: Option<String>, inference_type: Option<String>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_files_async": "pub async fn from_files_async( model_path: String, multimodal_projector_path: Option<String>, inference_type: Option<String>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
         "from_parts": "pub fn from_parts( bytes: Vec<u8>, multimodal_projector: Option<Vec<u8>>, inference_type: Option<String>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
         "from_parts_async": "pub async fn from_parts_async( bytes: Vec<u8>, multimodal_projector: Option<Vec<u8>>, inference_type: Option<String>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
         "from_path": "pub fn from_path(path: String, config: EngineConfig) -> Result<Arc<Self>, FfiError>",
