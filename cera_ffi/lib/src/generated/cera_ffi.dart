@@ -10956,6 +10956,26 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async != 55200) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async`: expected 55200, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ceraengine_from_files');
+      _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_files`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files != 25493) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_files`: expected 25493, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async');
+      _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async != 41974) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async`: expected 41974, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts');
@@ -10963,8 +10983,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts != 40765) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts`: expected 40765, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts != 43106) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts`: expected 43106, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async;
     try {
@@ -14019,6 +14039,441 @@ class CeraFfiFfi {
         await pollEvents.close();
         callback.close();
         _ceraEngineCtorFromBytesAsyncFfiBufferRustFutureFree(futureHandle);
+      }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineCtorFromFilesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ceraengine_from_files');
+
+  CeraEngine ceraEngineCreateFromFiles(String modelPath, String? multimodalProjectorPath, String? inferenceType, EngineConfig config) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(12);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List modelPathBytes = Uint8List.fromList(utf8.encode(modelPath));
+      final ffi.Pointer<ffi.Uint8> modelPathPtr = modelPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(modelPathBytes.length);
+      if (modelPathBytes.isNotEmpty) { modelPathPtr.asTypedList(modelPathBytes.length).setAll(0, modelPathBytes); }
+      foreignArgPtrs.add(modelPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> modelPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      modelPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      modelPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> modelPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      modelPathForeignPtr.ref
+        ..len = modelPathBytes.length
+        ..data = modelPathPtr;
+      final _UniFfiRustBuffer modelPathRustBuffer = _uniFfiRustBufferFromBytes(modelPathForeignPtr.ref, modelPathFromBytesStatusPtr);
+      calloc.free(modelPathForeignPtr);
+      final int modelPathFromBytesCode = modelPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer modelPathFromBytesErrBuf = modelPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(modelPathFromBytesStatusPtr);
+      if (modelPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> modelPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        modelPathFromBytesErrBufPtr.ref
+          ..capacity = modelPathFromBytesErrBuf.capacity
+          ..len = modelPathFromBytesErrBuf.len
+          ..data = modelPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(modelPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $modelPathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = modelPathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = modelPathRustBuffer.len;
+      (argBuf + 2).ref.ptr = modelPathRustBuffer.data.cast<ffi.Void>();
+      final multimodalProjectorPathWriter = _UniFfiBinaryWriter();
+      if (multimodalProjectorPath == null) {
+        multimodalProjectorPathWriter.writeI8(0);
+      } else {
+        multimodalProjectorPathWriter.writeI8(1);
+        multimodalProjectorPathWriter.writeString(multimodalProjectorPath!);
+      }
+      final Uint8List multimodalProjectorPathBytes = multimodalProjectorPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> multimodalProjectorPathPtr = multimodalProjectorPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(multimodalProjectorPathBytes.length);
+      if (multimodalProjectorPathBytes.isNotEmpty) { multimodalProjectorPathPtr.asTypedList(multimodalProjectorPathBytes.length).setAll(0, multimodalProjectorPathBytes); }
+      foreignArgPtrs.add(multimodalProjectorPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> multimodalProjectorPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      multimodalProjectorPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      multimodalProjectorPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> multimodalProjectorPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      multimodalProjectorPathForeignPtr.ref
+        ..len = multimodalProjectorPathBytes.length
+        ..data = multimodalProjectorPathPtr;
+      final _UniFfiRustBuffer multimodalProjectorPathRustBuffer = _uniFfiRustBufferFromBytes(multimodalProjectorPathForeignPtr.ref, multimodalProjectorPathFromBytesStatusPtr);
+      calloc.free(multimodalProjectorPathForeignPtr);
+      final int multimodalProjectorPathFromBytesCode = multimodalProjectorPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer multimodalProjectorPathFromBytesErrBuf = multimodalProjectorPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(multimodalProjectorPathFromBytesStatusPtr);
+      if (multimodalProjectorPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> multimodalProjectorPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        multimodalProjectorPathFromBytesErrBufPtr.ref
+          ..capacity = multimodalProjectorPathFromBytesErrBuf.capacity
+          ..len = multimodalProjectorPathFromBytesErrBuf.len
+          ..data = multimodalProjectorPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(multimodalProjectorPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $multimodalProjectorPathFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = multimodalProjectorPathRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = multimodalProjectorPathRustBuffer.len;
+      (argBuf + 5).ref.ptr = multimodalProjectorPathRustBuffer.data.cast<ffi.Void>();
+      final inferenceTypeWriter = _UniFfiBinaryWriter();
+      if (inferenceType == null) {
+        inferenceTypeWriter.writeI8(0);
+      } else {
+        inferenceTypeWriter.writeI8(1);
+        inferenceTypeWriter.writeString(inferenceType!);
+      }
+      final Uint8List inferenceTypeBytes = inferenceTypeWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> inferenceTypePtr = inferenceTypeBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(inferenceTypeBytes.length);
+      if (inferenceTypeBytes.isNotEmpty) { inferenceTypePtr.asTypedList(inferenceTypeBytes.length).setAll(0, inferenceTypeBytes); }
+      foreignArgPtrs.add(inferenceTypePtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> inferenceTypeFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      inferenceTypeFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      inferenceTypeFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> inferenceTypeForeignPtr = calloc<_UniFfiForeignBytes>();
+      inferenceTypeForeignPtr.ref
+        ..len = inferenceTypeBytes.length
+        ..data = inferenceTypePtr;
+      final _UniFfiRustBuffer inferenceTypeRustBuffer = _uniFfiRustBufferFromBytes(inferenceTypeForeignPtr.ref, inferenceTypeFromBytesStatusPtr);
+      calloc.free(inferenceTypeForeignPtr);
+      final int inferenceTypeFromBytesCode = inferenceTypeFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer inferenceTypeFromBytesErrBuf = inferenceTypeFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(inferenceTypeFromBytesStatusPtr);
+      if (inferenceTypeFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> inferenceTypeFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        inferenceTypeFromBytesErrBufPtr.ref
+          ..capacity = inferenceTypeFromBytesErrBuf.capacity
+          ..len = inferenceTypeFromBytesErrBuf.len
+          ..data = inferenceTypeFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(inferenceTypeFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $inferenceTypeFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = inferenceTypeRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = inferenceTypeRustBuffer.len;
+      (argBuf + 8).ref.ptr = inferenceTypeRustBuffer.data.cast<ffi.Void>();
+      final Uint8List configBytes = _uniffiEncodeEngineConfig(config);
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 9).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 10).ref.u64 = configRustBuffer.len;
+      (argBuf + 11).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _ceraEngineCtorFromFilesFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return CeraEngine._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineCtorFromFilesAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ceraengine_from_files_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _ceraEngineCtorFromFilesAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_u64');
+  late final void Function(int handle) _ceraEngineCtorFromFilesAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_u64');
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _ceraEngineCtorFromFilesAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_u64');
+  late final void Function(int handle) _ceraEngineCtorFromFilesAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_u64');
+
+  Future<CeraEngine> ceraEngineCreateFromFilesAsync(String modelPath, String? multimodalProjectorPath, String? inferenceType, EngineConfig config) async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(12);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List modelPathBytes = Uint8List.fromList(utf8.encode(modelPath));
+      final ffi.Pointer<ffi.Uint8> modelPathPtr = modelPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(modelPathBytes.length);
+      if (modelPathBytes.isNotEmpty) { modelPathPtr.asTypedList(modelPathBytes.length).setAll(0, modelPathBytes); }
+      foreignArgPtrs.add(modelPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> modelPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      modelPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      modelPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> modelPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      modelPathForeignPtr.ref
+        ..len = modelPathBytes.length
+        ..data = modelPathPtr;
+      final _UniFfiRustBuffer modelPathRustBuffer = _uniFfiRustBufferFromBytes(modelPathForeignPtr.ref, modelPathFromBytesStatusPtr);
+      calloc.free(modelPathForeignPtr);
+      final int modelPathFromBytesCode = modelPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer modelPathFromBytesErrBuf = modelPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(modelPathFromBytesStatusPtr);
+      if (modelPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> modelPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        modelPathFromBytesErrBufPtr.ref
+          ..capacity = modelPathFromBytesErrBuf.capacity
+          ..len = modelPathFromBytesErrBuf.len
+          ..data = modelPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(modelPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $modelPathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = modelPathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = modelPathRustBuffer.len;
+      (argBuf + 2).ref.ptr = modelPathRustBuffer.data.cast<ffi.Void>();
+      final multimodalProjectorPathWriter = _UniFfiBinaryWriter();
+      if (multimodalProjectorPath == null) {
+        multimodalProjectorPathWriter.writeI8(0);
+      } else {
+        multimodalProjectorPathWriter.writeI8(1);
+        multimodalProjectorPathWriter.writeString(multimodalProjectorPath!);
+      }
+      final Uint8List multimodalProjectorPathBytes = multimodalProjectorPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> multimodalProjectorPathPtr = multimodalProjectorPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(multimodalProjectorPathBytes.length);
+      if (multimodalProjectorPathBytes.isNotEmpty) { multimodalProjectorPathPtr.asTypedList(multimodalProjectorPathBytes.length).setAll(0, multimodalProjectorPathBytes); }
+      foreignArgPtrs.add(multimodalProjectorPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> multimodalProjectorPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      multimodalProjectorPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      multimodalProjectorPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> multimodalProjectorPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      multimodalProjectorPathForeignPtr.ref
+        ..len = multimodalProjectorPathBytes.length
+        ..data = multimodalProjectorPathPtr;
+      final _UniFfiRustBuffer multimodalProjectorPathRustBuffer = _uniFfiRustBufferFromBytes(multimodalProjectorPathForeignPtr.ref, multimodalProjectorPathFromBytesStatusPtr);
+      calloc.free(multimodalProjectorPathForeignPtr);
+      final int multimodalProjectorPathFromBytesCode = multimodalProjectorPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer multimodalProjectorPathFromBytesErrBuf = multimodalProjectorPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(multimodalProjectorPathFromBytesStatusPtr);
+      if (multimodalProjectorPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> multimodalProjectorPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        multimodalProjectorPathFromBytesErrBufPtr.ref
+          ..capacity = multimodalProjectorPathFromBytesErrBuf.capacity
+          ..len = multimodalProjectorPathFromBytesErrBuf.len
+          ..data = multimodalProjectorPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(multimodalProjectorPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $multimodalProjectorPathFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = multimodalProjectorPathRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = multimodalProjectorPathRustBuffer.len;
+      (argBuf + 5).ref.ptr = multimodalProjectorPathRustBuffer.data.cast<ffi.Void>();
+      final inferenceTypeWriter = _UniFfiBinaryWriter();
+      if (inferenceType == null) {
+        inferenceTypeWriter.writeI8(0);
+      } else {
+        inferenceTypeWriter.writeI8(1);
+        inferenceTypeWriter.writeString(inferenceType!);
+      }
+      final Uint8List inferenceTypeBytes = inferenceTypeWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> inferenceTypePtr = inferenceTypeBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(inferenceTypeBytes.length);
+      if (inferenceTypeBytes.isNotEmpty) { inferenceTypePtr.asTypedList(inferenceTypeBytes.length).setAll(0, inferenceTypeBytes); }
+      foreignArgPtrs.add(inferenceTypePtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> inferenceTypeFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      inferenceTypeFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      inferenceTypeFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> inferenceTypeForeignPtr = calloc<_UniFfiForeignBytes>();
+      inferenceTypeForeignPtr.ref
+        ..len = inferenceTypeBytes.length
+        ..data = inferenceTypePtr;
+      final _UniFfiRustBuffer inferenceTypeRustBuffer = _uniFfiRustBufferFromBytes(inferenceTypeForeignPtr.ref, inferenceTypeFromBytesStatusPtr);
+      calloc.free(inferenceTypeForeignPtr);
+      final int inferenceTypeFromBytesCode = inferenceTypeFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer inferenceTypeFromBytesErrBuf = inferenceTypeFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(inferenceTypeFromBytesStatusPtr);
+      if (inferenceTypeFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> inferenceTypeFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        inferenceTypeFromBytesErrBufPtr.ref
+          ..capacity = inferenceTypeFromBytesErrBuf.capacity
+          ..len = inferenceTypeFromBytesErrBuf.len
+          ..data = inferenceTypeFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(inferenceTypeFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $inferenceTypeFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = inferenceTypeRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = inferenceTypeRustBuffer.len;
+      (argBuf + 8).ref.ptr = inferenceTypeRustBuffer.data.cast<ffi.Void>();
+      final Uint8List configBytes = _uniffiEncodeEngineConfig(config);
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 9).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 10).ref.u64 = configRustBuffer.len;
+      (argBuf + 11).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _ceraEngineCtorFromFilesAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _ceraEngineCtorFromFilesAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _ceraEngineCtorFromFilesAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for from_files_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final int resultValue = _ceraEngineCtorFromFilesAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            return CeraEngine._(this, resultValue);
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for from_files_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for from_files_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _ceraEngineCtorFromFilesAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _ceraEngineCtorFromFilesAsyncFfiBufferRustFutureFree(futureHandle);
       }
     } finally {
       for (final ptr in foreignArgPtrs) {
@@ -32771,6 +33226,63 @@ final class CeraEngine {
     return _bindings().ceraEngineCreateFromBytesAsync(bytes, config);
   }
 
+  /// Load a model GGUF and an optional multimodal projector ("mmproj")
+  /// from files on disk, without a manifest.
+  ///
+  /// The file-backed twin of [`CeraEngine::from_parts`]. Both GGUFs are
+  /// memory-mapped, so their weights are not copied through the host's
+  /// managed (JVM or Dart) heap, which `from_parts` needs for both
+  /// files: a bundle larger than the runtime's heap limit cannot be
+  /// loaded that way at all. A backend may still copy or upload tensors
+  /// into its own memory, so this bounds the managed heap, not the
+  /// process footprint.
+  ///
+  /// **`inference_type` is taken literally**: `"llama.cpp/text-to-text"`,
+  /// `"llama.cpp/image-to-text"` or `"llama.cpp/lfm2-audio-v1"`. Unlike
+  /// `from_parts`, `None` decides from the model's architecture alone
+  /// and never looks at the projector, and the published LFM2-VL GGUFs
+  /// report the plain text architecture (`lfm2`). Pass
+  /// `"llama.cpp/image-to-text"` for a VL bundle, or `append_image` is
+  /// refused as an unsupported modality. Nothing downgrades the other
+  /// way: with an explicit image type and a projector that cannot be
+  /// used, `capabilities()` still reports image input, the reason is
+  /// usually only a warning in the log, and the first `append_image`
+  /// fails. For the text and image types a projector path is opened
+  /// and parsed as a vision tower, so pass `None` for the projector and
+  /// a text type to load text only.
+  ///
+  /// `model_path` must be a plain local path, relative to the process
+  /// working directory if it is relative; a URL fails with or without
+  /// `config.bundle_repo`. A relative `multimodal_projector_path` is
+  /// joined onto the model file's directory, so pass an absolute path
+  /// or a bare file name. An `http(s)://` projector is fetched through
+  /// `config.bundle_repo` and fails the whole load without one, and a
+  /// `file://` string fails it too.
+  ///
+  /// Only the model, the projector and the type are exposed. The
+  /// `ModelFiles` audio decoder and tokenizer, draft model (set
+  /// `config.draft_model` instead), extra files and chat template are
+  /// not. Audio input needs `"llama.cpp/lfm2-audio-v1"`, given
+  /// explicitly or inferred from an `lfm2-audio` architecture, and the
+  /// projector then supplies the encoder. Audio output from a separate
+  /// decoder or vocoder file is not available here; use `from_path`
+  /// with a manifest for such a bundle.
+  static CeraEngine fromFiles(String modelPath, String? multimodalProjectorPath, String? inferenceType, EngineConfig config) {
+    return _bindings().ceraEngineCreateFromFiles(modelPath, multimodalProjectorPath, inferenceType, config);
+  }
+
+  /// Async variant of [`CeraEngine::from_files`]; the same rules for
+  /// `inference_type` and paths apply.
+  ///
+  /// The files are memory-mapped, but loading still builds the
+  /// tokenizer, prepares the backend and, if a projector is given, the
+  /// vision tower, and on the CPU backend runs a warm-up pass, which is
+  /// enough to drop frames on a UI thread. Same weak cancellation as
+  /// [`CeraEngine::from_path_async`].
+  static Future<CeraEngine> fromFilesAsync(String modelPath, String? multimodalProjectorPath, String? inferenceType, EngineConfig config) async {
+    return _bindings().ceraEngineCreateFromFilesAsync(modelPath, multimodalProjectorPath, inferenceType, config);
+  }
+
   /// Load a multi-file bundle from memory: the model GGUF plus its
   /// multimodal projector ("mmproj").
   ///
@@ -32799,11 +33311,11 @@ final class CeraEngine {
   /// staying false. That mirrors the path-based loaders rather than
   /// failing a whole load over a sidecar.
   ///
-  /// **Prefer `from_path` whenever a path exists**, for the same
-  /// memory reason as [`CeraEngine::from_bytes`]: these buffers are
-  /// committed resident memory for the engine's lifetime, and a VL
-  /// bundle is the model *plus* the tower. `config.bundle_repo` is
-  /// ignored.
+  /// **Prefer [`CeraEngine::from_files`] (or `from_path`) whenever a
+  /// path exists**, for the same memory reason as
+  /// [`CeraEngine::from_bytes`]: these buffers are committed resident
+  /// memory for the engine's lifetime, and a VL bundle is the model
+  /// *plus* the tower. `config.bundle_repo` is ignored.
   static CeraEngine fromParts(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) {
     return _bindings().ceraEngineCreateFromParts(bytes, multimodalProjector, inferenceType, config);
   }

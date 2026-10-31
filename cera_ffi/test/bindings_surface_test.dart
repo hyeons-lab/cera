@@ -197,6 +197,21 @@ void main() {
     );
   });
 
+  test('fromFilesAsync returns a Future, not a bare engine', () {
+    // Guards the generated surface and signature only: a non-`async` wrapper has
+    // the same static type, so the `async` marker itself comes from
+    // `tool/patch_generated_bindings.dart` (its `asyncSigs` list), not from this
+    // test. This is the path-based way to load a model plus its mmproj on a
+    // phone, where `fromPartsAsync` would need both files in the heap, so
+    // losing the constructor would be silent for those callers.
+    expect(
+      CeraEngine.fromFilesAsync,
+      isA<
+        Future<CeraEngine> Function(String, String?, String?, EngineConfig)
+      >(),
+    );
+  });
+
   test('fromBundleIdAsync returns a Future, not a bare engine', () {
     // The generator had no rust-future path for async *constructors* (only for
     // methods), so this used to be a synchronous `throw UnsupportedError`. The

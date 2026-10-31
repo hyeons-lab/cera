@@ -11,11 +11,13 @@
 //! Engine-level:
 //! - [`CeraEngine`] — model loader, session factory, and tokenizer
 //!   accessor. Constructors: [`CeraEngine::from_path`] for a local
-//!   GGUF, manifest, or directory; [`CeraEngine::from_bundle_id`]
-//!   for LeapBundles-style remote loading;
-//!   [`CeraEngine::from_path_async`], [`CeraEngine::from_bytes_async`]
-//!   and [`CeraEngine::from_bundle_id_async`] for the tokio-async
-//!   variants, which move the load off the calling thread.
+//!   GGUF, manifest, or directory; [`CeraEngine::from_files`] for a
+//!   model GGUF plus a multimodal projector on disk;
+//!   [`CeraEngine::from_bundle_id`] for LeapBundles-style remote loading;
+//!   [`CeraEngine::from_path_async`], [`CeraEngine::from_files_async`],
+//!   [`CeraEngine::from_bytes_async`] and
+//!   [`CeraEngine::from_bundle_id_async`] for the tokio-async variants,
+//!   which move the load off the calling thread.
 //!   Tokenizer methods ([`CeraEngine::encode_text`],
 //!   [`CeraEngine::decode_tokens`],
 //!   [`CeraEngine::apply_chat_template`]) let foreign callers
@@ -1180,6 +1182,29 @@ pub struct CeraEngine {
     inner: Arc<cera::CeraEngine>,
 }
 
+/// The [`cera::ModelFiles`] a `from_files` call describes: a model, an optional
+/// multimodal projector, and an optional inference type. `parse_str` maps anything
+/// unrecognized to `Unknown(s)`, which the loader rejects by name, rather than
+/// silently falling back to text when a caller fat-fingers the string.
+fn model_files(
+    model_path: String,
+    multimodal_projector_path: Option<String>,
+    inference_type: Option<String>,
+) -> cera::ModelFiles {
+    cera::ModelFiles {
+        model: model_path.into(),
+        multimodal_projector: multimodal_projector_path.map(Into::into),
+        audio_decoder: None,
+        audio_tokenizer: None,
+        draft_model: None,
+        extras: Default::default(),
+        inference_type: inference_type
+            .as_deref()
+            .map(cera::manifest::InferenceType::parse_str),
+        chat_template: None,
+    }
+}
+
 #[uniffi::export]
 impl CeraEngine {
     /// Load a model from a local filesystem path. Accepts the same
@@ -1263,11 +1288,11 @@ impl CeraEngine {
     /// staying false. That mirrors the path-based loaders rather than
     /// failing a whole load over a sidecar.
     ///
-    /// **Prefer `from_path` whenever a path exists**, for the same
-    /// memory reason as [`CeraEngine::from_bytes`]: these buffers are
-    /// committed resident memory for the engine's lifetime, and a VL
-    /// bundle is the model *plus* the tower. `config.bundle_repo` is
-    /// ignored.
+    /// **Prefer [`CeraEngine::from_files`] (or `from_path`) whenever a
+    /// path exists**, for the same memory reason as
+    /// [`CeraEngine::from_bytes`]: these buffers are committed resident
+    /// memory for the engine's lifetime, and a VL bundle is the model
+    /// *plus* the tower. `config.bundle_repo` is ignored.
     #[uniffi::constructor]
     pub fn from_parts(
         bytes: Vec<u8>,
@@ -1292,6 +1317,61 @@ impl CeraEngine {
             audio_profile: None,
         };
         let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
+    }
+
+    /// Load a model GGUF and an optional multimodal projector ("mmproj")
+    /// from files on disk, without a manifest.
+    ///
+    /// The file-backed twin of [`CeraEngine::from_parts`]. Both GGUFs are
+    /// memory-mapped, so their weights are not copied through the host's
+    /// managed (JVM or Dart) heap, which `from_parts` needs for both
+    /// files: a bundle larger than the runtime's heap limit cannot be
+    /// loaded that way at all. A backend may still copy or upload tensors
+    /// into its own memory, so this bounds the managed heap, not the
+    /// process footprint.
+    ///
+    /// **`inference_type` is taken literally**: `"llama.cpp/text-to-text"`,
+    /// `"llama.cpp/image-to-text"` or `"llama.cpp/lfm2-audio-v1"`. Unlike
+    /// `from_parts`, `None` decides from the model's architecture alone
+    /// and never looks at the projector, and the published LFM2-VL GGUFs
+    /// report the plain text architecture (`lfm2`). Pass
+    /// `"llama.cpp/image-to-text"` for a VL bundle, or `append_image` is
+    /// refused as an unsupported modality. Nothing downgrades the other
+    /// way: with an explicit image type and a projector that cannot be
+    /// used, `capabilities()` still reports image input, the reason is
+    /// usually only a warning in the log, and the first `append_image`
+    /// fails. For the text and image types a projector path is opened
+    /// and parsed as a vision tower, so pass `None` for the projector and
+    /// a text type to load text only.
+    ///
+    /// `model_path` must be a plain local path, relative to the process
+    /// working directory if it is relative; a URL fails with or without
+    /// `config.bundle_repo`. A relative `multimodal_projector_path` is
+    /// joined onto the model file's directory, so pass an absolute path
+    /// or a bare file name. An `http(s)://` projector is fetched through
+    /// `config.bundle_repo` and fails the whole load without one, and a
+    /// `file://` string fails it too.
+    ///
+    /// Only the model, the projector and the type are exposed. The
+    /// `ModelFiles` audio decoder and tokenizer, draft model (set
+    /// `config.draft_model` instead), extra files and chat template are
+    /// not. Audio input needs `"llama.cpp/lfm2-audio-v1"`, given
+    /// explicitly or inferred from an `lfm2-audio` architecture, and the
+    /// projector then supplies the encoder. Audio output from a separate
+    /// decoder or vocoder file is not available here; use `from_path`
+    /// with a manifest for such a bundle.
+    #[uniffi::constructor]
+    pub fn from_files(
+        model_path: String,
+        multimodal_projector_path: Option<String>,
+        inference_type: Option<String>,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        let files = model_files(model_path, multimodal_projector_path, inference_type);
+        let inner = cera::CeraEngine::from_files(files, config.try_into()?)?;
         Ok(Arc::new(Self {
             inner: Arc::new(inner),
         }))
@@ -3655,6 +3735,29 @@ impl CeraEngine {
         })
         .await
     }
+
+    /// Async variant of [`CeraEngine::from_files`]; the same rules for
+    /// `inference_type` and paths apply.
+    ///
+    /// The files are memory-mapped, but loading still builds the
+    /// tokenizer, prepares the backend and, if a projector is given, the
+    /// vision tower, and on the CPU backend runs a warm-up pass, which is
+    /// enough to drop frames on a UI thread. Same weak cancellation as
+    /// [`CeraEngine::from_path_async`].
+    #[uniffi::constructor]
+    pub async fn from_files_async(
+        model_path: String,
+        multimodal_projector_path: Option<String>,
+        inference_type: Option<String>,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        let cera_config: cera::EngineConfig = config.try_into()?;
+        spawn_engine_build("from_files_async", move || {
+            let files = model_files(model_path, multimodal_projector_path, inference_type);
+            cera::CeraEngine::from_files(files, cera_config)
+        })
+        .await
+    }
 }
 
 // Session-level method on CeraEngine.
@@ -4510,6 +4613,83 @@ impl PiiClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `from_files` hands the core the paths as given, and the inference type goes through
+    /// `parse_str` so a typo is rejected by name rather than loading as text.
+    #[test]
+    fn model_files_carries_the_paths_and_the_inference_type() {
+        let f = model_files(
+            "/data/vlm.gguf".into(),
+            Some("/data/mmproj.gguf".into()),
+            Some("llama.cpp/image-to-text".into()),
+        );
+        assert_eq!(f.model, std::path::PathBuf::from("/data/vlm.gguf"));
+        assert_eq!(
+            f.multimodal_projector,
+            Some(std::path::PathBuf::from("/data/mmproj.gguf"))
+        );
+        assert!(matches!(
+            f.inference_type,
+            Some(cera::manifest::InferenceType::LlamaCppImageToText)
+        ));
+        assert!(
+            f.audio_decoder.is_none() && f.audio_tokenizer.is_none() && f.draft_model.is_none()
+        );
+
+        let bare = model_files("/data/text.gguf".into(), None, None);
+        assert!(bare.multimodal_projector.is_none() && bare.inference_type.is_none());
+
+        let typo = model_files(
+            "/data/m.gguf".into(),
+            None,
+            Some("llama.cpp/image-2-text".into()),
+        );
+        assert!(matches!(
+            typo.inference_type,
+            Some(cera::manifest::InferenceType::Unknown(_))
+        ));
+    }
+
+    /// A model that is not on disk is an error, not a panic; the message names the file, and the
+    /// sync and async constructors agree. (Loading a real VL bundle needs the model files; the
+    /// device run covers that.)
+    #[tokio::test]
+    async fn from_files_reports_a_missing_model_as_an_error() {
+        let model = "/nonexistent/cera-test/model.gguf";
+        let mmproj = Some("/nonexistent/cera-test/mmproj.gguf".to_string());
+
+        let sync =
+            CeraEngine::from_files(model.into(), mmproj.clone(), None, EngineConfig::default())
+                .err()
+                .expect("a missing model is an error");
+        assert!(sync.to_string().contains("model.gguf"), "got: {sync}");
+
+        let asynch =
+            CeraEngine::from_files_async(model.into(), mmproj, None, EngineConfig::default())
+                .await
+                .err()
+                .expect("a missing model is an error");
+        assert_eq!(asynch.to_string(), sync.to_string());
+    }
+
+    /// A mistyped inference type is rejected by name before any file is opened, so it needs no
+    /// model on disk: the caller sees the offending string instead of a silent text-only load.
+    #[test]
+    fn from_files_rejects_an_unknown_inference_type_by_name() {
+        let err = CeraEngine::from_files(
+            "/nonexistent/cera-test/model.gguf".into(),
+            None,
+            Some("llama.cpp/image-2-text".into()),
+            EngineConfig::default(),
+        )
+        .err()
+        .expect("a mistyped inference type is an error");
+        assert!(
+            matches!(&err, FfiError::UnsupportedInferenceType { inference_type }
+                if inference_type.contains("image-2-text")),
+            "got: {err}"
+        );
+    }
 
     /// The record carries cera's resolved profile field for field: every voice
     /// keeps the complete prompts cera built, so a client never assembles one.

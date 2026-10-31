@@ -14,16 +14,16 @@
 //      and the generator no longer emits those, so this now matches nothing.
 //      Left in place because it is a pure no-op when there is nothing to fix
 //      and the upstream shape could come back.
-//   2. async constructor wrappers (4 sites)
-//      `CeraEngine.fromBundleIdAsync`, `fromPathAsync`, `fromBytesAsync` and
-//      `fromPartsAsync` are
+//   2. async constructor wrappers (5 sites)
+//      `CeraEngine.fromBundleIdAsync`, `fromPathAsync`, `fromBytesAsync`,
+//      `fromPartsAsync` and `fromFilesAsync` are
 //      declared `Future<CeraEngine>` but not marked `async`, so each returns the
 //      inner binding call's Future directly. The types already agree (the inner
 //      call returns `Future<CeraEngine>` too), so this is about behaviour rather
 //      than typing: an `async` body turns a synchronous throw from `_bindings()`
 //      (a missing or unloadable native library) into a failed future, which is
-//      what a `Future`-returning constructor should do. All four are patched
-//      because all four have the same shape; patching one made them differ on
+//      what a `Future`-returning constructor should do. All five are patched
+//      because all five have the same shape; patching one made them differ on
 //      that failure.
 //
 //   (Callback-interface lowering is NO LONGER patched here. The vendored
@@ -116,6 +116,7 @@ void main(List<String> args) {
     'fromPathAsync(String path, EngineConfig config) {',
     'fromBytesAsync(Uint8List bytes, EngineConfig config) {',
     'fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) {',
+    'fromFilesAsync(String modelPath, String? multimodalProjectorPath, String? inferenceType, EngineConfig config) {',
   ];
   for (final sig in asyncSigs) {
     final fixed = '${sig.substring(0, sig.length - 1)}async {';

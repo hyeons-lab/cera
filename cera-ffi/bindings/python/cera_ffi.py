@@ -635,7 +635,11 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 55200:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 40765:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_files() != 25493:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async() != 41974:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 43106:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 3992:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1133,6 +1137,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes.restype = 
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_files.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_files.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_files_async.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts.restype = ctypes.c_uint16
@@ -1885,6 +1895,21 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async.argtypes =
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_files.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_files.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_files_async.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_files_async.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts.argtypes = (
     _UniffiRustBuffer,
     _UniffiRustBuffer,
@@ -13488,6 +13513,109 @@ class CeraEngine(CeraEngineProtocol):
             _uniffi_error_converter,
         )
     @classmethod
+    def from_files(cls, model_path: str,multimodal_projector_path: typing.Optional[str],inference_type: typing.Optional[str],config: EngineConfig) -> CeraEngine:
+        """
+        Load a model GGUF and an optional multimodal projector ("mmproj")
+        from files on disk, without a manifest.
+
+        The file-backed twin of [`CeraEngine::from_parts`]. Both GGUFs are
+        memory-mapped, so their weights are not copied through the host's
+        managed (JVM or Dart) heap, which `from_parts` needs for both
+        files: a bundle larger than the runtime's heap limit cannot be
+        loaded that way at all. A backend may still copy or upload tensors
+        into its own memory, so this bounds the managed heap, not the
+        process footprint.
+
+        **`inference_type` is taken literally**: `"llama.cpp/text-to-text"`,
+        `"llama.cpp/image-to-text"` or `"llama.cpp/lfm2-audio-v1"`. Unlike
+        `from_parts`, `None` decides from the model's architecture alone
+        and never looks at the projector, and the published LFM2-VL GGUFs
+        report the plain text architecture (`lfm2`). Pass
+        `"llama.cpp/image-to-text"` for a VL bundle, or `append_image` is
+        refused as an unsupported modality. Nothing downgrades the other
+        way: with an explicit image type and a projector that cannot be
+        used, `capabilities()` still reports image input, the reason is
+        usually only a warning in the log, and the first `append_image`
+        fails. For the text and image types a projector path is opened
+        and parsed as a vision tower, so pass `None` for the projector and
+        a text type to load text only.
+
+        `model_path` must be a plain local path, relative to the process
+        working directory if it is relative; a URL fails with or without
+        `config.bundle_repo`. A relative `multimodal_projector_path` is
+        joined onto the model file's directory, so pass an absolute path
+        or a bare file name. An `http(s)://` projector is fetched through
+        `config.bundle_repo` and fails the whole load without one, and a
+        `file://` string fails it too.
+
+        Only the model, the projector and the type are exposed. The
+        `ModelFiles` audio decoder and tokenizer, draft model (set
+        `config.draft_model` instead), extra files and chat template are
+        not. Audio input needs `"llama.cpp/lfm2-audio-v1"`, given
+        explicitly or inferred from an `lfm2-audio` architecture, and the
+        projector then supplies the encoder. Audio output from a separate
+        decoder or vocoder file is not available here; use `from_path`
+        with a manifest for such a bundle.
+"""
+        
+        _UniffiFfiConverterString.check_lower(model_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(multimodal_projector_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(inference_type)
+
+        _UniffiFfiConverterTypeEngineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(model_path),
+            _UniffiFfiConverterOptionalString.lower(multimodal_projector_path),
+            _UniffiFfiConverterOptionalString.lower(inference_type),
+            _UniffiFfiConverterTypeEngineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeCeraEngine.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_files,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    async def from_files_async(cls, model_path: str,multimodal_projector_path: typing.Optional[str],inference_type: typing.Optional[str],config: EngineConfig) -> CeraEngine:
+        """
+        Async variant of [`CeraEngine::from_files`]; the same rules for
+        `inference_type` and paths apply.
+
+        The files are memory-mapped, but loading still builds the
+        tokenizer, prepares the backend and, if a projector is given, the
+        vision tower, and on the CPU backend runs a warm-up pass, which is
+        enough to drop frames on a UI thread. Same weak cancellation as
+        [`CeraEngine::from_path_async`].
+"""
+        
+        _UniffiFfiConverterString.check_lower(model_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(multimodal_projector_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(inference_type)
+
+        _UniffiFfiConverterTypeEngineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(model_path),
+            _UniffiFfiConverterOptionalString.lower(multimodal_projector_path),
+            _UniffiFfiConverterOptionalString.lower(inference_type),
+            _UniffiFfiConverterTypeEngineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeCeraEngine.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_files_async(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_u64,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_u64,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_u64,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    @classmethod
     def from_parts(cls, bytes: bytes,multimodal_projector: typing.Optional[bytes],inference_type: typing.Optional[str],config: EngineConfig) -> CeraEngine:
         """
         Load a multi-file bundle from memory: the model GGUF plus its
@@ -13518,11 +13646,11 @@ class CeraEngine(CeraEngineProtocol):
         staying false. That mirrors the path-based loaders rather than
         failing a whole load over a sidecar.
 
-        **Prefer `from_path` whenever a path exists**, for the same
-        memory reason as [`CeraEngine::from_bytes`]: these buffers are
-        committed resident memory for the engine's lifetime, and a VL
-        bundle is the model *plus* the tower. `config.bundle_repo` is
-        ignored.
+        **Prefer [`CeraEngine::from_files`] (or `from_path`) whenever a
+        path exists**, for the same memory reason as
+        [`CeraEngine::from_bytes`]: these buffers are committed resident
+        memory for the engine's lifetime, and a VL bundle is the model
+        *plus* the tower. `config.bundle_repo` is ignored.
 """
         
         _UniffiFfiConverterBytes.check_lower(bytes)
