@@ -1572,8 +1572,10 @@ impl ResolvedPathSource {
         check_inference_type_supported(&self.manifest.inference_type)?;
         match self.gguf.take() {
             Some(gguf) => Ok(gguf),
+            // `{e:#}` keeps the OS error; plain `{e}` prints only the outermost
+            // "opening <path>" context and hides why the open failed.
             None => GgufFile::open(&self.primary).map_err(|e| {
-                CeraError::Backend(format!("opening `{}`: {e}", self.primary.display()))
+                CeraError::Backend(format!("opening `{}`: {e:#}", self.primary.display()))
             }),
         }
     }
@@ -2446,9 +2448,10 @@ fn check_inference_type_supported(it: &InferenceType) -> Result<(), CeraError> {
 
 #[cfg(feature = "mmap")]
 fn open_for_inference_type(model_path: &Path) -> Result<GgufFile, CeraError> {
+    // `{e:#}` for the same reason as `ResolvedPathSource::open_primary`.
     GgufFile::open(model_path).map_err(|e| {
         CeraError::Backend(format!(
-            "opening `{}` for inference-type auto-detect: {e}",
+            "opening `{}` for inference-type auto-detect: {e:#}",
             model_path.display()
         ))
     })

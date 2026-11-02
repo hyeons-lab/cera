@@ -88,6 +88,50 @@ fn file_kind_and_inference_gates_keep_auxiliary_error_order() {
     );
 }
 
+// A failed open must say why (missing, unreadable); `anyhow`'s plain `Display`
+// prints only the outermost "opening <path>" context.
+#[cfg(feature = "mmap")]
+#[test]
+fn failed_primary_open_reports_the_os_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.gguf");
+    let os_error = std::fs::File::open(&missing).unwrap_err();
+    let shown = missing.display();
+    // An explicit inference type opens the primary at assembly; `None` opens
+    // it first to read the architecture.
+    for (inference, expected) in [
+        (
+            Some(InferenceType::LlamaCppTextToText),
+            format!("opening `{shown}`: opening {shown}: {os_error}"),
+        ),
+        (
+            None,
+            format!(
+                "opening `{shown}` for inference-type auto-detect: opening {shown}: {os_error}"
+            ),
+        ),
+    ] {
+        let mut files = crate::ModelFiles::text(&missing);
+        files.inference_type = inference;
+        let legacy = CeraEngine::from_files(files.clone(), cpu_config())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&legacy, CeraError::Backend(message) if *message == expected),
+            "{legacy}"
+        );
+        let typed = error(
+            ModelLoader::new(ModelSource::files(files))
+                .config(cpu_config())
+                .build_generative(),
+        );
+        assert!(
+            matches!(&typed, LoadError::Source { source_kind: "files", error: CeraError::Backend(message) } if *message == expected),
+            "{typed}"
+        );
+    }
+}
+
 // APFS rejects these filenames. Linux exercises the legacy distinction between
 // a manifest's lossy string path and ModelFiles' original byte path.
 #[cfg(all(feature = "mmap", target_os = "linux"))]
