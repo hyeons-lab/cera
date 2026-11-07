@@ -35,7 +35,8 @@ vendoring them.
 
 - Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus three local Hexagon commits on
   top (`ead90bfd3`, `cf01d2b60`, `c2d4a889a`: the extended Conv1D, ConvTranspose1D, Snake and unary
-  operations, and the HVX float-clamp fix), then the quantizer patch below as `93b1163c9`.
+  operations, and the HVX float-clamp fix), then the quantizer patch below as `93b1163c9` and
+  `b5d25b652`.
   These commits live in a local, unpublished llama.cpp branch (`feat/hexagon-nov-rebase`;
   `ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`, plus the op-remap entries for our extensions in
   `htp-kparams.cpp`); the previous skels were built from upstream `de7fa0a3c` with the same
@@ -61,7 +62,8 @@ vendoring them.
 - Patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
   (`hvx-mm-kernels-tiled.h`, the `q8_0` and `q8_1` tiled activation
   quantizers, including the Q2_K `sums16` path that shares one scale per 256-element
-  super-block). The upstream quantizer computed the Q8 scale and its
+  super-block, and `hvx-quant.h`, the Q8_0 row quantizer; the shared scale rule lives in the new
+  `hvx-q8-scale.h`). The upstream quantizer computed the Q8 scale and its
   reciprocal in f16: for a block whose absolute maximum is below about
   2e-3 the reciprocal overflowed f16 and the int8 values were wrongly
   scaled (50% or more relative error on that block). Every HVX matmul
@@ -76,9 +78,16 @@ vendoring them.
   chunks went from 0.95..0.99 to 0.9995 or better (LFM2.5-2.6B Q4_0 from
   -0.003..0.99 to 0.991..0.9999), single tokens from as low as 0.377 to
   0.9995, with unchanged decode throughput (measured on an earlier build; the patch is ported
-  onto the reworked quantizers). Not covered: `hvx_quantize_row_q8_0_f32` (`hvx-quant.h`) still has
-  the f16 reciprocal. It quantizes cache and gather rows (the Q8_0 KV cache through `set_rows`,
-  `get_rows`, flash attention), not matmul activations, and `CERA_HEXAGON_KV_Q8` is off by default.
+  onto the reworked quantizers). The row quantizer `hvx_quantize_row_q8_0_f32` had the same f16
+  reciprocal in its four-block path, and its scalar tail stored the f16-rounded scale but
+  multiplied by an unrounded reciprocal. It quantizes cache and gather rows (the Q8_0 KV cache
+  through `set_rows`, `get_rows`, flash attention; `CERA_HEXAGON_KV_Q8`, off by default), not
+  matmul activations. It now uses the same rule as the tiled quantizers; on a v79 the device test
+  `device_set_rows_q8_0_keeps_small_blocks` (blocks with maxima from 1 down to 1e-5, vector path and
+  scalar tail) came back 100% off on every block below about 2e-3 before the fix and within one
+  quantization step (0.58% of the block maximum) after it. The tiled quantizers were only
+  refactored onto the shared helper: full-logit cosines against the CPU are unchanged to six digits
+  on four models (including a 1,300-token context), and decode replays stay bit-identical.
   v73, v75, v81 and v85 are the same C code rebuilt; only v79 has been run on hardware.
 - Build: Hexagon SDK 6.6.0.0 with Hexagon Tools 19.0.07 (hexagon-clang with
   whole-program LTO), compiling `libggml-htp-v{73,75,79,81}.so` targets with
@@ -93,22 +102,22 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: 0b461e10fa560638cbdea5491cfb59dd
-- v75: 8b97f3f546f57d47ed561daf97152a16
-- v79: 9aae26d385a63b438e267498ac33450d
-- v81: 879206b0859edc3f4ce164317eb6af59
-- v85: db965f4730864b9d7c7ce932cb7ef46f
+- v73: 8089a9c1c6de3e34d4ad989b04a3a8d3
+- v75: c33d7288d58e0e23d5573fc0b3f9e775
+- v79: d0f7324da78d2fffbf3cf25639fa6890
+- v81: a1c31cd344e31f0a96b04d61adc2dc3c
+- v85: c5684a8b5f61d8a05bb618f74c0589f8
 
 These are the md5s of the shipped, renamed files. The unrenamed build outputs were
-v73 4bb07b3937f64bd7c0462a0807918116, v75 20a6fc16c93f628c481aff79363f93f5,
-v79 707ce806982a9c703ee85f0795c16d00, v81 95611a06ab5b84d3002bf9424bc64d02
+v73 7961e516e3744fa9d4f5c6d2ad3bae04, v75 041365ae69f9fcc0a4567f7118ba2377,
+v79 36a6fa4c73efbb6cec7d29ab8545145e, v81 0a8519321dc95621ff3b2398a04b9a12
 (and v85 is that same v81 file). `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
 file's SWIV CRC and lists the SONAME inside.
 
 ## Rebuilding
 
 ```bash
-# in the llama.cpp checkout described under Source (commit 93b1163c9), Docker toolchain image
+# in the llama.cpp checkout described under Source (commit b5d25b652), Docker toolchain image
 # ghcr.io/snapdragon-toolchain/arm64-android:v0.7 (Hexagon SDK 6.6.0.0, Tools 19.0.07):
 cp docs/backend/snapdragon/CMakeUserPresets.json .
 docker run --rm --platform linux/amd64 -v "$PWD":/workspace -w /workspace <image> bash -lc \
