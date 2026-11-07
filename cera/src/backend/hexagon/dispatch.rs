@@ -2355,6 +2355,139 @@ mod tests {
         );
     }
 
+    /// `SetRows` into a Q8_0 cache (the `CERA_HEXAGON_KV_Q8` path) keeps the precision of blocks
+    /// whose largest value is tiny. The DSP's row quantizer used to scale in f16, whose reciprocal
+    /// overflows once a block's maximum is below about 2e-3, so those blocks came back wrong by
+    /// 50% or more. Rows of 288 values (nine blocks: two groups of four, then a single block) cover
+    /// the vector path and the scalar tail; the block maxima run from 1 down to 1e-5, and include
+    /// an all-zero block.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_set_rows_q8_0_keeps_small_blocks() {
+        use super::super::{HTP_TENSOR_COMPUTE, HtpDataType};
+        let mut rig = GeluRig::open();
+        let (n, rows, ctx) = (288usize, 4usize, 8usize);
+        let blocks = n / 32;
+        let row_bytes = blocks * 34;
+        let maxima = [1.0f32, 3e-3, 1e-3, 3e-4, 1e-5, 0.0, 6e-2, 2e-3];
+        let amax = |r: usize, b: usize| maxima[(r * blocks + b) % maxima.len()];
+        let mut src = vec![0f32; n * rows];
+        for r in 0..rows {
+            for b in 0..blocks {
+                for i in 0..32 {
+                    // a ramp through the block, with its largest magnitude exactly at element 0
+                    let v = if i == 0 {
+                        1.0
+                    } else {
+                        ((i * 37) % 64) as f32 / 32.0 - 1.0
+                    };
+                    src[r * n + b * 32 + i] = v * amax(r, b);
+                }
+            }
+        }
+        let positions = [3i32, 0, 2, 1];
+        let src_buf = rig.alloc(src.len() * 4);
+        gelu_upload(&src_buf, &src);
+        let idx_buf = rig.alloc(rows * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                positions.as_ptr().cast::<u8>(),
+                idx_buf.as_mut_ptr(),
+                rows * 4,
+            );
+        }
+        idx_buf.flush_cpu_cache(0, rows * 4);
+        let cache_bytes = ctx * row_bytes;
+        let cache_buf = rig.alloc(cache_bytes);
+        unsafe { std::ptr::write_bytes(cache_buf.as_mut_ptr(), 0x55, cache_bytes) };
+        cache_buf.flush_cpu_cache(0, cache_bytes);
+        {
+            let session = rig.device.queue_session_mut();
+            let src_ti = session
+                .add_tensor(
+                    &src_buf,
+                    0,
+                    src.len() * 4,
+                    HTP_TENSOR_COMPUTE,
+                    HtpDataType::F32 as u32,
+                    [n as u32, rows as u32, 1, 1],
+                    [
+                        4,
+                        (n * 4) as u32,
+                        (n * rows * 4) as u32,
+                        (n * rows * 4) as u32,
+                    ],
+                )
+                .unwrap();
+            let idx_ti = session
+                .add_tensor(
+                    &idx_buf,
+                    0,
+                    rows * 4,
+                    HTP_TENSOR_COMPUTE,
+                    HtpDataType::I32 as u32,
+                    [rows as u32, 1, 1, 1],
+                    [4, (rows * 4) as u32, (rows * 4) as u32, (rows * 4) as u32],
+                )
+                .unwrap();
+            let cache_ti = session
+                .add_tensor(
+                    &cache_buf,
+                    0,
+                    cache_bytes,
+                    HTP_TENSOR_COMPUTE,
+                    HtpDataType::Q8_0 as u32,
+                    [n as u32, ctx as u32, 1, 1],
+                    [34, row_bytes as u32, cache_bytes as u32, cache_bytes as u32],
+                )
+                .unwrap();
+            session
+                .enqueue_op(
+                    HtpOpCode::SetRows as u32,
+                    &[src_ti, idx_ti],
+                    &[cache_ti],
+                    [0i32; 16],
+                    [0i32; 32],
+                )
+                .unwrap();
+            session.flush().unwrap();
+        }
+        cache_buf.invalidate_cpu_cache(0, cache_bytes);
+        let bytes = unsafe { std::slice::from_raw_parts(cache_buf.as_mut_ptr(), cache_bytes) };
+        let mut worst = 0f64;
+        for (r, &pos) in positions.iter().enumerate() {
+            let row = &bytes[pos as usize * row_bytes..(pos as usize + 1) * row_bytes];
+            let mut got = vec![0f32; n];
+            crate::quant::dequantize_q8_0_row(row, &mut got);
+            for b in 0..blocks {
+                let a = f64::from(amax(r, b));
+                let err = (0..32)
+                    .map(|i| f64::from((got[b * 32 + i] - src[r * n + b * 32 + i]).abs()))
+                    .fold(0.0f64, f64::max);
+                // one quantization step of the block is 1/127 of its maximum; an all-zero block
+                // must stay zero
+                let rel = if a == 0.0 { err } else { err / a };
+                worst = worst.max(rel);
+                if rel > 1.0 / 127.0 {
+                    gelu_trace(&format!(
+                        "row {r} block {b}: max {a:e}, worst element error {err:e} ({:.1}% of the block max)",
+                        rel * 100.0
+                    ));
+                }
+            }
+        }
+        gelu_trace(&format!(
+            "worst error {:.3}% of a block's maximum (one step is {:.3}%)",
+            worst * 100.0,
+            100.0 / 127.0
+        ));
+        rig.release(&[&src_buf, &idx_buf, &cache_buf]);
+        assert!(
+            worst <= 1.0 / 127.0,
+            "a block came back {worst} off its maximum"
+        );
+    }
+
     /// Step 1, the harness: the known-good tanh sequence on 2 rows of 128.
     #[test]
     #[ignore = "needs a Hexagon NPU"]
