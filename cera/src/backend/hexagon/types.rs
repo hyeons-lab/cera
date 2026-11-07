@@ -527,11 +527,6 @@ pub(crate) const fn align128(sz: usize) -> usize {
     sz.next_multiple_of(128)
 }
 
-/// Round `sz` up to 256 bytes (the KV/state slab and theta-row alignment).
-pub(crate) const fn align256(sz: usize) -> usize {
-    sz.next_multiple_of(256)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,9 +596,5 @@ mod tests {
         assert_eq!(align128(1), 128);
         assert_eq!(align128(128), 128);
         assert_eq!(align128(129), 256);
-        assert_eq!(align256(0), 0);
-        assert_eq!(align256(1), 256);
-        assert_eq!(align256(256), 256);
-        assert_eq!(align256(257), 512);
     }
 }

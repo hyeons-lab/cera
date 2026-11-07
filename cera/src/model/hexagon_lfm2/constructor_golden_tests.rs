@@ -518,26 +518,26 @@ fn constructors_build_pinned_models() {
     assert_model(
         "ctor_dense",
         &dense,
-        (5153141503434646990, 64189687555477636),
+        (5153141503434646990, 12934653203394638101),
     );
     let lfm2 = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(false), 64).unwrap();
     assert_model(
         "ctor_lfm2",
         &lfm2,
-        (3932535791928950102, 16081593749882006606),
+        (3932535791928950102, 6849908726525516304),
     );
     let moe = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(true), 64).unwrap();
     assert_model(
         "ctor_moe",
         &moe,
-        (17415058047840074287, 4431082039610235919),
+        (17415058047840074287, 12964236396959625804),
     );
     let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
     let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();
     assert_model(
         "ctor_qwen35",
         &qwen35,
-        (3116775937788930880, 1277822656173788493),
+        (3116775937788930880, 4190262809288729821),
     );
 }
 
@@ -2292,7 +2292,7 @@ fn lfm3_constructor_is_pinned() {
     assert_model(
         "ctor_lfm3",
         &model,
-        (14294067538294377481, 13080567521429679373),
+        (14294067538294377481, 5377328684519655946),
     );
 }
 

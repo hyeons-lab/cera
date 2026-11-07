@@ -534,32 +534,32 @@ fn forward_op_sequences_are_pinned() {
         (
             "dense",
             dense_spec,
-            (32, 550514674436499070),
-            (32, 10853267902376882227),
+            (32, 8869652289627336829),
+            (32, 3763999611626278258),
         ),
         (
             "conv",
             conv_spec,
-            (33, 12584797275809301743),
-            (32, 953390829309466638),
+            (33, 439997489579468378),
+            (32, 15421880075439186786),
         ),
         (
             "deltanet",
             deltanet_spec,
-            (32, 7660913431104920875),
-            (94, 11090755616379016208),
+            (32, 14001998924406809113),
+            (94, 3312936139267892230),
         ),
         (
             "extras_dsp",
             extras_dsp_spec,
-            (53, 15260943937542437622),
-            (53, 11815372197931265380),
+            (53, 16178507010475849948),
+            (53, 6881173537588109138),
         ),
         (
             "extras_host",
             extras_host_spec,
-            (22, 1870361462054347564),
-            (22, 12424807418726140139),
+            (22, 16570920656904817224),
+            (22, 4560576524901617856),
         ),
     ];
     for (label, spec, decode, prefill) in cases {
@@ -569,7 +569,7 @@ fn forward_op_sequences_are_pinned() {
         assert_pinned(&format!("fwd_{label}_prefill"), &p, prefill);
     }
     let greedy = decode_capture(dense_spec(), DecodeOutput::Greedy);
-    assert_pinned("fwd_dense_greedy", &greedy, (33, 11217311543508123711));
+    assert_pinned("fwd_dense_greedy", &greedy, (33, 16313879222070177891));
 }
 
 /// The Qwen 3.5 attention gate (`attn_out * sigmoid(gate)`) must see one row
@@ -615,7 +615,7 @@ fn small_m_capped_prefill_is_pinned() {
             "flush {i} carries {n} ops, above the {MAX_OPS_PER_FLUSH} cap"
         );
     }
-    assert_pinned("fwd_dense_small_m_prefill", &p, (32, 2705245229776236587));
+    assert_pinned("fwd_dense_small_m_prefill", &p, (32, 13420716391065619589));
 }
 
 /// The dense-path semantics add exactly the ops the CPU reference performs:

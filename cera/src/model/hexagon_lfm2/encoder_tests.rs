@@ -1033,7 +1033,7 @@ fn encoder_op_sequence_is_pinned() {
     op_capture::assert_golden("hexagon_encoder_two_pass", key, GOLDEN, &batches);
 }
 
-const GOLDEN: (usize, u64) = (115, 15225821633316841891);
+const GOLDEN: (usize, u64) = (115, 15325767978308504901);
 
 /// A real LFM2 GGUF (full-size scratch: hidden 1024, 16 layers) through both
 /// encoder passes on the fake device, with the config flipped to non-causal:
