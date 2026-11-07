@@ -77,8 +77,8 @@ fn encoder_hmx(session: &HexagonQueueSession) -> Option<dispatch::HmxMm> {
     })
 }
 
-/// `CERA_HEXAGON_WHISPER_FA=hvx` keeps the flash attention on the HVX kernel instead of letting
-/// the solver pick HMX, for comparison.
+/// `CERA_HEXAGON_WHISPER_FA=hvx` keeps the encoder's flash attention on the HVX kernel instead of
+/// letting the solver pick HMX, for comparison (the decode step is always HVX).
 fn whisper_fa_hvx_only() -> bool {
     std::env::var("CERA_HEXAGON_WHISPER_FA").is_ok_and(|v| v == "hvx")
 }
@@ -1440,8 +1440,11 @@ impl HexagonWhisperModel {
 
         let params = flash_attn_op_params(scale, 0.0);
 
-        // the queue solves the kernel from the tensors (`CERA_HEXAGON_WHISPER_FA=hvx` keeps HVX)
-        let kparams = flash_attn_kernel_request(!whisper_fa_hvx_only());
+        // One query row per head: the HMX kernel pads it to a 32-row tile and measured 2.8 ms slower
+        // per step than the HVX one on a v79 (9.2 against 6.4 ms, with twice the host CPU), so the
+        // decode step stays on HVX whatever the solver would pick. The encoder keeps the solver's
+        // choice (`dispatch_flash_attn`), where HMX is 8x faster.
+        let kparams = flash_attn_kernel_request(false);
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,

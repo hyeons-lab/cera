@@ -16,8 +16,8 @@ use crate::backend::hexagon::dispatch::{self, TokenShape, TokenTile};
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_WEIGHT, HexagonContext, HexagonDevice,
     HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128, build_rms_norm_params,
-    build_rope_params, flash_attn_kernel_request, flash_attn_op_params, repack_q4_0, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    build_rope_params, flash_attn_hmx_rows_ok, flash_attn_kernel_request, flash_attn_op_params,
+    repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::gguf::GgufFile;
@@ -2168,7 +2168,8 @@ impl HexagonAudioDecoder {
         // The queue solves the kernel from the tensors: HMX when the DSP has a unit and a tiling
         // fits VTCM, else HVX. `CERA_HEXAGON_DETOK_FA=hvx` keeps it on the HVX kernel.
         let hvx_only = std::env::var("CERA_HEXAGON_DETOK_FA").is_ok_and(|v| v == "hvx");
-        let kparams = flash_attn_kernel_request(!hvx_only);
+        let kparams =
+            flash_attn_kernel_request(!hvx_only && flash_attn_hmx_rows_ok(head_dim, n_tokens));
 
         session
             .enqueue_op(

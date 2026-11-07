@@ -18,7 +18,7 @@ use crate::backend::hexagon::{
     HTP_TENSOR_WEIGHT, HexagonArch, HexagonContext, HexagonDevice, HexagonQueueSession,
     HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer, StagedBatch,
     build_flash_attn_kernel_params, build_get_rows_kernel_params, build_hmx_mm_kernel_params,
-    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_params,
+    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_params, flash_attn_hmx_rows_ok,
     flash_attn_kernel_request, flash_attn_op_params, lock_or_discard, mm_hmx_nb1,
     mm_is_hmx_eligible,
 };

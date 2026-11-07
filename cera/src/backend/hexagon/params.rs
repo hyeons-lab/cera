@@ -863,6 +863,16 @@ pub fn flash_attn_op_params(scale: f32, logit_softcap: f32) -> [i32; 16] {
     p
 }
 
+/// Whether a flash-attention op with `n_tokens` query rows may take the HMX kernel: the rule the
+/// builders used before the upstream refresh (`head_dim` a multiple of 8, and from 5 rows up for
+/// heads of at most 128). The upstream solver also picks HMX for a single row once the KV is long
+/// enough, and on a v79 that measured slower: LFM2 decode at a 2048-token context lost 9 to 11%,
+/// and a Whisper decode step took 9.2 ms against 6.4 ms on HVX (with twice the host CPU). Callers
+/// pass this as `allow_hmx` to [`flash_attn_kernel_request`].
+pub fn flash_attn_hmx_rows_ok(head_dim: usize, n_tokens: usize) -> bool {
+    head_dim.is_multiple_of(8) && !(head_dim <= 128 && n_tokens < 5)
+}
+
 /// The `kernel_params` argument of a `FlashAttnExt` whose kernel the queue solves from the
 /// registered tensors: free to take HMX when the heuristics pick it, or HVX only.
 pub fn flash_attn_kernel_request(allow_hmx: bool) -> [i32; 32] {

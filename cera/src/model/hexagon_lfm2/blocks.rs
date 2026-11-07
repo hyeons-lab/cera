@@ -691,7 +691,6 @@ impl HexagonLfmModel {
                 attn_scale,
                 self.kv_dtype,
                 self.attn_logit_softcapping.unwrap_or(0.0),
-                self.use_hmx,
             )?;
             if let Some(patches) = patches {
                 patches.push(FlashAttnPatch {

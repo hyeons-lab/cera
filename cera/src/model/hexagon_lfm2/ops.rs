@@ -1999,15 +1999,15 @@ impl HexagonLfmModel {
         Ok(())
     }
 
-    /// The session limits and HMX setting a flash-attention op is solved against: what the queue
-    /// uses when it derives the params, and what a recorded decode template re-solves with.
+    /// The limits a recorded decode template re-solves its flash attention against. A decode step
+    /// is one query row, which stays on the HVX kernel (see [`flash_attn_hmx_rows_ok`]).
     pub(super) fn flash_attn_host(&self, session: &HexagonQueueSession) -> FlashAttnHost {
-        let host = FlashAttnHost::new(
+        FlashAttnHost::new(
             session.dsp_threads(),
             session.dsp_vtcm_bytes(),
             session.dsp_hmx(),
-        );
-        if self.use_hmx { host } else { host.hvx_only() }
+        )
+        .hvx_only()
     }
 
     pub(super) fn dispatch_flash_attn_ext_typed(
@@ -2029,7 +2029,6 @@ impl HexagonLfmModel {
         scale: f32,
         kv_dtype: HtpDataType,
         softcap: f32,
-        use_hmx: bool,
     ) -> Result<FlashAttnTensors, CeraError> {
         let q_bytes = head_dim * n_heads * 4;
         let kv_dim = head_dim * n_kv_heads;
@@ -2108,7 +2107,8 @@ impl HexagonLfmModel {
             &[q_ti, k_ti, v_ti, mask_ti],
             &[dst_ti],
             params,
-            flash_attn_kernel_request(use_hmx),
+            // one query row: HVX (see `flash_attn_hmx_rows_ok`)
+            flash_attn_kernel_request(false),
         )?;
         Ok(FlashAttnTensors {
             q_ti: q_ti as usize,
@@ -2235,7 +2235,7 @@ impl HexagonLfmModel {
             &[q_ti, k_ti, v_ti, mask_ti],
             &[dst_ti],
             params,
-            flash_attn_kernel_request(self.use_hmx),
+            flash_attn_kernel_request(self.use_hmx && flash_attn_hmx_rows_ok(head_dim, n_tokens)),
         )?;
         Ok(())
     }
