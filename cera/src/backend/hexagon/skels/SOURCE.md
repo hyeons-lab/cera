@@ -89,12 +89,17 @@ vendoring them.
   refactored onto the shared helper: full-logit cosines against the CPU are unchanged to six digits
   on four models (including a 1,300-token context), and decode replays stay bit-identical.
   v73, v75, v81 and v85 are the same C code rebuilt; only v79 has been run on hardware.
+  The v85 skel is built with the newer toolchain below, so the same sources were also built for
+  v79 with it and run on the same device: Q8_0 SetRows test, full-logit cosines against the CPU
+  (four models, including a 1,300-token context), decode replays and throughput all match the v0.7
+  build (cosines identical to six digits, decode replays bit-identical, throughput within noise).
 - Build: Hexagon SDK 6.6.0.0 with Hexagon Tools 19.0.07 (hexagon-clang with
   whole-program LTO), compiling `libggml-htp-v{73,75,79,81}.so` targets with
   `-DDSP_VERSION`. Upstream's CMake then runs `htp-swiv.py`, which appends a SWIV (software image
-  validation) section: a CRC32 over the contents of every loadable segment. Upstream moved its own
-  builds to toolchain image v0.8 (SDK 6.7), which the native v85 target needs; the v0.7 image used
-  here has no v85 mapping, so the shipped v85 skel is the v81 build renamed. The data segments of
+  validation) section: a CRC32 over the contents of every loadable segment. Upstream builds with
+  toolchain image v0.8 (Hexagon SDK 6.7.0.0, Hexagon Tools 21.0.04), which the v85 target needs;
+  the v0.7 image has no v85 mapping, so v85 alone is built with v0.8 (ELF `e_flags` 0x85, as the
+  v81 file's is 0x81) while v73 to v81 stay on v0.7. The data segments of
   these skels are 4 KB aligned (`p_align = 0x1000`), the DSP loader's own requirement; Android's
   16 KB page rule applies to the app's `.so` files, not to these embedded blobs.
 - License of the compiled sources: MIT (llama.cpp). Toolchain output
@@ -106,12 +111,12 @@ vendoring them.
 - v75: c33d7288d58e0e23d5573fc0b3f9e775
 - v79: d0f7324da78d2fffbf3cf25639fa6890
 - v81: a1c31cd344e31f0a96b04d61adc2dc3c
-- v85: c5684a8b5f61d8a05bb618f74c0589f8
+- v85: 756d4cdcf6573351b454c76de3139b57
 
 These are the md5s of the shipped, renamed files. The unrenamed build outputs were
 v73 7961e516e3744fa9d4f5c6d2ad3bae04, v75 041365ae69f9fcc0a4567f7118ba2377,
-v79 36a6fa4c73efbb6cec7d29ab8545145e, v81 0a8519321dc95621ff3b2398a04b9a12
-(and v85 is that same v81 file). `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
+v79 36a6fa4c73efbb6cec7d29ab8545145e, v81 0a8519321dc95621ff3b2398a04b9a12 and
+v85 b9b676dcd658872d2d9610d1bbe980b4. `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
 file's SWIV CRC and lists the SONAME inside.
 
 ## Rebuilding
@@ -126,6 +131,12 @@ docker run --rm --platform linux/amd64 -v "$PWD":/workspace -w /workspace <image
 # outputs: build-snapdragon/ggml/src/ggml-hexagon/htp-vXX-prefix/src/htp-vXX-build/libggml-htp-vXX.so
 # (htp-v79 is also installed one level up; the other targets stop before their install step when
 # one target in the same invocation fails)
+
+# v85 alone, with toolchain image ghcr.io/snapdragon-toolchain/arm64-android:v0.8 (Hexagon SDK
+# 6.7.0.0, Tools 21.0.04), in its own build directory so the v0.7 outputs stay untouched:
+docker run --rm --platform linux/amd64 -v "$PWD":/workspace -w /workspace <image-v0.8> bash -lc \
+  'cmake --preset arm64-android-snapdragon-release -B build-snapdragon-v08 &&
+   cmake --build build-snapdragon-v08 --target htp-v85'
 ```
 
 ## Renaming (llama.cpp coexistence)
@@ -139,11 +150,9 @@ patch is a same-length byte substitution that moves no offsets. It does change l
 which the SWIV CRC covers, so the CRC is recomputed in the same step:
 
 ```bash
-for v in 73 75 79 81; do
+for v in 73 75 79 81 85; do
   python3 scripts/hexagon-skels/finalize.py libggml-htp-v$v.so cera/src/backend/hexagon/skels/libcera-htp-v$v.so
 done
-# the v85 file is the v81 build under its own name:
-python3 scripts/hexagon-skels/finalize.py --as v85 libggml-htp-v81.so cera/src/backend/hexagon/skels/libcera-htp-v85.so
 ```
 
 The tool first recomputes the input's CRC and refuses to continue unless it equals the one
