@@ -383,6 +383,10 @@ pub const HTP_TENSOR_TILED: u32 = 2;
 /// Tensor is a synchronization fence (explicitly managed).
 pub const HTP_TENSOR_FENCE: u32 = 4;
 
+/// `HTP_POWER_MODE_BURST`: the DCVS/HMX profile that pins every corner to its maximum and keeps
+/// the DSP awake (`enum htp_power_mode`; lower values trade speed for power).
+pub const HTP_POWER_MODE_BURST: u32 = 7;
+
 pub const HTP_MAX_DIMS: usize = 4;
 pub const HTP_MAX_OP_PARAMS: usize = 16;
 pub const HTP_MAX_PACKET_BUFFERS: usize = 8;

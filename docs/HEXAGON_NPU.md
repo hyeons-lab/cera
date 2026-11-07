@@ -77,11 +77,11 @@ The DSP-side worker libraries (`libcera-htp-v{73,75,79,81,85}.so`) are precompil
    - `Snake` / `Snake1D`: Specialized sinusoidal activation function ($\sin^2(\alpha x)$) required for neural vocoders (BigVGAN, Vocos).
    - `UnaryStep` and `Sum`: Element-wise step activations and reductions executing directly on HVX vector registers.
 2. **Opcode Alignment (`HtpOpCode`)**:
-   - Realigned all discriminant values in Cera's `HtpOpCode` enum with the upstream DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Scale = 32`, `Cpy = 33`, `Conv1D = 68`, `UnarySnake = 69`). This prevents command displacement where non-scale operators were previously misinterpreted as `Scale` operations with invalid parameters.
+   - Realigned all discriminant values in Cera's `HtpOpCode` enum with the upstream DSP firmware ABI (`UnaryStep = 22`, `Sum = 40`, `Scale = 33`, `Cpy = 34`, `Conv1D = 83`, `UnarySnake = 84`). This prevents command displacement where non-scale operators were previously misinterpreted as `Scale` operations with invalid parameters.
 3. **Compilation**:
    - Built with Qualcomm Hexagon SDK 6.6.0.0 and Hexagon Tools 19.0.07 (`hexagon-clang` with whole-program Link-Time Optimization), compiling dedicated targets with `-DDSP_VERSION`.
-4. **16 KB Page Alignment**:
-   - All ELF headers and program segments comply with Android 16+ 16 KB page-alignment requirements (`0x4000`), ensuring compatibility with Google Play store distribution.
+4. **Page alignment**:
+   - Android's 16 KB page-size rule applies to the app's own `.so` files (the AAR's `libcera_ffi.so` keeps it). The skels are not loaded by the Android linker: they are embedded as data and mapped by the cDSP's own loader from their program headers, which are 4 KB aligned (`p_align = 0x1000`).
 
 ---
 
@@ -112,7 +112,7 @@ The DSP-side worker libraries (`libcera-htp-v{73,75,79,81,85}.so`) are precompil
 - **Throughput & Thermals**: Audio decode throughput reaches 36.67 tok/s on Snapdragon 8 Elite (1.59x faster than Leap CPU at 23.02 tok/s, and 2.82x faster than previous NPU decode of 13.00 tok/s). Offloading audio synthesis to the NPU protects real-time speech generation from Android CPU frequency throttling.
 
 ### 4.5 On-DSP Argmax (`HtpOpCode::Argmax`)
-- **Direct DSP Reduction**: Offloads greedy token selection directly to the Hexagon HTP execution engine using `HtpOpCode::Argmax` (opcode 62).
+- **Direct DSP Reduction**: Offloads greedy token selection directly to the Hexagon HTP execution engine using `HtpOpCode::Argmax` (opcode 65).
 - **Zero-Copy Host Retrieval**: The host CPU reads only 4 bytes containing the winning token ID from rpcmem rather than transferring or cache-invalidating 128 to 256 KB of float32 logits. This eliminates memory bandwidth bottlenecks and host vector allocations during greedy token generation.
 
 ### 4.6 Training-Free Speculative Decoding (`forward_prefill_logits_all`)
