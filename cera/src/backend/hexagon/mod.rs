@@ -38,6 +38,7 @@ pub mod adpf;
 pub mod device;
 pub(crate) mod dispatch;
 pub mod eltwise;
+pub mod matmul_params;
 #[cfg(test)]
 pub(crate) mod op_capture;
 pub mod params;
@@ -52,6 +53,7 @@ pub use adpf::AdpfSession;
 pub use device::{HexagonArch, HexagonDevice, probe_device};
 pub(crate) use device::{arch_override, arch_override_with};
 pub use eltwise::*;
+pub use matmul_params::*;
 pub use params::*;
 pub use queue::{BufferIndexMap, HexagonQueueSession, StagedBatch};
 pub use repack::*;

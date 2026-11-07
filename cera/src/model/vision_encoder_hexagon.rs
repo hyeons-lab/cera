@@ -831,7 +831,6 @@ impl HexagonVisionEncoder {
                     HtpDataType::F16,
                     ne0,
                     ne1,
-                    n_tokens.next_multiple_of(32),
                     n_tokens,
                     session.dsp_threads(),
                     h.vtcm_budget,
@@ -935,16 +934,34 @@ impl HexagonVisionEncoder {
                     n_tokens,
                 )
             });
-        let Some((w_dtype, block_bytes, tile_size)) = fused_quant.filter(|_| {
-            fits_fused
-                && !hmx_matmul
-                && q_w.cols == k_w.cols
-                && k_w.cols == v_w.cols
-                && q_w.rows == k_w.rows
-                && k_w.rows == v_w.rows
-                && q_w.format == k_w.format
-                && k_w.format == v_w.format
-        }) else {
+        // The fused HVX kernel (the HMX matmul above takes the rows it can feed): the solver's
+        // params for the first weight, which the other two match in shape.
+        let fused = fused_quant
+            .filter(|_| {
+                fits_fused
+                    && !hmx_matmul
+                    && q_w.cols == k_w.cols
+                    && k_w.cols == v_w.cols
+                    && q_w.rows == k_w.rows
+                    && k_w.rows == v_w.rows
+                    && q_w.format == k_w.format
+                    && k_w.format == v_w.format
+            })
+            .and_then(|quant| {
+                crate::backend::hexagon::build_mul_mat_nx_kernel_params(
+                    quant.0,
+                    q_w.cols,
+                    q_w.cols,
+                    q_w.rows,
+                    3,
+                    n_tokens,
+                    session.dsp_threads(),
+                    dispatch::VTCM_BUDGET,
+                    false,
+                )
+                .map(|kparams| (quant, kparams))
+            });
+        let Some(((w_dtype, block_bytes, tile_size), kparams)) = fused else {
             Self::dispatch_linear_m(
                 session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens,
             )?;
@@ -1041,25 +1058,6 @@ impl HexagonVisionEncoder {
             dst_ne,
             dst_nb,
         )?;
-
-        let mut mm = crate::backend::hexagon::MmKernelParams::from_words(
-            &crate::backend::hexagon::build_mul_mat_kernel_params(
-                w_dtype,
-                ne0,
-                n_tokens as u32,
-                1,
-                ne1 * 4,
-                session.dsp_threads(),
-                dispatch::VTCM_BUDGET,
-            ),
-        );
-        // `fits_fused` above keeps the rows inside what the fused layout holds,
-        // which implies the plain layout needs no chunk; the fused kernel could
-        // not honour one.
-        debug_assert_eq!(mm.m_chunk, 0, "fused QKV must not need a row chunk");
-        mm.kernel_type = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
-        mm.n_weights = 3;
-        let kparams = mm.to_words();
 
         let params = [0i32; 16];
         session

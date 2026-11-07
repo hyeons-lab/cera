@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::backend::hexagon::dispatch::{self, ConcatSrc, TokenShape, TokenTile, View};
-use crate::backend::hexagon::{CopyTensor, MmKernelParams, collapse_glu, solve_binary};
+use crate::backend::hexagon::{
+    CopyTensor, MmKernelParams, MmTensor, build_mul_mat_id_kernel_params,
+    build_mul_mat_nx_kernel_params, collapse_glu, solve_binary,
+};
 
 impl HexagonLfmModel {
     /// Contiguous f32 vector descriptor (`[dim,1,1,1]`): the one spelling of
@@ -844,18 +847,22 @@ impl HexagonLfmModel {
             ],
         )?;
 
-        // The same host-precomputed HVX matmul params as `dispatch_mul_mat`:
-        // the DSP rejects an all-zero set (`InvalParams`). `in_rows` activation
-        // rows per expert slice, one batch.
-        let kparams = build_mul_mat_kernel_params(
-            w.wire_dtype,
-            k,
-            in_rows as u32,
-            1,
-            m * 4,
+        // The solver's routed HVX params for these operands: the DSP rejects an all-zero set
+        // (`InvalParams`). `in_rows` activation rows per expert slice, one token.
+        let u = |v: usize| v as u64;
+        let kparams = build_mul_mat_id_kernel_params(
+            &MmTensor::tiled_weight(w.wire_dtype as u32, [u(ne0), u(ne1), u(w.n_expert), 1]),
+            &MmTensor::f32_rows([u(k), u(in_rows), 1, 1], u(k) * 4),
+            &MmTensor::contiguous(HtpDataType::I32 as u32, [u(n_expert_used), 1, 1, 1]),
+            &MmTensor::f32_rows([u(m), u(n_expert_used), 1, 1], u(m) * 4),
             dsp_threads,
             vtcm_budget,
-        );
+        )
+        .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "no routed matmul kernel fits {n_expert_used} experts of {m}x{k} in the VTCM"
+            ))
+        })?;
         Self::enqueue_labeled(
             session,
             "dispatch_mul_mat_id",
@@ -1310,7 +1317,8 @@ impl HexagonLfmModel {
             out_dim * 4,
             session.dsp_threads(),
             self.vtcm_budget,
-        );
+        )
+        .ok_or_else(|| no_matmul_kernel(out_dim, in_dim, 1))?;
         Self::enqueue_labeled(
             session,
             "dispatch_mul_mat",
@@ -1365,7 +1373,6 @@ impl HexagonLfmModel {
                 wtype,
                 ne0,
                 ne1,
-                n_rows.next_multiple_of(32),
                 n_rows,
                 session.dsp_threads(),
                 self.vtcm_budget,
@@ -1422,8 +1429,9 @@ impl HexagonLfmModel {
             ],
         )?;
         let params = [0i32; 16];
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            build_mul_mat_kernel_params(
+        let kparams = match hmx_kparams {
+            Some(kparams) => kparams,
+            None => build_mul_mat_kernel_params(
                 wtype,
                 in_dim,
                 n_rows as u32,
@@ -1432,7 +1440,8 @@ impl HexagonLfmModel {
                 session.dsp_threads(),
                 self.vtcm_budget,
             )
-        });
+            .ok_or_else(|| no_matmul_kernel(out_dim, in_dim, n_rows))?,
+        };
         Self::enqueue_labeled(
             session,
             "dispatch_mul_mat_m",
@@ -1454,13 +1463,12 @@ impl HexagonLfmModel {
     ///
     /// Falls back to N single dispatches when fusion is unsupported: N
     /// outside 2..=4, mixed K (`in_dim`) or wire dtype, HMX-eligibility
-    /// mismatch across the set, Q6_K on the HVX path (no fused HVX
-    /// kernel), or HMX chunking overflow (which retries HVX first, like
-    /// the single path), or HVX rows past the fused limit. Kernel parameters are W0's single-matmul
-    /// parameters with `n_weights` set. On the HVX path the fused kernel cannot
-    /// chunk rows, so more rows than `mm_hvx_fused_nx_max_rows` also fall back;
-    /// W0 must carry the largest N (`out_dim`) so the
-    /// m=1 dst scratch covers every output.
+    /// mismatch across the set, or no fused kernel for the shape
+    /// ([`build_mul_mat_nx_kernel_params`]): the solver takes the HMX when the
+    /// rows and budget allow and the fused HVX kernel otherwise, and that one
+    /// cannot chunk rows, so more rows than `mm_hvx_fused_nx_max_rows` also
+    /// fall back. The kernel parameters are solved for W0, which should carry
+    /// the largest N (`out_dim`); the others only need the same K.
     pub(super) fn dispatch_mul_mat_nx(
         &self,
         session: &mut HexagonQueueSession,
@@ -1496,8 +1504,7 @@ impl HexagonLfmModel {
             && ws.iter().all(|w| {
                 (self.use_hmx && mm_is_hmx_eligible(wtype, pad32(k), pad32(w.out_dim), n_rows))
                     == hmx0
-            })
-            && (hmx0 || wtype != HtpDataType::Q6K);
+            });
         if !fusable {
             if crate::backend::hexagon::queue::debug_enabled() {
                 eprintln!("cera-hexagon: NX fallback: {n} unfused matmuls");
@@ -1505,59 +1512,27 @@ impl HexagonLfmModel {
             unfused(self, session)?;
             return Ok(());
         }
-        // HMX first, HVX fallback: the same selection as singles, with
-        // `n_weights` set. HVX forces QUANT_ROW: NX has no block kernel.
-        let hmx_built = if hmx0 {
-            build_hmx_mm_kernel_params(
-                wtype,
-                pad32(k),
-                pad32(w0.out_dim),
-                n_rows.next_multiple_of(32),
-                n_rows,
-                session.dsp_threads(),
-                self.vtcm_budget,
-            )
-        } else {
-            None
-        };
-        let kparams = if let Some(kp) = hmx_built {
-            let mut mm = MmKernelParams::from_words(&kp);
-            mm.n_weights = n as u8;
-            mm.to_words()
-        } else {
-            // HVX path (ineligible or HMX chunking overflow): Q6_K has no
-            // fused HVX kernel either way.
-            if wtype == HtpDataType::Q6K {
-                unfused(self, session)?;
-                return Ok(());
+        // The solver takes the HMX when the rows and budget allow and falls back to the fused
+        // HVX kernel (which cannot chunk rows) otherwise; a shape neither fused kernel takes,
+        // such as more rows than the HVX layout holds, runs as separate matmuls (which can chunk).
+        let Some(kparams) = build_mul_mat_nx_kernel_params(
+            wtype,
+            pad32(k),
+            k,
+            pad32(w0.out_dim),
+            n,
+            n_rows,
+            session.dsp_threads(),
+            self.vtcm_budget,
+            self.use_hmx,
+        ) else {
+            if crate::backend::hexagon::queue::debug_enabled() {
+                eprintln!(
+                    "cera-hexagon: NX fallback: no fused kernel for {n} x {k} over {n_rows} rows"
+                );
             }
-            let mut mm = MmKernelParams::from_words(&build_mul_mat_kernel_params(
-                wtype,
-                k,
-                n_rows as u32,
-                1,
-                w0.out_dim * 4,
-                session.dsp_threads(),
-                self.vtcm_budget,
-            ));
-            // The fused kernel cannot chunk rows: past what its layout holds
-            // the separate matmuls (which can) take over. Within the limit the
-            // plain layout needs no chunk either.
-            if n_rows
-                > crate::backend::hexagon::mm_hvx_fused_nx_max_rows(
-                    wtype,
-                    k,
-                    session.dsp_threads(),
-                    self.vtcm_budget,
-                )
-            {
-                unfused(self, session)?;
-                return Ok(());
-            }
-            debug_assert_eq!(mm.m_chunk, 0, "a fused matmul within the row limit chunks");
-            mm.kernel_type = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
-            mm.n_weights = n as u8;
-            mm.to_words()
+            unfused(self, session)?;
+            return Ok(());
         };
         let hmx_path = MmKernelParams::from_words(&kparams).n_hmx == 1;
         let tiled_row_bytes = (pad32(k) / 32) * w0.tile_size;
@@ -2368,6 +2343,12 @@ impl super::pager::PagerHost for SessionHost<'_> {
     fn release(&mut self, buf: &RpcmemBuffer) {
         self.0.release_dsp_reference(buf);
     }
+}
+
+fn no_matmul_kernel(rows: usize, cols: usize, n_rows: usize) -> CeraError {
+    CeraError::Backend(format!(
+        "no matmul kernel fits {n_rows} activation rows of a {rows}x{cols} weight in the VTCM"
+    ))
 }
 
 fn plain_f16_needs_rows() -> CeraError {

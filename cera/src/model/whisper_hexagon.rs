@@ -1104,7 +1104,12 @@ impl HexagonWhisperModel {
                 out_channels * 4,
                 session.dsp_threads(),
                 dispatch::VTCM_BUDGET,
-            );
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "no matmul kernel fits {chunk} rows of a {out_channels}x{padded_in_channels} conv tap in the VTCM"
+                ))
+            })?;
 
             // Tap 0 -> cur_dst
             let x0_off = conv_tap_input_offset(src_base_offset, row_bytes, 0, t_start, stride);
