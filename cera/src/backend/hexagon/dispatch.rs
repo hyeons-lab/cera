@@ -12,12 +12,11 @@
 //! device is needed to check the emitted op sequence.
 
 use super::{
-    HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT,
-    HexagonQueueSession, HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode,
-    MulMatF32Shape, RpcmemBuffer, build_binary_kernel_params, build_hmx_mm_kernel_params,
-    build_layer_norm_params, build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params,
-    build_softmax_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
-    mm_hmx_nb1, mm_is_hmx_eligible,
+    HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonQueueSession,
+    HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
+    build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
+    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
+    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -294,7 +293,7 @@ pub(crate) fn linear_m_with<S: OpSink>(
                 weights,
                 w_desc.offset,
                 w_desc.size_bytes,
-                HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+                HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
                 w_dtype as u32,
                 [cols as u32, rows as u32, 1, 1],
                 [block_bytes as u32, nb1 as u32, w_tot as u32, w_tot as u32],
@@ -1432,7 +1431,7 @@ mod tests {
             vec![OP_MULMAT, OP_ADD, OP_MULMAT, OP_ADD, OP_MULMAT, OP_ADD]
         );
         // Weight first, bias second, then per tile x and dst.
-        assert_eq!(s.tensors[0].flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK);
+        assert_eq!(s.tensors[0].flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED);
         assert_eq!(s.tensors[0].ne, [64, 96, 1, 1]);
         assert_eq!(s.tensors[1].offset, 512);
         assert_eq!(s.tensors[1].ne, [96, 1, 1, 1]);
@@ -1622,7 +1621,7 @@ mod tests {
         assert_eq!(w_hmx.nb[1] as usize, mm_hmx_nb1(HtpDataType::Q8_0, 64));
         assert_eq!(w_hvx.nb[1] as usize, (64 / 32) * 32 * 34);
         assert_eq!(w_hmx.offset, 4096);
-        assert_eq!(w_hmx.flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK);
+        assert_eq!(w_hmx.flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED);
         assert_eq!(s.tensors.iter().filter(|t| t.offset == 4096).count(), 2);
     }
 

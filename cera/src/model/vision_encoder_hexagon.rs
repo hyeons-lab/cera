@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer,
     align128, build_binary_kernel_params, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
     repacked_matrix_size_q8_0,
@@ -983,7 +983,7 @@ impl HexagonVisionEncoder {
             weights,
             q_w.offset,
             q_w.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             w_ne,
             w_nb,
@@ -992,7 +992,7 @@ impl HexagonVisionEncoder {
             weights,
             k_w.offset,
             k_w.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             w_ne,
             w_nb,
@@ -1001,7 +1001,7 @@ impl HexagonVisionEncoder {
             weights,
             v_w.offset,
             v_w.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             w_ne,
             w_nb,

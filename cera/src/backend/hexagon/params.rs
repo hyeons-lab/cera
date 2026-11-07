@@ -737,46 +737,82 @@ pub fn build_rope_kernel_params_with_freq_factors(
     kparams
 }
 
-/// Build kernel parameters for SetRows dispatch.
+/// Bytes in one row of `ne00` elements of wire type `dtype`: port of `htp_tensor_get_row_size`
+/// (`htp-tensor.h`), 0 for a type it does not know. 32-bit arithmetic, like the C.
+pub(crate) fn htp_tensor_row_size(dtype: u32, ne00: u32) -> u32 {
+    use HtpDataType as T;
+    let is = |t: T| dtype == t as u32;
+    if is(T::F32) || is(T::I32) {
+        ne00.wrapping_mul(4)
+    } else if is(T::F16) || is(T::Bf16) {
+        ne00.wrapping_mul(2)
+    } else if is(T::Q8_0) {
+        (ne00 / 32).wrapping_mul(34)
+    } else if is(T::Q4_0) || is(T::Iq4Nl) {
+        (ne00 / 32).wrapping_mul(18)
+    } else if is(T::Q4_1) {
+        (ne00 / 32).wrapping_mul(20)
+    } else if is(T::Mxfp4) {
+        (ne00 / 32).wrapping_mul(17)
+    } else if is(T::Q2K) {
+        (ne00 / 256).wrapping_mul(84)
+    } else if is(T::Q2_0) {
+        (ne00 / 64).wrapping_mul(18)
+    } else if is(T::Q3K) {
+        (ne00 / 256).wrapping_mul(110)
+    } else if is(T::Q4K) {
+        (ne00 / 256).wrapping_mul(144)
+    } else if is(T::Q5K) {
+        (ne00 / 256).wrapping_mul(176)
+    } else if is(T::Q6K) {
+        (ne00 / 256).wrapping_mul(210)
+    } else if is(T::I64) {
+        ne00.wrapping_mul(8)
+    } else {
+        0
+    }
+}
+
+/// Kernel parameters for a `SetRows` that scatters `src0` (F32 value rows, `ne[1]` of them) into
+/// the cache `dst` at the positions in `idx` (I32 or I64): port of
+/// `htp_kparams_solve_set_rows` and `htp_set_rows_vtcm_layout_build`. `None` when the kernels do
+/// not take the operands or the working set does not fit `vtcm_bytes`.
 ///
-/// Mirrors `ggml_hexagon_precompute_set_rows_params` +
-/// `htp_set_rows_vtcm_layout_build`: `n_rows` value rows (src0->ne\[1\]),
-/// `idx_ne1`/`idx_ne2` index-vector dims (1 for a flat positions vector),
-/// `src0_ne2` value dim-2 (head count for KV), `ne00` row width,
-/// `dst_f16` cache dtype.
+/// Words (`htp_set_rows_kernel_params`): 0 `n_threads` (the session's, capped at the row count),
+/// 1 `total_tasks` (the row count), 2 `vtcm_size`. The DSP derives its divisors itself.
 pub fn build_set_rows_kernel_params(
-    n_rows: usize,
-    idx_ne1: usize,
-    idx_ne2: usize,
-    src0_ne2: usize,
-    ne00: usize,
-    dst_f16: bool,
-    sess_threads: u32,
-) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    let n_threads = (sess_threads as usize).min(n_rows.max(1)).max(1);
-    let tasks_per_thread = n_rows.div_ceil(n_threads);
-    kparams[0] = n_threads as i32;
-    kparams[1] = n_rows as i32;
-    kparams[2] = tasks_per_thread as i32;
-    // VTCM layout: value/cache rows 256-aligned, double-buffered, per thread.
-    let src0_aligned = (ne00 * 4).next_multiple_of(256);
-    let dst_row = if dst_f16 { ne00 * 2 } else { ne00 * 4 };
-    let dst_aligned = dst_row.next_multiple_of(256);
-    kparams[3] = ((src0_aligned * 2 + dst_aligned * 2) * n_threads) as i32;
-    let div_ne11 = init_fastdiv(idx_ne1.max(1) as u32);
-    kparams[4] = div_ne11.mp as i32;
-    kparams[5] = div_ne11.l as i32;
-    let div_ne12 = init_fastdiv(idx_ne2.max(1) as u32);
-    kparams[6] = div_ne12.mp as i32;
-    kparams[7] = div_ne12.l as i32;
-    let div_tpt = init_fastdiv(tasks_per_thread as u32);
-    kparams[8] = div_tpt.mp as i32;
-    kparams[9] = div_tpt.l as i32;
-    let div_ne02 = init_fastdiv(src0_ne2.max(1) as u32);
-    kparams[10] = div_ne02.mp as i32;
-    kparams[11] = div_ne02.l as i32;
-    kparams
+    src0: &CopyTensor,
+    idx: &CopyTensor,
+    dst: &CopyTensor,
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    use HtpDataType as T;
+    let ne00 = src0.ne[0];
+    if dst.dtype == T::Q8_0 as u32 && ne00 < 32 {
+        return None;
+    }
+    if src0.dtype != T::F32 as u32 {
+        return None;
+    }
+    if idx.dtype != T::I32 as u32 && idx.dtype != T::I64 as u32 {
+        return None;
+    }
+    if ![T::F32 as u32, T::F16 as u32, T::Q8_0 as u32].contains(&dst.dtype) {
+        return None;
+    }
+    let nr = src0.ne[1];
+    let threads = n_threads.min(nr);
+    // htp_set_rows_vtcm_layout_build: double-buffered value and cache rows, 256-aligned, per thread
+    let align256 = |n: u64| (n + 255) & !255;
+    let src0_row = align256(u64::from(ne00) * 4);
+    let dst_row = align256(u64::from(htp_tensor_row_size(dst.dtype, ne00)));
+    let total = (src0_row * 2 + dst_row * 2) * u64::from(threads);
+    let mut k = [0i32; 32];
+    k[0] = threads as i32;
+    k[1] = nr as i32;
+    k[2] = total as u32 as i32;
+    (total <= vtcm_bytes as u64).then_some(k)
 }
 
 /// Build kernel parameters for SsmConv dispatch.
@@ -2595,6 +2631,45 @@ mod tests {
         );
     }
 
+    /// Every case of `testdata/set_rows_golden.txt`: llama.cpp's real `htp_kparams_solve` for a
+    /// `SET_ROWS` (compiled and run by `scripts/hexagon-golden/gen.py`), over the cache dtypes,
+    /// row widths, row counts, session thread counts and VTCM budgets cera meets.
+    #[test]
+    fn set_rows_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/set_rows_golden.txt");
+        let (mut cases, mut unsupported) = (0usize, 0usize);
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let mut sides = inputs.split('|');
+            let v = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let i = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let d = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let mut run = sides.next().unwrap().split_whitespace();
+            let threads: u32 = run.next().unwrap().parse().unwrap();
+            let vtcm: usize = run.next().unwrap().parse().unwrap();
+            let got = build_set_rows_kernel_params(&v, &i, &d, threads, vtcm);
+            let want = want.trim();
+            if want == "unsupported" {
+                assert_eq!(got, None, "{line}");
+                unsupported += 1;
+            } else {
+                let words: Vec<i32> = want
+                    .split_whitespace()
+                    .map(|w| w.parse::<u32>().unwrap() as i32)
+                    .collect();
+                assert_eq!(got.map(|k| k.to_vec()), Some(words), "{line}");
+            }
+            cases += 1;
+        }
+        assert!(
+            cases > 5000 && unsupported > 1000,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported"
+        );
+    }
+
     /// Every case of `testdata/cpy_golden.txt`, which `scripts/hexagon-golden/gen.py` produces by
     /// compiling llama.cpp's own `ggml_hexagon_precompute_cpy_params`, must come out word for word
     /// (or as `unsupported`) from the Rust port.
@@ -3188,19 +3263,6 @@ mod tests {
 
     #[test]
     fn test_prefill_param_builders() {
-        // SetRows: single row (decode) and 32-row chunk (prefill).
-        let sr1 = build_set_rows_kernel_params(1, 1, 1, 8, 64, true, 4);
-        assert_eq!(sr1[0], 1); // n_threads
-        assert_eq!(sr1[1], 1); // total_tasks
-        assert_eq!(sr1[2], 1); // tasks_per_thread
-        assert_eq!(sr1[3], 1024); // vtcm: (512 + 512) * 1
-        let sr32 = build_set_rows_kernel_params(32, 1, 1, 8, 64, true, 4);
-        assert_eq!(sr32[0], 4);
-        assert_eq!(sr32[1], 32);
-        assert_eq!(sr32[2], 8);
-        assert_eq!(sr32[3], 4096);
-        assert_eq!(sr32[8], init_fastdiv(8).mp as i32); // div_tasks_per_thread
-
         // SsmConv: scalar (n_t=1) and chunk (n_t=32) branches, LFM2 K=3/C=1024.
         let ssm1 = build_ssm_conv_kernel_params(3, 1024, 1, 1, 3, 4, 8 << 20);
         assert_eq!(ssm1[0], 4); // n_threads

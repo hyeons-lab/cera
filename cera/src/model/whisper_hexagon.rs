@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
     align128, build_binary_kernel_params, build_flash_attn_kernel_params,
     build_hmx_fa_kernel_params, build_mul_mat_kernel_params, fa_is_hmx_eligible, hexagon_warn,
@@ -1000,7 +1000,7 @@ impl HexagonWhisperModel {
             weights,
             w_conv.w0.offset,
             w_conv.w0.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1014,7 +1014,7 @@ impl HexagonWhisperModel {
             weights,
             w_conv.w1.offset,
             w_conv.w1.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1028,7 +1028,7 @@ impl HexagonWhisperModel {
             weights,
             w_conv.w2.offset,
             w_conv.w2.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1385,15 +1385,8 @@ impl HexagonWhisperModel {
             ],
         )?;
         let params = [0i32; 16];
-        let kparams = crate::backend::hexagon::params::build_set_rows_kernel_params(
-            1,
-            1,
-            1,
-            1,
-            kv_dim,
-            true,
-            session.dsp_threads(),
-        );
+        // the queue derives the params from the registered tensors
+        let kparams = [0i32; 32];
         session.enqueue_op(
             HtpOpCode::SetRows as u32,
             &[src_ti, pos_ti],

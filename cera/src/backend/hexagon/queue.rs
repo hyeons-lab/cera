@@ -6,7 +6,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use super::params::{build_concat_kernel_params, build_copy_kernel_params};
+use super::params::{
+    build_concat_kernel_params, build_copy_kernel_params, build_set_rows_kernel_params,
+};
 use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
 use super::types::{
@@ -1537,7 +1539,7 @@ impl Drop for HexagonQueueSession {
 }
 
 /// Validate `enqueue_op` operand counts, tensor indices, and `Cpy`/`Concat` arity, and derive
-/// `Cpy`/`Concat` `kernel_params` when the caller passed `[0; 32]`. Shared with test sinks so
+/// `Cpy`/`Concat`/`SetRows` `kernel_params` when the caller passed `[0; 32]`. Shared with test sinks so
 /// fake and real queues enforce identical preconditions and derive identical parameter words.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_derive_op_params<T>(
@@ -1632,6 +1634,40 @@ where
                 CeraError::Backend(format!(
                     "enqueue_op Concat: the HTP concat kernels do not handle dim {} for {ta:?} + {tb:?} -> {td:?}",
                     params[0]
+                ))
+            })?;
+        }
+    }
+    // `SetRows` likewise: the DSP derives its divisors, but the thread count, task count and VTCM
+    // working set come from the host (`htp_kparams_solve_set_rows`).
+    if opcode == HtpOpCode::SetRows as u32 {
+        if src.len() != 2
+            || dst.len() != 1
+            || src[0] == 0xffff
+            || src[1] == 0xffff
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op SetRows: needs two registered src tensors and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        if kernel_params == [0i32; 32] {
+            let (tv, ti, td) = (
+                &tensors[src[0] as usize],
+                &tensors[src[1] as usize],
+                &tensors[dst[0] as usize],
+            );
+            kernel_params = build_set_rows_kernel_params(
+                &tv.into(),
+                &ti.into(),
+                &td.into(),
+                dsp_threads,
+                vtcm_bytes,
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op SetRows: the HTP set_rows kernel does not handle {tv:?} + {ti:?} -> {td:?}"
                 ))
             })?;
         }

@@ -1,76 +1,76 @@
 #!/usr/bin/env python3
-"""Generate golden kernel-params for the Rust Hexagon host from the real llama.cpp C++ source.
+"""Generate golden kernel-params for the Rust Hexagon host from llama.cpp's real host solvers.
 
     LLAMA_CPP=<llama.cpp checkout> python3 scripts/hexagon-golden/gen.py [op ...]
 
-For each op it extracts the `ggml_hexagon_precompute_<op>_params` function text from
-`ggml/src/ggml-hexagon/ggml-hexagon.cpp`, compiles it with `stubs.h` against the real `htp/*.h`
-headers, runs the op's case table, and writes `cera/src/backend/hexagon/testdata/<op>_golden.txt`
-(one case per line: inputs, then `=>`, then the words of the params blob, or `unsupported`).
-The Rust unit tests read those files, so a port is checked against the C it mirrors, word for word.
+The oracle links llama.cpp's own `htp-kparams.cpp`, `htp-opnode.cpp` and `htp-repack.cpp`,
+unmodified, against ggml-base built for the desktop, so what it prints is exactly what the real
+host would send the DSP for the same tensors. Each `oracle/<op>.cpp` is a case table with its own
+`main()`; its output goes to `cera/src/backend/hexagon/testdata/<op>_golden.txt`, one case per
+line: inputs, then `=>`, then the words of the params blob or `unsupported`. The Rust unit tests
+read those files, so a port is checked against the C++ it mirrors, word for word.
+
+With no `op` arguments every oracle runs. ggml-base is built on first use into
+`$LLAMA_CPP/build-host` (CMake + Ninja, no GPU backends, a few seconds).
 """
-import os, re, subprocess, sys, tempfile, pathlib
+import os, pathlib, shutil, subprocess, sys, tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
+ORACLE = HERE / "oracle"
 OUT = HERE.parent.parent / "cera/src/backend/hexagon/testdata"
 LLAMA = pathlib.Path(os.environ.get("LLAMA_CPP") or sys.exit("set LLAMA_CPP to a llama.cpp checkout"))
-SRC = LLAMA / "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-HTP = LLAMA / "ggml/src/ggml-hexagon/htp"
+HOST = LLAMA / "ggml/src/ggml-hexagon"
+BUILD = LLAMA / "build-host"
+SOLVERS = ["htp-kparams.cpp", "htp-opnode.cpp", "htp-repack.cpp"]
+INCLUDES = [LLAMA / "ggml/include", LLAMA / "ggml/src", HOST, HOST / "htp"]
 
 
-def extract(name: str) -> str:
-    """The text of the function DEFINITION `name` (not a forward declaration)."""
-    s = SRC.read_text()
-    for m in re.finditer(r"^static [^\n;{]*\b%s\s*\(" % re.escape(name), s, re.M):
-        # walk the argument list, then require a body
-        depth, j = 1, m.end()
-        while depth:
-            depth += (s[j] == "(") - (s[j] == ")")
-            j += 1
-        k = j
-        while s[k].isspace():
-            k += 1
-        if s[k] != "{":
-            continue
-        start = m.start()
-        depth = 0
-        for e in range(k, len(s)):
-            depth += (s[e] == "{") - (s[e] == "}")
-            if depth == 0:
-                return s[start:e + 1]
-    raise SystemExit(f"definition of {name} not found")
+def run(*cmd, **kw):
+    return subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
-def build_and_run(op: str, includes: list[str]) -> str:
-    harness = (HERE / f"{op}.cpp").read_text()
+def ggml_base() -> pathlib.Path:
+    lib = BUILD / "bin"
+    if not list(lib.glob("libggml-base*")):
+        run("cmake", "-S", LLAMA, "-B", BUILD, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+            "-DGGML_METAL=OFF", "-DGGML_BLAS=OFF", "-DGGML_OPENMP=OFF", "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_SERVER=OFF", "-DLLAMA_BUILD_TOOLS=OFF",
+            "-DLLAMA_CURL=OFF")
+        run("cmake", "--build", BUILD, "--target", "ggml-base")
+    return lib
+
+
+def compile_obj(src: pathlib.Path, obj: pathlib.Path):
+    flags = [f"-I{i}" for i in INCLUDES]
+    run("clang++", "-std=c++17", "-O1", "-w", *flags, "-c", src, "-o", obj)
+
+
+def main(ops):
+    available = sorted(p.stem for p in ORACLE.glob("*.cpp") if p.stem != "common")
+    ops = ops or available
+    for op in ops:
+        if op not in available:
+            sys.exit(f"no oracle for {op!r}; have: {', '.join(available)}")
+    lib = ggml_base()
+    sha = subprocess.check_output(["git", "-C", LLAMA, "rev-parse", "--short=9", "HEAD"], text=True).strip()
+    OUT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as d:
         d = pathlib.Path(d)
-        # most harnesses wrap a host function; a header-only one (e.g. hmx_chunks) has no fn.inc
-        if '"fn.inc"' in harness:
-            (d / "fn.inc").write_text(extract(f"ggml_hexagon_precompute_{op}_params"))
-        src = "\n".join(f'#include "{i}"' for i in includes) + "\n" + harness
-        (d / "main.cpp").write_text(src)
-        exe = d / "golden"
-        subprocess.check_call(["clang++", "-std=c++17", "-O1", "-w", "-I", str(HERE), "-I", str(HTP), "-I", str(d),
-                               str(d / "main.cpp"), "-o", str(exe)])
-        return subprocess.check_output([str(exe)], text=True)
+        objs = []
+        for src in [ORACLE / "common.cpp"] + [HOST / s for s in SOLVERS]:
+            obj = d / (src.stem + ".o")
+            compile_obj(src, obj)
+            objs.append(obj)
+        for op in ops:
+            op_obj = d / f"op_{op}.o"
+            compile_obj(ORACLE / f"{op}.cpp", op_obj)
+            exe = d / op
+            run("clang++", op_obj, *objs, f"-L{lib}", "-lggml-base", f"-Wl,-rpath,{lib}", "-o", exe)
+            body = subprocess.check_output([exe], text=True)
+            path = OUT / f"{op}_golden.txt"
+            path.write_text(f"# generated by scripts/hexagon-golden/gen.py from llama.cpp {sha}; do not edit\n{body}")
+            print(f"{op}: {body.count(chr(10))} cases -> {path.relative_to(HERE.parent.parent)}")
 
-
-OPS = {
-    "cpy": ["stubs.h", "hex-common.h", "hex-fastdiv.h", "cpy-ops.h"],
-    "concat": ["stubs.h", "hex-common.h", "concat-ops.h"],
-    "get_rows": ["stubs.h", "hex-common.h", "hex-fastdiv.h", "get-rows-ops.h"],
-    "ssm_conv": ["stubs.h", "hex-common.h", "hex-fastdiv.h", "ssm-conv.h"],
-    "hmx_chunks": ["stubs.h", "hex-common.h", "hex-fastdiv.h", "matmul-ops.h"],
-    "hmx_solve": ["stubs.h", "hex-common.h", "hex-fastdiv.h", "matmul-ops.h"],
-}
 
 if __name__ == "__main__":
-    OUT.mkdir(parents=True, exist_ok=True)
-    rev = subprocess.check_output(["git", "-C", str(LLAMA), "rev-parse", "--short", "HEAD"], text=True).strip()
-    for op in (sys.argv[1:] or OPS):
-        if op not in OPS:
-            sys.exit(f"unknown op {op!r}; expected one of: {', '.join(OPS)}")
-        text = build_and_run(op, OPS[op])
-        (OUT / f"{op}_golden.txt").write_text(f"# generated by scripts/hexagon-golden/gen.py from llama.cpp {rev}; do not edit\n" + text)
-        print(op, len(text.splitlines()), "cases")
+    main(sys.argv[1:])

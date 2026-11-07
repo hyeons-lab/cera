@@ -807,7 +807,7 @@ impl HexagonLfmModel {
             weights,
             w.offset,
             w.size,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w.wire_dtype as u32,
             [ne0 as u32, ne1 as u32, w.n_expert as u32, 1],
             [nb0, nb1, nb2, nb3],
@@ -1286,7 +1286,7 @@ impl HexagonLfmModel {
             weights,
             w.offset,
             (ne1 / 32) * tiled_row_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w.wire_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1407,7 +1407,7 @@ impl HexagonLfmModel {
             weights,
             w.offset,
             (ne1 / 32) * tiled_row_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w.wire_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1598,7 +1598,7 @@ impl HexagonLfmModel {
                 weights,
                 w.offset,
                 (ne1 / 32) * tiled_row_bytes,
-                HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+                HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
                 w.wire_dtype as u32,
                 [pad32(k) as u32, ne1 as u32, 1, 1],
                 [
@@ -1908,7 +1908,8 @@ impl HexagonLfmModel {
             ],
         )?;
         let params = [0i32; 16];
-        let kparams = build_set_rows_kernel_params(1, 1, 1, 1, kv_dim, true, session.dsp_threads());
+        // the queue derives the params from the registered tensors
+        let kparams = [0i32; 32];
         Self::enqueue_labeled(
             session,
             "dispatch_set_rows",
@@ -1980,8 +1981,7 @@ impl HexagonLfmModel {
             ],
         )?;
         let params = [0i32; 16];
-        let kparams =
-            build_set_rows_kernel_params(n_rows, 1, 1, 1, kv_dim, true, session.dsp_threads());
+        let kparams = [0i32; 32];
         Self::enqueue_labeled(
             session,
             "dispatch_set_rows_m",
