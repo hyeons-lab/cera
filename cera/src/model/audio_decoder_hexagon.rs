@@ -15,10 +15,9 @@ pub use crate::backend::hexagon::HexagonWeightFormat;
 use crate::backend::hexagon::dispatch::{self, TokenShape, TokenTile};
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_WEIGHT, HexagonContext, HexagonDevice,
-    HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128,
-    build_binary_kernel_params, build_rms_norm_params, build_rope_params,
-    build_unary_kernel_params, flash_attn_kernel_request, flash_attn_op_params, repack_q4_0,
-    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128, build_rms_norm_params,
+    build_rope_params, flash_attn_kernel_request, flash_attn_op_params, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::gguf::GgufFile;
@@ -1802,14 +1801,6 @@ impl HexagonAudioDecoder {
         )?;
 
         let params = build_rms_norm_params(eps);
-        let kparams = build_unary_kernel_params(
-            dim,
-            n_tokens,
-            dim,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-            true,
-        );
 
         session
             .enqueue_op(
@@ -1817,7 +1808,7 @@ impl HexagonAudioDecoder {
                 &[src_ti, weight_ti],
                 &[dst_ti],
                 params,
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| CeraError::Backend(format!("detok_rms_norm_mul: {e}")))?;
         session.end_group()
@@ -1927,16 +1918,6 @@ impl HexagonAudioDecoder {
         )?;
 
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
 
         session
             .enqueue_op(
@@ -1944,7 +1925,7 @@ impl HexagonAudioDecoder {
                 &[src0_ti, src1_ti],
                 &[dst_ti],
                 params,
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| CeraError::Backend(format!("detok_mul: {e}")))?;
         session.end_group()
@@ -1995,16 +1976,6 @@ impl HexagonAudioDecoder {
         )?;
 
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
 
         session
             .enqueue_op(
@@ -2012,7 +1983,7 @@ impl HexagonAudioDecoder {
                 &[src0_ti, src1_ti],
                 &[dst_ti],
                 params,
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| CeraError::Backend(format!("detok_add: {e}")))?;
         session.end_group()

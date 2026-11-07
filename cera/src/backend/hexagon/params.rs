@@ -4,7 +4,7 @@
 //! by consuming precomputed integer division constants (Granlund and Montgomery FastDiv)
 //! and layout descriptors generated on the host.
 
-use super::types::{HtpDataType, HtpOpCode, align128};
+use super::types::{HtpDataType, HtpOpCode};
 
 /// A value for one of the one-byte fields of the matmul params. Out-of-contract counts
 /// saturate at 255 rather than wrapping: a wrapped count aliases to a plausible but wrong
@@ -216,121 +216,6 @@ pub fn build_elu_params(alpha: f32) -> [i32; 16] {
     params
 }
 
-/// Host-computed kernel parameters for unary operations (RMS norm, activations).
-///
-/// Mirrors `ggml_hexagon_precompute_unary_params` + `htp_unary_vtcm_layout_build`.
-/// `nrows` is dim-1..3 flattened (rows split across threads); `weight_dim` is
-/// the RMS weight width (single broadcast row; ignored without weight).
-/// Single-row-per-thread blocking here costs milliseconds on wide row counts
-/// (QK norms run `m * n_heads` rows), so size it from the VTCM budget.
-pub fn build_unary_kernel_params(
-    ne0: usize,
-    nrows: usize,
-    weight_dim: usize,
-    vtcm_size: usize,
-    sess_threads: u32,
-    has_weight: bool,
-) -> [i32; 32] {
-    // Debug: single-threaded single-row blocking (pre-port behavior). Never
-    // read under `cfg(test)`, so an exported `CERA_HEXAGON_UNARY_T1` cannot
-    // change goldens or param tests; tests reach the legacy shape through
-    // [`build_unary_kernel_params_with`].
-    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let legacy = !cfg!(test)
-        && *LEGACY.get_or_init(|| {
-            std::env::var("CERA_HEXAGON_UNARY_T1")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-        });
-    build_unary_kernel_params_with(
-        legacy,
-        ne0,
-        nrows,
-        weight_dim,
-        vtcm_size,
-        sess_threads,
-        has_weight,
-    )
-}
-
-/// [`build_unary_kernel_params`] with the legacy (single-thread, single-row)
-/// blocking choice explicit instead of read from the environment.
-pub(crate) fn build_unary_kernel_params_with(
-    legacy: bool,
-    ne0: usize,
-    nrows: usize,
-    weight_dim: usize,
-    vtcm_size: usize,
-    sess_threads: u32,
-    has_weight: bool,
-) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    let n_threads = if legacy {
-        1
-    } else {
-        (sess_threads.max(1) as usize).min(nrows.max(1))
-    };
-    let row = (ne0 * 4).next_multiple_of(128);
-    let wrow = if has_weight {
-        (weight_dim * 4).next_multiple_of(128)
-    } else {
-        0
-    };
-
-    // RMS_NORM_MUL broadcast branch (our weights are always one row);
-    // plain reductions share the weightless shape.
-    let avail = vtcm_size.saturating_sub(n_threads * wrow);
-    let per_row = 2 * (row + row);
-    let rpt = if legacy {
-        1
-    } else {
-        (avail / (n_threads.max(1) * per_row.max(1))).max(1)
-    };
-
-    kparams[0] = n_threads as i32;
-    kparams[1] = 0; // col_tile: reductions never column-tile
-    kparams[2] = rpt as i32;
-    kparams[3] = rpt as i32; // block = (src0_bytes / 2) / row
-    kparams[4] = has_weight as i32; // broadcast_weight
-
-    let src0_bytes = row * rpt * 2;
-    let dst_bytes = row * rpt * 2;
-    let src1_bytes = wrow;
-
-    kparams[5] = src0_bytes as i32;
-    kparams[6] = src1_bytes as i32;
-    kparams[7] = dst_bytes as i32;
-
-    kparams[8] = (src0_bytes * n_threads) as i32;
-    kparams[9] = (src1_bytes * n_threads) as i32;
-    kparams[10] = (dst_bytes * n_threads) as i32;
-
-    kparams[11] = row as i32;
-    kparams[12] = wrow as i32;
-    kparams[13] = row as i32;
-
-    let total_vtcm = (src0_bytes + src1_bytes + dst_bytes) * n_threads;
-    kparams[14] = total_vtcm as i32;
-
-    // Row decomposition divs for ne = [ne0, nrows, 1, 1]; tpr = 1.
-    let div_rows = if legacy {
-        init_fastdiv(1)
-    } else {
-        init_fastdiv(nrows.max(1) as u32)
-    };
-    let div_1 = init_fastdiv(1);
-    kparams[15] = div_rows.mp as i32;
-    kparams[16] = div_rows.l as i32;
-    kparams[17] = div_1.mp as i32;
-    kparams[18] = div_1.l as i32;
-    kparams[19] = div_rows.mp as i32;
-    kparams[20] = div_rows.l as i32;
-    kparams[21] = div_1.mp as i32;
-    kparams[22] = div_1.l as i32;
-
-    kparams
-}
-
 // The solvers below port llama.cpp's `htp-kparams.cpp` and the layout helpers in `htp/*-ops.h`
 // word for word; `scripts/hexagon-golden` runs the real C++ against each of them.
 
@@ -451,7 +336,7 @@ fn htp_tile_k(dtype: u32) -> u32 {
     }
 }
 
-/// `enum htp_get_rows_kernel_type`.
+/// Which `get_rows` kernel runs (`enum htp_get_rows_kernel_type`).
 const GET_ROWS_SAMETYPE: u32 = 0;
 const GET_ROWS_TILED: u32 = 1;
 const GET_ROWS_FLAT: u32 = 2;
@@ -610,167 +495,6 @@ pub fn build_get_rows_kernel_params(
     }
     let fits = threads > 0 && u64::from(vtcm_size) <= vtcm_bytes as u64;
     (total_tasks == 0 || fits).then_some(k)
-}
-
-/// `HTP_BINARY_KERNEL_CHUNKED`: the kernel the DSP runs for a contiguous
-/// op whose `src1` is a single element (`ggml_hexagon_precompute_binary_params`'s
-/// scalar-broadcast branch). A scalar `src1` under the same-shape kernel makes
-/// the DSP read `src0`-many elements from it and fault.
-const HTP_BINARY_KERNEL_CHUNKED: i32 = 7;
-
-/// Host-computed kernel parameters for `dst[i] = src0[i] <op> scalar` over a
-/// contiguous `total_elems`-element F32 vector (Mul by a routed-expert weight,
-/// Div by the renormalization sum). Mirrors the llama.cpp host precompute:
-/// chunk size from the thread count, VTCM for double-buffered `src0` and
-/// `dst` chunks per thread plus one 128-byte slot for the scalar. `None` when
-/// that does not fit `vtcm_size`.
-pub(crate) fn build_binary_scalar_kernel_params(
-    total_elems: usize,
-    vtcm_size: usize,
-    n_threads: u32,
-) -> Option<[i32; 32]> {
-    const ELEM: usize = 4;
-    const MAX_CHUNK_BYTES: usize = 32768;
-    const MIN_CHUNK_ELEMS: usize = 256;
-    let n_threads = n_threads.max(1) as usize;
-
-    let max_chunk_elems = MAX_CHUNK_BYTES / ELEM;
-    let target = (total_elems.div_ceil(2 * n_threads)).next_multiple_of(32);
-    let chunk_size = max_chunk_elems.min(target.max(MIN_CHUNK_ELEMS));
-    let chunk_bytes = (chunk_size * ELEM).next_multiple_of(128);
-
-    // src0 and dst: two chunks per thread each; the scalar takes one slot.
-    let vtcm_total = n_threads * 2 * chunk_bytes + 128 + n_threads * 2 * chunk_bytes;
-    if vtcm_total > vtcm_size {
-        return None;
-    }
-    let row_aligned = (total_elems * ELEM).next_multiple_of(128);
-
-    let mut kparams = [0i32; 32];
-    kparams[0] = HTP_BINARY_KERNEL_CHUNKED;
-    kparams[1] = n_threads as i32;
-    kparams[2] = 1; // rows_per_buffer
-    kparams[3] = row_aligned as i32; // src0_row_size_aligned
-    kparams[4] = 0; // src1_row_size_aligned: the scalar needs no row
-    kparams[5] = row_aligned as i32; // dst_row_size_aligned
-    kparams[6] = 0; // src1_size
-    kparams[7] = vtcm_total as i32;
-    kparams[8] = chunk_size as i32;
-    kparams[9] = chunk_bytes as i32;
-    kparams[10] = 1; // is_scalar
-    Some(kparams)
-}
-
-/// Host-computed kernel parameters for binary operations (Mul, Add, Sub, Div).
-// Arity mirrors llama.cpp's fixed kparam builder signature; bundling into a
-// struct would diverge from that C truth for no readability gain.
-#[allow(clippy::too_many_arguments)]
-pub fn build_binary_kernel_params(
-    ne00: usize,
-    ne10: usize,
-    ne11: usize,
-    ne12: usize,
-    ne13: usize,
-    elem_size: usize,
-    vtcm_size: usize,
-    n_threads: u32,
-) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    let n_threads = n_threads.max(1);
-
-    let src0_row_size = ne00 * elem_size;
-    let src1_row_size = ne10 * elem_size;
-    let dst_row_size = ne00 * elem_size;
-
-    let src0_row_size_aligned = align128(src0_row_size);
-    let src1_row_size_aligned = align128(src1_row_size);
-    let dst_row_size_aligned = align128(dst_row_size);
-
-    let is_row_bcast = ne11 == 1 && ne12 == 1 && ne13 == 1 && ne10 == ne00;
-    // Single-row same-shape vectors take the ROW_BCAST path (kernel 1),
-    // which preloads the one src1 row; SAME_SHAPE (kernel 0) with a nonzero
-    // src1_size would under-allocate VTCM and corrupt results.
-    let kernel_type = if is_row_bcast { 1u32 } else { 0u32 };
-    let src1_size = if is_row_bcast {
-        src1_row_size_aligned
-    } else {
-        0
-    };
-
-    let spad_row_total = 2
-        * (src0_row_size_aligned
-            + dst_row_size_aligned
-            + if kernel_type == 0 {
-                src1_row_size_aligned
-            } else {
-                0
-            });
-    let avail = vtcm_size.saturating_sub(src1_size);
-    let denom = spad_row_total * n_threads as usize;
-    let rows_per_buffer = avail.checked_div(denom).unwrap_or(0).max(1);
-    let total_vtcm = rows_per_buffer * spad_row_total * n_threads as usize + src1_size;
-
-    kparams[0] = kernel_type as i32;
-    kparams[1] = n_threads as i32;
-    kparams[2] = rows_per_buffer as i32;
-    kparams[3] = src0_row_size_aligned as i32;
-    kparams[4] = src1_row_size_aligned as i32;
-    kparams[5] = dst_row_size_aligned as i32;
-    kparams[6] = src1_size as i32;
-    kparams[7] = total_vtcm.min(vtcm_size) as i32;
-
-    kparams
-}
-
-/// `htp_binary_kernel_params::kernel_type` of the per-row scalar worker
-/// (`HTP_BINARY_KERNEL_SCALAR_DMA`): `src1` is a contiguous `[1, ne11]` table that
-/// the DSP stages in VTCM, and row `i` of `src0` is combined with `table[i % ne11]`.
-pub(crate) const HTP_BINARY_KERNEL_SCALAR_DMA: i32 = 2;
-
-/// Kernel parameters for a binary op whose second operand is a per-row scalar
-/// table (`src1 = [1, ne11]`, contiguous), as `ggml_hexagon_precompute_binary_params`
-/// builds them for `HTP_BINARY_KERNEL_SCALAR_DMA`.
-///
-/// `rows_per_buffer` is capped at 16 so the reported footprint stays small. The DSP
-/// recomputes the real block size from its own VTCM size and ignores `kparams[2]` and
-/// `kparams[7]` (they are reported values only), so what this checks is that the staged
-/// `src1` table plus one double-buffered row per thread fits `vtcm_size`: `None` when it
-/// does not, as for [`build_binary_scalar_kernel_params`], rather than a DSP
-/// `VTCM_TOO_SMALL` at run time.
-pub(crate) fn build_binary_scalar_dma_kernel_params(
-    ne00: usize,
-    ne11: usize,
-    elem_size: usize,
-    vtcm_size: usize,
-    n_threads: u32,
-) -> Option<[i32; 32]> {
-    const MAX_ROWS_PER_BUFFER: usize = 16;
-    let mut kparams = [0i32; 32];
-    let n_threads = n_threads.max(1) as usize;
-
-    let src0_row_size_aligned = align128(ne00 * elem_size);
-    let src1_row_size_aligned = align128(elem_size);
-    let dst_row_size_aligned = align128(ne00 * elem_size);
-    let src1_size = align128(ne11 * elem_size);
-
-    let spad_row_total = 2 * (src0_row_size_aligned + dst_row_size_aligned);
-    if src1_size + spad_row_total * n_threads > vtcm_size {
-        return None;
-    }
-    let avail = vtcm_size - src1_size;
-    let rows_per_buffer =
-        (avail / (spad_row_total * n_threads).max(1)).clamp(1, MAX_ROWS_PER_BUFFER);
-    let total_vtcm = rows_per_buffer * spad_row_total * n_threads + src1_size;
-
-    kparams[0] = HTP_BINARY_KERNEL_SCALAR_DMA;
-    kparams[1] = n_threads as i32;
-    kparams[2] = rows_per_buffer as i32;
-    kparams[3] = src0_row_size_aligned as i32;
-    kparams[4] = src1_row_size_aligned as i32;
-    kparams[5] = dst_row_size_aligned as i32;
-    kparams[6] = src1_size as i32;
-    kparams[7] = total_vtcm as i32;
-    Some(kparams)
 }
 
 /// The 16 op-param words of a `Rope` (`struct ggml_tensor::op_params`): `n_dims` (1), `mode` (2),
@@ -4788,60 +4512,6 @@ mod tests {
         assert_eq!((k[0], k[2], k[5]), (0, 8 * 2 * 2 * 512, 0));
     }
 
-    /// The scalar-broadcast params the llama.cpp host precompute produces
-    /// (`ggml_hexagon_precompute_binary_params`, contiguous src1 of one
-    /// element), worked out by hand from its formulas.
-    #[test]
-    fn scalar_binary_kparams_follow_the_host_precompute() {
-        // 64 elements over 8 threads: chunk floors at 256 elements (1 KiB);
-        // VTCM = src0 + dst double buffers per thread + one 128 B scalar slot.
-        let k = build_binary_scalar_kernel_params(64, 8 << 20, 8).unwrap();
-        assert_eq!(
-            k[..11],
-            [
-                7,
-                8,
-                1,
-                256,
-                0,
-                256,
-                0,
-                2 * 8 * 2 * 1024 + 128,
-                256,
-                1024,
-                1
-            ]
-        );
-        assert!(k[11..].iter().all(|&v| v == 0));
-        // 2048 elements: the row is 8 KiB, the chunk size unchanged.
-        let k = build_binary_scalar_kernel_params(2048, 8 << 20, 8).unwrap();
-        assert_eq!((k[3], k[5], k[8], k[9]), (8192, 8192, 256, 1024));
-        // A big vector caps the chunk at 32 KiB.
-        let k = build_binary_scalar_kernel_params(1_000_000, 8 << 20, 4).unwrap();
-        assert_eq!((k[8], k[9], k[7]), (8192, 32768, 2 * 4 * 2 * 32768 + 128));
-        // Too little VTCM is a refusal, not a clipped layout.
-        assert!(build_binary_scalar_kernel_params(64, 1000, 8).is_none());
-    }
-
-    /// The per-row scalar worker's descriptor: kernel type 2, the staged table size and
-    /// row sizes aligned to 128, and a refusal when one row per thread cannot fit.
-    #[test]
-    fn scalar_dma_kernel_params_follow_the_host_precompute() {
-        // 128 floats per row (512 B), a 64-entry table (256 B), 4 threads
-        let k = build_binary_scalar_dma_kernel_params(128, 64, 4, 8 << 20, 4).unwrap();
-        assert_eq!((k[0], k[1], k[2]), (HTP_BINARY_KERNEL_SCALAR_DMA, 4, 16));
-        assert_eq!((k[3], k[4], k[5], k[6]), (512, 128, 512, 256));
-        assert_eq!(k[7] as usize, 16 * 2 * (512 + 512) * 4 + 256);
-        // a wide row shrinks the block to what fits
-        let k = build_binary_scalar_dma_kernel_params(65536, 8, 4, 8 << 20, 4).unwrap();
-        assert!(k[2] >= 1 && k[2] < 16, "{}", k[2]);
-        assert!(k[7] as usize <= 8 << 20);
-        // not even one double-buffered row per thread: a refusal, not a clipped layout
-        assert!(build_binary_scalar_dma_kernel_params(65536, 8, 4, 1 << 20, 4).is_none());
-        // the table alone overflowing is a refusal too
-        assert!(build_binary_scalar_dma_kernel_params(128, 1 << 20, 4, 1 << 20, 1).is_none());
-    }
-
     #[test]
     fn test_fastdiv_basic() {
         let divisors = [1, 2, 3, 5, 7, 10, 16, 32, 64, 128, 256, 1024, 4096];
@@ -4862,37 +4532,10 @@ mod tests {
         assert_eq!(fd.l, 0);
     }
 
-    /// The legacy knob shape is reachable only through the explicit seam, and
-    /// differs from the default blocking (one thread, one row).
-    #[test]
-    fn unary_legacy_blocking_is_explicit() {
-        let legacy = build_unary_kernel_params_with(true, 1024, 32, 1024, 8 << 20, 4, true);
-        assert_eq!(legacy[0], 1);
-        assert_eq!(legacy[2], 1);
-        let new = build_unary_kernel_params_with(false, 1024, 32, 1024, 8 << 20, 4, true);
-        assert_eq!(
-            new,
-            build_unary_kernel_params(1024, 32, 1024, 8 << 20, 4, true)
-        );
-        assert_ne!(new, legacy);
-    }
-
     #[test]
     fn test_param_builders() {
         let rms = build_rms_norm_params(1e-5);
         assert_eq!(rms[0], (1e-5f32).to_bits() as i32);
-
-        let unary_kp = build_unary_kernel_params(1024, 32, 1024, 8 * 1024 * 1024, 4, true);
-        assert_eq!(unary_kp[0], 4); // min(sess_threads, nrows)
-        assert_eq!(unary_kp[4], 1);
-        assert_eq!(unary_kp[11], 4096);
-        // 8MB budget, 4KB rows: (8MB - 4*4KB) / (4 * 2*8KB) = 127 rows/thread.
-        assert_eq!(unary_kp[2], 127);
-        assert_eq!(unary_kp[3], 127);
-        // QK-norm shape: 64-wide rows block 2047/thread.
-        let qk = build_unary_kernel_params(64, 8192, 64, 8 * 1024 * 1024, 4, true);
-        assert_eq!(qk[0], 4);
-        assert_eq!(qk[2], 2047);
 
         let rope = build_rope_params(128, 0, 4096, 10000.0, 1.0);
         assert_eq!(rope[1], 128);

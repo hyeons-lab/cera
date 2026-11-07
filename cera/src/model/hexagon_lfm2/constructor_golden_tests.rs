@@ -2093,14 +2093,10 @@ fn lfm3_decode_emits_the_lfm3_graph() {
     let scalar_muls: Vec<_> = op_lines(&decode, "Mul")
         .into_iter()
         .filter(|l| {
-            kparams(l)[0] == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR_DMA)
+            kparams(l)[0] & 0xff == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR)
         })
         .collect();
-    assert_eq!(
-        scalar_muls.len(),
-        2,
-        "SCALAR_DMA multiply per attention layer"
-    );
+    assert_eq!(scalar_muls.len(), 2, "SCALAR multiply per attention layer");
     for line in scalar_muls {
         let (src, dst) = descs(line);
         assert_eq!(src[0].ne[..2], [HEAD_DIM, N_HEADS]);
@@ -2269,13 +2265,13 @@ fn lfm3_prefill_emits_the_lfm3_graph() {
     let prefill_gates: Vec<_> = op_lines(&prefill, "Mul")
         .into_iter()
         .filter(|l| {
-            kparams(l)[0] == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR_DMA)
+            kparams(l)[0] & 0xff == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR)
         })
         .collect();
     assert_eq!(
         prefill_gates.len(),
         2,
-        "a SCALAR_DMA multiply per attention layer"
+        "a SCALAR multiply per attention layer"
     );
     for line in prefill_gates {
         let (src, _) = descs(line);

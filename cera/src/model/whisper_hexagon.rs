@@ -17,9 +17,9 @@ use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTi
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
-    align128, build_binary_kernel_params, build_mul_mat_kernel_params, flash_attn_kernel_request,
-    flash_attn_op_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    align128, build_mul_mat_kernel_params, flash_attn_kernel_request, flash_attn_op_params,
+    hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
+    repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{
     LockOrRecover, lock_or_discard, lock_reporting_poison, report_poison,
@@ -1144,22 +1144,12 @@ impl HexagonWhisperModel {
                 kparams_mm,
             )?;
 
-            let add_kparams = build_binary_kernel_params(
-                out_channels,
-                out_channels,
-                chunk,
-                1,
-                1,
-                4,
-                dispatch::VTCM_BUDGET,
-                session.dsp_threads(),
-            );
             session.enqueue_op(
                 HtpOpCode::Add as u32,
                 &[cur_dst_ti, tmp_ti],
                 &[cur_dst_ti],
                 [0i32; 16],
-                add_kparams,
+                [0i32; 32],
             )?;
 
             // Tap 2 -> tmp; cur_dst += tmp
@@ -1185,26 +1175,16 @@ impl HexagonWhisperModel {
                 &[cur_dst_ti, tmp_ti],
                 &[cur_dst_ti],
                 [0i32; 16],
-                add_kparams,
+                [0i32; 32],
             )?;
 
             // Add bias: cur_dst += bias
-            let bias_add_kparams = build_binary_kernel_params(
-                out_channels,
-                out_channels,
-                1,
-                1,
-                1,
-                4,
-                dispatch::VTCM_BUDGET,
-                session.dsp_threads(),
-            );
             session.enqueue_op(
                 HtpOpCode::Add as u32,
                 &[cur_dst_ti, b_ti],
                 &[cur_dst_ti],
                 [0i32; 16],
-                bias_add_kparams,
+                [0i32; 32],
             )?;
 
             t_start += chunk;

@@ -479,6 +479,54 @@ fn test_hexagon_glu_opcode_selection() {
     }
 }
 
+/// A decode-sized FFN activation is one long row, which one DSP thread would work through; the
+/// GLU is registered collapsed, as the host does, so the threads share it. The kernel params
+/// are solved for the collapsed tensors and the bytes covered do not change.
+#[test]
+fn a_decode_glu_is_registered_as_rows_the_threads_share() {
+    use crate::backend::hexagon::{CopyTensor, op_capture, solve_glu};
+    let (driver, mut device) = op_capture::fresh_device();
+    let ff = 8192usize;
+    let buf = RpcmemBuffer::alloc(driver, 3 * ff * 4, false).unwrap();
+    let session = device.queue_session_mut();
+    let threads = session.dsp_threads();
+    let vtcm = session.dsp_vtcm_bytes();
+    HexagonLfmModel::dispatch_glu(
+        session,
+        &buf,
+        0,
+        &buf,
+        ff * 4,
+        &buf,
+        2 * ff * 4,
+        ff,
+        1,
+        FfnActivation::Swiglu,
+    )
+    .unwrap();
+    let (_, _, tens, ops) = session.export_batch();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(tens.len(), 3);
+    for t in &tens {
+        assert!(t.ne[0] < ff as u32 && t.ne[1] > 1, "collapsed: {:?}", t.ne);
+        assert_eq!(u64::from(t.ne[0]) * u64::from(t.ne[1]), ff as u64);
+        assert_eq!(t.nb[1], t.ne[0] * 4);
+        assert_eq!(t.size as usize, ff * 4, "the same bytes");
+    }
+    let view = |i: usize| CopyTensor::from(&tens[i]);
+    let want = solve_glu(
+        HtpOpCode::GluSwiglu as u32,
+        &view(0),
+        Some(&view(1)),
+        &view(2),
+        threads,
+        vtcm,
+    )
+    .unwrap();
+    assert_eq!(ops[0].kernel_params, want);
+    assert!(want[0] > 1, "more than one thread: {}", want[0]);
+}
+
 /// `lfm3`'s per-head gate dispatch sizes its VTCM layout before it registers anything, so a
 /// row that cannot fit is a typed refusal that leaves the pending batch untouched (the
 /// caller drops the batch on any error, but nothing half-registered should exist to drop).
