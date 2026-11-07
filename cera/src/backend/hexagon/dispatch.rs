@@ -2186,6 +2186,175 @@ mod tests {
             .collect()
     }
 
+    /// A Q8_0 and a Q4_0 matmul against the CPU for output sizes that leave a partial last weight tile (the
+    /// audio depthformer's head has 2049 outputs: 64 full tiles and one row), at one token, a short
+    /// run and a full tile. Quantized activations add error everywhere, so the check is the cosine
+    /// over each token's row and, separately, the error of the last four outputs, where a kernel
+    /// that mishandles the partial tile shows first.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_linear_m_matches_the_cpu_on_partial_row_tiles() {
+        use super::super::{
+            HexagonWeightDesc, HexagonWeightFormat, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+            repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+        };
+        // ggml `Q4_0` blocks: an f16 scale `d = max / -8` (the signed extreme) and 16 bytes holding
+        // element i in the low nibble and element i + 16 in the high one
+        let quantize_q4_0 = |vals: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(vals.len() / 32 * 18);
+            for blk in vals.chunks(32) {
+                let max = blk
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+                let d = max / -8.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+                for i in 0..16 {
+                    let q = |v: f32| ((v * id + 8.5) as i32).clamp(0, 15) as u8;
+                    out.push(q(blk[i]) | (q(blk[i + 16]) << 4));
+                }
+            }
+            out
+        };
+        let mut rig = GeluRig::open();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let mut worst_cos = 1.0f64;
+        let mut worst_tail = 0.0f64;
+        for (q4, (k, n)) in [false, true].iter().flat_map(|q4| {
+            [
+                (1024usize, 2049usize),
+                (1024, 2048),
+                (1024, 2080),
+                (512, 33),
+                (2048, 65),
+                (1024, 4097),
+            ]
+            .map(move |kn| (*q4, kn))
+        }) {
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| rand() * 0.25).collect();
+            let (blocks, block_bytes, size) = if q4 {
+                (
+                    quantize_q4_0(&weights_f32),
+                    18,
+                    repacked_matrix_size_q4_0(k, n).unwrap(),
+                )
+            } else {
+                (
+                    quantize_f32_to_q8_0(&weights_f32, k, n).unwrap(),
+                    34,
+                    repacked_matrix_size_q8_0(k, n).unwrap(),
+                )
+            };
+            let mut tiled = vec![0u8; size];
+            if q4 {
+                repack_q4_0(&blocks, k, n, &mut tiled).unwrap();
+            } else {
+                repack_q8_0(&blocks, k, n, &mut tiled).unwrap();
+            }
+            // the CPU reference: the dequantized weights, so only the activation quantization differs
+            let mut dequant = vec![0f32; n * k];
+            for (row, out) in blocks
+                .chunks(k / 32 * block_bytes)
+                .zip(dequant.chunks_mut(k))
+            {
+                if q4 {
+                    crate::quant::dequantize_q4_0_row(row, out);
+                } else {
+                    crate::quant::dequantize_q8_0_row(row, out);
+                }
+            }
+            let w_buf = rig.alloc(size);
+            unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), w_buf.as_mut_ptr(), size) };
+            w_buf.flush_cpu_cache(0, size);
+            let desc = HexagonWeightDesc {
+                offset: 0,
+                size_bytes: size,
+                format: if q4 {
+                    HexagonWeightFormat::RepackedQ4_0
+                } else {
+                    HexagonWeightFormat::RepackedQ8_0
+                },
+                rows: n,
+                cols: k,
+            };
+            for &m in &[1usize, 8, 32] {
+                let x: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+                let x_buf = rig.alloc(m * k * 4);
+                let dst_buf = rig.alloc(m * n * 4);
+                gelu_upload(&x_buf, &x);
+                {
+                    let session = rig.device.queue_session_mut();
+                    linear_m(
+                        session,
+                        &x_buf,
+                        0,
+                        &w_buf,
+                        desc,
+                        None,
+                        &dst_buf,
+                        0,
+                        m,
+                        TokenTile::Whole,
+                    )
+                    .unwrap();
+                    session.flush().unwrap();
+                }
+                let got = gelu_download(&dst_buf, m * n);
+                for t in 0..m {
+                    let want: Vec<f32> = (0..n)
+                        .map(|r| {
+                            dequant[r * k..(r + 1) * k]
+                                .iter()
+                                .zip(&x[t * k..(t + 1) * k])
+                                .map(|(a, b)| a * b)
+                                .sum()
+                        })
+                        .collect();
+                    let g = &got[t * n..(t + 1) * n];
+                    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                    for (a, b) in g.iter().zip(&want) {
+                        dot += f64::from(*a) * f64::from(*b);
+                        na += f64::from(*a) * f64::from(*a);
+                        nb += f64::from(*b) * f64::from(*b);
+                    }
+                    let cos = dot / (na.sqrt() * nb.sqrt());
+                    let rms = (nb / n as f64).sqrt();
+                    let tail = (n - 4..n)
+                        .map(|r| f64::from((g[r] - want[r]).abs()))
+                        .fold(0.0f64, f64::max)
+                        / rms;
+                    worst_cos = worst_cos.min(cos);
+                    worst_tail = worst_tail.max(tail);
+                    if t == 0 {
+                        gelu_trace(&format!(
+                            "{} k={k} n={n} m={m}: cosine {cos:.6}, last-4 error {tail:.4} of rms, last out {:.4} want {:.4}",
+                            if q4 { "Q4_0" } else { "Q8_0" },
+                            g[n - 1],
+                            want[n - 1]
+                        ));
+                    }
+                }
+                rig.release(&[&x_buf, &dst_buf]);
+            }
+            rig.release(&[&w_buf]);
+        }
+        gelu_trace(&format!(
+            "worst cosine {worst_cos:.6}, worst last-4 error {worst_tail:.4} of rms"
+        ));
+        assert!(worst_cos > 0.999, "cosine {worst_cos}");
+        assert!(
+            worst_tail < 0.05,
+            "the last outputs are off by {worst_tail} of rms"
+        );
+    }
+
     /// Step 1, the harness: the known-good tanh sequence on 2 rows of 128.
     #[test]
     #[ignore = "needs a Hexagon NPU"]
