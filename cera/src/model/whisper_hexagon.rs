@@ -17,10 +17,9 @@ use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTi
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
-    align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_hmx_fa_kernel_params, build_mul_mat_kernel_params, fa_is_hmx_eligible, hexagon_warn,
-    quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    align128, build_binary_kernel_params, build_mul_mat_kernel_params, flash_attn_kernel_request,
+    flash_attn_op_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{
     LockOrRecover, lock_or_discard, lock_reporting_poison, report_poison,
@@ -76,6 +75,12 @@ fn encoder_hmx(session: &HexagonQueueSession) -> Option<dispatch::HmxMm> {
     (!hvx_only && session.dsp_hmx() > 0).then(|| dispatch::HmxMm {
         vtcm_budget: session.dsp_vtcm_bytes(),
     })
+}
+
+/// `CERA_HEXAGON_WHISPER_FA=hvx` keeps the flash attention on the HVX kernel instead of letting
+/// the solver pick HMX, for comparison.
+fn whisper_fa_hvx_only() -> bool {
+    std::env::var("CERA_HEXAGON_WHISPER_FA").is_ok_and(|v| v == "hvx")
 }
 
 /// Whether `n_ctx` encoder rows can run: the full window, or a multiple of 64 within it.
@@ -1292,40 +1297,12 @@ impl HexagonWhisperModel {
             [4, (head_dim * 4) as u32, (q_dim * 4) as u32, q_bytes as u32],
         )?;
 
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
+        let params = flash_attn_op_params(scale, 0.0);
 
-        // Many query rows against the same K/V: the HMX kernel when the DSP has one and a
-        // tiling fits VTCM (as the LFM2 prefill and the vision tower do), else the
-        // row-at-a-time HVX kernel. `CERA_HEXAGON_WHISPER_FA=hvx` forces the HVX one.
-        let hvx_only = std::env::var("CERA_HEXAGON_WHISPER_FA").is_ok_and(|v| v == "hvx");
-        let hmx_kparams =
-            if !hvx_only && session.dsp_hmx() > 0 && fa_is_hmx_eligible(head_dim, n_tokens) {
-                build_hmx_fa_kernel_params(
-                    head_dim,
-                    n_heads,
-                    n_heads,
-                    n_tokens,
-                    n_tokens,
-                    scale,
-                    session.dsp_threads(),
-                    session.dsp_vtcm_bytes(),
-                )
-            } else {
-                None
-            };
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            build_flash_attn_kernel_params(
-                head_dim,
-                n_heads,
-                n_heads,
-                n_tokens,
-                n_tokens,
-                scale,
-                session.dsp_threads(),
-                false,
-            )
-        });
+        // The queue solves the kernel from the tensors: HMX when the DSP has a unit and a tiling
+        // fits VTCM (as the LFM2 prefill and the vision tower do), else the HVX kernel.
+        // `CERA_HEXAGON_WHISPER_FA=hvx` forces the HVX one.
+        let kparams = flash_attn_kernel_request(!whisper_fa_hvx_only());
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,
@@ -1476,19 +1453,10 @@ impl HexagonWhisperModel {
             ],
         )?;
 
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
+        let params = flash_attn_op_params(scale, 0.0);
 
-        let kparams = build_flash_attn_kernel_params(
-            head_dim,
-            n_heads,
-            n_heads,
-            1,
-            seq_len,
-            scale,
-            session.dsp_threads(),
-            false,
-        );
+        // the queue solves the kernel from the tensors (`CERA_HEXAGON_WHISPER_FA=hvx` keeps HVX)
+        let kparams = flash_attn_kernel_request(!whisper_fa_hvx_only());
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,

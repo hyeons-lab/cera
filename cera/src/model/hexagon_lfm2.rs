@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
-    AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
-    RpcmemBuffer, StagedBatch, build_binary_kernel_params, build_binary_scalar_dma_kernel_params,
-    build_binary_scalar_kernel_params, build_flash_attn_kernel_params_with_softcap,
-    build_get_rows_f32_kernel_params, build_hmx_fa_kernel_params_with_softcap,
-    build_hmx_mm_kernel_params, build_mul_mat_kernel_params, build_rms_norm_params,
-    build_rope_kernel_params_with_freq_factors, build_rope_params, build_unary_kernel_params,
-    fa_is_hmx_eligible, lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
+    AdpfSession, CopyTensor, FlashAttnHost, FlashAttnOp, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED,
+    HTP_TENSOR_WEIGHT, HexagonArch, HexagonContext, HexagonDevice, HexagonQueueSession,
+    HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer, StagedBatch, build_binary_kernel_params,
+    build_binary_scalar_dma_kernel_params, build_binary_scalar_kernel_params,
+    build_flash_attn_kernel_params, build_get_rows_f32_kernel_params, build_hmx_mm_kernel_params,
+    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params_with_freq_factors,
+    build_rope_params, build_unary_kernel_params, flash_attn_kernel_request, flash_attn_op_params,
+    lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::backend::hexagon::{hexagon_error, hexagon_warn};
 use crate::gguf::GgufFile;
@@ -1225,10 +1225,18 @@ fn kv_elem_nb0(kv_dtype: HtpDataType) -> u32 {
 
 /// Re-point every flash-attention op of a resident decode template at the
 /// current `seq_len`: K/V tensor row counts, the mask tensor size and strides,
-/// and the packed KV-block count in `kernel_params[2]`. Shared by decode and
-/// its test so the DSP-visible patch cannot drift from what is pinned.
-fn apply_flash_attn_patches(staged: &mut StagedBatch, patches: &[FlashAttnPatch], seq_len: usize) {
-    let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
+/// and the kernel params. The kernel choice (HMX or HVX), the tiling and the
+/// block count all depend on the KV length, so the params are solved again
+/// from the patched tensors, the way the queue solved them when the template
+/// was recorded; `host` must be the limits and HMX setting of that recording.
+/// Shared by decode and its test so the DSP-visible patch cannot drift from
+/// what is pinned.
+fn apply_flash_attn_patches(
+    staged: &mut StagedBatch,
+    patches: &[FlashAttnPatch],
+    seq_len: usize,
+    host: &FlashAttnHost,
+) -> Result<(), CeraError> {
     let mask_bytes = (seq_len * 2) as u32;
     for patch in patches {
         staged.update_tensor(patch.k_ti, |t| t.ne[1] = seq_len as u32);
@@ -1241,9 +1249,38 @@ fn apply_flash_attn_patches(staged: &mut StagedBatch, patches: &[FlashAttnPatch]
             t.nb[3] = mask_bytes;
         });
 
-        let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
-        staged.update_op(patch.op_idx, |o| o.kernel_params[2] = b2 as i32);
+        let params = staged.op(patch.op_idx).params;
+        let view = |ti: usize| CopyTensor::from(&staged.tensor(ti));
+        let (q, k, v, mask, dst) = (
+            view(patch.q_ti),
+            view(patch.k_ti),
+            view(patch.v_ti),
+            view(patch.mask_ti),
+            view(patch.dst_ti),
+        );
+        let float = |i: usize| f32::from_bits(params[i] as u32);
+        let kparams = build_flash_attn_kernel_params(
+            host,
+            &FlashAttnOp {
+                q: &q,
+                k: &k,
+                v: &v,
+                mask: Some(&mask),
+                sinks: None,
+                dst: &dst,
+                scale: float(0),
+                max_bias: float(1),
+                logit_softcap: float(2),
+            },
+        )
+        .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "flash attention over {seq_len} KV rows has no kernel configuration"
+            ))
+        })?;
+        staged.update_op(patch.op_idx, |o| o.kernel_params = kparams);
     }
+    Ok(())
 }
 
 /// Split an all-logits verification batch at `max` tokens per chunk. Causal
@@ -1264,13 +1301,26 @@ fn chunked_all_logits(
     Ok(all)
 }
 
+/// The tensors one decode flash-attention op registered.
 #[derive(Clone, Copy, Debug)]
-struct FlashAttnPatch {
-    op_idx: usize,
+struct FlashAttnTensors {
+    q_ti: usize,
     k_ti: usize,
     v_ti: usize,
     mask_ti: usize,
-    g: usize,
+    dst_ti: usize,
+}
+
+/// A decode flash-attention op of a recorded template: where it sits and which of the batch's
+/// tensors it reads, so each step can re-point it at the current KV length.
+#[derive(Clone, Copy, Debug)]
+struct FlashAttnPatch {
+    op_idx: usize,
+    q_ti: usize,
+    k_ti: usize,
+    v_ti: usize,
+    mask_ti: usize,
+    dst_ti: usize,
 }
 
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
@@ -3096,7 +3146,18 @@ impl HexagonLfmModel {
             // may leave it half-updated: drop it and take the rebuild path.
             let mut guard = lock_or_discard(template_slot);
             if let Some(tpl) = guard.as_mut() {
-                apply_flash_attn_patches(&mut tpl.staged, &tpl.flash_attn_patches, pos + 1);
+                let fa_host = self.flash_attn_host(session);
+                if let Err(e) = apply_flash_attn_patches(
+                    &mut tpl.staged,
+                    &tpl.flash_attn_patches,
+                    pos + 1,
+                    &fa_host,
+                ) {
+                    // nothing reached the DSP: the template is merely stale, so drop it
+                    // and fail the step
+                    *guard = None;
+                    return Err(e);
+                }
                 if let Err(e) =
                     session.flush_staged_resident(tpl.resident_id, &tpl.staged, &tpl.patch_ranges)
                 {

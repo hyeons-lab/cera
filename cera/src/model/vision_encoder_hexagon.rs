@@ -14,8 +14,8 @@ use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTi
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer,
-    align128, build_binary_kernel_params, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    align128, build_binary_kernel_params, flash_attn_kernel_request, flash_attn_op_params,
+    repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
@@ -1161,42 +1161,13 @@ impl HexagonVisionEncoder {
             [4, (head_dim * 4) as u32, (q_dim * 4) as u32, q_bytes as u32],
         )?;
 
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
+        let params = flash_attn_op_params(scale, 0.0);
 
-        // Many query rows against the same K/V: run the HMX kernel when the DSP has one
-        // and a tiling fits VTCM, as the LFM2 prefill does; `CERA_HEXAGON_VIT_FA=hvx`
-        // keeps the row-at-a-time HVX kernel for comparison.
+        // Many query rows against the same K/V: the queue solves the kernel from the tensors,
+        // HMX when the DSP has a unit and a tiling fits VTCM, as the LFM2 prefill does;
+        // `CERA_HEXAGON_VIT_FA=hvx` keeps the row-at-a-time HVX kernel for comparison.
         let hvx_only = std::env::var("CERA_HEXAGON_VIT_FA").is_ok_and(|v| v == "hvx");
-        let hmx_kparams = if !hvx_only
-            && session.dsp_hmx() > 0
-            && crate::backend::hexagon::fa_is_hmx_eligible(head_dim, n_tokens)
-        {
-            crate::backend::hexagon::build_hmx_fa_kernel_params(
-                head_dim,
-                n_heads,
-                n_heads,
-                n_tokens,
-                n_tokens,
-                scale,
-                session.dsp_threads(),
-                session.dsp_vtcm_bytes(),
-            )
-        } else {
-            None
-        };
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            crate::backend::hexagon::build_flash_attn_kernel_params(
-                head_dim,
-                n_heads,
-                n_heads,
-                n_tokens,
-                n_tokens,
-                scale,
-                session.dsp_threads(),
-                false,
-            )
-        });
+        let kparams = flash_attn_kernel_request(!hvx_only);
 
         session
             .enqueue_op(

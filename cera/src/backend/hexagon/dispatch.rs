@@ -1350,6 +1350,8 @@ pub(crate) mod testing {
                 &self.tensors,
                 self.dsp_threads(),
                 VTCM_BUDGET,
+                // a device with one HMX unit, like the S25 Ultra
+                1,
             )?;
             self.ops.push(RecOp {
                 opcode,
