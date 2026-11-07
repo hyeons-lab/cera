@@ -1911,13 +1911,15 @@ pub(crate) fn mm_hvx_fused_nx_max_rows(
 
 /// Shape of an F32 x F32 matmul, in the strides the host solver reads. `ne0x` are the weight-side
 /// (`src0`) dims, `ne1x` the activation-side (`src1`) dims; the contraction length is `ne00`.
-/// `src0_nb1` is `src0`'s row stride in bytes and `dst_nb1` the destination's.
+/// `src0_nb0` / `src0_nb1` are `src0`'s element and row strides in bytes (a transposed view has
+/// `nb0 > nb1`, which no kernel takes) and `dst_nb1` the destination's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MulMatF32Shape {
     pub ne00: usize,
     pub ne01: usize,
     pub ne02: usize,
     pub ne03: usize,
+    pub src0_nb0: usize,
     pub src0_nb1: usize,
     pub ne11: usize,
     pub ne12: usize,
@@ -1940,6 +1942,7 @@ pub fn build_mul_mat_f32_kernel_params(
         ne01,
         ne02,
         ne03,
+        src0_nb0,
         src0_nb1,
         ne11,
         ne12,
@@ -1956,7 +1959,7 @@ pub fn build_mul_mat_f32_kernel_params(
         F32,
         [u(ne00), u(ne01), u(ne02), u(ne03)],
         [
-            4,
+            u(src0_nb0),
             u(src0_nb1),
             u(src0_nb1) * u(ne01),
             u(src0_nb1) * u(ne01) * u(ne02),
@@ -2607,6 +2610,7 @@ mod tests {
             ne01: 126,
             ne02: 8,
             ne03: 1,
+            src0_nb0: 4,
             src0_nb1: 2048,
             ne11: 126,
             ne12: 8,
@@ -2647,6 +2651,7 @@ mod tests {
             ne01: 126,
             ne02: 8,
             ne03: 1,
+            src0_nb0: 4,
             src0_nb1: 2048,
             ne11: 126,
             ne12: 8,
@@ -2668,6 +2673,7 @@ mod tests {
             ne01: 126,
             ne02: 8,
             ne03: 1,
+            src0_nb0: 4,
             src0_nb1: 2048,
             ne11: 126,
             ne12: 8,
@@ -2687,6 +2693,14 @@ mod tests {
             "not a divisor"
         );
         assert!(params(MulMatF32Shape { ne11: 0, ..ok }).is_none());
+        assert!(
+            params(MulMatF32Shape {
+                src0_nb0: 4096,
+                ..ok
+            })
+            .is_none(),
+            "a transposed weight view"
+        );
         assert!(params(MulMatF32Shape { ne12: 0, ..ok }).is_none());
         assert!(params(MulMatF32Shape { ne02: 0, ..ok }).is_none());
     }

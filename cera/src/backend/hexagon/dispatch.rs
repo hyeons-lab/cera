@@ -1041,6 +1041,7 @@ pub(crate) fn matmul_f32<S: OpSink>(
             ne01: a.ne[1],
             ne02: a.ne[2],
             ne03: 1,
+            src0_nb0: a.nb[0],
             src0_nb1: a.nb[1],
             ne11: x.ne[1],
             ne12: x.ne[2],
