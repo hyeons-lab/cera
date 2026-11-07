@@ -18,10 +18,10 @@ use crate::backend::hexagon::{
     HTP_TENSOR_WEIGHT, HexagonArch, HexagonContext, HexagonDevice, HexagonQueueSession,
     HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer, StagedBatch, build_binary_kernel_params,
     build_binary_scalar_dma_kernel_params, build_binary_scalar_kernel_params,
-    build_flash_attn_kernel_params, build_get_rows_f32_kernel_params, build_hmx_mm_kernel_params,
-    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params_with_freq_factors,
-    build_rope_params, build_unary_kernel_params, flash_attn_kernel_request, flash_attn_op_params,
-    lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
+    build_flash_attn_kernel_params, build_get_rows_kernel_params, build_hmx_mm_kernel_params,
+    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_params,
+    build_unary_kernel_params, flash_attn_kernel_request, flash_attn_op_params, lock_or_discard,
+    mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::backend::hexagon::{hexagon_error, hexagon_warn};
 use crate::gguf::GgufFile;

@@ -1542,7 +1542,8 @@ impl Drop for HexagonQueueSession {
 
 /// Validate `enqueue_op` operand counts, tensor indices, and `Cpy`/`Concat` arity, and derive
 /// `Cpy`/`Concat`/`SetRows`/`FlashAttnExt` `kernel_params` when the caller passed `[0; 32]`
-/// (`FlashAttnExt` also for [`FLASH_ATTN_HVX_ONLY`]). Shared with test sinks so fake and real
+/// (`FlashAttnExt` also for [`FLASH_ATTN_HVX_ONLY`]); likewise `Rope`, `Softmax`,
+/// `Sum`/`SumRows`/`Argmax` and `Argsort`/`TopK`. Shared with test sinks so fake and real
 /// queues enforce identical preconditions and derive identical parameter words. `dsp_hmx` is the
 /// DSP's HMX unit count (0 keeps the HMX kernels off).
 #[allow(clippy::too_many_arguments)]
@@ -1738,6 +1739,86 @@ where
                     "enqueue_op FlashAttnExt: the HTP flash-attention kernels do not handle q {q:?}, \
                      k {k:?}, v {v:?}, mask {mask:?}, sinks {sinks:?} -> {d:?} within {vtcm_bytes} \
                      bytes of VTCM"
+                ))
+            })?;
+        }
+    }
+    // `Rope`, `Softmax`, the reductions and the sorts take every word from the registered tensors
+    // and the op's own params (llama.cpp's `htp_kparams_solve_*`); the DSP answers NO_SUPPORT or
+    // reads garbage without them.
+    if let Some(
+        op @ (HtpOpCode::Rope
+        | HtpOpCode::Softmax
+        | HtpOpCode::Argmax
+        | HtpOpCode::Sum
+        | HtpOpCode::SumRows
+        | HtpOpCode::Argsort
+        | HtpOpCode::TopK),
+    ) = HtpOpCode::from_u32(opcode)
+    {
+        use super::params as p;
+        // Rope may carry frequency factors, Softmax a mask (its attention sinks have no kernel)
+        let max_src = match op {
+            HtpOpCode::Rope => 3,
+            HtpOpCode::Softmax => 2,
+            _ => 1,
+        };
+        let min_src = if op == HtpOpCode::Rope { 2 } else { 1 };
+        if !(min_src..=max_src).contains(&src.len())
+            || dst.len() != 1
+            || src.contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {}: needs {min_src} to {max_src} registered src tensors and one registered dst tensor",
+                op.name()
+            )));
+        }
+        if kernel_params == [0i32; 32] {
+            let view = |i: u16| -> super::params::CopyTensor { (&tensors[usize::from(i)]).into() };
+            let first = view(src[0]);
+            let second = src.get(1).map(|&i| view(i));
+            let third = src.get(2).map(|&i| view(i));
+            let out = view(dst[0]);
+            let derived = match op {
+                HtpOpCode::Rope => p::build_rope_kernel_params(
+                    &p::RopeOperands {
+                        src0: &first,
+                        positions: second.as_ref().expect("two sources checked above"),
+                        freq_factors: third.as_ref(),
+                        dst: &out,
+                    },
+                    params,
+                    dsp_threads,
+                    vtcm_bytes,
+                ),
+                HtpOpCode::Softmax => p::build_softmax_kernel_params_strided_mask(
+                    &first,
+                    second.as_ref(),
+                    &out,
+                    params,
+                    dsp_threads,
+                    vtcm_bytes,
+                ),
+                HtpOpCode::Argsort | HtpOpCode::TopK => p::build_sort_kernel_params(
+                    opcode,
+                    &first,
+                    &out,
+                    params,
+                    dsp_threads,
+                    vtcm_bytes,
+                ),
+                _ => p::build_sum_rows_kernel_params(opcode, &first, &out, dsp_threads),
+            };
+            kernel_params = derived.ok_or_else(|| {
+                let operands: Vec<&T> = src
+                    .iter()
+                    .chain(dst)
+                    .map(|&i| &tensors[usize::from(i)])
+                    .collect();
+                CeraError::Backend(format!(
+                    "enqueue_op {}: the HTP kernel does not handle {operands:?}",
+                    op.name()
                 ))
             })?;
         }
@@ -2274,6 +2355,254 @@ mod tests {
             .to_string();
         assert!(err.contains("do not handle"), "{err}");
         assert_pending_empty(&q, "f32 mask");
+    }
+
+    /// `Rope`, `Softmax`, `Argmax`, `Argsort` and the other reductions and sorts enqueued with empty
+    /// kernel params get them from the registered tensors and the op's params (the DSP refuses
+    /// zero threads); a shape or operand count the kernels cannot take is an error that drops the
+    /// batch.
+    #[test]
+    fn rope_softmax_reduction_and_sort_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{
+            CopyTensor, RopeOperands, build_rope_kernel_params, build_rope_params,
+            build_softmax_kernel_params_strided_mask, build_sort_kernel_params,
+            build_sum_rows_kernel_params,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 20, false).unwrap();
+        let (f32_t, i32_t) = (HtpDataType::F32 as u32, HtpDataType::I32 as u32);
+        let mut q = test_session();
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+        let view = |q: &HexagonQueueSession, t: u16| CopyTensor::from(&q.tens[t as usize]);
+
+        // Rope: 8 heads of 64 over one token, positions, and frequency factors.
+        let act = q
+            .add_tensor(&buf, 0, 2048, 0, f32_t, [64, 8, 1, 1], [4, 256, 2048, 2048])
+            .unwrap();
+        let pos = q
+            .add_tensor(&buf, 2048, 4, 0, i32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        let ff = q
+            .add_tensor(&buf, 4096, 128, 1, f32_t, [32, 1, 1, 1], [4, 128, 128, 128])
+            .unwrap();
+        let params = build_rope_params(64, 2, 4096, 10000.0, 1.0);
+        q.enqueue_op(HtpOpCode::Rope as u32, &[act, pos], &[act], params, [0; 32])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::Rope as u32,
+            &[act, pos, ff],
+            &[act],
+            params,
+            [0; 32],
+        )
+        .unwrap();
+        let (a, p, f) = (view(&q, act), view(&q, pos), view(&q, ff));
+        let rope = |ff| {
+            build_rope_kernel_params(
+                &RopeOperands {
+                    src0: &a,
+                    positions: &p,
+                    freq_factors: ff,
+                    dst: &a,
+                },
+                &params,
+                threads,
+                vtcm,
+            )
+            .unwrap()
+        };
+        assert_eq!(q.ops[0].kernel_params, rope(None));
+        assert_eq!(q.ops[1].kernel_params, rope(Some(&f)));
+        assert_ne!(q.ops[0].kernel_params, [0; 32]);
+
+        // Softmax over [32, 4, 8] with an F32 mask, scale in the op params.
+        let sx = q
+            .add_tensor(
+                &buf,
+                8192,
+                4096,
+                0,
+                f32_t,
+                [32, 4, 8, 1],
+                [4, 128, 512, 4096],
+            )
+            .unwrap();
+        let sm = q
+            .add_tensor(
+                &buf,
+                16384,
+                4096,
+                0,
+                f32_t,
+                [32, 4, 8, 1],
+                [4, 128, 512, 4096],
+            )
+            .unwrap();
+        let sd = q
+            .add_tensor(
+                &buf,
+                24576,
+                4096,
+                0,
+                f32_t,
+                [32, 4, 8, 1],
+                [4, 128, 512, 4096],
+            )
+            .unwrap();
+        let mut sp = [0i32; 16];
+        sp[0] = 0.25f32.to_bits() as i32;
+        q.enqueue_op(HtpOpCode::Softmax as u32, &[sx, sm], &[sd], sp, [0; 32])
+            .unwrap();
+        let want = build_softmax_kernel_params_strided_mask(
+            &view(&q, sx),
+            Some(&view(&q, sm)),
+            &view(&q, sd),
+            &sp,
+            threads,
+            vtcm,
+        )
+        .unwrap();
+        assert_eq!(q.ops[2].kernel_params, want);
+        assert_eq!(f32::from_bits(want[7] as u32), 0.25);
+
+        // Argmax over a vocabulary row, and Argsort descending over expert scores.
+        let logits = q
+            .add_tensor(
+                &buf,
+                32768,
+                4096,
+                0,
+                f32_t,
+                [1024, 1, 1, 1],
+                [4, 4096, 4096, 4096],
+            )
+            .unwrap();
+        let tok = q
+            .add_tensor(&buf, 36864, 4, 0, i32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::Argmax as u32,
+            &[logits],
+            &[tok],
+            [0; 16],
+            [0; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            q.ops[3].kernel_params,
+            build_sum_rows_kernel_params(
+                HtpOpCode::Argmax as u32,
+                &view(&q, logits),
+                &view(&q, tok),
+                threads
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            q.ops[3].kernel_params[0], 0,
+            "a zero-thread op is refused by the DSP"
+        );
+        let scores = q
+            .add_tensor(
+                &buf,
+                40960,
+                128,
+                0,
+                f32_t,
+                [32, 1, 1, 1],
+                [4, 128, 128, 128],
+            )
+            .unwrap();
+        let order = q
+            .add_tensor(
+                &buf,
+                41088,
+                128,
+                0,
+                i32_t,
+                [32, 1, 1, 1],
+                [4, 128, 128, 128],
+            )
+            .unwrap();
+        let mut desc = [0i32; 16];
+        desc[0] = 1;
+        q.enqueue_op(
+            HtpOpCode::Argsort as u32,
+            &[scores],
+            &[order],
+            desc,
+            [0; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            q.ops[4].kernel_params,
+            build_sort_kernel_params(
+                HtpOpCode::Argsort as u32,
+                &view(&q, scores),
+                &view(&q, order),
+                &desc,
+                threads,
+                vtcm
+            )
+            .unwrap()
+        );
+
+        // Params the caller computed are left alone.
+        q.enqueue_op(
+            HtpOpCode::Argmax as u32,
+            &[logits],
+            &[tok],
+            [0; 16],
+            [7; 32],
+        )
+        .unwrap();
+        assert_eq!(q.ops[5].kernel_params, [7; 32]);
+
+        // Refusals, each over freshly registered operands (a refusal drops the batch): a Softmax
+        // with attention sinks (a third source), a Rope over F16, an Argsort into F32, a Rope without
+        // positions, and the "no operand" sentinel.
+        type Operand = (u32, [u32; 4], [u32; 4]);
+        let f32_row: Operand = (f32_t, [32, 4, 8, 1], [4, 128, 512, 4096]);
+        let f16_act: Operand = (HtpDataType::F16 as u32, [64, 8, 1, 1], [2, 128, 1024, 1024]);
+        let positions: Operand = (i32_t, [1, 1, 1, 1], [4, 4, 4, 4]);
+        let f32_vec: Operand = (f32_t, [32, 1, 1, 1], [4, 128, 128, 128]);
+        let mut refuse = |op: HtpOpCode, operands: &[Operand], src: &[usize], dst: usize| {
+            let ids: Vec<u16> = operands
+                .iter()
+                .map(|&(d, ne, nb)| q.add_tensor(&buf, 0, 4096, 0, d, ne, nb).unwrap())
+                .collect();
+            let src: Vec<u16> = src.iter().map(|&i| ids[i]).collect();
+            let err = q
+                .enqueue_op(op as u32, &src, &[ids[dst]], params, [0; 32])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(op.name()), "{err}");
+            assert_pending_empty(&q, "refused op");
+        };
+        refuse(HtpOpCode::Softmax, &[f32_row; 3], &[0, 1, 2], 0);
+        refuse(HtpOpCode::Rope, &[f16_act, positions], &[0, 1], 0);
+        refuse(HtpOpCode::Argsort, &[f32_vec, f32_vec], &[0], 1);
+        refuse(
+            HtpOpCode::Rope,
+            &[(f32_t, [64, 8, 1, 1], [4, 256, 2048, 2048])],
+            &[0],
+            0,
+        );
+        let dst = q
+            .add_tensor(&buf, 0, 4, 0, i32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        let err = q
+            .enqueue_op(
+                HtpOpCode::Argmax as u32,
+                &[0xffff],
+                &[dst],
+                [0; 16],
+                [0; 32],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Argmax"), "{err}");
+        assert_pending_empty(&q, "argmax sentinel");
     }
 
     /// A batch the DSP has not answered may still be running against the

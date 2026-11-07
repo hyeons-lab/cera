@@ -729,41 +729,65 @@ impl HexagonLfmModel {
         if n_rows_out == 0 {
             return Ok(());
         }
+        let f32_t = HtpDataType::F32 as u32;
+        let i32_t = HtpDataType::I32 as u32;
+        // a table of single values, one I32 index per gathered value
+        let (src0_ne, src0_nb) = (
+            [1, n_rows_in as u32, 1, 1],
+            [4, 4, (n_rows_in * 4) as u32, (n_rows_in * 4) as u32],
+        );
+        let idx_nb = (n_rows_out * 4) as u32;
+        let (src1_ne, src1_nb) = ([n_rows_out as u32, 1, 1, 1], [4, idx_nb, idx_nb, idx_nb]);
+        let (dst_ne, dst_nb) = (
+            [1, n_rows_out as u32, 1, 1],
+            [4, 4, (n_rows_out * 4) as u32, (n_rows_out * 4) as u32],
+        );
         let src0_ti = session.add_tensor(
             src0,
             src0_offset,
             n_rows_in * 4,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [1, n_rows_in as u32, 1, 1],
-            [4, 4, (n_rows_in * 4) as u32, (n_rows_in * 4) as u32],
+            f32_t,
+            src0_ne,
+            src0_nb,
         )?;
         let src1_ti = session.add_tensor(
             src1,
             src1_offset,
             n_rows_out * 4,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::I32 as u32,
-            [n_rows_out as u32, 1, 1, 1],
-            [
-                4,
-                (n_rows_out * 4) as u32,
-                (n_rows_out * 4) as u32,
-                (n_rows_out * 4) as u32,
-            ],
+            i32_t,
+            src1_ne,
+            src1_nb,
         )?;
         let dst_ti = session.add_tensor(
             dst,
             dst_offset,
             n_rows_out * 4,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [1, n_rows_out as u32, 1, 1],
-            [4, 4, (n_rows_out * 4) as u32, (n_rows_out * 4) as u32],
+            f32_t,
+            dst_ne,
+            dst_nb,
         )?;
         let params = [0i32; 16];
-        // The DSP splits the gather by these; zeros leave the output untouched.
-        let kparams = build_get_rows_f32_kernel_params(1, 1, 1, n_rows_out, 1, 1, dsp_threads);
+        // GetRows is the one op the queue cannot derive: whether the table is tiled is a tensor
+        // flag the shared view does not carry. This table is a plain activation, never tiled.
+        let view = |dtype, ne, nb| CopyTensor { dtype, ne, nb };
+        let kparams = build_get_rows_kernel_params(
+            &view(f32_t, src0_ne, src0_nb),
+            &view(i32_t, src1_ne, src1_nb),
+            &view(f32_t, dst_ne, dst_nb),
+            false,
+            dsp_threads,
+            session.dsp_vtcm_bytes(),
+        )
+        .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "dispatch_get_rows: no HTP kernel for {n_rows_out} values from {n_rows_in} \
+                 (threads {dsp_threads}, VTCM {})",
+                session.dsp_vtcm_bytes()
+            ))
+        })?;
         Self::enqueue_labeled(
             session,
             "dispatch_get_rows",
@@ -1767,13 +1791,9 @@ impl HexagonLfmModel {
             [4, 4, 4, 4],
         )?;
         let params = build_rope_params(head_dim, mode, max_seq_len as u32, rope_theta, 1.0);
-        // Dims are [head_dim, n_heads, 1]: heads are dim 1, tokens dim 2.
-        let nrows = n_heads;
-        let n_threads = session.dsp_threads().min(nrows as u32).max(1);
+        // Dims are [head_dim, n_heads, 1]: heads are dim 1, tokens dim 2. The queue derives the
+        // kernel params from the registered tensors.
         let (ff_ti, n_ff) = Self::rope_freq_factors_tensor(session, freq_factors)?;
-        let kparams = build_rope_kernel_params_with_freq_factors(
-            head_dim, nrows, n_heads, 1, n_threads, n_ff,
-        );
         let srcs = [act_ti, pos_ti, ff_ti];
         Self::enqueue_labeled(
             session,
@@ -1782,7 +1802,7 @@ impl HexagonLfmModel {
             &srcs[..2 + usize::from(n_ff > 0)],
             &[act_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -1835,12 +1855,7 @@ impl HexagonLfmModel {
             ],
         )?;
         let params = build_rope_params(head_dim, mode, max_seq_len as u32, rope_theta, 1.0);
-        let nrows = n_heads * n_tokens;
-        let n_threads = session.dsp_threads().min(nrows as u32).max(1);
         let (ff_ti, n_ff) = Self::rope_freq_factors_tensor(session, freq_factors)?;
-        let kparams = build_rope_kernel_params_with_freq_factors(
-            head_dim, nrows, n_heads, n_tokens, n_threads, n_ff,
-        );
         let srcs = [act_ti, pos_ti, ff_ti];
         Self::enqueue_labeled(
             session,
@@ -1849,7 +1864,7 @@ impl HexagonLfmModel {
             &srcs[..2 + usize::from(n_ff > 0)],
             &[act_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }

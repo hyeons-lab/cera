@@ -15,8 +15,8 @@ use super::{
     HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonQueueSession,
     HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
     build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
-    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
-    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
+    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_ssm_conv_kernel_params,
+    build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -1085,12 +1085,6 @@ pub(crate) fn softmax<S: OpSink>(
     dst: View<'_, S::Buf>,
     scale: f32,
 ) -> Result<(), CeraError> {
-    let kparams = build_softmax_kernel_params(
-        [x.ne[0], x.ne[1], x.ne[2], 1],
-        mask.as_ref().map(|m| [m.ne[0], m.ne[2], 1]),
-        scale,
-        session.dsp_threads(),
-    );
     let x_ti = x.add(session, HTP_TENSOR_COMPUTE)?;
     let mask_ti = match &mask {
         Some(m) => Some(m.add(session, HTP_TENSOR_COMPUTE)?),
@@ -1101,7 +1095,13 @@ pub(crate) fn softmax<S: OpSink>(
     params[0] = scale.to_bits() as i32;
     let src: Vec<u16> = std::iter::once(x_ti).chain(mask_ti).collect();
     session
-        .enqueue_op(HtpOpCode::Softmax as u32, &src, &[dst_ti], params, kparams)
+        .enqueue_op(
+            HtpOpCode::Softmax as u32,
+            &src,
+            &[dst_ti],
+            params,
+            [0i32; 32],
+        )
         .map_err(|e| op_err("softmax", e))?;
     session.end_group().map_err(|e| op_err("softmax", e))
 }
@@ -1844,7 +1844,7 @@ mod tests {
         concat_time_inner(&mut s, src(0), src(512), &"b", 2048, 8).unwrap();
         check(&s);
         // The softmax carries the mask as its second source and the scale in
-        // both the op params and the kernel params.
+        // both the op params and the kernel params (word 7).
         let sm = s
             .ops
             .iter()
@@ -1852,7 +1852,7 @@ mod tests {
             .unwrap();
         assert_eq!(sm.src.len(), 2);
         assert_eq!(f32::from_bits(sm.params[0] as u32), 0.5);
-        assert_eq!(f32::from_bits(sm.kparams[18] as u32), 0.5);
+        assert_eq!(f32::from_bits(sm.kparams[7] as u32), 0.5);
         for code in [HtpOpCode::Cpy as u32, HtpOpCode::Concat as u32] {
             let op = s.ops.iter().find(|o| o.opcode == code).unwrap();
             assert_ne!(op.kparams, [0i32; 32], "opcode {code} kparams precomputed");
