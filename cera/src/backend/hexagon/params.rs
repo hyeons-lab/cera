@@ -1878,6 +1878,23 @@ impl CopyTensor {
             .try_fold(1u64, |acc, &n| acc.checked_mul(u64::from(n)))
     }
 
+    /// Whether two distinct indices can address the same element: some dimension's stride is
+    /// smaller than the extent the faster dimensions already cover, as in a sliding window over
+    /// consecutive rows (an im2col view) or a broadcast (stride 0). A ggml graph from llama.cpp
+    /// never gives the DSP such a source; cera does, to build the K-window of a conv as a copy.
+    fn overlaps(&self) -> bool {
+        let mut dims: Vec<(u64, u64)> = (0..4)
+            .filter(|&i| self.ne[i] > 1)
+            .map(|i| (u64::from(self.nb[i]), u64::from(self.ne[i])))
+            .collect();
+        // a zero stride repeats one element (and would make the product below zero)
+        if dims.iter().any(|&(nb, _)| nb == 0) {
+            return true;
+        }
+        dims.sort_unstable();
+        dims.windows(2).any(|w| w[1].0 < w[0].0 * w[0].1)
+    }
+
     /// `ggml_is_contiguous` for a type with a block size of 1.
     fn is_contiguous(&self, type_size: u64) -> bool {
         if self.ne[0] != 1 && u64::from(self.nb[0]) != type_size {
@@ -2263,6 +2280,12 @@ fn copy_transpose_plan(
     n_threads: u32,
     vtcm_size: u64,
 ) -> Option<(CopyTranspose, u64)> {
+    // The kernel DMAs `blkk * es` bytes per source row at a row stride of `src_nb[0]`: rows that
+    // overlap in memory make that DMA fault the DSP (seen on a v79 with a window view of
+    // `ne = [3, 192, 100]`, `nb = [768, 4, 768]`). Such a copy takes the generic reshape kernel.
+    if src0.overlaps() {
+        return None;
+    }
     // a contiguous dst is viewed with the src shape, which is how a reshaping copy is handled
     let dst_cont = dst.is_contiguous(dst.type_size()?);
     if !dst_cont && src0.ne != dst.ne {
@@ -2833,6 +2856,53 @@ mod tests {
             kernels[1] > 3000 && kernels[2] > 1000 && kernels[3] > 1500,
             "kernel mix {kernels:?}"
         );
+    }
+
+    /// A conv's K-window built as a copy (`[3, 192, 100]` over rows that are 768 bytes apart, so
+    /// consecutive windows share rows) must not take the tiled-transpose kernel: its input DMA
+    /// reads each row far past the row stride, and that faulted the DSP on a v79. The generic
+    /// reshape kernel reads any strides. The same shape with the planes laid out apart is an
+    /// ordinary transpose and keeps the fast kernel.
+    #[test]
+    fn overlapping_source_windows_skip_the_transposed_copy() {
+        let f32t = HtpDataType::F32 as u32;
+        let dst = CopyTensor {
+            dtype: f32t,
+            ne: [3, 192, 100, 1],
+            nb: [4, 12, 2304, 230400],
+        };
+        let window = CopyTensor {
+            dtype: f32t,
+            ne: [3, 192, 100, 1],
+            nb: [768, 4, 768, 78336],
+        };
+        assert!(window.overlaps());
+        let kernel = |src: &CopyTensor| {
+            build_copy_kernel_params(src, &dst, 6, 8 << 20).map(|w| w[0] as u32 & 0xff)
+        };
+        assert_eq!(kernel(&window), Some(COPY_KERNEL_RESHAPE));
+
+        let planes = CopyTensor {
+            dtype: f32t,
+            ne: [3, 192, 100, 1],
+            nb: [76800, 4, 768, 230400],
+        };
+        assert!(!planes.overlaps());
+        assert_eq!(kernel(&planes), Some(COPY_KERNEL_TRANSPOSE));
+
+        // a broadcast (stride 0) aliases too; dense and padded rows do not
+        let broadcast = CopyTensor {
+            dtype: f32t,
+            ne: [8, 4, 1, 1],
+            nb: [4, 0, 32, 32],
+        };
+        assert!(broadcast.overlaps());
+        let padded = CopyTensor {
+            dtype: f32t,
+            ne: [8, 4, 1, 1],
+            nb: [4, 48, 192, 192],
+        };
+        assert!(!padded.overlaps());
     }
 
     /// The copies and joins cera's graphs issue pick the kernels the firmware was built for (the
