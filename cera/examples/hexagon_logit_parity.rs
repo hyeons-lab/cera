@@ -10,6 +10,8 @@
 //! cargo ndk -t arm64-v8a build --release -p cera --example hexagon_logit_parity --features hexagon
 //! adb push target/aarch64-linux-android/release/examples/hexagon_logit_parity /data/local/tmp/cera-bench/
 //! adb shell 'cd /data/local/tmp/cera-bench && ADSP_LIBRARY_PATH=$PWD ./hexagon_logit_parity model.gguf 32'
+//! # a long context: STEPS, PROMPT (any text), CONTEXT size
+//! ./hexagon_logit_parity model.gguf 16 "$(yes 'The quick brown fox jumps over the lazy dog.' | head -130)" 2048
 //! ```
 //!
 //! Needs the skel next to the binary (see `skels/SOURCE.md`) when run from `adb shell`.
@@ -20,18 +22,19 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let model = args
         .next()
-        .expect("usage: hexagon_logit_parity MODEL [STEPS] [PROMPT]");
+        .expect("usage: hexagon_logit_parity MODEL [STEPS] [PROMPT] [CONTEXT]");
     let steps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(32);
     let prompt_text = args
         .next()
         .unwrap_or_else(|| "Explain in three sentences why the sky is blue.".into());
 
+    let context_size: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
     let open = |backend| {
         CeraEngine::from_path(
             &model,
             EngineConfig {
                 backend,
-                context_size: 1024,
+                context_size,
                 ..EngineConfig::default()
             },
         )
