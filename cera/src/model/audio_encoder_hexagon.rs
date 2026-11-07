@@ -698,17 +698,7 @@ pub(crate) fn emit_conv_module<S: OpSink>(
         n,
     )?;
     dispatch::ssm_conv(
-        s,
-        weights,
-        conv.dw_w,
-        scratch,
-        so.conv_x,
-        scratch,
-        so.conv_y,
-        kernel,
-        n,
-        t,
-        dispatch::VTCM_BUDGET,
+        s, weights, conv.dw_w, scratch, so.conv_x, scratch, so.conv_y, kernel, n, t,
     )?;
     // Depthwise bias, the per-channel affine "conv_norm", then SiLU.
     dispatch::add_row_bcast(s, scratch, so.conv_y, weights, conv.dw_b, embd, TILE)?;

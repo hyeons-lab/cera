@@ -283,8 +283,8 @@ impl HexagonLfmModel {
     /// `[s0_rows, dim] + [s1_rows, dim] -> [s0_rows + s1_rows, dim]`.
     /// `params[0]` is the concat dim; kparams are zero, and `enqueue_op` fills them from the
     /// registered tensors (the DSP answers NO_SUPPORT for empty ones). The second source may be a transposed view (`s1_nb0 >
-    /// s1_nb1`), which takes the DSP's specialized 2D-transposed worker:
-    /// the conv state prepend (`[s0; s1] + bx-as-[m, hs]`).
+    /// s1_nb1`), the conv state prepend (`[s0; s1] + bx-as-[m, hs]`): the solver sends a joined row
+    /// of up to 32 floats to the gather-rows kernel and a wider one to the 2D-transposed worker.
     pub(super) fn dispatch_concat_2d(
         session: &mut HexagonQueueSession,
         s0_buf: &RpcmemBuffer,
@@ -2364,10 +2364,9 @@ impl HexagonLfmModel {
     /// space, independent strides). A transpose carries the transposed
     /// shape on the source side; a scatter (interleaved destination)
     /// strides the destination side. kparams are zero and `enqueue_op` fills them from the
-    /// registered tensors, which pick the copy kernel (including the strided ones). Strided
-    /// sides were a scalar per-element path on the previous firmware; the current one has
-    /// threaded strided kernels, but the transposes of m*hs elements still go through CONCAT's
-    /// transposed worker.
+    /// registered tensors, which pick the copy kernel: gather-rows for short source rows, the
+    /// tiled transpose when one side is channel-major, and the strided reshape copy otherwise.
+    /// The conv window's transposed `bx` is joined by CONCAT instead.
     pub(super) fn dispatch_cpy_2d(
         session: &mut HexagonQueueSession,
         src: &RpcmemBuffer,
@@ -2422,7 +2421,6 @@ impl HexagonLfmModel {
             d_conv,
             d_inner,
             n_t,
-            self.vtcm_budget,
         )
     }
 }
