@@ -9,6 +9,7 @@ use std::sync::Arc;
 use super::params::{
     CopyTensor, FLASH_ATTN_HVX_ONLY, FlashAttnHost, FlashAttnOp, build_concat_kernel_params,
     build_copy_kernel_params, build_flash_attn_kernel_params, build_set_rows_kernel_params,
+    build_ssm_conv_kernel_params,
 };
 use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
@@ -1541,7 +1542,7 @@ impl Drop for HexagonQueueSession {
 }
 
 /// Validate `enqueue_op` operand counts, tensor indices, and `Cpy`/`Concat` arity, and derive
-/// `Cpy`/`Concat`/`SetRows`/`FlashAttnExt` `kernel_params` when the caller passed `[0; 32]`
+/// `Cpy`/`Concat`/`SsmConv`/`SetRows`/`FlashAttnExt` `kernel_params` when the caller passed `[0; 32]`
 /// (`FlashAttnExt` also for [`FLASH_ATTN_HVX_ONLY`]); likewise `Rope`, `Softmax`,
 /// `Sum`/`SumRows`/`Argmax` and `Argsort`/`TopK`. Shared with test sinks so fake and real
 /// queues enforce identical preconditions and derive identical parameter words. `dsp_hmx` is the
@@ -1640,6 +1641,40 @@ where
                 CeraError::Backend(format!(
                     "enqueue_op Concat: the HTP concat kernels do not handle dim {} for {ta:?} + {tb:?} -> {td:?}",
                     params[0]
+                ))
+            })?;
+        }
+    }
+    // `SsmConv` likewise: the window, taps and output decide the kernel, the channel tile and the
+    // VTCM plan (`htp_kparams_solve_ssm_conv`).
+    if opcode == HtpOpCode::SsmConv as u32 {
+        if src.len() != 2
+            || dst.len() != 1
+            || src[0] == 0xffff
+            || src[1] == 0xffff
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op SsmConv: needs two registered src tensors and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        if kernel_params == [0i32; 32] {
+            let (tx, tw, td) = (
+                &tensors[src[0] as usize],
+                &tensors[src[1] as usize],
+                &tensors[dst[0] as usize],
+            );
+            kernel_params = build_ssm_conv_kernel_params(
+                &tx.into(),
+                &tw.into(),
+                &td.into(),
+                dsp_threads,
+                vtcm_bytes,
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op SsmConv: the HTP ssm_conv kernel does not handle {tx:?} * {tw:?} -> {td:?} in {vtcm_bytes} bytes of VTCM"
                 ))
             })?;
         }
@@ -2603,6 +2638,106 @@ mod tests {
             .to_string();
         assert!(err.contains("Argmax"), "{err}");
         assert_pending_empty(&q, "argmax sentinel");
+    }
+
+    /// An `SsmConv` enqueued with empty kernel params gets them from the registered window, taps
+    /// and output at the session's thread count and VTCM size; a window the VTCM cannot hold, an
+    /// operand that is not registered and a wrong operand count are errors that drop the batch.
+    #[test]
+    fn ssm_conv_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{CopyTensor, build_ssm_conv_kernel_params};
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 20, false).unwrap();
+        let f32_t = HtpDataType::F32 as u32;
+        let (d_conv, d_inner, n_t) = (3u32, 1024u32, 32u32);
+        let ncs = d_conv - 1 + n_t;
+        let mut q = test_session();
+        let register = |q: &mut HexagonQueueSession| {
+            let x = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    (ncs * d_inner * 4) as usize,
+                    0,
+                    f32_t,
+                    [ncs, d_inner, 1, 1],
+                    [4, ncs * 4, ncs * d_inner * 4, ncs * d_inner * 4],
+                )
+                .unwrap();
+            let w = q
+                .add_tensor(
+                    &buf,
+                    1 << 17,
+                    (d_conv * d_inner * 4) as usize,
+                    0,
+                    f32_t,
+                    [d_conv, d_inner, 1, 1],
+                    [4, d_conv * 4, d_conv * d_inner * 4, d_conv * d_inner * 4],
+                )
+                .unwrap();
+            let y = q
+                .add_tensor(
+                    &buf,
+                    1 << 18,
+                    (d_inner * n_t * 4) as usize,
+                    0,
+                    f32_t,
+                    [d_inner, n_t, 1, 1],
+                    [4, d_inner * 4, d_inner * n_t * 4, d_inner * n_t * 4],
+                )
+                .unwrap();
+            (x, w, y)
+        };
+
+        let (x, w, y) = register(&mut q);
+        q.enqueue_op(HtpOpCode::SsmConv as u32, &[x, w], &[y], [0; 16], [0; 32])
+            .unwrap();
+        let view = |t: &HtpTensor| CopyTensor::from(t);
+        let want = build_ssm_conv_kernel_params(
+            &view(&q.tens[x as usize]),
+            &view(&q.tens[w as usize]),
+            &view(&q.tens[y as usize]),
+            q.dsp_threads(),
+            q.dsp_vtcm_bytes(),
+        )
+        .expect("an LFM2 conv chunk fits the default VTCM");
+        assert_eq!(q.ops[0].kernel_params, want);
+        assert_ne!(want, [0; 32]);
+        assert_eq!(
+            want[0] as u32,
+            q.dsp_threads(),
+            "one thread per 32 channels"
+        );
+
+        // The caller's own params pass through untouched.
+        q.enqueue_op(HtpOpCode::SsmConv as u32, &[x, w], &[y], [0; 16], [7; 32])
+            .unwrap();
+        assert_eq!(q.ops[1].kernel_params, [7; 32]);
+
+        // Operand counts and unregistered operands.
+        for (src, dst) in [
+            (vec![x], vec![y]),
+            (vec![x, w], vec![]),
+            (vec![x, 0xffff], vec![y]),
+            (vec![x, w], vec![0xffff]),
+            (vec![x, 99], vec![y]),
+        ] {
+            let e = q.enqueue_op(HtpOpCode::SsmConv as u32, &src, &dst, [0; 16], [0; 32]);
+            assert!(e.is_err(), "{src:?} -> {dst:?} must be refused");
+            assert_pending_empty(&q, "ssm_conv operands");
+            register(&mut q);
+        }
+        q.drop_pending_batch();
+
+        // A VTCM too small for the plan: the error names the budget, and the batch is dropped.
+        q.set_dsp_hw(0, 64 * 1024);
+        let (x, w, y) = register(&mut q);
+        let err = q
+            .enqueue_op(HtpOpCode::SsmConv as u32, &[x, w], &[y], [0; 16], [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("65536 bytes of VTCM"), "{err}");
+        assert_pending_empty(&q, "ssm_conv vtcm");
     }
 
     /// A batch the DSP has not answered may still be running against the

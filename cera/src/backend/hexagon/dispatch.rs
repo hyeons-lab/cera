@@ -15,8 +15,8 @@ use super::{
     HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonQueueSession,
     HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
     build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
-    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_ssm_conv_kernel_params,
-    build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
+    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_unary_kernel_params,
+    mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -912,7 +912,8 @@ pub(crate) fn concat_time_inner<S: OpSink>(
 /// `y[t, c] = sum_j x[t + j, c] * w[j, c]` over a channel-major input of
 /// `d_conv - 1 + n_t` positions (the caller supplies the padding) and a
 /// `[d_conv, d_inner]` tap matrix, producing a time-major `[n_t, d_inner]`
-/// output. `vtcm_budget` caps the VTCM the kernel may plan for.
+/// output. The kernel's channel tile and VTCM plan come from the registered tensors
+/// (`enqueue_op` derives them), so a window the session's VTCM cannot hold is an error there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ssm_conv<S: OpSink>(
     session: &mut S,
@@ -925,7 +926,6 @@ pub(crate) fn ssm_conv<S: OpSink>(
     d_conv: usize,
     d_inner: usize,
     n_t: usize,
-    vtcm_budget: usize,
 ) -> Result<(), CeraError> {
     let ncs = d_conv - 1 + n_t;
     let x_bytes = ncs * d_inner * 4;
@@ -958,22 +958,13 @@ pub(crate) fn ssm_conv<S: OpSink>(
         [d_inner as u32, n_t as u32, 1, 1],
         [4, (d_inner * 4) as u32, dst_bytes as u32, dst_bytes as u32],
     )?;
-    let kparams = build_ssm_conv_kernel_params(
-        d_conv,
-        d_inner,
-        n_t,
-        1,
-        ncs,
-        session.dsp_threads(),
-        vtcm_budget,
-    );
     session
         .enqueue_op(
             HtpOpCode::SsmConv as u32,
             &[x_ti, w_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err("ssm_conv", e))?;
     session.end_group().map_err(|e| op_err("ssm_conv", e))
@@ -1832,7 +1823,7 @@ mod tests {
         check(&s);
         add_row_bcast_to(&mut s, v(0), &"v", 0, v(1024)).unwrap();
         check(&s);
-        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4, VTCM_BUDGET).unwrap();
+        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4).unwrap();
         check(&s);
         let src = |off| ConcatSrc {
             buf: &"b",

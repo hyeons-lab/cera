@@ -1016,89 +1016,129 @@ pub fn build_set_rows_kernel_params(
     (total <= vtcm_bytes as u64).then_some(k)
 }
 
-/// Build kernel parameters for SsmConv dispatch.
+/// Kernel parameters for an `SsmConv` (depthwise 1-D convolution, `y[c, t] = sum_j x[t + j, c] *
+/// w[j, c]`): port of `htp_kparams_solve_ssm_conv` (`htp-kparams.cpp`) with
+/// `htp_ssm_conv_vtcm_layout_build` (`ssm-conv.h`). `src0` is the `[d_conv - 1 + n_t, d_inner,
+/// n_s]` window (rows of `ne[0]` dense floats), `src1` the `[d_conv, d_inner]` taps, `dst` the
+/// `[d_inner, n_t, n_s]` output. `None` when the operands are not a convolution the kernel takes
+/// (F32 only, at most 32 taps, dense rows) or its working set does not fit `vtcm_bytes`.
 ///
-/// Port of `ggml_hexagon_precompute_ssm_conv_params`: `d_conv` taps (src1->ne\[0\], 3 for LFM2
-/// short conv), `d_inner` channels (src0->ne\[1\]), `n_t` new positions (dst->ne\[1\]), `n_s`
-/// sequences (dst->ne\[2\], 1), `ncs` src0 dim-0 (`d_conv - 1 + n_t`). `vtcm_budget == 0` means
-/// unknown and takes the host's 1 MiB default per call.
-///
-/// Words (`htp_ssm_conv_kernel_params`): `n_threads, d_conv, d_inner, n_t, n_s, d_inner_tile,
-/// vtcm_src0_size_per_thread, vtcm_src1_size_per_thread, vtcm_dst_size_per_thread, vtcm_src0_size,
-/// vtcm_src1_size, vtcm_dst_size, vtcm_size`.
+/// Words (`htp_ssm_conv_kernel_params`): `n_threads` (the session's, capped at one per 32
+/// channels), `d_conv`, `d_inner`, `n_t`, `n_s`, `d_inner_tile` (the channel tile one thread
+/// stages), `vtcm_size`, `silu`, then the divider of `d_inner_tile` (`mp, l`). `silu` is set by
+/// llama.cpp's op fusion when a SiLU follows the convolution; cera applies its activations as
+/// separate ops, so it stays 0. A session without threads divides by zero in the C and never
+/// reaches it, so it counts as one here.
 pub fn build_ssm_conv_kernel_params(
-    d_conv: usize,
-    d_inner: usize,
-    n_t: usize,
-    n_s: usize,
-    ncs: usize,
-    sess_threads: u32,
-    vtcm_budget: usize,
-) -> [i32; 32] {
-    let up128 = |x: u32| x.next_multiple_of(128);
-    let (d_conv, d_inner, n_t, n_s, ncs) = (
-        d_conv as u32,
-        d_inner as u32,
-        n_t as u32,
-        n_s as u32,
-        ncs as u32,
-    );
-    let n_threads = sess_threads.min(d_inner.div_ceil(32)).max(1);
-    let d_inner_per_thread = d_inner.div_ceil(n_threads).next_multiple_of(32);
+    src0: &CopyTensor,
+    src1: &CopyTensor,
+    dst: &CopyTensor,
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    let f32t = HtpDataType::F32 as u32;
+    if src0.dtype != f32t || src1.dtype != f32t || dst.dtype != f32t {
+        return None;
+    }
+    if src0.ne[3] != 1 || src1.ne[2] != 1 || src1.ne[3] != 1 || dst.ne[3] != 1 {
+        return None;
+    }
+    let (d_conv, d_inner, n_t, n_s) = (src1.ne[0], src0.ne[1], dst.ne[1], dst.ne[2]);
+    if d_conv == 0 || d_conv > 32 || d_inner == 0 {
+        return None;
+    }
+    if u64::from(src0.ne[0]) != u64::from(d_conv) - 1 + u64::from(n_t)
+        || src0.ne[2] != n_s
+        || src1.ne[1] != d_inner
+        || dst.ne[0] != d_inner
+    {
+        return None;
+    }
+    // the kernel DMAs rows of the window and the taps whole
+    if src0.nb[0] != 4 || src1.nb[0] != 4 || dst.nb[0] != 4 {
+        return None;
+    }
+    if u64::from(src0.nb[1]) != u64::from(src0.ne[0]) * 4
+        || u64::from(src1.nb[1]) != u64::from(src1.ne[0]) * 4
+    {
+        return None;
+    }
 
-    // The weight side is the same in both branches: the raw rows plus the transposed copy the
-    // HVX kernel multiplies from.
-    let src1_raw_bytes = up128(d_inner_per_thread * d_conv * 4) + 128;
-    let src1_t_bytes = up128(d_conv * d_inner_per_thread * 4);
-    let vtcm_src1_per_thread = src1_raw_bytes + src1_t_bytes;
+    let ncs = src0.ne[0];
+    let n_threads = n_threads.min(d_inner.div_ceil(32)).max(1);
+    let raw_rpt = d_inner.div_ceil(n_threads);
+    let d_inner_per_thread = hex_round_up(raw_rpt, 32);
 
-    let (d_inner_tile, vtcm_src0_per_thread, vtcm_dst_per_thread);
-    if n_t == 1 {
-        d_inner_tile = d_inner_per_thread;
-        let src0_tile_raw = up128(d_inner_per_thread * d_conv * 4);
-        let src0_t = up128(d_conv * d_inner_per_thread * 4);
-        vtcm_src0_per_thread = 2 * src0_tile_raw + src0_t;
-        vtcm_dst_per_thread = 2 * up128(d_inner_per_thread * 4);
+    let mut k = [0i32; 32];
+    // the weight side of one thread's slab, in both branches: the raw taps plus the transposed
+    // copy the HVX kernel multiplies from
+    let ssm_src1_per_thread = |dipt: u32| -> u64 {
+        let raw = u64::from(hex_round_up(
+            (u64::from(dipt) * u64::from(d_conv) * 4) as u32,
+            128,
+        )) + 128;
+        let transposed = u64::from(hex_round_up(
+            (u64::from(d_conv) * u64::from(dipt) * 4) as u32,
+            128,
+        ));
+        raw + transposed
+    };
+
+    let d_inner_tile = if n_t == 1 {
+        d_inner_per_thread
     } else {
-        let budget = if vtcm_budget > 0 {
-            (vtcm_budget / n_threads as usize) as u64
+        let vtcm_src1_per_thread = ssm_src1_per_thread(d_inner_per_thread) as u32;
+        let vtcm_budget = if vtcm_bytes > 0 {
+            vtcm_bytes as u64 / u64::from(n_threads)
         } else {
             1024 * 1024
         };
-        // the kernel double-buffers the raw src0 tile and the dst tile, and transposes one
-        // 32-channel block at a time
-        let src0_block_t = up128(ncs * 32 * 4);
-        let fixed = u64::from(vtcm_src1_per_thread) + u64::from(src0_block_t);
-        let avail = if budget > fixed {
-            budget - fixed
+        let src0_block_t = hex_round_up(ncs.wrapping_mul(32 * 4), 128);
+        let fixed_bytes = u64::from(vtcm_src1_per_thread.wrapping_add(src0_block_t));
+        let avail_for_tiles = if vtcm_budget > fixed_bytes {
+            vtcm_budget - fixed_bytes
         } else {
             128 * 1024
         };
-        let target_max = (d_inner_per_thread + 3)
-            .div_euclid(4)
-            .next_multiple_of(32)
-            .clamp(32, 128);
-        let mut tile = (avail / (2 * u64::from((ncs + n_t).max(1)) * 4)) as u32;
-        tile = (tile / 32) * 32;
-        if tile == 0 {
-            tile = 32;
-        }
-        if tile > target_max {
-            tile = target_max;
-        }
-        if tile > d_inner_per_thread {
-            tile = d_inner_per_thread;
-        }
-        d_inner_tile = tile;
-        let src0_tile_raw = up128(tile * ncs * 4);
-        vtcm_src0_per_thread = 2 * src0_tile_raw + src0_block_t;
-        vtcm_dst_per_thread = 2 * up128(tile * n_t * 4);
-    }
 
-    let vtcm_src0 = vtcm_src0_per_thread * n_threads;
-    let vtcm_src1 = vtcm_src1_per_thread * n_threads;
-    let vtcm_dst = vtcm_dst_per_thread * n_threads;
-    let mut k = [0i32; 32];
+        // the tile is a quarter of a thread's channels, between 32 and 128
+        let target_max_tile = hex_round_up(d_inner_per_thread.div_ceil(4), 32).clamp(32, 128);
+        let raw_stride_bytes = u64::from(ncs) * 4 + 4;
+        let per_channel = 2 * (raw_stride_bytes + u64::from(n_t) * 4);
+        let tile = ((avail_for_tiles / per_channel) as u32 / 32 * 32).max(32);
+        tile.min(target_max_tile).min(d_inner_per_thread)
+    };
+
+    // htp_ssm_conv_vtcm_layout_build
+    let (src0_per_thread, dst_per_thread);
+    if n_t == 1 {
+        let src0_tile_raw = u64::from(hex_round_up(
+            (u64::from(d_inner_tile) * u64::from(d_conv) * 4) as u32,
+            128,
+        ));
+        let src0_t = u64::from(hex_round_up(
+            (u64::from(d_conv) * u64::from(d_inner_tile) * 4) as u32,
+            128,
+        ));
+        src0_per_thread = 2 * src0_tile_raw + src0_t;
+        dst_per_thread = 2 * u64::from(hex_round_up((u64::from(d_inner_tile) * 4) as u32, 128));
+    } else {
+        let raw_stride_bytes = u64::from(ncs) * 4 + 4;
+        let src0_block_t = u64::from(hex_round_up((u64::from(ncs) * 32 * 4) as u32, 128));
+        let src0_tile_raw = u64::from(hex_round_up(
+            (u64::from(d_inner_tile) * raw_stride_bytes) as u32,
+            128,
+        ));
+        src0_per_thread = 2 * src0_tile_raw + src0_block_t;
+        dst_per_thread = 2 * u64::from(hex_round_up(
+            (u64::from(d_inner_tile) * u64::from(n_t) * 4) as u32,
+            128,
+        ));
+    }
+    let total = (src0_per_thread + ssm_src1_per_thread(d_inner_per_thread) + dst_per_thread)
+        * u64::from(n_threads);
+
+    let div = init_fastdiv(d_inner_tile);
     for (i, v) in [
         n_threads,
         d_conv,
@@ -1106,20 +1146,17 @@ pub fn build_ssm_conv_kernel_params(
         n_t,
         n_s,
         d_inner_tile,
-        vtcm_src0_per_thread,
-        vtcm_src1_per_thread,
-        vtcm_dst_per_thread,
-        vtcm_src0,
-        vtcm_src1,
-        vtcm_dst,
-        vtcm_src0 + vtcm_src1 + vtcm_dst,
+        total as u32,
+        0, // silu
+        div.mp,
+        div.l,
     ]
     .into_iter()
     .enumerate()
     {
         k[i] = v as i32;
     }
-    k
+    (total <= vtcm_bytes as u64).then_some(k)
 }
 
 /// `enum htp_fa_kernel_type`: the HVX kernel walks one query row (or one GQA group) at a time, the
@@ -2985,26 +3022,511 @@ impl CopyTensor {
     }
 }
 
+/// `htp_gather_rows_tensor_outer_contiguous` (`gather-rows.h`): dims 2 and 3 follow dim 1 with no
+/// gap, so the tensor is a run of rows of `nb[1]` bytes.
+fn gather_rows_outer_contiguous(t: &CopyTensor) -> bool {
+    let mut next_nb = u64::from(t.nb[1]).wrapping_mul(u64::from(t.ne[1]));
+    for i in 2..4 {
+        if t.ne[i] != 1 && u64::from(t.nb[i]) != next_nb {
+            return false;
+        }
+        next_nb = next_nb.wrapping_mul(u64::from(t.ne[i]));
+    }
+    true
+}
+
+/// `htp_gather_rows_params` (`gather-rows.h`): the plan of the gather-rows kernel, which joins
+/// short rows (`ne` elements) into vectors and moves a whole run of them per DMA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GatherRowsPlan {
+    na: u32,
+    nb: u32,
+    ne: u32,
+    rg: u32,
+    vg: u32,
+    nr_max: u32,
+    v1: u32,
+    span1: u32,
+    region_size: u32,
+    slice: u32,
+    total_rows: u32,
+    rows_per_thread: u32,
+    b_dense: bool,
+}
+
+impl GatherRowsPlan {
+    fn write(&self, out: &mut [i32]) {
+        let words = [
+            self.na,
+            self.nb,
+            self.ne,
+            self.rg,
+            self.vg,
+            self.nr_max,
+            self.v1,
+            self.span1,
+            self.region_size,
+            self.slice,
+            self.total_rows,
+            self.rows_per_thread,
+            u32::from(self.b_dense),
+        ];
+        for (o, w) in out.iter_mut().zip(words) {
+            *o = w as i32;
+        }
+    }
+}
+
+/// Bytes one thread's slice must hold for a gather plan: port of
+/// `htp_gather_rows_vtcm_layout_build`, in the header's mixed 32/64-bit arithmetic.
+fn gather_rows_slice_bytes(vg: u32, region_size: u32, nr_max: u32, ne: u32, elem_size: u32) -> u64 {
+    let vec_bytes = u64::from(vg) * 128;
+    let region_aligned = u64::from(hex_round_up(region_size, 128));
+    let out_end =
+        region_aligned.wrapping_add(u64::from(nr_max) * u64::from(ne) * u64::from(elem_size));
+    let out_aligned = u64::from(hex_round_up(out_end as u32, 128)).wrapping_sub(region_aligned);
+    // lookup table, increment and cursor vectors, then two (region, output) buffer pairs
+    (3 * vec_bytes)
+        .wrapping_add(2 * region_aligned)
+        .wrapping_add(2u64.wrapping_mul(out_aligned))
+}
+
+/// Port of `htp_gather_rows_solve_layout` (`gather-rows.h`), shared by the gather variants of
+/// `Cpy` and `Concat`: `a` rows of `na` elements (stride `a_nb1`) optionally followed by `b` rows
+/// of `nb` (`b_dense`: rows of `b_nb1` bytes; otherwise `b` is read column by column), written
+/// as rows of `na + nb`. `None` when the rows are too wide or no run of them fits `vtcm_size`
+/// split over `n_threads`. A zero thread count or device count divides by zero in the C and
+/// never reaches it from a session, so it is a refusal here.
+#[allow(clippy::too_many_arguments)]
+fn gather_rows_solve_layout(
+    na: u32,
+    a_nb1: u32,
+    nb: u32,
+    b_nb1: u32,
+    b_dense: bool,
+    elem_size: u32,
+    total_rows: u32,
+    n_threads: u32,
+    mdev_count: u32,
+    vtcm_size: u32,
+) -> Option<GatherRowsPlan> {
+    if elem_size != 4 && elem_size != 2 {
+        return None;
+    }
+    let ne = na.wrapping_add(nb);
+    if ne == 0 || ne > 128 / elem_size || n_threads == 0 || mdev_count == 0 {
+        return None;
+    }
+
+    let v_lanes = 128 / elem_size;
+    let (mut x, mut y) = (ne, v_lanes);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    let rg = v_lanes / x;
+    let vg = ne / x;
+
+    let slice = (vtcm_size / n_threads) & !127u32;
+    let total_chunks = total_rows / rg;
+    let chunks_per_dev = total_chunks.wrapping_add(mdev_count).wrapping_sub(1) / mdev_count;
+    let max_rows_per_dev = if mdev_count > 1 && total_chunks >= mdev_count {
+        chunks_per_dev
+            .wrapping_mul(rg)
+            .wrapping_add(total_rows % rg)
+    } else {
+        total_rows
+    };
+    let rows_per_thread = hex_round_up(
+        max_rows_per_dev.wrapping_add(n_threads).wrapping_sub(1) / n_threads,
+        rg,
+    );
+
+    let fixed = 3u32.wrapping_mul(vg).wrapping_mul(128);
+    // bytes of source rows one output row needs: the `a` row plus the `b` row (or its columns)
+    let region_row = a_nb1.wrapping_add(if nb == 0 {
+        0
+    } else if b_dense {
+        b_nb1
+    } else {
+        nb.wrapping_mul(b_nb1)
+    });
+    let per_row = region_row.wrapping_add(ne.wrapping_mul(elem_size));
+    if slice <= fixed.wrapping_add(2u32.wrapping_mul(per_row).wrapping_mul(rg)) {
+        return None;
+    }
+
+    let avail_per_buf = slice.wrapping_sub(fixed) / 2;
+    let mut nr_max = avail_per_buf.checked_div(per_row)?.min(rows_per_thread);
+    if elem_size == 2 && region_row > 0 {
+        // f16 gathers address VTCM with 16-bit offsets, so a region stays under 32 KiB
+        nr_max = nr_max.min((32768 - 256) / region_row);
+    }
+    nr_max = (nr_max / rg) * rg;
+
+    let (mut v1, mut span1, mut region_size) = (0u32, 0u32, 0u32);
+    while nr_max > 0 {
+        v1 = hex_round_up(
+            (nr_max - 1)
+                .wrapping_mul(a_nb1)
+                .wrapping_add(na.wrapping_mul(elem_size)),
+            128,
+        );
+        if nb == 0 {
+            span1 = 0;
+            region_size = v1;
+        } else if b_dense {
+            span1 = elem_size;
+            region_size = v1
+                .wrapping_add((nr_max - 1).wrapping_mul(b_nb1))
+                .wrapping_add(nb.wrapping_mul(elem_size));
+        } else {
+            span1 = (nr_max - 1).wrapping_mul(b_nb1).wrapping_add(elem_size);
+            region_size = v1.wrapping_add(nb.wrapping_mul(span1));
+        }
+        let total = gather_rows_slice_bytes(vg, region_size, nr_max, ne, elem_size);
+        if (elem_size != 2 || region_size <= 32768) && total <= u64::from(slice) {
+            break;
+        }
+        nr_max -= rg;
+    }
+    if nr_max == 0 {
+        return None;
+    }
+
+    Some(GatherRowsPlan {
+        na,
+        nb,
+        ne,
+        rg,
+        vg,
+        nr_max,
+        v1,
+        span1,
+        region_size,
+        slice,
+        total_rows,
+        rows_per_thread,
+        b_dense,
+    })
+}
+
+/// Words per `htp_copy_transpose_params` in the blob.
+const COPY_TRANSPOSE_WORDS: usize = 25;
+/// Words before the kernel union of `htp_copy_kernel_params`.
+const COPY_HEADER_WORDS: usize = 4;
+
 const COPY_KERNEL_1D_CONTIG: u32 = 1;
 const COPY_KERNEL_SAMESHAPE_SAMETYPE: u32 = 2;
 const COPY_KERNEL_SAMESHAPE_CONVERT: u32 = 3;
 const COPY_KERNEL_RESHAPE: u32 = 4;
 const COPY_KERNEL_SCALAR: u32 = 5;
+const COPY_KERNEL_GATHER_ROWS: u32 = 6;
+const COPY_KERNEL_TRANSPOSE: u32 = 7;
 
-/// Kernel parameters for a `Cpy`: port of `ggml_hexagon_precompute_cpy_params` and of
-/// `htp_copy_kernel_params` / `htp_copy_convert_vtcm_layout_build` (`cpy-ops.h`).
+/// Bytes of one VTCM staging buffer of the convert copy (`HTP_COPY_VTCM_BLK_BYTES`).
+const COPY_VTCM_BLK_BYTES: u32 = 32 * 1024;
+/// Largest staging buffer of the transposing copy (`HTP_COPY_TRANSPOSE_BLK_BYTES`).
+const COPY_TRANSPOSE_BLK_BYTES: u32 = 64 * 1024;
+
+/// `htp_copy_transpose_params` (`cpy-ops.h`): a batched 2-D transpose of `elem_size`-byte
+/// elements, dim 0 dense in the destination and dim 1 dense in the source, tiled through VTCM.
+#[derive(Debug, Clone, Copy, Default)]
+struct CopyTranspose {
+    ne: [u32; 3],
+    src_nb: [u32; 3],
+    dst_nb: [u32; 3],
+    div_nkb: FastDivValues,
+    div_n0b: FastDivValues,
+    div_ne2: FastDivValues,
+    blk0: u32,
+    blkk: u32,
+    n0b: u32,
+    nkb: u32,
+    in_stride: u32,
+    out_stride: u32,
+    in_buf_size: u32,
+    out_buf_size: u32,
+    total_tiles: u32,
+    elem_size: u8,
+    packed: bool,
+    log2_m: u8,
+    log2_r: u8,
+}
+
+impl CopyTranspose {
+    fn write(&self, out: &mut [i32]) {
+        let words: [u32; COPY_TRANSPOSE_WORDS] = [
+            self.ne[0],
+            self.ne[1],
+            self.ne[2],
+            self.src_nb[0],
+            self.src_nb[1],
+            self.src_nb[2],
+            self.dst_nb[0],
+            self.dst_nb[1],
+            self.dst_nb[2],
+            self.div_nkb.mp,
+            self.div_nkb.l,
+            self.div_n0b.mp,
+            self.div_n0b.l,
+            self.div_ne2.mp,
+            self.div_ne2.l,
+            self.blk0,
+            self.blkk,
+            self.n0b,
+            self.nkb,
+            self.in_stride,
+            self.out_stride,
+            self.in_buf_size,
+            self.out_buf_size,
+            self.total_tiles,
+            u32::from_le_bytes([
+                self.elem_size,
+                u8::from(self.packed),
+                self.log2_m,
+                self.log2_r,
+            ]),
+        ];
+        for (o, w) in out.iter_mut().zip(words) {
+            *o = w as i32;
+        }
+    }
+
+    /// Port of `htp_copy_transpose_layout_build`: the tile (`blk0` x `blkk` elements) for a
+    /// staging buffer of `blk_bytes`, or `false` when not even one vector fits.
+    fn layout_build(&mut self, blk_bytes: u32) -> bool {
+        let (ne0, nek, es) = (self.ne[0], self.ne[1], u32::from(self.elem_size));
+        let epv = 128 / es;
+        let (blk0, blkk);
+        if self.packed {
+            // a vector holds epv / ne0 whole destination rows
+            blk0 = ne0;
+            let Some(mut k) = blk_bytes.checked_div(ne0.wrapping_mul(es)) else {
+                return false;
+            };
+            if es == 2 {
+                let cap = (16384u32.checked_div(ne0).unwrap_or(0)).wrapping_sub(64);
+                if k > cap {
+                    k = cap;
+                }
+            }
+            if k > nek {
+                k = nek;
+            }
+            if k == 0 {
+                return false;
+            }
+            blkk = k;
+        } else if nek <= epv {
+            // a short contiguous dim is staged whole and dim 0 is expanded
+            blkk = nek;
+            let Some(mut b) = blk_bytes.checked_div(nek.wrapping_mul(es)) else {
+                return false;
+            };
+            b -= b % epv;
+            if b > hex_round_up(ne0, epv) {
+                b = hex_round_up(ne0, epv);
+            }
+            if b < epv {
+                return false;
+            }
+            blk0 = b;
+        } else {
+            let mut b0 = hex_round_up(ne0, epv);
+            if b0 > 256 {
+                b0 = 256;
+            }
+            let Some(mut k) = blk_bytes.checked_div(b0.wrapping_mul(es)) else {
+                return false;
+            };
+            k -= k % epv;
+            // f16 gather offsets are 16 bits wide
+            let max_blkk = (if es == 2 { 512 } else { 4096 }) / es;
+            if k > max_blkk {
+                k = max_blkk;
+            }
+            if k > hex_round_up(nek, epv) {
+                k = hex_round_up(nek, epv);
+            }
+            if k < epv {
+                return false;
+            }
+            blk0 = b0;
+            blkk = k;
+        }
+
+        self.blk0 = blk0;
+        self.blkk = blkk;
+        self.n0b = ne0.wrapping_add(blk0).wrapping_sub(1) / blk0;
+        self.nkb = nek.wrapping_add(blkk).wrapping_sub(1) / blkk;
+        // one element of row padding keeps the staged rows off one VTCM bank
+        let pad = if es == 2 { 2 } else { 4 };
+        self.in_stride = blkk.wrapping_mul(es).wrapping_add(pad);
+        self.out_stride = blk0.wrapping_mul(es);
+        // a packed gather overhangs by one vector
+        self.in_buf_size = hex_round_up(
+            blk0.wrapping_mul(self.in_stride)
+                .wrapping_add(if self.packed { 128 } else { 0 }),
+            128,
+        );
+        self.out_buf_size = hex_round_up(blkk.wrapping_mul(self.out_stride), 128);
+        self.log2_m = if es == 2 {
+            0
+        } else {
+            (es.trailing_zeros() - 2) as u8
+        };
+        self.log2_r = (if self.packed { ne0 } else { epv }).trailing_zeros() as u8;
+        true
+    }
+}
+
+/// A transposing `Cpy`: port of `htp_kparams_solve_cpy_transpose` (a permuted copy whose dim 0
+/// is strided on one side, such as channel-first to channel-last). Returns the plan and the
+/// VTCM bytes it takes, or `None` when the strides are not one of the transposes the kernel
+/// tiles.
+fn copy_transpose_plan(
+    src0: &CopyTensor,
+    dst: &CopyTensor,
+    type_size: u64,
+    n_threads: u32,
+    vtcm_size: u64,
+) -> Option<(CopyTranspose, u64)> {
+    // a contiguous dst is viewed with the src shape, which is how a reshaping copy is handled
+    let dst_cont = dst.is_contiguous(dst.type_size()?);
+    if !dst_cont && src0.ne != dst.ne {
+        return None;
+    }
+
+    // drop size-1 dims and merge dims adjacent in both tensors
+    let (mut ne, mut nbs, mut nbd) = ([0u64; 4], [0u64; 4], [0u64; 4]);
+    let mut dst_stride = type_size;
+    let mut n = 0usize;
+    for d in 0..4 {
+        let sd = if dst_cont {
+            dst_stride
+        } else {
+            u64::from(dst.nb[d])
+        };
+        dst_stride = dst_stride.wrapping_mul(u64::from(src0.ne[d]));
+        if src0.ne[d] == 1 {
+            continue;
+        }
+        if n > 0
+            && u64::from(src0.nb[d]) == nbs[n - 1].wrapping_mul(ne[n - 1])
+            && sd == nbd[n - 1].wrapping_mul(ne[n - 1])
+        {
+            ne[n - 1] = ne[n - 1].wrapping_mul(u64::from(src0.ne[d]));
+            continue;
+        }
+        ne[n] = u64::from(src0.ne[d]);
+        nbs[n] = u64::from(src0.nb[d]);
+        nbd[n] = sd;
+        n += 1;
+    }
+
+    // fold the leading dense dim into the element block
+    let mut es = type_size;
+    for i in 0..n {
+        if nbs[i] == type_size && nbd[i] == type_size {
+            es = es.wrapping_mul(ne[i]);
+            for j in i..n - 1 {
+                ne[j] = ne[j + 1];
+                nbs[j] = nbs[j + 1];
+                nbd[j] = nbd[j + 1];
+            }
+            n -= 1;
+            break;
+        }
+    }
+    if es > 128 || es & es.wrapping_sub(1) != 0 {
+        return None;
+    }
+
+    // the transpose axes: `a` is dense in dst, `k` is dense in src
+    let (mut a, mut k) = (None, None);
+    for i in 0..n {
+        if a.is_none() && nbd[i] == es {
+            a = Some(i);
+        }
+        if k.is_none() && nbs[i] == es {
+            k = Some(i);
+        }
+    }
+    let (a, k) = (a?, k?);
+    if a == k {
+        return None;
+    }
+
+    let mut tp = CopyTranspose {
+        elem_size: es as u8,
+        ne: [ne[a] as u32, ne[k] as u32, 1],
+        ..CopyTranspose::default()
+    };
+    tp.src_nb[0] = nbs[a] as u32;
+    tp.dst_nb[0] = nbd[k] as u32;
+    let row_bytes = ne[a].wrapping_mul(es);
+    tp.packed = nbd[k] == row_bytes && row_bytes < 128 && row_bytes != 0 && 128 % row_bytes == 0;
+
+    let mut ne3 = 1u64;
+    let mut m = 0usize;
+    for i in 0..n {
+        if i == a || i == k {
+            continue;
+        }
+        if m == 0 {
+            tp.ne[2] = ne[i] as u32;
+        } else {
+            ne3 = ne[i];
+        }
+        tp.src_nb[1 + m] = nbs[i] as u32;
+        tp.dst_nb[1 + m] = nbd[i] as u32;
+        m += 1;
+    }
+
+    // halve the staging buffers until every thread's double-buffered tile pair fits
+    let mut blk_bytes = COPY_TRANSPOSE_BLK_BYTES;
+    let vtcm = loop {
+        if !tp.layout_build(blk_bytes) {
+            return None;
+        }
+        let vtcm = u64::from(n_threads)
+            .wrapping_mul(2)
+            .wrapping_mul(u64::from(tp.in_buf_size.wrapping_add(tp.out_buf_size)));
+        if vtcm <= vtcm_size {
+            break vtcm;
+        }
+        blk_bytes /= 2;
+    };
+
+    let total_tiles = u64::from(tp.n0b)
+        .wrapping_mul(u64::from(tp.nkb))
+        .wrapping_mul(u64::from(tp.ne[2]))
+        .wrapping_mul(ne3);
+    if total_tiles > u64::from(u32::MAX) {
+        return None;
+    }
+    tp.total_tiles = total_tiles as u32;
+    tp.div_nkb = init_fastdiv(tp.nkb);
+    tp.div_n0b = init_fastdiv(tp.n0b);
+    tp.div_ne2 = init_fastdiv(tp.ne[2]);
+    Some((tp, vtcm))
+}
+
+/// Kernel parameters for a `Cpy`: port of `htp_kparams_solve_cpy` (`htp-kparams.cpp`) with
+/// `htp_copy_kernel_params` and its layout helpers (`cpy-ops.h`, `gather-rows.h`). The session is
+/// one device (`mdev_count == 1`).
 ///
 /// The DSP's `op_cpy` has no fallback: it dispatches on `kernel_type` and answers
 /// `HTP_STATUS_NO_SUPPORT` for 0, so a copy sent with empty params fails. `None` means the
 /// pair is not a copy the kernels handle (the C++ host runs such a node on the CPU).
-/// `n_threads == 0` means "unknown" and takes the host's default of 4; `vtcm_bytes == 0` skips
-/// the VTCM fit check, as the host does.
+/// `n_threads == 0` means "unknown" and takes the host's default of 4 where the kernel allows
+/// it; `vtcm_bytes == 0` skips the VTCM fit check of the convert kernel, as the host does.
 ///
 /// Words (`htp_copy_kernel_params`): 0 = `kernel_type | src0_type_size << 8 | dst_type_size << 16
 /// | n_threads << 24`, 1 `total_elems`, 2 `total_rows`, 3 `vtcm_size`, then the union from word 4:
-/// convert = `src0_buf_size, dst_buf_size, spad0_size_per_thread, spad1_size_per_thread,
-/// div_ne01, div_ne02_ne01`; reshape = `div_ne0, div_ne1_ne0, div_ne2_ne1_ne0, div_ne00,
-/// div_ne01_ne00, div_ne02_ne01_ne00` (each divider is `mp, l`).
+/// convert = `blk_rows, div_ne01, div_ne02_ne01`; reshape = `div_ne0, div_ne1_ne0,
+/// div_ne2_ne1_ne0, div_ne00, div_ne01_ne00, div_ne02_ne01_ne00` (each divider is `mp, l`);
+/// gather = a `GatherRowsPlan`; transpose = a `CopyTranspose` (both in their struct order).
 pub fn build_copy_kernel_params(
     src: &CopyTensor,
     dst: &CopyTensor,
@@ -3017,32 +3539,37 @@ pub fn build_copy_kernel_params(
     if Some(nelem) != dst.nelements() {
         return None;
     }
-    let pack = |kernel: u32, threads: u32| -> u32 {
-        kernel
+    let pack = |kernel: u32, threads: u32| -> i32 {
+        (kernel
             | ((src_ts as u32) << 8)
             | ((dst_ts as u32) << 16)
-            | ((wire_byte(threads as usize) as u32) << 24)
+            | ((wire_byte(threads as usize) as u32) << 24)) as i32
     };
     let mut k = [0i32; 32];
     k[1] = nelem as u32 as i32; // total_elems
 
     if nelem == 0 {
-        k[0] = pack(COPY_KERNEL_1D_CONTIG, 0) as i32;
+        k[0] = pack(COPY_KERNEL_1D_CONTIG, 0);
         return Some(k);
     }
     if nelem == 1 {
+        let (f32t, f16t, i32t) = (
+            HtpDataType::F32 as u32,
+            HtpDataType::F16 as u32,
+            HtpDataType::I32 as u32,
+        );
         let ok = src.dtype == dst.dtype
             || matches!(
                 (src.dtype, dst.dtype),
-                (a, b) if (a == HtpDataType::F32 as u32 && b == HtpDataType::I32 as u32)
-                    || (a == HtpDataType::I32 as u32 && b == HtpDataType::F32 as u32)
-                    || (a == HtpDataType::F32 as u32 && b == HtpDataType::F16 as u32)
-                    || (a == HtpDataType::F16 as u32 && b == HtpDataType::F32 as u32)
+                (a, b) if (a == f32t && b == i32t)
+                    || (a == i32t && b == f32t)
+                    || (a == f32t && b == f16t)
+                    || (a == f16t && b == f32t)
             );
         if !ok {
             return None;
         }
-        k[0] = pack(COPY_KERNEL_SCALAR, 0) as i32;
+        k[0] = pack(COPY_KERNEL_SCALAR, 0);
         return Some(k);
     }
 
@@ -3055,35 +3582,78 @@ pub fn build_copy_kernel_params(
         || u64::from(src.nb[1]) < u64::from(src.ne[0]) * src_ts
         || u64::from(dst.nb[1]) < u64::from(dst.ne[0]) * dst_ts;
     let sameshape = same_extents && !transposed;
+    let src_cont = src.is_contiguous(src_ts);
+    let dst_cont = dst.is_contiguous(dst_ts);
     let rows = (u64::from(src.ne[1]) * u64::from(src.ne[2]) * u64::from(src.ne[3])) as u32;
-    let threads = if n_threads > 0 { n_threads } else { 4 };
+    // the C narrows the byte budget to 32 bits wherever it hands it to a gather plan
+    let vtcm_size = vtcm_bytes as u64;
 
     if sametype {
-        if src.is_contiguous(src_ts) && dst.is_contiguous(dst_ts) {
-            k[0] = pack(COPY_KERNEL_1D_CONTIG, 0) as i32;
+        if src_cont && dst_cont {
+            k[0] = pack(COPY_KERNEL_1D_CONTIG, 0);
             return Some(k);
         }
+
+        let (f32t, f16t) = (HtpDataType::F32 as u32, HtpDataType::F16 as u32);
+        if (src.dtype == f32t || src.dtype == f16t)
+            && dst_cont
+            && !src_cont
+            && u64::from(src.nb[0]) == src_ts
+            && u64::from(src.ne[0]) <= 128 / src_ts
+            && u64::from(src.nb[1]) >= u64::from(src.ne[0]) * src_ts
+            && rows > 1
+            && gather_rows_outer_contiguous(src)
+            && let Some(plan) = gather_rows_solve_layout(
+                src.ne[0],
+                src.nb[1],
+                0,
+                0,
+                false,
+                src_ts as u32,
+                rows,
+                n_threads,
+                1,
+                vtcm_bytes as u32,
+            )
+        {
+            k[0] = pack(COPY_KERNEL_GATHER_ROWS, n_threads);
+            k[3] = plan.slice.wrapping_mul(n_threads) as i32;
+            plan.write(&mut k[COPY_HEADER_WORDS..]);
+            return Some(k);
+        }
+
+        if let Some((tp, vtcm)) = copy_transpose_plan(src, dst, src_ts, n_threads, vtcm_size) {
+            k[0] = pack(COPY_KERNEL_TRANSPOSE, n_threads);
+            k[3] = vtcm as u32 as i32;
+            tp.write(&mut k[COPY_HEADER_WORDS..]);
+            return Some(k);
+        }
+
         if sameshape {
-            k[0] = pack(COPY_KERNEL_SAMESHAPE_SAMETYPE, 0) as i32;
+            k[0] = pack(COPY_KERNEL_SAMESHAPE_SAMETYPE, 0);
             k[2] = rows as i32;
             return Some(k);
         }
-        k[0] = pack(COPY_KERNEL_RESHAPE, threads) as i32;
-        let d = |x: u64| init_fastdiv(x as u32);
-        let n = |t: &CopyTensor, upto: usize| -> u64 {
-            t.ne[..upto].iter().map(|&v| u64::from(v)).product()
+        k[0] = pack(
+            COPY_KERNEL_RESHAPE,
+            if n_threads > 0 { n_threads } else { 4 },
+        );
+        let prod = |t: &CopyTensor, upto: usize| -> u32 {
+            t.ne[..upto]
+                .iter()
+                .fold(1u64, |acc, &v| acc.wrapping_mul(u64::from(v))) as u32
         };
         let dividers = [
-            d(n(dst, 1)),
-            d(n(dst, 2)),
-            d(n(dst, 3)),
-            d(n(src, 1)),
-            d(n(src, 2)),
-            d(n(src, 3)),
+            init_fastdiv(prod(dst, 1)),
+            init_fastdiv(prod(dst, 2)),
+            init_fastdiv(prod(dst, 3)),
+            init_fastdiv(prod(src, 1)),
+            init_fastdiv(prod(src, 2)),
+            init_fastdiv(prod(src, 3)),
         ];
         for (i, v) in dividers.iter().enumerate() {
-            k[4 + 2 * i] = v.mp as i32;
-            k[5 + 2 * i] = v.l as i32;
+            k[COPY_HEADER_WORDS + 2 * i] = v.mp as i32;
+            k[COPY_HEADER_WORDS + 1 + 2 * i] = v.l as i32;
         }
         return Some(k);
     }
@@ -3107,43 +3677,58 @@ pub fn build_copy_kernel_params(
         return None;
     }
 
-    // htp_copy_convert_vtcm_layout_build
-    let round256 = |x: u64| x.next_multiple_of(256);
-    let src_buf = round256(u64::from(src.ne[0]) * src_ts);
-    let dst_buf = round256(u64::from(dst.ne[0]) * dst_ts);
-    let spad0 = 2 * src_buf;
-    let spad1 = 2 * dst_buf;
-    let total = u64::from(threads) * (spad0 + spad1);
-    if vtcm_bytes > 0 && total > vtcm_bytes as u64 {
+    // htp_copy_convert_solve_layout
+    let nth = if n_threads > 0 { n_threads } else { 4 };
+    let src_row_stride = hex_round_up((src.ne[0] as u64 * src_ts) as u32, 256);
+    let dst_row_stride = hex_round_up((src.ne[0] as u64 * dst_ts) as u32, 256);
+    let mut blk_rows = COPY_VTCM_BLK_BYTES
+        .checked_div(src_row_stride.max(dst_row_stride))
+        .unwrap_or(0);
+    if blk_rows > src.ne[1] {
+        blk_rows = src.ne[1];
+    }
+    if blk_rows == 0 {
+        blk_rows = 1;
+    }
+    // htp_copy_convert_vtcm_layout_build: two buffers per thread on each side
+    let spad0 = 2u32.wrapping_mul(blk_rows.wrapping_mul(src_row_stride));
+    let spad1 = 2u32.wrapping_mul(blk_rows.wrapping_mul(dst_row_stride));
+    let total = u64::from(nth) * u64::from(spad0) + u64::from(nth) * u64::from(spad1);
+    if vtcm_size > 0 && total > vtcm_size {
         return None;
     }
-    k[0] = pack(COPY_KERNEL_SAMESHAPE_CONVERT, threads) as i32;
+
+    k[0] = pack(COPY_KERNEL_SAMESHAPE_CONVERT, nth);
     k[2] = rows as i32;
     k[3] = total as u32 as i32;
-    k[4] = src_buf as u32 as i32;
-    k[5] = dst_buf as u32 as i32;
-    k[6] = spad0 as u32 as i32;
-    k[7] = spad1 as u32 as i32;
+    k[COPY_HEADER_WORDS] = blk_rows as i32;
     let div_ne01 = init_fastdiv(src.ne[1]);
     let div_ne02_ne01 = init_fastdiv((u64::from(src.ne[2]) * u64::from(src.ne[1])) as u32);
-    k[8] = div_ne01.mp as i32;
-    k[9] = div_ne01.l as i32;
-    k[10] = div_ne02_ne01.mp as i32;
-    k[11] = div_ne02_ne01.l as i32;
+    k[5] = div_ne01.mp as i32;
+    k[6] = div_ne01.l as i32;
+    k[7] = div_ne02_ne01.mp as i32;
+    k[8] = div_ne02_ne01.l as i32;
     Some(k)
 }
 
 const CONCAT_KERNEL_REGULAR: u32 = 1;
 const CONCAT_KERNEL_TRANSPOSED: u32 = 2;
+const CONCAT_KERNEL_GATHER_ROWS: u32 = 3;
 
 /// Kernel parameters for a `Concat` along `dim` (`op_params[0]`): port of
-/// `ggml_hexagon_precompute_concat_params` and `htp_concat_transposed_vtcm_layout_build`
-/// (`concat-ops.h`). `None` when the operands are not a concat the kernels handle.
+/// `htp_kparams_solve_concat` (`htp-kparams.cpp`) with `htp_concat_kernel_params`,
+/// `htp_concat_transposed_vtcm_layout_build` (`concat-ops.h`) and the gather-rows plan
+/// (`gather-rows.h`). The session is one device (`mdev_count == 1`). `None` when the operands
+/// are not a concat the kernels handle.
+///
+/// Three kernels: the gather-rows one for a dim-0 join into short rows (such as a conv state
+/// ahead of the new positions), the regular one when every operand is dense along dim 0 (a DMA
+/// per row, one thread), and the transposed one for a transposed `src1` joined along dim 0.
 ///
 /// Words (`htp_concat_kernel_params`): 0 = `kernel_type | dim << 8 | n_threads << 16`,
-/// 1 `vtcm_size`, 2 `spad0_size_per_thread`, 3 `spad1_size_per_thread`. The regular kernel runs
-/// one thread; the transposed one (a transposed `src1` joined along dim 0) takes `n_threads`
-/// (0 means unknown, which the host defaults to 8) and a VTCM working set.
+/// 1 `vtcm_size`, then the union from word 2: transposed = `div_ne2` (`mp, l`); gather = a
+/// `GatherRowsPlan`. The transposed kernel takes `n_threads` (0 means unknown, which the host
+/// defaults to 8) and a VTCM working set.
 pub fn build_concat_kernel_params(
     src0: &CopyTensor,
     src1: &CopyTensor,
@@ -3177,13 +3762,51 @@ pub fn build_concat_kernel_params(
         }
     }
     let pack = |kernel: u32, threads: u32| {
-        kernel | ((d as u32) << 8) | ((wire_byte(threads as usize) as u32) << 16)
+        (kernel | ((d as u32) << 8) | ((wire_byte(threads as usize) as u32) << 16)) as i32
     };
     let mut k = [0i32; 32];
 
     let nb0 = |t: &CopyTensor| u64::from(t.nb[0]);
+    let total_rows = (u64::from(dst.ne[1]) * u64::from(dst.ne[2]) * u64::from(dst.ne[3])) as u32;
+    let b_dense = nb0(src1) == ts;
+    let gather_strides_ok = u64::from(src0.nb[1]) >= u64::from(src0.ne[0]) * ts
+        && if b_dense {
+            u64::from(src1.nb[1]) >= u64::from(src1.ne[0]) * ts
+        } else {
+            u64::from(src1.nb[0]) >= u64::from(src1.ne[1]) * ts
+        };
+    if d == 0
+        && dst.dtype != i32t
+        && u64::from(dst.ne[0]) <= 128 / ts
+        && nb0(dst) == ts
+        && u64::from(dst.nb[1]) == u64::from(dst.ne[0]) * ts
+        && nb0(src0) == ts
+        && (nb0(src1) == ts || u64::from(src1.nb[1]) == ts)
+        && gather_strides_ok
+        && gather_rows_outer_contiguous(dst)
+        && gather_rows_outer_contiguous(src0)
+        && gather_rows_outer_contiguous(src1)
+        && let Some(plan) = gather_rows_solve_layout(
+            src0.ne[0],
+            src0.nb[1],
+            src1.ne[0],
+            src1.nb[1],
+            b_dense,
+            ts as u32,
+            total_rows,
+            n_threads,
+            1,
+            vtcm_bytes as u32,
+        )
+    {
+        k[0] = pack(CONCAT_KERNEL_GATHER_ROWS, n_threads);
+        k[1] = plan.slice.wrapping_mul(n_threads) as i32;
+        plan.write(&mut k[2..]);
+        return Some(k);
+    }
+
     if nb0(src0) == ts && nb0(src1) == ts && nb0(dst) == ts {
-        k[0] = pack(CONCAT_KERNEL_REGULAR, 1) as i32;
+        k[0] = pack(CONCAT_KERNEL_REGULAR, 1);
         return Some(k);
     }
 
@@ -3192,22 +3815,30 @@ pub fn build_concat_kernel_params(
     let rows_ok = nb0(src0) == ts && u64::from(src1.nb[1]) == ts && nb0(dst) == ts;
     if d == 0 && src1_transposed && !src0_transposed && rows_ok && dst.dtype != i32t {
         let threads = if n_threads > 0 { n_threads } else { 8 };
-        // htp_concat_transposed_vtcm_layout_build
-        let block_i: u64 = if ts == 4 { 32 } else { 64 };
-        let spad1_stride = block_i * ts;
-        let src1_ne0_padded = u64::from(src1.ne[0]).next_multiple_of(block_i);
-        let spad0_row_bytes =
-            (u64::from(src0.ne[0]) * ts).next_multiple_of(128) + src1_ne0_padded * ts;
-        let spad0 = block_i * spad0_row_bytes;
-        let spad1 = src1_ne0_padded * spad1_stride;
-        let total = u64::from(threads) * (spad0 + spad1);
-        if vtcm_bytes > 0 && total > vtcm_bytes as u64 {
+        // htp_concat_transposed_vtcm_layout_build: src1 is consumed in blocks of tokens, so the
+        // working set does not grow with the batch; both sides are double-buffered
+        let ts32 = ts as u32;
+        let block_rows = 128u32;
+        let block_cols = if ts32 == 4 { 256u32 } else { 512 };
+        let spad1_stride = (block_rows * ts32).wrapping_add(ts32);
+        let block_cols_padded =
+            hex_round_up(src1.ne[0], if ts32 == 4 { 32 } else { 64 }).min(block_cols);
+        let spad0_row_bytes = hex_round_up(src0.ne[0].wrapping_mul(ts32), 128)
+            .wrapping_add(block_cols_padded.wrapping_mul(ts32));
+        let spad0 = 2u32.wrapping_mul(block_rows).wrapping_mul(spad0_row_bytes);
+        let spad1 = 2u32
+            .wrapping_mul(block_cols_padded)
+            .wrapping_mul(spad1_stride);
+        let total =
+            (u64::from(threads) * u64::from(spad0) + u64::from(threads) * u64::from(spad1)) as u32;
+        if vtcm_bytes > 0 && u64::from(total) > vtcm_bytes as u64 {
             return None;
         }
-        k[0] = pack(CONCAT_KERNEL_TRANSPOSED, threads) as i32;
-        k[1] = total as u32 as i32;
-        k[2] = spad0 as u32 as i32;
-        k[3] = spad1 as u32 as i32;
+        k[0] = pack(CONCAT_KERNEL_TRANSPOSED, threads);
+        k[1] = total as i32;
+        let div_ne2 = init_fastdiv(dst.ne[2]);
+        k[2] = div_ne2.mp as i32;
+        k[3] = div_ne2.l as i32;
         return Some(k);
     }
     None
@@ -3299,36 +3930,24 @@ mod tests {
         );
     }
 
-    /// Every case of `testdata/ssm_conv_golden.txt` (llama.cpp's own
-    /// `ggml_hexagon_precompute_ssm_conv_params`): the scalar and tiled branches, thread counts
-    /// and VTCM budgets from 64 KiB to unknown.
+    /// Every case of `testdata/ssm_conv_golden.txt`: llama.cpp's real `htp_kparams_solve` for an
+    /// `SSM_CONV` (compiled and run by `scripts/hexagon-golden/gen.py`): the decode and the tiled
+    /// prefill kernels, tap counts up to the limit, session thread counts and VTCM budgets from
+    /// 64 KiB to none, and the operands it refuses.
     #[test]
     fn ssm_conv_kernel_params_match_the_llama_cpp_host_code() {
-        let golden = include_str!("testdata/ssm_conv_golden.txt");
-        let mut cases = 0usize;
-        for line in golden
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-        {
-            let (inputs, want) = line.split_once("=>").unwrap();
-            let (shape, run) = inputs.split_once('|').unwrap();
-            let v: Vec<usize> = shape
-                .split_whitespace()
-                .map(|x| x.parse().unwrap())
-                .collect();
-            let mut run = run.split_whitespace();
-            let threads: u32 = run.next().unwrap().parse().unwrap();
-            let vtcm: usize = run.next().unwrap().parse().unwrap();
-            let mut words: Vec<i32> = want
-                .split_whitespace()
-                .map(|w| w.parse::<u32>().unwrap() as i32)
-                .collect();
-            words.resize(32, 0);
-            let got = build_ssm_conv_kernel_params(v[0], v[1], v[2], v[3], v[4], threads, vtcm);
-            assert_eq!(got.to_vec(), words, "{line}");
+        let (mut cases, mut unsupported) = (0usize, 0usize);
+        for (line, t, run, want) in golden_cases(include_str!("testdata/ssm_conv_golden.txt"), 3) {
+            let got =
+                build_ssm_conv_kernel_params(&t[0], &t[1], &t[2], run[0] as u32, run[1] as usize);
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
             cases += 1;
+            unsupported += usize::from(want.is_none());
         }
-        assert!(cases > 3000, "golden file looks truncated: {cases} cases");
+        assert!(
+            cases > 6000 && unsupported > 2000,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported"
+        );
     }
 
     /// Parse `ne0..3 nb0..3` after a type id, from a golden-file side.
@@ -3340,44 +3959,177 @@ mod tests {
         CopyTensor { dtype, ne, nb }
     }
 
-    /// Every case of `testdata/concat_golden.txt` (llama.cpp's own
-    /// `ggml_hexagon_precompute_concat_params`, compiled by `scripts/hexagon-golden/gen.py`).
+    /// The cases of a `scripts/hexagon-golden` file whose lines hold `n_tensors` tensors, then
+    /// the run fields (`|`-separated) and the words after `=>`: `(line, tensors, run fields,
+    /// words)`. The words are `None` for `unsupported`; the file omits trailing zeros of the
+    /// 32-word blob, which are restored here.
+    #[allow(clippy::type_complexity)]
+    fn golden_cases(
+        text: &'static str,
+        n_tensors: usize,
+    ) -> impl Iterator<Item = (&'static str, Vec<CopyTensor>, Vec<i64>, Option<Vec<i32>>)> {
+        text.lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(move |line| {
+                let (inputs, want) = line.split_once("=>").unwrap();
+                let mut sides = inputs.split('|');
+                let tensors = (0..n_tensors)
+                    .map(|_| golden_tensor(&mut sides.next().unwrap().split_whitespace()))
+                    .collect();
+                let run = sides
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .map(|v| v.parse().unwrap())
+                    .collect();
+                let want = want.trim();
+                let words = (want != "unsupported").then(|| {
+                    let mut words: Vec<i32> = want
+                        .split_whitespace()
+                        .map(|w| w.parse::<u32>().unwrap() as i32)
+                        .collect();
+                    words.resize(32, 0);
+                    words
+                });
+                (line, tensors, run, words)
+            })
+    }
+
+    /// The window, taps and output tensors of a dense `SsmConv`.
+    fn ssm_conv_tensors(d_conv: u32, d_inner: u32, n_t: u32, n_s: u32) -> [CopyTensor; 3] {
+        let f32t = HtpDataType::F32 as u32;
+        let dense = |ne: [u32; 4]| CopyTensor {
+            dtype: f32t,
+            ne,
+            nb: [4, ne[0] * 4, ne[0] * ne[1] * 4, ne[0] * ne[1] * ne[2] * 4],
+        };
+        [
+            dense([d_conv - 1 + n_t, d_inner, n_s, 1]),
+            dense([d_conv, d_inner, 1, 1]),
+            dense([d_inner, n_t, n_s, 1]),
+        ]
+    }
+
+    /// Every case of `testdata/concat_golden.txt`: llama.cpp's real `htp_kparams_solve` for a
+    /// `CONCAT` (compiled and run by `scripts/hexagon-golden/gen.py`): the regular, transposed
+    /// and gather-rows kernels over every dim, dtype and operand layout, session thread counts
+    /// and VTCM budgets, and the joins it refuses.
     #[test]
     fn concat_kernel_params_match_the_llama_cpp_host_code() {
-        let golden = include_str!("testdata/concat_golden.txt");
         let (mut cases, mut unsupported) = (0usize, 0usize);
-        for line in golden
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-        {
-            let (inputs, want) = line.split_once("=>").unwrap();
-            let mut sides = inputs.split('|');
-            let a = golden_tensor(&mut sides.next().unwrap().split_whitespace());
-            let b = golden_tensor(&mut sides.next().unwrap().split_whitespace());
-            let d = golden_tensor(&mut sides.next().unwrap().split_whitespace());
-            let mut run = sides.next().unwrap().split_whitespace();
-            let dim: i32 = run.next().unwrap().parse().unwrap();
-            let threads: u32 = run.next().unwrap().parse().unwrap();
-            let vtcm: usize = run.next().unwrap().parse().unwrap();
-            let got = build_concat_kernel_params(&a, &b, &d, dim, threads, vtcm);
-            let want = want.trim();
-            if want == "unsupported" {
-                assert_eq!(got, None, "{line}");
-                unsupported += 1;
-            } else {
-                // the golden file keeps the first 8 words of the blob; the rest must be zero
-                let mut words: Vec<i32> = want
-                    .split_whitespace()
-                    .map(|w| w.parse::<u32>().unwrap() as i32)
-                    .collect();
-                words.resize(32, 0);
-                assert_eq!(got.map(|k| k.to_vec()), Some(words), "{line}");
-            }
+        let mut kernels = [0usize; 4];
+        for (line, t, run, want) in golden_cases(include_str!("testdata/concat_golden.txt"), 3) {
+            let got = build_concat_kernel_params(
+                &t[0],
+                &t[1],
+                &t[2],
+                run[0] as i32,
+                run[1] as u32,
+                run[2] as usize,
+            );
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
             cases += 1;
+            unsupported += usize::from(want.is_none());
+            if let Some(w) = &want {
+                kernels[(w[0] & 0xff) as usize] += 1;
+            }
         }
         assert!(
-            cases > 2000 && unsupported > 100,
-            "golden file looks truncated: {cases} cases"
+            cases > 10000 && unsupported > 4000,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported"
+        );
+        // every kernel stays reachable from the table: regular, transposed, gather rows
+        assert!(
+            kernels[1] > 3000 && kernels[2] > 1000 && kernels[3] > 1500,
+            "kernel mix {kernels:?}"
+        );
+    }
+
+    /// The copies and joins cera's graphs issue pick the kernels the firmware was built for (the
+    /// golden tables pin every word; this pins why a graph shape lands on a kernel). Kernel type
+    /// is the low byte of word 0.
+    #[test]
+    fn cera_graph_shapes_pick_the_expected_copy_and_concat_kernels() {
+        let (f32t, f16t) = (HtpDataType::F32 as u32, HtpDataType::F16 as u32);
+        let view = |dtype: u32, ne0: u32, ne1: u32, nb0: u32, nb1: u32| {
+            let span = (ne0 - 1) * nb0 + (ne1 - 1) * nb1 + 4;
+            CopyTensor {
+                dtype,
+                ne: [ne0, ne1, 1, 1],
+                nb: [nb0, nb1, span, span],
+            }
+        };
+        let kernel = |k: Option<[i32; 32]>| k.map(|w| w[0] as u32 & 0xff);
+        let (hs, threads, vtcm) = (1024u32, 8, 8 << 20);
+
+        // LFM2's conv-state prepend, `[2, hs]` state rows + bx as a transposed `[m, hs]` view: the
+        // gather-rows kernel while the joined row is at most 32 floats, the transposed worker past it
+        for (m, want) in [(1, 3), (8, 3), (30, 3), (31, 2), (32, 2), (128, 2)] {
+            let state = view(f32t, 2, hs, 4, 8);
+            let bx = view(f32t, m, hs, hs * 4, 4);
+            let dst = view(f32t, 2 + m, hs, 4, (2 + m) * 4);
+            let got = build_concat_kernel_params(&state, &bx, &dst, 0, threads, vtcm);
+            assert_eq!(kernel(got), Some(want), "m = {m}");
+        }
+        // the conformer's pads (dense on both sides) and a join the kernels cannot read
+        let pad = view(f32t, 4, hs, 4, 16);
+        let seq = view(f32t, 126, hs, 4, 126 * 4);
+        let dst = view(f32t, 130, hs, 4, 130 * 4);
+        assert_eq!(
+            kernel(build_concat_kernel_params(
+                &pad, &seq, &dst, 0, threads, vtcm
+            )),
+            Some(1)
+        );
+        let strided = view(f32t, 126, hs, 8, 126 * 8);
+        assert_eq!(
+            kernel(build_concat_kernel_params(
+                &pad, &strided, &dst, 0, threads, vtcm
+            )),
+            None
+        );
+
+        // conv-state write-back (short strided rows into a dense state): gather rows
+        let window = view(f32t, 2, hs, 4, 34 * 4);
+        let state = view(f32t, 2, hs, 4, 8);
+        assert_eq!(
+            kernel(build_copy_kernel_params(&window, &state, threads, vtcm)),
+            Some(6)
+        );
+        // time-major to channel-major (and back): the tiled transpose, f32 and f16
+        for dtype in [f32t, f16t] {
+            let ts = if dtype == f32t { 4 } else { 2 };
+            let time_major = view(dtype, 64, hs, hs * ts, ts);
+            let channel_major = view(dtype, 64, hs, ts, 64 * ts);
+            assert_eq!(
+                kernel(build_copy_kernel_params(
+                    &time_major,
+                    &channel_major,
+                    threads,
+                    vtcm
+                )),
+                Some(7)
+            );
+        }
+        // the interleaved conv state (stride 8) goes through the reshaping copy, in both directions
+        let interleaved = view(f32t, hs, 1, 8, 8);
+        let packed = view(f32t, hs, 1, 4, hs * 4);
+        for (a, b) in [(&interleaved, &packed), (&packed, &interleaved)] {
+            assert_eq!(
+                kernel(build_copy_kernel_params(a, b, threads, vtcm)),
+                Some(4)
+            );
+        }
+        // narrowing an activation: the converting copy (needs the VTCM for its staging rows)
+        let act = view(f32t, hs, 40, 4, hs * 4);
+        let half = view(f16t, hs, 40, 2, hs * 2);
+        assert_eq!(
+            kernel(build_copy_kernel_params(&act, &half, threads, vtcm)),
+            Some(3)
+        );
+        assert_eq!(
+            kernel(build_copy_kernel_params(&act, &half, threads, 4096)),
+            None
         );
     }
 
@@ -3420,43 +4172,37 @@ mod tests {
         );
     }
 
-    /// Every case of `testdata/cpy_golden.txt`, which `scripts/hexagon-golden/gen.py` produces by
-    /// compiling llama.cpp's own `ggml_hexagon_precompute_cpy_params`, must come out word for word
-    /// (or as `unsupported`) from the Rust port.
+    /// Every case of `testdata/cpy_golden.txt`: llama.cpp's real `htp_kparams_solve` for a `CPY`
+    /// (compiled and run by `scripts/hexagon-golden/gen.py`): all seven kernels over dtype pairs,
+    /// shapes and operand layouts (dense, row-padded, transposed, permuted, wider views), session
+    /// thread counts and VTCM budgets, reshaping copies, the model's strided 2-d copies, and the
+    /// pairs it refuses.
     #[test]
     fn copy_kernel_params_match_the_llama_cpp_host_code() {
-        let golden = include_str!("testdata/cpy_golden.txt");
         let (mut cases, mut unsupported) = (0usize, 0usize);
-        for line in golden
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-        {
-            let (inputs, want) = line.split_once("=>").unwrap();
-            let mut sides = inputs.split('|');
-            let src = golden_tensor(&mut sides.next().unwrap().split_whitespace());
-            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
-            let mut run = sides.next().unwrap().split_whitespace();
-            let threads: u32 = run.next().unwrap().parse().unwrap();
-            let vtcm: usize = run.next().unwrap().parse().unwrap();
-            let got = build_copy_kernel_params(&src, &dst, threads, vtcm);
-            let want = want.trim();
-            if want == "unsupported" {
-                assert_eq!(got, None, "{line}");
-                unsupported += 1;
-            } else {
-                let words: Vec<i32> = want
-                    .split_whitespace()
-                    .map(|w| w.parse::<u32>().unwrap() as i32)
-                    .collect();
-                assert_eq!(got.map(|k| k.to_vec()), Some(words), "{line}");
-            }
+        let mut kernels = [0usize; 8];
+        for (line, t, run, want) in golden_cases(include_str!("testdata/cpy_golden.txt"), 2) {
+            let got = build_copy_kernel_params(&t[0], &t[1], run[0] as u32, run[1] as usize);
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
             cases += 1;
+            unsupported += usize::from(want.is_none());
+            if let Some(w) = &want {
+                kernels[(w[0] & 0xff) as usize] += 1;
+            }
         }
         assert!(
-            cases > 2000 && unsupported > 100,
-            "golden file looks truncated: {cases} cases"
+            cases > 12000 && unsupported > 3000,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported"
         );
+        // every kernel stays reachable from the table
+        for (kernel, n) in kernels.iter().enumerate().skip(1) {
+            assert!(
+                *n > 100,
+                "kernel {kernel} only appears {n} times: {kernels:?}"
+            );
+        }
     }
+
     /// A per-head attention-score matmul worked out from the host precompute:
     /// K as `[64, 126, 8]` (row stride 2048 B) against 8 batches of 126 query
     /// rows. 1008 activation rows of 256 B, 16 prefetched 2048 B weight rows
@@ -3599,7 +4345,7 @@ mod tests {
     }
 
     /// The case lines of a golden file as `(line, inputs, want)`.
-    fn golden_cases(golden: &str) -> impl Iterator<Item = (&str, &str, &str)> {
+    fn golden_case_lines(golden: &str) -> impl Iterator<Item = (&str, &str, &str)> {
         golden
             .lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
@@ -3627,7 +4373,7 @@ mod tests {
     fn rope_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/rope_golden.txt");
         let (mut cases, mut unsupported, mut with_ff) = (0usize, 0usize, 0usize);
-        for (line, inputs, want) in golden_cases(golden) {
+        for (line, inputs, want) in golden_case_lines(golden) {
             let mut sides = inputs.split('|');
             let mut tensor = || golden_tensor(&mut sides.next().unwrap().split_whitespace());
             let src0 = tensor();
@@ -3667,7 +4413,7 @@ mod tests {
     fn softmax_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/softmax_golden.txt");
         let (mut cases, mut unsupported, mut sinks, mut alibi) = (0usize, 0usize, 0usize, 0usize);
-        for (line, inputs, want) in golden_cases(golden) {
+        for (line, inputs, want) in golden_case_lines(golden) {
             let mut sides = inputs.split('|');
             let src0 = golden_tensor(&mut sides.next().unwrap().split_whitespace());
             let mask = golden_optional_tensor(sides.next().unwrap());
@@ -3718,7 +4464,7 @@ mod tests {
     fn strided_softmax_mask_only_relaxes_the_row_stride_check() {
         let golden = include_str!("testdata/softmax_golden.txt");
         let (mut relaxed, mut strided_rows_refused) = (0usize, 0usize);
-        for (line, inputs, _) in golden_cases(golden) {
+        for (line, inputs, _) in golden_case_lines(golden) {
             let mut sides = inputs.split('|');
             let src0 = golden_tensor(&mut sides.next().unwrap().split_whitespace());
             let Some(mask) = golden_optional_tensor(sides.next().unwrap()) else {
@@ -3776,7 +4522,7 @@ mod tests {
     fn sum_rows_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/sum_rows_golden.txt");
         let (mut cases, mut unsupported) = (0usize, 0usize);
-        for (line, inputs, want) in golden_cases(golden) {
+        for (line, inputs, want) in golden_case_lines(golden) {
             let mut sides = inputs.split('|');
             let mut src = sides.next().unwrap().split_whitespace();
             let opcode = match src.next().unwrap() {
@@ -3816,7 +4562,7 @@ mod tests {
     fn sort_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/sort_golden.txt");
         let (mut cases, mut unsupported, mut chunked) = (0usize, 0usize, 0usize);
-        for (line, inputs, want) in golden_cases(golden) {
+        for (line, inputs, want) in golden_case_lines(golden) {
             let mut sides = inputs.split('|');
             let mut src = sides.next().unwrap().split_whitespace();
             let opcode = match src.next().unwrap() {
@@ -3860,7 +4606,7 @@ mod tests {
         let (mut cases, mut unsupported, mut zero_rows, mut zero_vtcm) =
             (0usize, 0usize, 0usize, 0usize);
         let mut kernels = [0usize; 3];
-        for (line, inputs, want) in golden_cases(golden) {
+        for (line, inputs, want) in golden_case_lines(golden) {
             let mut sides = inputs.split('|');
             let mut table = sides.next().unwrap().split_whitespace();
             let src0 = golden_tensor(&mut table);
@@ -4599,10 +5345,13 @@ mod tests {
     #[test]
     fn test_prefill_param_builders() {
         // SsmConv: scalar (n_t=1) and chunk (n_t=32) branches, LFM2 K=3/C=1024.
-        let ssm1 = build_ssm_conv_kernel_params(3, 1024, 1, 1, 3, 4, 8 << 20);
+        let ssm = |n_t: u32| {
+            let [x, w, y] = ssm_conv_tensors(3, 1024, n_t, 1);
+            build_ssm_conv_kernel_params(&x, &w, &y, 4, 8 << 20).unwrap()
+        };
+        let (ssm1, ssm32) = (ssm(1), ssm(32));
         assert_eq!(ssm1[0], 4); // n_threads
         assert_eq!(ssm1[5], 256); // d_inner_tile (scalar: the full per-thread range)
-        let ssm32 = build_ssm_conv_kernel_params(3, 1024, 32, 1, 34, 4, 8 << 20);
         assert_eq!(ssm32[5], 64); // a quarter of the 256 channels per thread, within 32..=128
     }
 
