@@ -921,171 +921,679 @@ pub fn build_ssm_conv_kernel_params(
     k
 }
 
-/// `htp_fa_kernel_params.head_split`: 1 partitions flash attention by KV heads when it runs on
-/// several threads, 0 by tokens. llama.cpp defaults it on (`opt_fa_head_split`).
-const FA_HEAD_SPLIT: u32 = 1;
+/// `enum htp_fa_kernel_type`: the HVX kernel walks one query row (or one GQA group) at a time, the
+/// HMX kernel runs tiled `Q K^T` and `P V` on the matrix unit.
+const FA_KERNEL_HVX: u8 = 1;
+const FA_KERNEL_HMX: u8 = 2;
+/// `HTP_FA_FLAG_TEAM_SPLIT`: several devices share the query blocks of one KV head.
+const FA_FLAG_TEAM_SPLIT: u8 = 0x01;
+/// KV rows per block of the HVX kernel (`FA_HVX_BLOCK_SIZE`).
+const FA_HVX_BLOCK_SIZE: usize = 64;
+/// Query rows (GQA group members) one HVX pass handles (`FA_HVX_G_MAX`).
+const FA_HVX_G_MAX: usize = 8;
+/// HVX mask rows cached per thread (`HVX_FA_DMA_CACHE_SIZE`).
+const FA_HVX_DMA_CACHE: usize = 128;
+/// HMX flash-attention VTCM group alignment and tile size (`HTP_FA_HMX_TILE_SIZE`).
+const FA_HMX_TILE_BYTES: usize = 2048;
+/// HMX FA tile rows and columns (`HMX_FP16_TILE_N_ROWS`, `HMX_FP16_TILE_N_COLS`).
+const FA_TILE_ROWS: usize = 32;
+const FA_TILE_COLS: usize = 32;
+/// Minimum KV blocks for pipelining (`FA_MIN_KV_BLOCKS`).
+const FA_MIN_KV_BLOCKS: usize = 3;
+/// HMX FA mask DMA cache slots (`HMX_FA_DMA_CACHE_SIZE`).
+const FA_HMX_DMA_CACHE: usize = 4;
+/// Solver cost weights, calibrated from profiling (`hmx_fa_find_chunk_size`).
+const FA_C_Q_FIXED: usize = 800;
+const FA_C_ITER_BASE: usize = 200;
+const FA_C_SOFTMAX: usize = 600;
 
-/// Build kernel parameters for Flash Attention dispatch (HVX path).
+/// What `htp_kparams_solve_flash_attn` reads about the session and the host options.
 ///
-/// `n_tokens` query rows (1 for decode, M for prefill); `seq_len` total KV
-/// length. Queries are `n_heads * n_tokens` head-rows; the mask stays
-/// `[kv_len, n_tokens]` with unit dim-2/3 (causal rows via dim-1 stride).
-// Arity mirrors llama.cpp's fixed kparam builder signature; see above.
-#[allow(clippy::too_many_arguments)]
-pub fn build_flash_attn_kernel_params(
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    n_tokens: usize,
-    seq_len: usize,
+/// [`FlashAttnHost::new`] is a single device with llama.cpp's shipped options
+/// (`opt_fa_select = 2`, `opt_fa_split = 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashAttnHost {
+    /// `htp_session_n_threads`.
+    pub n_threads: u32,
+    /// `htp_session_vtcm_size`: the VTCM budget a tiling must fit.
+    pub vtcm_bytes: usize,
+    /// `htp_session_n_hmx`: 0 keeps the HMX kernel off.
+    pub n_hmx: u32,
+    /// `htp_session_mdev_count`.
+    pub mdev_count: u32,
+    /// `opt_fa_select`: 0 refuses the op, 1 is HVX only, 2 picks HMX by the heuristics and falls
+    /// back to HVX, above 2 takes HMX whenever it is eligible.
+    pub select: i32,
+    /// `opt_fa_split`: partition by KV heads (and by teams on several devices).
+    pub split: bool,
+}
+
+impl FlashAttnHost {
+    pub fn new(n_threads: u32, vtcm_bytes: usize, n_hmx: u32) -> Self {
+        Self {
+            n_threads,
+            vtcm_bytes,
+            n_hmx,
+            mdev_count: 1,
+            select: 2,
+            split: true,
+        }
+    }
+
+    /// The same session with the HMX kernel off, for A/B runs against the HVX one.
+    pub fn hvx_only(self) -> Self {
+        Self { n_hmx: 0, ..self }
+    }
+}
+
+/// The operands of one `FLASH_ATTN_EXT`: `q`, `k`, `v`, the optional mask and attention sinks, the
+/// output, and the three op params llama.cpp stores in `op_params[0..3]`. Only extents and types
+/// are read; strides play no part in the choice.
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnOp<'a> {
+    pub q: &'a CopyTensor,
+    pub k: &'a CopyTensor,
+    pub v: &'a CopyTensor,
+    pub mask: Option<&'a CopyTensor>,
+    pub sinks: Option<&'a CopyTensor>,
+    pub dst: &'a CopyTensor,
+    pub scale: f32,
+    pub max_bias: f32,
+    pub logit_softcap: f32,
+}
+
+/// `kernel_params` that ask the queue (`validate_and_derive_op_params`) to solve a `FlashAttnExt`
+/// on the HVX kernel only (`CERA_HEXAGON_*_FA=hvx`, `CERA_HEXAGON_HMX=0`). The
+/// kernel byte alone is never a solved blob: those always carry a scale and a block count.
+pub const FLASH_ATTN_HVX_ONLY: [i32; 32] = {
+    let mut k = [0i32; 32];
+    k[0] = FA_KERNEL_HVX as i32;
+    k
+};
+
+/// `op_params` of a `FlashAttnExt`, laid out as ggml's node stores them: scale, ALiBi bias, soft
+/// cap. The DSP reads none of them (the solved kernel params carry the folded values); the queue
+/// reads them back to solve the kernel params when the caller passes none.
+pub fn flash_attn_op_params(scale: f32, logit_softcap: f32) -> [i32; 16] {
+    let mut p = [0i32; 16];
+    p[0] = scale.to_bits() as i32;
+    p[2] = logit_softcap.to_bits() as i32;
+    p
+}
+
+/// The `kernel_params` argument of a `FlashAttnExt` whose kernel the queue solves from the
+/// registered tensors: free to take HMX when the heuristics pick it, or HVX only.
+pub fn flash_attn_kernel_request(allow_hmx: bool) -> [i32; 32] {
+    if allow_hmx {
+        [0; 32]
+    } else {
+        FLASH_ATTN_HVX_ONLY
+    }
+}
+
+/// The two flash-attention kernels place different things in the tail of `htp_fa_kernel_params`
+/// (a union in the C struct).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FaKernelUnion {
+    Hmx {
+        g_br: u32,
+        mask_broadcast: i32,
+        pipeline: i32,
+        div_g: FastDivValues,
+    },
+    Hvx {
+        size_q_row_padded: u32,
+        size_k_row_padded: u32,
+        size_v_row_padded: u32,
+        src0_div21: FastDivValues,
+        src0_div1: FastDivValues,
+    },
+}
+
+/// `struct htp_fa_kernel_params` (`flash-attn-ops.h`): the four one-byte fields and four `u16`s
+/// share the first three words, then the floats and sizes, six `{mp, l}` dividers, and the union.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FaKernelParams {
+    kernel_type: u8,
+    head_split: u8,
+    flags: u8,
+    n_threads: u8,
+    br: u16,
+    bc: u16,
+    n_kv_blocks: u16,
+    g: u16,
     scale: f32,
-    n_threads: u32,
-    has_mask: bool,
-) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    let n_threads = wire_byte(n_threads.max(1) as usize);
-    let g = (n_heads / n_kv_heads.max(1)).max(1);
-    let n_kv_blocks = seq_len.div_ceil(64).max(1);
+    max_bias: f32,
+    logit_softcap: f32,
+    vtcm_size: u32,
+    m0: f32,
+    m1: f32,
+    n_head_log2: u32,
+    src3_div2: FastDivValues,
+    src3_div3: FastDivValues,
+    broadcast_rk2: FastDivValues,
+    broadcast_rk3: FastDivValues,
+    broadcast_rv2: FastDivValues,
+    broadcast_rv3: FastDivValues,
+    tail: FaKernelUnion,
+}
 
-    // byte 0: kernel_type = 1 (HTP_FA_KERNEL_HVX)
-    // byte 1: head_split (llama.cpp's default: partition by KV heads across threads)
-    // byte 2: flags (reserved, 0)
-    // byte 3: n_threads
-    // (These bytes used to be `is_q_fp32` / `is_dst_fp32`; the DSP now reads the tensor types.)
-    let b0 = 1u32 | (FA_HEAD_SPLIT << 8) | ((n_threads as u32) << 24);
-    kparams[0] = b0 as i32;
+impl FaKernelParams {
+    fn to_words(self) -> [i32; 32] {
+        let mut w = [0i32; 32];
+        w[0] = u32::from_le_bytes([
+            self.kernel_type,
+            self.head_split,
+            self.flags,
+            self.n_threads,
+        ]) as i32;
+        w[1] = (u32::from(self.br) | (u32::from(self.bc) << 16)) as i32;
+        w[2] = (u32::from(self.n_kv_blocks) | (u32::from(self.g) << 16)) as i32;
+        w[3] = self.scale.to_bits() as i32;
+        w[4] = self.max_bias.to_bits() as i32;
+        w[5] = self.logit_softcap.to_bits() as i32;
+        w[6] = self.vtcm_size as i32;
+        w[7] = self.m0.to_bits() as i32;
+        w[8] = self.m1.to_bits() as i32;
+        w[9] = self.n_head_log2 as i32;
+        let divs = [
+            self.src3_div2,
+            self.src3_div3,
+            self.broadcast_rk2,
+            self.broadcast_rk3,
+            self.broadcast_rv2,
+            self.broadcast_rv3,
+        ];
+        for (i, d) in divs.iter().enumerate() {
+            w[10 + 2 * i] = d.mp as i32;
+            w[11 + 2 * i] = d.l as i32;
+        }
+        match self.tail {
+            FaKernelUnion::Hmx {
+                g_br,
+                mask_broadcast,
+                pipeline,
+                div_g,
+            } => {
+                w[22] = g_br as i32;
+                w[23] = mask_broadcast;
+                w[24] = pipeline;
+                w[25] = div_g.mp as i32;
+                w[26] = div_g.l as i32;
+            }
+            FaKernelUnion::Hvx {
+                size_q_row_padded,
+                size_k_row_padded,
+                size_v_row_padded,
+                src0_div21,
+                src0_div1,
+            } => {
+                w[22] = size_q_row_padded as i32;
+                w[23] = size_k_row_padded as i32;
+                w[24] = size_v_row_padded as i32;
+                w[25] = src0_div21.mp as i32;
+                w[26] = src0_div21.l as i32;
+                w[27] = src0_div1.mp as i32;
+                w[28] = src0_div1.l as i32;
+            }
+        }
+        w
+    }
+}
 
-    // offset 4..8: Br: u16 = 1, Bc: u16 = 64
-    let b1 = 1u32 | (64u32 << 16);
-    kparams[1] = b1 as i32;
+/// `hex_gcd_u32`.
+fn fa_gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
 
-    // offset 8..12: n_kv_blocks: u16, G: u16
-    let b2 = (n_kv_blocks as u32 & 0xffff) | ((g as u32 & 0xffff) << 16);
-    kparams[2] = b2 as i32;
+/// `hex_round_up`: 32-bit like the C, so an oversized operand wraps the same way.
+fn fa_round_up(n: u32, m: u32) -> u32 {
+    m.wrapping_mul(n.wrapping_add(m - 1) / m)
+}
 
-    // offset 12..16: scale: f32
-    kparams[3] = scale.to_bits() as i32;
-
-    // offset 16..20: max_bias: f32 = 0.0
-    kparams[4] = 0;
-
-    // offset 20..24: logit_softcap: f32 = 0.0
-    kparams[5] = 0;
-
-    // offset 24..28: vtcm_size: u32
-    let size_q_row_padded = align128(head_dim * 4);
-    let size_k_row_padded = align128(head_dim * 2);
-    let size_v_row_padded = align128(head_dim * 2);
-    let size_q_block = size_q_row_padded;
-    let size_k_block = size_k_row_padded * 64;
-    let size_v_block = size_v_row_padded * 64;
-    let size_m_block = align128(64 * 2);
-    let size_vkq_acc = align128(head_dim * 4);
-    let size_per_thread = size_q_block
-        + size_k_block * 2
-        + size_v_block * 2
-        + if has_mask { size_m_block * 128 } else { 0 }
-        + size_vkq_acc;
-    let vtcm_size = size_per_thread * (n_threads as usize);
-    kparams[6] = vtcm_size as i32;
-
-    // offset 28..32: qrows: u32 = n_heads * n_tokens (all query head-rows)
-    let qrows = n_heads * n_tokens.max(1);
-    kparams[7] = qrows as i32;
-
-    // offset 32..36: qrows_per_thread: u32
-    kparams[8] = qrows.div_ceil(n_threads as usize) as i32;
-
-    // offset 36..40: qrow_start: u32 = 0 (single-batch decode starts at row 0)
-    kparams[9] = 0;
-
-    // offset 40..44: m0: f32 = 1.0
-    kparams[10] = 1.0f32.to_bits() as i32;
-
-    // offset 44..48: m1: f32 = 1.0
-    kparams[11] = 1.0f32.to_bits() as i32;
-
-    // offset 48..52: n_head_log2: u32
-    let n_head_log2 = if n_heads > 0 {
-        1u32 << (31 - (n_heads as u32).leading_zeros())
+/// Exact HMX FA VTCM footprint (`hmx_fa_vtcm_layout_build`, its `total_bytes`). `dk`/`dv` are the
+/// head dims padded to 64.
+#[allow(clippy::too_many_arguments)]
+fn fa_hmx_layout_total(
+    g: usize,
+    dk: usize,
+    dv: usize,
+    br: usize,
+    bc: usize,
+    n_threads: usize,
+    pipeline: bool,
+    is_q_fp32: bool,
+    has_sinks: bool,
+    n_heads: usize,
+) -> usize {
+    let g_br = (g * br).next_multiple_of(FA_TILE_ROWS);
+    let q_tile = (g_br * dk * 2).next_multiple_of(FA_HMX_TILE_BYTES);
+    let o_tile = (g_br * dv * 2).next_multiple_of(FA_HMX_TILE_BYTES);
+    let k_tile = (bc * dk * 2).next_multiple_of(FA_HMX_TILE_BYTES);
+    let v_tile = (bc * dv * 2).next_multiple_of(FA_HMX_TILE_BYTES);
+    let s_tile = (g_br * bc * 2).next_multiple_of(FA_HMX_TILE_BYTES);
+    // The rescale matrices are diagonal: only the g_br/32 diagonal tiles exist, one tile apart.
+    let d_tile = (g_br / FA_TILE_ROWS) * FA_HMX_TILE_BYTES;
+    let q_dma = (g_br * dk * if is_q_fp32 { 4 } else { 2 }).next_multiple_of(128);
+    let k_dma = (bc * fa_round_up((dk * 2) as u32, 128) as usize).next_multiple_of(128);
+    let v_dma = (bc * fa_round_up((dv * 2) as u32, 128) as usize).next_multiple_of(128);
+    let col_vec = (g_br * 4).next_multiple_of(256);
+    let row_vec = (bc * 2).next_multiple_of(256);
+    let m_line = (bc * 2).next_multiple_of(128);
+    let m_buf = (br * m_line).next_multiple_of(256) * FA_HMX_DMA_CACHE;
+    let slopes = (g_br * 2).next_multiple_of(128);
+    let sinks = if has_sinks {
+        fa_round_up((n_heads * 4) as u32, 128) as usize
     } else {
         0
     };
-    kparams[12] = n_head_log2 as i32;
 
-    // offset 52..60: src3_div2: FastDivValues (mask)
-    let div_1 = init_fastdiv(1);
-    kparams[13] = div_1.mp as i32;
-    kparams[14] = div_1.l as i32;
-
-    // offset 60..68: src3_div3: FastDivValues (mask)
-    kparams[15] = div_1.mp as i32;
-    kparams[16] = div_1.l as i32;
-
-    // offset 68..76: broadcast_rk2: FastDivValues (n_heads / n_kv_heads)
-    let div_g = init_fastdiv(g as u32);
-    kparams[17] = div_g.mp as i32;
-    kparams[18] = div_g.l as i32;
-
-    // offset 76..84: broadcast_rk3: FastDivValues (1)
-    kparams[19] = div_1.mp as i32;
-    kparams[20] = div_1.l as i32;
-
-    // offset 84..92: broadcast_rv2: FastDivValues (g)
-    kparams[21] = div_g.mp as i32;
-    kparams[22] = div_g.l as i32;
-
-    // offset 92..100: broadcast_rv3: FastDivValues (1)
-    kparams[23] = div_1.mp as i32;
-    kparams[24] = div_1.l as i32;
-
-    // offset 100..104: u.hvx.size_q_row_padded
-    kparams[25] = size_q_row_padded as i32;
-
-    // offset 104..108: u.hvx.size_k_row_padded
-    kparams[26] = size_k_row_padded as i32;
-
-    // offset 108..112: u.hvx.size_v_row_padded
-    kparams[27] = size_v_row_padded as i32;
-
-    // offset 112..120: u.hvx.src0_div21: FastDivValues (n_heads * n_tokens)
-    let div_qrows = init_fastdiv(qrows as u32);
-    kparams[28] = div_qrows.mp as i32;
-    kparams[29] = div_qrows.l as i32;
-
-    // offset 120..128: u.hvx.src0_div1: FastDivValues (n_tokens)
-    let div_n_tokens = init_fastdiv(n_tokens.max(1) as u32);
-    kparams[30] = div_n_tokens.mp as i32;
-    kparams[31] = div_n_tokens.l as i32;
-
-    kparams
+    // Group A, part 1: the HMX-tiled buffers (Q, two O, the diagonal rescale tiles, 1/l).
+    let mut off = q_tile + o_tile * 2 + d_tile + d_tile;
+    if pipeline {
+        off += d_tile;
+    }
+    // Groups B (compute-only buffers) and C (the Q fetch buffer) overlap from a 2 KiB boundary.
+    let base = off.next_multiple_of(FA_HMX_TILE_BYTES);
+    let copies = if pipeline { 2 } else { 1 };
+    let group_b = (k_tile + v_tile + s_tile * 2) * copies + col_vec * 2 + row_vec * 2 * n_threads;
+    off = base + group_b.max(q_dma);
+    // Group A, part 2: the K/V staging rows, the running max and sum, the scale constants.
+    off + k_dma * 2 + v_dma * 2 + col_vec * 2 + 256 + 256 + m_buf + slopes + sinks
 }
 
-/// Same as [`build_flash_attn_kernel_params`] with attention logit soft-capping.
-#[allow(clippy::too_many_arguments)]
-pub fn build_flash_attn_kernel_params_with_softcap(
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    n_tokens: usize,
-    seq_len: usize,
-    scale: f32,
-    n_threads: u32,
+/// HVX FA VTCM footprint (`hvx_fa_vtcm_layout_build`, its `total_bytes`): per thread one Q block,
+/// double-buffered K and V blocks, the mask rows when there is a mask, and the f32 accumulators.
+fn fa_hvx_layout_total(
+    dk: usize,
+    dv: usize,
+    is_q_fp32: bool,
     has_mask: bool,
-    softcap: f32,
-) -> [i32; 32] {
-    // The DSP computes `tanh(scale * s) * softcap`, so the host divides the scale by the softcap
-    // first (`ggml_hexagon_precompute_flash_attn_params`).
-    let scale = if softcap != 0.0 {
-        scale / softcap
+    has_sinks: bool,
+    n_heads: usize,
+    n_threads: usize,
+) -> usize {
+    let q_row = fa_round_up((dk * if is_q_fp32 { 4 } else { 2 }) as u32, 128) as usize;
+    let k_row = fa_round_up((dk * 2) as u32, 128) as usize;
+    let v_row = fa_round_up((dv * 2) as u32, 128) as usize;
+    let q_block = q_row * FA_HVX_G_MAX;
+    let k_block = k_row * FA_HVX_BLOCK_SIZE;
+    let v_block = v_row * FA_HVX_BLOCK_SIZE;
+    let m_block = fa_round_up((FA_HVX_BLOCK_SIZE * 2) as u32, 128) as usize;
+    let vkq_acc = fa_round_up((dv * 4) as u32, 128) as usize * FA_HVX_G_MAX;
+    let sinks = fa_round_up((n_heads * 4) as u32, 128) as usize;
+    q_block * n_threads
+        + k_block * 2 * n_threads
+        + v_block * 2 * n_threads
+        + if has_mask {
+            m_block * FA_HVX_DMA_CACHE * n_threads
+        } else {
+            0
+        }
+        + vkq_acc * n_threads
+        + if has_sinks { sinks } else { 0 }
+}
+
+/// HMX FA (Br, Bc) solver (`hmx_fa_find_chunk_size`): the cost-minimal tiling whose VTCM layout
+/// fits `vtcm_budget`. `dk`/`dv` are padded to 64; `q_split` is the team size (query blocks one
+/// device of a team owns).
+#[allow(clippy::too_many_arguments)]
+fn fa_hmx_find_chunk_size(
+    g: usize,
+    dk: usize,
+    dv: usize,
+    qo_len: usize,
+    kv_len: usize,
+    vtcm_budget: usize,
+    n_threads: usize,
+    is_q_fp32: bool,
+    has_sinks: bool,
+    n_heads: usize,
+    q_split: usize,
+) -> Option<(usize, usize)> {
+    let br_unit = FA_TILE_ROWS.div_ceil(g);
+    let bc_unit = FA_TILE_COLS * 2;
+    let can_pipeline = kv_len >= FA_MIN_KV_BLOCKS * bc_unit && n_threads >= 2;
+    let br_max = if qo_len >= br_unit {
+        qo_len / br_unit * br_unit
     } else {
-        scale
+        br_unit
     };
-    let mut kparams = build_flash_attn_kernel_params(
-        head_dim, n_heads, n_kv_heads, n_tokens, seq_len, scale, n_threads, has_mask,
-    );
-    kparams[5] = softcap.to_bits() as i32;
-    kparams
+    // cap Bc so there are enough blocks to pipeline, unless the KV is too short for that
+    let mut bc_limit = if can_pipeline {
+        kv_len / FA_MIN_KV_BLOCKS / bc_unit * bc_unit
+    } else if kv_len >= bc_unit {
+        kv_len / bc_unit * bc_unit
+    } else {
+        bc_unit
+    };
+    // small-Q sliding-window-sized caches keep Bc at 256 for block-skipping granularity
+    if qo_len <= 16 && kv_len <= 2048 && bc_limit > 256 {
+        bc_limit = 256;
+    }
+    let mut best_cost = usize::MAX;
+    let mut best_mn = 0;
+    let mut best = (0, 0);
+    let mut br = br_max;
+    loop {
+        let mut bc = bc_limit;
+        while bc >= bc_unit {
+            let need = fa_hmx_layout_total(
+                g,
+                dk,
+                dv,
+                br,
+                bc,
+                n_threads,
+                can_pipeline,
+                is_q_fp32,
+                has_sinks,
+                n_heads,
+            );
+            if need <= vtcm_budget {
+                let q_blocks = qo_len.div_ceil(br);
+                let kv_blocks = kv_len.div_ceil(bc);
+                let actual = if kv_blocks >= FA_MIN_KV_BLOCKS && n_threads >= 2 {
+                    n_threads
+                } else {
+                    1
+                };
+                let cnt = (br * g).div_ceil(64);
+                let n_use = cnt.min(actual);
+                let vpt = if n_use > 0 { cnt.div_ceil(n_use) } else { 1 };
+                let iter = FA_C_ITER_BASE + FA_C_SOFTMAX * vpt;
+                let q_blocks_split = q_blocks.div_ceil(q_split.max(1));
+                let cost = q_blocks_split * (FA_C_Q_FIXED + kv_blocks * iter);
+                let mn = br * bc;
+                if cost < best_cost || (cost == best_cost && mn > best_mn) {
+                    best_cost = cost;
+                    best_mn = mn;
+                    best = (br, bc);
+                }
+                // Bc descends, so the first fit is the largest for this Br
+                break;
+            }
+            bc -= bc_unit;
+        }
+        if br == br_unit {
+            break;
+        }
+        br -= br_unit;
+    }
+    (best != (0, 0)).then_some(best)
+}
+
+/// Whether the HMX kernel is a candidate (`htp_flash_attn_is_hmx_eligible`): an HMX unit, f16 or
+/// Q8_0 K and V, head dims that tile by 8, then llama.cpp's calibrated crossover from the HVX
+/// kernel by query count, KV length, GQA factor and thread count.
+fn fa_is_hmx_eligible(host: &FlashAttnHost, op: &FlashAttnOp<'_>) -> bool {
+    use HtpDataType as T;
+    if host.n_hmx == 0 || host.select < 2 {
+        return false;
+    }
+    let kv_ok = |t: &CopyTensor| t.dtype == T::F16 as u32 || t.dtype == T::Q8_0 as u32;
+    if !kv_ok(op.k) || !kv_ok(op.v) {
+        return false;
+    }
+    let dk = op.q.ne[0];
+    let dv = op.v.ne[0];
+    if !dk.is_multiple_of(8) || !dv.is_multiple_of(8) {
+        return false;
+    }
+    if host.select > 2 {
+        return true;
+    }
+    let m = op.q.ne[1];
+    if m > 1 {
+        return true;
+    }
+    let n_threads = host.n_threads;
+    let n_head = op.q.ne[2];
+    let n_kv_heads = op.k.ne[2];
+    let g = n_head.checked_div(n_kv_heads).unwrap_or(1);
+    let s = op.k.ne[1];
+    let total_threads = n_threads.wrapping_mul(host.mdev_count);
+    if dk > 256 || (dk == 256 && (dv > 256 || n_kv_heads < total_threads)) {
+        return true;
+    }
+    let tile_aligned = g > 0 && 32 % g == 0;
+    if !tile_aligned {
+        if n_threads >= 6 {
+            return false;
+        }
+        return s >= 1024;
+    }
+    let s_cross = if dk == 256 {
+        4096
+    } else if dk <= 64 {
+        if n_threads >= 8 {
+            2048
+        } else if n_threads >= 6 {
+            768
+        } else {
+            512
+        }
+    } else if n_threads >= 8 {
+        1024
+    } else {
+        512
+    };
+    s >= s_cross
+}
+
+/// `{mp, l}` for a divisor the solver takes from tensor extents. llama.cpp divides by it without a
+/// check (a zero is undefined behaviour there); here it is an unsupported shape.
+fn fa_fastdiv(d: u64) -> Option<FastDivValues> {
+    // init_fastdiv_values takes a uint32_t: wider extents truncate
+    let d = d as u32;
+    (d != 0).then(|| init_fastdiv(d))
+}
+
+/// Port of `htp_kparams_solve_flash_attn`: `None` where the solver answers unsupported.
+fn solve_flash_attn(host: &FlashAttnHost, op: &FlashAttnOp<'_>) -> Option<FaKernelParams> {
+    use HtpDataType as T;
+    if host.select < 1 {
+        return None;
+    }
+    let (q, k, v, dst) = (op.q, op.k, op.v, op.dst);
+    let is = |t: &CopyTensor, ty: T| t.dtype == ty as u32;
+    if !(is(q, T::F16) || is(q, T::F32))
+        || !(is(k, T::F16) || is(k, T::Q8_0))
+        || !(is(v, T::F16) || is(v, T::Q8_0))
+    {
+        return None;
+    }
+    if op.mask.is_some_and(|m| !is(m, T::F16)) {
+        return None;
+    }
+    if op.sinks.is_some_and(|s| !is(s, T::F32)) {
+        return None;
+    }
+    if !(is(dst, T::F32) || is(dst, T::F16)) {
+        return None;
+    }
+
+    let n_threads = host.n_threads;
+    let q_is_f32 = is(q, T::F32);
+    let (neq0, neq1, neq2) = (q.ne[0], q.ne[1], q.ne[2]);
+    let nek1 = k.ne[1];
+    let (dk, dv) = (neq0, v.ne[0]);
+    let n_kv_heads = k.ne[2];
+    // llama.cpp divides by the KV head count and a zero GQA factor reaches fastdiv(0)
+    if n_kv_heads == 0 || neq2 / n_kv_heads == 0 {
+        return None;
+    }
+    let g = neq2 / n_kv_heads;
+    let n_head = neq2;
+
+    // the host folds the soft cap into the scale: the DSP computes tanh(scale * s) * softcap
+    let mut scale = op.scale;
+    if op.logit_softcap != 0.0 {
+        scale /= op.logit_softcap;
+    }
+
+    let mut kp = FaKernelParams {
+        kernel_type: 0,
+        head_split: u8::from(host.split),
+        flags: 0,
+        n_threads: 0,
+        br: 0,
+        bc: 0,
+        n_kv_blocks: 0,
+        g: g as u16,
+        scale,
+        max_bias: op.max_bias,
+        logit_softcap: op.logit_softcap,
+        vtcm_size: 0,
+        m0: 0.0,
+        m1: 0.0,
+        n_head_log2: 0,
+        src3_div2: FastDivValues::default(),
+        src3_div3: FastDivValues::default(),
+        broadcast_rk2: FastDivValues::default(),
+        broadcast_rk3: FastDivValues::default(),
+        broadcast_rv2: FastDivValues::default(),
+        broadcast_rv3: FastDivValues::default(),
+        tail: FaKernelUnion::Hmx {
+            g_br: 0,
+            mask_broadcast: 0,
+            pipeline: 0,
+            div_g: FastDivValues::default(),
+        },
+    };
+
+    // team-split only when a team has more than one member (n_kv_heads < the device count)
+    let mut fa_team_size = 1usize;
+    if host.split && host.mdev_count > 1 {
+        let teams = fa_gcd(n_kv_heads, host.mdev_count);
+        fa_team_size = (host.mdev_count / teams) as usize;
+        if fa_team_size > 1 {
+            kp.flags |= FA_FLAG_TEAM_SPLIT;
+        }
+    }
+
+    // ALiBi slopes: m0 for the first n_head_log2 heads, m1 for the rest
+    kp.n_head_log2 = 1u32 << (31 - n_head.leading_zeros());
+    let log2_heads = kp.n_head_log2 as f32;
+    kp.m0 = 2.0f32.powf(-op.max_bias / log2_heads);
+    kp.m1 = 2.0f32.powf(-(op.max_bias / 2.0) / log2_heads);
+
+    let has_sinks = op.sinks.is_some();
+    if fa_is_hmx_eligible(host, op) {
+        let dk_pad = fa_round_up(dk, 64);
+        let dv_pad = fa_round_up(dv, 64);
+        if let Some((br, bc)) = fa_hmx_find_chunk_size(
+            g as usize,
+            dk_pad as usize,
+            dv_pad as usize,
+            neq1 as usize,
+            nek1 as usize,
+            host.vtcm_bytes,
+            n_threads as usize,
+            q_is_f32,
+            has_sinks,
+            n_head as usize,
+            fa_team_size,
+        ) {
+            use std::f32::consts::LOG2_E;
+            kp.kernel_type = FA_KERNEL_HMX;
+            // the HMX kernel works in the log2 domain: log2(e) goes into the scale, or into the
+            // soft cap when there is one
+            if op.logit_softcap == 0.0 {
+                kp.scale = scale * LOG2_E;
+                kp.logit_softcap = 0.0;
+            } else {
+                kp.scale = scale;
+                kp.logit_softcap = op.logit_softcap * LOG2_E;
+            }
+            kp.br = br as u16;
+            kp.bc = bc as u16;
+            kp.n_kv_blocks = (nek1 as usize).div_ceil(bc) as u16;
+            let pipeline = kp.n_kv_blocks >= 3 && n_threads >= 2;
+            kp.n_threads = if pipeline { n_threads as u8 } else { 1 };
+            kp.vtcm_size = fa_hmx_layout_total(
+                g as usize,
+                dk_pad as usize,
+                dv_pad as usize,
+                br,
+                bc,
+                usize::from(kp.n_threads),
+                pipeline,
+                q_is_f32,
+                has_sinks,
+                n_head as usize,
+            ) as u32;
+            if let Some(m) = op.mask {
+                kp.src3_div2 = fa_fastdiv(u64::from(m.ne[2]))?;
+                kp.src3_div3 = fa_fastdiv(u64::from(m.ne[3]))?;
+            }
+            kp.tail = FaKernelUnion::Hmx {
+                g_br: (g as usize * br).next_multiple_of(FA_TILE_ROWS) as u32,
+                mask_broadcast: i32::from(op.mask.is_some_and(|m| m.ne[2] == 1)),
+                pipeline: i32::from(pipeline),
+                div_g: fa_fastdiv(u64::from(g))?,
+            };
+            return Some(kp);
+        }
+    }
+
+    kp.kernel_type = FA_KERNEL_HVX;
+    kp.br = 1;
+    kp.bc = FA_HVX_BLOCK_SIZE as u16;
+    kp.n_kv_blocks = (u64::from(k.ne[1]).div_ceil(FA_HVX_BLOCK_SIZE as u64)) as u16;
+    kp.n_threads = n_threads as u8;
+
+    kp.vtcm_size = fa_hvx_layout_total(
+        dk as usize,
+        dv as usize,
+        q_is_f32,
+        op.mask.is_some(),
+        has_sinks,
+        n_head as usize,
+        n_threads as usize,
+    ) as u32;
+    if kp.vtcm_size as usize > host.vtcm_bytes {
+        return None;
+    }
+
+    let q_row = u64::from(q.ne[0]) * if q_is_f32 { 4 } else { 2 };
+    kp.tail = FaKernelUnion::Hvx {
+        size_q_row_padded: fa_round_up(q_row as u32, 128),
+        size_k_row_padded: fa_round_up((u64::from(k.ne[0]) * 2) as u32, 128),
+        size_v_row_padded: fa_round_up((u64::from(v.ne[0]) * 2) as u32, 128),
+        src0_div21: fa_fastdiv(u64::from(q.ne[2]) * u64::from(q.ne[1]))?,
+        src0_div1: fa_fastdiv(u64::from(q.ne[1]))?,
+    };
+    kp.broadcast_rk2 = fa_fastdiv(u64::from(q.ne[2] / k.ne[2]))?;
+    kp.broadcast_rk3 = fa_fastdiv(u64::from(q.ne[3].checked_div(k.ne[3])?))?;
+    kp.broadcast_rv2 = fa_fastdiv(u64::from(q.ne[2].checked_div(v.ne[2])?))?;
+    kp.broadcast_rv3 = fa_fastdiv(u64::from(q.ne[3].checked_div(v.ne[3])?))?;
+    if let Some(m) = op.mask {
+        kp.src3_div2 = fa_fastdiv(u64::from(m.ne[2]))?;
+        kp.src3_div3 = fa_fastdiv(u64::from(m.ne[3]))?;
+    }
+    Some(kp)
+}
+
+/// Kernel parameters for a `FlashAttnExt`: port of `htp_kparams_solve_flash_attn`
+/// (`htp-kparams.cpp`) with `hmx_fa_find_chunk_size`, `hmx_fa_vtcm_layout_build` and
+/// `hvx_fa_vtcm_layout_build` (`flash-attn-ops.h`). `None` when the kernels do not take the
+/// operands or the HVX working set does not fit the VTCM budget; the HMX kernel is tried first
+/// when it is eligible and falls back to HVX when no tiling fits.
+///
+/// Words (`htp_fa_kernel_params`): 0 packs `kernel_type`, `head_split`, `flags`, `n_threads`;
+/// 1 `Br | Bc << 16`; 2 `n_kv_blocks | G << 16`; 3..=5 scale, max_bias, logit soft cap (f32 bits);
+/// 6 `vtcm_size`; 7, 8, 9 the ALiBi `m0`, `m1`, `n_head_log2`; 10..=21 six `{mp, l}` dividers (mask
+/// dims 2 and 3, then the Q:K and Q:V broadcast ratios); 22.. the kernel-specific tail. The
+/// query-row split is the DSP's own and no longer a host word.
+pub fn build_flash_attn_kernel_params(
+    host: &FlashAttnHost,
+    op: &FlashAttnOp<'_>,
+) -> Option<[i32; 32]> {
+    solve_flash_attn(host, op).map(|k| k.to_words())
 }
 
 /// HVX weight tile sizes (see `HTP_MM_WEIGHT_*_TILE_SIZE_*`).
@@ -1890,297 +2398,6 @@ pub fn build_hmx_mm_kernel_params(
             ..Default::default()
         }
         .to_words(),
-    )
-}
-
-/// HMX flash-attention VTCM group alignment (`HTP_FA_HMX_TILE_SIZE`).
-const FA_HMX_TILE_BYTES: usize = 2048;
-/// HMX FA tile rows (`HMX_FP16_TILE_N_ROWS`).
-const FA_TILE_ROWS: usize = 32;
-/// Minimum KV blocks for pipelining (`FA_MIN_KV_BLOCKS`).
-const FA_MIN_KV_BLOCKS: usize = 3;
-/// HMX FA mask DMA cache slots (`HMX_FA_DMA_CACHE_SIZE`; HVX uses 128).
-const FA_HMX_DMA_CACHE: usize = 4;
-/// Solver cost weights (calibrated from profiling).
-const FA_C_Q_FIXED: usize = 800;
-const FA_C_ITER_BASE: usize = 200;
-const FA_C_SOFTMAX: usize = 600;
-
-/// HMX flash-attention eligibility (`ggml_hexagon_flash_attn_is_hmx_eligible`;
-/// f16/Q8_0 KV and HMX-present gating done by the caller).
-pub fn fa_is_hmx_eligible(head_dim: usize, n_tokens: usize) -> bool {
-    head_dim.is_multiple_of(8) && !(head_dim <= 128 && n_tokens < 5)
-}
-
-/// Exact HMX FA VTCM footprint (`hmx_fa_vtcm_layout_build` + `..._usage`).
-/// `dk`/`dv` are padded to 64 by the caller.
-#[allow(clippy::too_many_arguments)]
-fn fa_hmx_layout_total(
-    g: usize,
-    dk: usize,
-    dv: usize,
-    br: usize,
-    bc: usize,
-    n_threads: usize,
-    pipeline: bool,
-    is_q_fp32: bool,
-    has_sinks: bool,
-    n_heads: usize,
-) -> usize {
-    let g_br = (g * br).next_multiple_of(FA_TILE_ROWS);
-    let q_tile = (g_br * dk * 2).next_multiple_of(FA_HMX_TILE_BYTES);
-    let o_tile = (g_br * dv * 2).next_multiple_of(FA_HMX_TILE_BYTES);
-    let k_tile = (bc * dk * 2).next_multiple_of(FA_HMX_TILE_BYTES);
-    let v_tile = (bc * dv * 2).next_multiple_of(FA_HMX_TILE_BYTES);
-    let s_tile = (g_br * bc * 2).next_multiple_of(FA_HMX_TILE_BYTES);
-    let d_tile = (g_br / FA_TILE_ROWS) * FA_HMX_TILE_BYTES;
-    let q_dma = (g_br * dk * if is_q_fp32 { 4 } else { 2 }).next_multiple_of(128);
-    let k_dma = (bc * (dk * 2).next_multiple_of(128)).next_multiple_of(128);
-    let v_dma = (bc * (dv * 2).next_multiple_of(128)).next_multiple_of(128);
-    let col_vec = (g_br * 4).next_multiple_of(256);
-    let row_vec = (bc * 2).next_multiple_of(256);
-    let m_line = (bc * 2).next_multiple_of(128);
-    let m_buf = ((br * m_line).next_multiple_of(256)) * FA_HMX_DMA_CACHE;
-    let slopes = (g_br * 2).next_multiple_of(128);
-    let sinks = if has_sinks {
-        (n_heads * 4).next_multiple_of(128)
-    } else {
-        0
-    };
-    // Group A part 1: HMX-tiled buffers.
-    let mut off = q_tile + o_tile * 2 + d_tile + d_tile;
-    if pipeline {
-        off += d_tile;
-    }
-    // Groups B and C share a 2KB-aligned base.
-    let base = off.next_multiple_of(FA_HMX_TILE_BYTES);
-    let mut b = base + k_tile + v_tile + s_tile * 2 + col_vec * 2 + row_vec * 2 * n_threads;
-    if pipeline {
-        b += k_tile + v_tile + s_tile * 2;
-    }
-    let group_b = b - base;
-    let group_c = q_dma;
-    off = base + group_b.max(group_c);
-    // Group A part 2: DMA + vector buffers.
-    off += k_dma * 2 + v_dma * 2 + col_vec * 2 + 256 + 256 + m_buf + slopes + sinks;
-    off
-}
-
-/// HMX FA (Br, Bc) solver (`hmx_fa_find_chunk_size`). `dk`/`dv` padded to 64.
-#[allow(clippy::too_many_arguments)]
-pub fn fa_hmx_find_chunk_size(
-    g: usize,
-    dk: usize,
-    dv: usize,
-    qo_len: usize,
-    kv_len: usize,
-    vtcm_budget: usize,
-    n_threads: usize,
-    is_q_fp32: bool,
-    has_sinks: bool,
-    n_heads: usize,
-) -> Option<(usize, usize)> {
-    let br_unit = FA_TILE_ROWS.div_ceil(g.max(1));
-    let bc_unit = 64;
-    let can_pipeline = kv_len >= FA_MIN_KV_BLOCKS * bc_unit && n_threads >= 2;
-    let br_max = if qo_len >= br_unit {
-        qo_len / br_unit * br_unit
-    } else {
-        br_unit
-    };
-    let bc_limit = if can_pipeline {
-        kv_len / FA_MIN_KV_BLOCKS / bc_unit * bc_unit
-    } else if kv_len >= bc_unit {
-        kv_len / bc_unit * bc_unit
-    } else {
-        bc_unit
-    };
-    let mut best_cost = usize::MAX;
-    let mut best_mn = 0;
-    let mut best = (0, 0);
-    let mut br = br_max;
-    loop {
-        let mut bc = bc_limit;
-        while bc >= bc_unit {
-            let need = fa_hmx_layout_total(
-                g,
-                dk,
-                dv,
-                br,
-                bc,
-                n_threads,
-                can_pipeline,
-                is_q_fp32,
-                has_sinks,
-                n_heads,
-            );
-            if need <= vtcm_budget {
-                let q_blocks = qo_len.div_ceil(br);
-                let kv_blocks = kv_len.div_ceil(bc);
-                let actual = if kv_blocks >= FA_MIN_KV_BLOCKS && n_threads >= 2 {
-                    n_threads
-                } else {
-                    1
-                };
-                let cnt = (br * g).div_ceil(64);
-                let n_use = cnt.min(actual);
-                let vpt = if n_use > 0 { cnt.div_ceil(n_use) } else { 1 };
-                let cost =
-                    q_blocks * (FA_C_Q_FIXED + kv_blocks * (FA_C_ITER_BASE + FA_C_SOFTMAX * vpt));
-                let mn = br * bc;
-                if cost < best_cost || (cost == best_cost && mn > best_mn) {
-                    best_cost = cost;
-                    best_mn = mn;
-                    best = (br, bc);
-                }
-                // Bc descends: first fit is the largest for this Br.
-                break;
-            }
-            bc -= bc_unit;
-        }
-        if br == br_unit {
-            break;
-        }
-        br -= br_unit;
-    }
-    if best == (0, 0) { None } else { Some(best) }
-}
-
-/// HMX flash-attention kernel parameters.
-///
-/// Mirrors the HMX branch of `ggml_hexagon_precompute_flash_attn_params`
-/// (f32 Q/dst, f16 KV + mask, no sinks/slopes beyond defaults). Returns
-/// `None` when no (Br, Bc) fits `vtcm_budget` (caller falls back to HVX).
-#[allow(clippy::too_many_arguments)]
-pub fn build_hmx_fa_kernel_params(
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    n_tokens: usize,
-    seq_len: usize,
-    scale: f32,
-    n_threads: u32,
-    vtcm_budget: usize,
-) -> Option<[i32; 32]> {
-    build_hmx_fa_kernel_params_impl(
-        head_dim,
-        n_heads,
-        n_kv_heads,
-        n_tokens,
-        seq_len,
-        scale,
-        0.0,
-        n_threads,
-        vtcm_budget,
-    )
-}
-
-/// The HMX kernel works in the log2 domain, so the host folds log2(e) into the softmax scale
-/// (no softcap) or into the softcap (when there is one), as llama.cpp's host does: with softcap 0,
-/// `scale * log2(e)`; otherwise `scale / softcap` with `softcap * log2(e)`.
-fn hmx_fa_scale_words(scale: f32, softcap: f32) -> (i32, i32) {
-    use std::f32::consts::LOG2_E;
-    if softcap == 0.0 {
-        ((scale * LOG2_E).to_bits() as i32, 0)
-    } else {
-        (
-            (scale / softcap).to_bits() as i32,
-            (softcap * LOG2_E).to_bits() as i32,
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_hmx_fa_kernel_params_impl(
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    n_tokens: usize,
-    seq_len: usize,
-    scale: f32,
-    softcap: f32,
-    n_threads: u32,
-    vtcm_budget: usize,
-) -> Option<[i32; 32]> {
-    let g = (n_heads / n_kv_heads.max(1)).max(1);
-    let dk = head_dim.next_multiple_of(64);
-    let dv = dk;
-    let nt = n_threads.max(1) as usize;
-    let (br, bc) = fa_hmx_find_chunk_size(
-        g,
-        dk,
-        dv,
-        n_tokens,
-        seq_len,
-        vtcm_budget,
-        nt,
-        true,
-        false,
-        n_heads,
-    )?;
-    let n_kv_blocks = seq_len.div_ceil(bc);
-    let pipelined = n_kv_blocks >= FA_MIN_KV_BLOCKS && nt >= 2;
-    let kt = if pipelined { nt } else { 1 };
-    let mut kparams = [0i32; 32];
-    kparams[0] = (2u32 | (FA_HEAD_SPLIT << 8) | ((wire_byte(kt) as u32) << 24)) as i32;
-    kparams[1] = (br as u32 | ((bc as u32) << 16)) as i32;
-    kparams[2] = ((n_kv_blocks as u32 & 0xffff) | ((g as u32 & 0xffff) << 16)) as i32;
-    let (scale_word, softcap_word) = hmx_fa_scale_words(scale, softcap);
-    kparams[3] = scale_word;
-    // [4] max_bias: zero.
-    kparams[5] = softcap_word;
-    kparams[6] = fa_hmx_layout_total(g, dk, dv, br, bc, kt, pipelined, true, false, n_heads) as i32;
-    // [7] qrows, [8] qrows_per_thread, [9] qrow_start: zero for HMX.
-    kparams[10] = 1.0f32.to_bits() as i32;
-    kparams[11] = 1.0f32.to_bits() as i32;
-    kparams[12] = if n_heads > 0 {
-        (1u32 << (31 - (n_heads as u32).leading_zeros())) as i32
-    } else {
-        0
-    };
-    // Mask is [seq, tokens, 1, 1]: src3 divs over unit dims.
-    let div_1 = init_fastdiv(1);
-    kparams[13] = div_1.mp as i32;
-    kparams[14] = div_1.l as i32;
-    kparams[15] = div_1.mp as i32;
-    kparams[16] = div_1.l as i32;
-    // [17..=24] broadcast divs: unset (zero) on the HMX path.
-    // HMX union: g_br, row_buf_stride, mask_buf_row_stride, mask_broadcast,
-    // pipeline, div_G.
-    kparams[25] = ((g * br).next_multiple_of(FA_TILE_ROWS)) as i32;
-    kparams[26] = ((bc * 2).next_multiple_of(256) / 128) as i32;
-    kparams[27] = ((bc * 2).next_multiple_of(128) / 2) as i32;
-    kparams[28] = 1; // mask_broadcast: mask->ne[2] == 1
-    kparams[29] = pipelined as i32;
-    let div_g = init_fastdiv(g as u32);
-    kparams[30] = div_g.mp as i32;
-    kparams[31] = div_g.l as i32;
-    Some(kparams)
-}
-
-/// Same as [`build_hmx_fa_kernel_params`] with attention logit soft-capping.
-#[allow(clippy::too_many_arguments)]
-pub fn build_hmx_fa_kernel_params_with_softcap(
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    n_tokens: usize,
-    seq_len: usize,
-    scale: f32,
-    n_threads: u32,
-    vtcm_budget: usize,
-    softcap: f32,
-) -> Option<[i32; 32]> {
-    build_hmx_fa_kernel_params_impl(
-        head_dim,
-        n_heads,
-        n_kv_heads,
-        n_tokens,
-        seq_len,
-        scale,
-        softcap,
-        n_threads,
-        vtcm_budget,
     )
 }
 
@@ -3178,7 +3395,7 @@ mod tests {
             ((2, 64, 64, 5, 5), (16, 64, 85632)),
         ];
         for ((g, dk, dv, qo, kv), (br, bc, vs)) in cases {
-            let got = fa_hmx_find_chunk_size(g, dk, dv, qo, kv, b8, 4, true, false, 16);
+            let got = fa_hmx_find_chunk_size(g, dk, dv, qo, kv, b8, 4, true, false, 16, 1);
             assert_eq!(got, Some((br, bc)), "g={g} qo={qo} kv={kv}");
             let pipelined = kv >= 3 * 64;
             let total = fa_hmx_layout_total(g, dk, dv, br, bc, 4, pipelined, true, false, 16);
@@ -3186,7 +3403,7 @@ mod tests {
         }
         // Small budget + single thread.
         assert_eq!(
-            fa_hmx_find_chunk_size(2, 64, 64, 32, 128, 1024 * 1024, 4, true, false, 16),
+            fa_hmx_find_chunk_size(2, 64, 64, 32, 128, 1024 * 1024, 4, true, false, 16, 1),
             Some((32, 128))
         );
         assert_eq!(
@@ -3194,7 +3411,7 @@ mod tests {
             200320
         );
         assert_eq!(
-            fa_hmx_find_chunk_size(2, 64, 64, 32, 256, b8, 1, true, false, 16),
+            fa_hmx_find_chunk_size(2, 64, 64, 32, 256, b8, 1, true, false, 16, 1),
             Some((32, 256))
         );
         assert_eq!(
@@ -3203,43 +3420,279 @@ mod tests {
         );
     }
 
+    /// A tensor of a flash-attention case, `[type ne0 ne1 ne2 ne3]` as the golden file prints it.
+    fn fa_tensor(dtype: HtpDataType, ne: [u32; 4]) -> CopyTensor {
+        CopyTensor {
+            dtype: dtype as u32,
+            ne,
+            nb: [0; 4],
+        }
+    }
+
+    /// LFM2-style attention operands: f32 Q, f16 K/V of `s` rows, `[s, m]` f16 mask.
+    fn fa_operands(dk: u32, n_heads: u32, n_kv_heads: u32, m: u32, s: u32) -> [CopyTensor; 5] {
+        let f32t = HtpDataType::F32;
+        let f16t = HtpDataType::F16;
+        [
+            fa_tensor(f32t, [dk, m, n_heads, 1]),
+            fa_tensor(f16t, [dk, s, n_kv_heads, 1]),
+            fa_tensor(f16t, [dk, s, n_kv_heads, 1]),
+            fa_tensor(f16t, [s, m, 1, 1]),
+            fa_tensor(f32t, [dk, n_heads, m, 1]),
+        ]
+    }
+
+    fn fa_solve(
+        host: &FlashAttnHost,
+        t: &[CopyTensor; 5],
+        scale: f32,
+        softcap: f32,
+    ) -> Option<[i32; 32]> {
+        build_flash_attn_kernel_params(
+            host,
+            &FlashAttnOp {
+                q: &t[0],
+                k: &t[1],
+                v: &t[2],
+                mask: Some(&t[3]),
+                sinks: None,
+                dst: &t[4],
+                scale,
+                max_bias: 0.0,
+                logit_softcap: softcap,
+            },
+        )
+    }
+
+    /// Every case of `testdata/flash_attn_golden.txt`: llama.cpp's real `htp_kparams_solve` for a
+    /// `FLASH_ATTN_EXT` (compiled and run by `scripts/hexagon-golden/gen.py`), over the model
+    /// shapes cera runs, query counts and KV lengths, session thread counts and VTCM budgets,
+    /// operand types, mask shapes, soft caps, ALiBi biases and the host's `opt_fa_*` options.
     #[test]
-    fn test_hmx_fa_kparams_golden() {
-        let scale = 1.0f32 / 64.0f32.sqrt();
-        let kp = build_hmx_fa_kernel_params(64, 16, 8, 32, 602, scale, 4, 8 << 20)
-            .expect("m=32 kv=602 fits");
-        assert_eq!(kp[0] & 0xff, 2); // HMX
-        // bytes 1 and 2 are head_split (on, as in llama.cpp) and reserved flags; they used to be
-        // is_q_fp32 / is_dst_fp32
-        assert_eq!((kp[0] >> 8) & 0xff, 1);
-        assert_eq!((kp[0] >> 16) & 0xff, 0);
-        assert_eq!(kp[1], 32 | (192 << 16)); // Br | Bc << 16
-        assert_eq!(kp[2] & 0xffff, 4); // n_kv_blocks = ceil(602/192)
-        assert_eq!((kp[2] >> 16) & 0xffff, 2); // G
-        // the HMX kernel works in the log2 domain: the host folds log2(e) into the scale
+    fn flash_attn_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/flash_attn_golden.txt");
+        let tensor = |side: &str| -> Option<CopyTensor> {
+            let side = side.trim();
+            (side != "-").then(|| {
+                let mut f = side.split_whitespace();
+                let mut next = || -> u32 { f.next().unwrap().parse().unwrap() };
+                CopyTensor {
+                    dtype: next(),
+                    ne: [next(), next(), next(), next()],
+                    nb: [0; 4],
+                }
+            })
+        };
+        let (mut cases, mut unsupported, mut hmx, mut hvx, mut teams) = (0usize, 0, 0, 0, 0);
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let mut sides = inputs.split('|');
+            let q = tensor(sides.next().unwrap()).unwrap();
+            let k = tensor(sides.next().unwrap()).unwrap();
+            let v = tensor(sides.next().unwrap()).unwrap();
+            let mask = tensor(sides.next().unwrap());
+            let sinks = tensor(sides.next().unwrap());
+            let dst = tensor(sides.next().unwrap()).unwrap();
+            let mut params = sides.next().unwrap().split_whitespace();
+            let mut float = || f32::from_bits(params.next().unwrap().parse().unwrap());
+            let (scale, max_bias, logit_softcap) = (float(), float(), float());
+            let kv_rows: u32 = params.next().unwrap().parse().unwrap();
+            let mut run = sides.next().unwrap().split_whitespace();
+            let mut next = || -> u64 { run.next().unwrap().parse().unwrap() };
+            let host = FlashAttnHost {
+                n_threads: next() as u32,
+                vtcm_bytes: next() as usize,
+                n_hmx: next() as u32,
+                mdev_count: next() as u32,
+                select: next() as i32,
+                split: next() != 0,
+            };
+            // a K/V row list (src[5]) is refused by the solver, and by the queue before it asks
+            let got = (kv_rows == 0)
+                .then(|| {
+                    build_flash_attn_kernel_params(
+                        &host,
+                        &FlashAttnOp {
+                            q: &q,
+                            k: &k,
+                            v: &v,
+                            mask: mask.as_ref(),
+                            sinks: sinks.as_ref(),
+                            dst: &dst,
+                            scale,
+                            max_bias,
+                            logit_softcap,
+                        },
+                    )
+                })
+                .flatten();
+            let want = want.trim();
+            if want == "unsupported" {
+                assert_eq!(got, None, "{line}");
+                unsupported += 1;
+            } else {
+                let mut words: Vec<i32> = want
+                    .split_whitespace()
+                    .map(|w| w.parse::<u32>().unwrap() as i32)
+                    .collect();
+                words.resize(32, 0);
+                assert_eq!(got.map(|k| k.to_vec()), Some(words), "{line}");
+                let got = got.unwrap();
+                match got[0] & 0xff {
+                    1 => hvx += 1,
+                    2 => hmx += 1,
+                    other => panic!("kernel type {other}: {line}"),
+                }
+                teams += usize::from((got[0] >> 16) & 0xff != 0);
+            }
+            cases += 1;
+        }
+        assert!(
+            cases > 6000 && unsupported > 800 && hmx > 3000 && hvx > 1000 && teams > 100,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {hmx} hmx, {hvx} hvx, {teams} team-split"
+        );
+    }
+
+    /// The decode and prefill-chunk shapes of an LFM2 attention layer, worked from the C++ by hand:
+    /// each field of `htp_fa_kernel_params` where it lands in the words.
+    #[test]
+    fn flash_attn_params_for_lfm2_shapes_carry_the_solver_fields() {
+        let host = FlashAttnHost::new(6, 8 << 20, 1);
+        let scale = 0.125f32;
+
+        // a 32-row chunk over 602 KV rows: HMX, Br=32, Bc=192, pipelined across 6 threads
+        let t = fa_operands(64, 16, 8, 32, 602);
+        let kp = fa_solve(&host, &t, scale, 0.0).expect("chunk fits");
+        assert_eq!(kp[0].to_le_bytes(), [2, 1, 0, 6]);
+        assert_eq!(kp[1], 32 | (192 << 16));
+        assert_eq!(kp[2], 4 | (2 << 16)); // ceil(602 / 192) blocks, G = 2
         assert_eq!(kp[3], (scale * std::f32::consts::LOG2_E).to_bits() as i32);
-        assert_eq!(kp[5], 0);
-        assert_eq!(kp[6], 386688); // vtcm_size
-        assert_eq!(kp[7], 0);
-        assert_eq!(kp[8], 0);
-        assert_eq!(kp[12], 16); // n_head_log2
-        assert_eq!(kp[17], 0); // broadcast divs unset on HMX
-        assert_eq!(kp[25], 64); // g_br = align_up(2*32, 32)
-        assert_eq!(kp[26], 4); // row_buf_stride = align_up(384, 256)/128
-        assert_eq!(kp[27], 192); // mask_buf_row_stride = align_up(384, 128)/2
-        assert_eq!(kp[28], 1); // mask_broadcast
-        assert_eq!(kp[29], 1); // pipelined
+        assert_eq!((kp[4], kp[5]), (0, 0));
+        assert_eq!(kp[6], 388736); // the 4-thread layout's 386688 plus two more row buffers per thread
+        assert_eq!(
+            (kp[7], kp[8]),
+            (1.0f32.to_bits() as i32, 1.0f32.to_bits() as i32)
+        );
+        assert_eq!(kp[9], 16); // n_head_log2
+        let one = init_fastdiv(1);
+        assert_eq!((kp[10], kp[11]), (one.mp as i32, one.l as i32)); // mask ne[2] = 1
+        assert_eq!((kp[22], kp[23], kp[24]), (64, 1, 1)); // g_br, mask_broadcast, pipeline
         let div_g = init_fastdiv(2);
-        assert_eq!((kp[30], kp[31]), (div_g.mp as i32, div_g.l as i32));
+        assert_eq!((kp[25], kp[26]), (div_g.mp as i32, div_g.l as i32));
+        assert_eq!(
+            &kp[14..22],
+            &[0; 8],
+            "HMX leaves the HVX broadcast dividers unset"
+        );
+        assert_eq!(&kp[27..], &[0; 5]);
+
+        // one decode row over 64 KV rows: HVX, one KV block
+        let t = fa_operands(64, 16, 8, 1, 64);
+        let kp = fa_solve(&host, &t, scale, 0.0).expect("decode fits");
+        assert_eq!(kp[0].to_le_bytes(), [1, 1, 0, 6]);
+        assert_eq!(kp[1], 1 | (64 << 16));
+        assert_eq!(kp[2], 1 | (2 << 16));
+        assert_eq!(kp[3], scale.to_bits() as i32);
+        assert_eq!(kp[6], 319488); // 6 threads x (Q, 2 K, 2 V, mask rows, accumulators) = 6 x 53248
+        assert_eq!((kp[22], kp[23], kp[24]), (256, 128, 128)); // padded Q (f32), K, V rows
+        let div21 = init_fastdiv(16);
+        assert_eq!((kp[25], kp[26]), (div21.mp as i32, div21.l as i32)); // q.ne[2] * q.ne[1]
+        let div1 = init_fastdiv(1);
+        assert_eq!((kp[27], kp[28]), (div1.mp as i32, div1.l as i32));
+        assert_eq!((kp[14], kp[15]), (div_g.mp as i32, div_g.l as i32)); // rk2 = 16 / 8
+    }
+
+    /// The soft cap is folded into the scale on both kernels, and the HMX kernel's log2(e) goes
+    /// into the cap instead of the scale when there is one.
+    #[test]
+    fn flash_attn_softcap_folds_into_the_scale() {
+        let host = FlashAttnHost::new(4, 8 << 20, 1);
+        let log2e = std::f32::consts::LOG2_E;
+        let hvx = fa_solve(&host, &fa_operands(64, 16, 8, 1, 64), 0.125, 50.0).unwrap();
+        assert_eq!(hvx[0] & 0xff, 1);
+        assert_eq!(hvx[3], (0.125f32 / 50.0).to_bits() as i32);
+        assert_eq!(hvx[5], 50.0f32.to_bits() as i32);
+        let hmx = fa_solve(&host, &fa_operands(64, 16, 8, 32, 602), 0.125, 50.0).unwrap();
+        assert_eq!(hmx[0] & 0xff, 2);
+        assert_eq!(hmx[3], (0.125f32 / 50.0).to_bits() as i32);
+        assert_eq!(hmx[5], (50.0f32 * log2e).to_bits() as i32);
+        let plain = fa_solve(&host, &fa_operands(64, 16, 8, 32, 602), 0.125, 0.0).unwrap();
+        assert_eq!(plain[3], (0.125f32 * log2e).to_bits() as i32);
+        assert_eq!(plain[5], 0);
+    }
+
+    #[test]
+    fn flash_attn_kernel_choice_follows_the_host_options() {
+        let t = fa_operands(64, 16, 8, 32, 602);
+        let hmx = FlashAttnHost::new(6, 8 << 20, 1);
+        assert_eq!(fa_solve(&hmx, &t, 0.125, 0.0).unwrap()[0] & 0xff, 2);
+        // no HMX unit, or the caller keeps it off: the HVX kernel
+        let no_unit = FlashAttnHost::new(6, 8 << 20, 0);
+        assert_eq!(fa_solve(&no_unit, &t, 0.125, 0.0).unwrap()[0] & 0xff, 1);
+        assert_eq!(
+            fa_solve(&hmx.hvx_only(), &t, 0.125, 0.0).unwrap()[0] & 0xff,
+            1
+        );
+        // opt_fa_select 0 refuses the op
+        let off = FlashAttnHost { select: 0, ..hmx };
+        assert_eq!(fa_solve(&off, &t, 0.125, 0.0), None);
+        // a short chunk at a small head dim stays on HVX unless HMX is forced
+        let short = fa_operands(64, 16, 8, 4, 602);
+        assert_eq!(fa_solve(&hmx, &short, 0.125, 0.0).unwrap()[0] & 0xff, 2);
+        let decode = fa_operands(64, 16, 8, 1, 100);
+        assert_eq!(fa_solve(&hmx, &decode, 0.125, 0.0).unwrap()[0] & 0xff, 1);
+        let forced = FlashAttnHost { select: 3, ..hmx };
+        assert_eq!(fa_solve(&forced, &decode, 0.125, 0.0).unwrap()[0] & 0xff, 2);
+        // head dims that do not tile by 8 have no HMX path
+        let odd = fa_operands(70, 14, 7, 32, 602);
+        assert_eq!(fa_solve(&hmx, &odd, 0.125, 0.0).unwrap()[0] & 0xff, 1);
+        // an HVX working set above the budget is unsupported
+        let tight = FlashAttnHost::new(6, 64 << 10, 0);
+        assert_eq!(fa_solve(&tight, &t, 0.125, 0.0), None);
+    }
+
+    /// Shapes the solver cannot divide by (llama.cpp would divide by zero) are unsupported rather
+    /// than a panic or garbage params.
+    #[test]
+    fn flash_attn_degenerate_shapes_are_unsupported() {
+        let host = FlashAttnHost::new(6, 8 << 20, 1);
+        for (n_heads, n_kv_heads) in [(0, 1), (8, 0), (4, 8)] {
+            let t = fa_operands(64, n_heads, n_kv_heads, 1, 64);
+            assert_eq!(
+                fa_solve(&host, &t, 0.125, 0.0),
+                None,
+                "{n_heads}/{n_kv_heads}"
+            );
+        }
     }
 
     #[test]
     fn test_hmx_fa_eligibility() {
-        assert!(fa_is_hmx_eligible(64, 5));
-        assert!(fa_is_hmx_eligible(64, 32));
-        assert!(fa_is_hmx_eligible(128, 32));
-        assert!(!fa_is_hmx_eligible(64, 4)); // small-DK short chunk: HVX
-        assert!(!fa_is_hmx_eligible(70, 32)); // DK % 8 != 0
+        let host = FlashAttnHost::new(6, 8 << 20, 1);
+        let eligible = |dk, m, s| {
+            let t = fa_operands(dk, 16, 8, m, s);
+            let op = FlashAttnOp {
+                q: &t[0],
+                k: &t[1],
+                v: &t[2],
+                mask: Some(&t[3]),
+                sinks: None,
+                dst: &t[4],
+                scale: 0.125,
+                max_bias: 0.0,
+                logit_softcap: 0.0,
+            };
+            fa_is_hmx_eligible(&host, &op)
+        };
+        assert!(eligible(64, 5, 100));
+        assert!(eligible(64, 32, 100));
+        assert!(eligible(128, 32, 100));
+        assert!(!eligible(64, 1, 100)); // decode over a short cache: HVX
+        assert!(eligible(64, 1, 768)); // ... and HMX past the crossover at 6 threads
+        assert!(!eligible(70, 32, 100)); // DK % 8 != 0
     }
 
     #[test]
@@ -3269,16 +3722,6 @@ mod tests {
         assert_eq!(ssm1[5], 256); // d_inner_tile (scalar: the full per-thread range)
         let ssm32 = build_ssm_conv_kernel_params(3, 1024, 32, 1, 34, 4, 8 << 20);
         assert_eq!(ssm32[5], 64); // a quarter of the 256 channels per thread, within 32..=128
-
-        // Flash attention: decode (M=1) and prefill chunk (M=32).
-        let fa1 = build_flash_attn_kernel_params(64, 16, 8, 1, 64, 0.125, 1, true);
-        assert_eq!(fa1[7], 16); // qrows
-        assert_eq!(fa1[8], 16); // qrows_per_thread (1 thread)
-        let fa32 = build_flash_attn_kernel_params(64, 16, 8, 32, 544, 0.125, 4, true);
-        assert_eq!(fa32[7], 512);
-        assert_eq!(fa32[8], 128);
-        assert_eq!(fa32[28], init_fastdiv(512).mp as i32); // src0_div21
-        assert_eq!(fa32[30], init_fastdiv(32).mp as i32); // src0_div1
     }
 
     #[test]
@@ -3348,41 +3791,6 @@ mod tests {
 
         let p_custom = build_elu_params(0.5);
         assert_eq!(p_custom[0], 0.5f32.to_bits() as i32);
-    }
-
-    #[test]
-    fn test_build_flash_attn_kernel_params_zero_heads() {
-        let p = build_flash_attn_kernel_params(64, 0, 1, 1, 1, 0.1, 1, false);
-        // Offset 12 corresponds to n_head_log2; must be 0 when n_heads == 0 without underflow
-        assert_eq!(p[12], 0);
-    }
-
-    #[test]
-    fn test_flash_attn_kernel_params_with_softcap() {
-        let p = build_flash_attn_kernel_params_with_softcap(64, 16, 8, 1, 64, 0.125, 1, true, 50.0);
-        assert_eq!(p[5], 50.0f32.to_bits() as i32);
-        // HVX: head_split on, no type flags
-        assert_eq!((p[0] >> 8) & 0xff, 1);
-        assert_eq!((p[0] >> 16) & 0xff, 0);
-
-        // The scale is divided by the softcap, as the C++ host does
-        assert_eq!(p[3], (0.125f32 / 50.0).to_bits() as i32);
-        // HMX with a softcap folds log2(e) into the softcap and leaves the (divided) scale alone;
-        // without one it folds it into the scale
-        let hmx =
-            build_hmx_fa_kernel_params_with_softcap(64, 16, 8, 32, 602, 0.125, 4, 8 << 20, 50.0)
-                .expect("should fit");
-        assert_eq!(hmx[3], (0.125f32 / 50.0).to_bits() as i32);
-        assert_eq!(
-            hmx[5],
-            (50.0f32 * std::f32::consts::LOG2_E).to_bits() as i32
-        );
-        let plain = build_hmx_fa_kernel_params(64, 16, 8, 32, 602, 0.125, 4, 8 << 20).unwrap();
-        assert_eq!(
-            plain[3],
-            (0.125f32 * std::f32::consts::LOG2_E).to_bits() as i32
-        );
-        assert_eq!(plain[5], 0);
     }
 
     const VTCM: usize = 8 * 1024 * 1024;

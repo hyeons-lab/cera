@@ -2070,6 +2070,17 @@ impl HexagonLfmModel {
         Ok(())
     }
 
+    /// The session limits and HMX setting a flash-attention op is solved against: what the queue
+    /// uses when it derives the params, and what a recorded decode template re-solves with.
+    pub(super) fn flash_attn_host(&self, session: &HexagonQueueSession) -> FlashAttnHost {
+        let host = FlashAttnHost::new(
+            session.dsp_threads(),
+            session.dsp_vtcm_bytes(),
+            session.dsp_hmx(),
+        );
+        if self.use_hmx { host } else { host.hvx_only() }
+    }
+
     pub(super) fn dispatch_flash_attn_ext_typed(
         session: &mut HexagonQueueSession,
         q: &RpcmemBuffer,
@@ -2089,7 +2100,8 @@ impl HexagonLfmModel {
         scale: f32,
         kv_dtype: HtpDataType,
         softcap: f32,
-    ) -> Result<(usize, usize, usize), CeraError> {
+        use_hmx: bool,
+    ) -> Result<FlashAttnTensors, CeraError> {
         let q_bytes = head_dim * n_heads * 4;
         let kv_dim = head_dim * n_kv_heads;
         let cache_bytes = kv_cache_bytes(kv_dtype, kv_dim, max_seq_len);
@@ -2159,19 +2171,7 @@ impl HexagonLfmModel {
             [seq_len as u32, 1, 1, 1],
             [2, mask_bytes as u32, mask_bytes as u32, mask_bytes as u32],
         )?;
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
-        let kparams = build_flash_attn_kernel_params_with_softcap(
-            head_dim,
-            n_heads,
-            n_kv_heads,
-            1,
-            seq_len,
-            scale,
-            session.dsp_threads(),
-            true,
-            softcap,
-        );
+        let params = flash_attn_op_params(scale, softcap);
         Self::enqueue_labeled(
             session,
             "dispatch_flash_attn_ext",
@@ -2179,9 +2179,15 @@ impl HexagonLfmModel {
             &[q_ti, k_ti, v_ti, mask_ti],
             &[dst_ti],
             params,
-            kparams,
+            flash_attn_kernel_request(use_hmx),
         )?;
-        Ok((k_ti as usize, v_ti as usize, mask_ti as usize))
+        Ok(FlashAttnTensors {
+            q_ti: q_ti as usize,
+            k_ti: k_ti as usize,
+            v_ti: v_ti as usize,
+            mask_ti: mask_ti as usize,
+            dst_ti: dst_ti as usize,
+        })
     }
 
     /// Flush pending ops if debug_barriers is set.
@@ -2292,37 +2298,7 @@ impl HexagonLfmModel {
                 (seq_len * n_tokens * 2) as u32,
             ],
         )?;
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
-        let softcap = self.attn_logit_softcapping.unwrap_or(0.0);
-        // HMX first (DK % 8, M >= 5 at small head_dim), HVX fallback.
-        let kparams = if self.use_hmx
-            && fa_is_hmx_eligible(head_dim, n_tokens)
-            && let Some(hmx) = build_hmx_fa_kernel_params_with_softcap(
-                head_dim,
-                n_heads,
-                n_kv_heads,
-                n_tokens,
-                seq_len,
-                scale,
-                session.dsp_threads(),
-                self.vtcm_budget,
-                softcap,
-            ) {
-            hmx
-        } else {
-            build_flash_attn_kernel_params_with_softcap(
-                head_dim,
-                n_heads,
-                n_kv_heads,
-                n_tokens,
-                seq_len,
-                scale,
-                session.dsp_threads(),
-                true,
-                softcap,
-            )
-        };
+        let params = flash_attn_op_params(scale, self.attn_logit_softcapping.unwrap_or(0.0));
         Self::enqueue_labeled(
             session,
             "dispatch_flash_attn_m",
@@ -2330,7 +2306,7 @@ impl HexagonLfmModel {
             &[q_ti, k_ti, v_ti, mask_ti],
             &[dst_ti],
             params,
-            kparams,
+            flash_attn_kernel_request(self.use_hmx),
         )?;
         Ok(())
     }

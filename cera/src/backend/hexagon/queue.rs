@@ -7,7 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use super::params::{
-    build_concat_kernel_params, build_copy_kernel_params, build_set_rows_kernel_params,
+    CopyTensor, FLASH_ATTN_HVX_ONLY, FlashAttnHost, FlashAttnOp, build_concat_kernel_params,
+    build_copy_kernel_params, build_flash_attn_kernel_params, build_set_rows_kernel_params,
 };
 use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
@@ -939,6 +940,7 @@ impl HexagonQueueSession {
             &self.tens,
             self.dsp_threads(),
             self.dsp_vtcm_bytes(),
+            self.dsp_hmx(),
         )
         .inspect_err(|_| self.drop_pending_batch())?;
         let mut op = HtpOpDesc {
@@ -1539,8 +1541,10 @@ impl Drop for HexagonQueueSession {
 }
 
 /// Validate `enqueue_op` operand counts, tensor indices, and `Cpy`/`Concat` arity, and derive
-/// `Cpy`/`Concat`/`SetRows` `kernel_params` when the caller passed `[0; 32]`. Shared with test sinks so
-/// fake and real queues enforce identical preconditions and derive identical parameter words.
+/// `Cpy`/`Concat`/`SetRows`/`FlashAttnExt` `kernel_params` when the caller passed `[0; 32]`
+/// (`FlashAttnExt` also for [`FLASH_ATTN_HVX_ONLY`]). Shared with test sinks so fake and real
+/// queues enforce identical preconditions and derive identical parameter words. `dsp_hmx` is the
+/// DSP's HMX unit count (0 keeps the HMX kernels off).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_derive_op_params<T>(
     opcode: u32,
@@ -1551,6 +1555,7 @@ pub(crate) fn validate_and_derive_op_params<T>(
     tensors: &[T],
     dsp_threads: u32,
     vtcm_bytes: usize,
+    dsp_hmx: u32,
 ) -> Result<[i32; 32], CeraError>
 where
     T: std::fmt::Debug,
@@ -1668,6 +1673,71 @@ where
             .ok_or_else(|| {
                 CeraError::Backend(format!(
                     "enqueue_op SetRows: the HTP set_rows kernel does not handle {tv:?} + {ti:?} -> {td:?}"
+                ))
+            })?;
+        }
+    }
+    // `FlashAttnExt`: the DSP reads everything from the kernel params, and the kernel (HMX or HVX),
+    // tiling and VTCM working set come from the registered tensors, the op params (scale, ALiBi
+    // bias and soft cap, as in a ggml node's `op_params`) and the session's limits
+    // (`htp_kparams_solve_flash_attn`).
+    if opcode == HtpOpCode::FlashAttnExt as u32 {
+        if src.len() < 3
+            || src.len() > 6
+            || dst.len() != 1
+            || src[..3].contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op FlashAttnExt: needs registered q, k, v src tensors (then an optional \
+                 mask and attention sinks) and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        // the DSP kernels take no K/V row lists (src[5])
+        if src.get(5).is_some_and(|&s| s != 0xffff) {
+            return Err(CeraError::Backend(
+                "enqueue_op FlashAttnExt: K/V row lists are not supported".into(),
+            ));
+        }
+        let hvx_only = kernel_params == FLASH_ATTN_HVX_ONLY;
+        if kernel_params == [0i32; 32] || hvx_only {
+            let operand = |i: usize| -> Option<CopyTensor> {
+                src.get(i)
+                    .filter(|&&s| s != 0xffff)
+                    .map(|&s| (&tensors[s as usize]).into())
+            };
+            let (q, k, v) = (
+                operand(0).unwrap(),
+                operand(1).unwrap(),
+                operand(2).unwrap(),
+            );
+            let (mask, sinks) = (operand(3), operand(4));
+            let d: CopyTensor = (&tensors[dst[0] as usize]).into();
+            let mut host = FlashAttnHost::new(dsp_threads, vtcm_bytes, dsp_hmx);
+            if hvx_only {
+                host = host.hvx_only();
+            }
+            let f = |i: usize| f32::from_bits(params[i] as u32);
+            kernel_params = build_flash_attn_kernel_params(
+                &host,
+                &FlashAttnOp {
+                    q: &q,
+                    k: &k,
+                    v: &v,
+                    mask: mask.as_ref(),
+                    sinks: sinks.as_ref(),
+                    dst: &d,
+                    scale: f(0),
+                    max_bias: f(1),
+                    logit_softcap: f(2),
+                },
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op FlashAttnExt: the HTP flash-attention kernels do not handle q {q:?}, \
+                     k {k:?}, v {v:?}, mask {mask:?}, sinks {sinks:?} -> {d:?} within {vtcm_bytes} \
+                     bytes of VTCM"
                 ))
             })?;
         }
@@ -1979,6 +2049,231 @@ mod tests {
                 .is_err()
         );
         assert_pending_empty(&q, "concat single src");
+    }
+
+    /// A `FlashAttnExt` enqueued with empty kernel params gets them from the registered tensors,
+    /// the op params and the session's limits (thread count, VTCM, HMX units); the HVX-only
+    /// request keeps the HMX kernel off; precomputed params pass through; K/V row lists, missing
+    /// operands and shapes no kernel takes are errors that drop the batch.
+    #[test]
+    fn flash_attn_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{
+            CopyTensor, FlashAttnHost, FlashAttnOp, build_flash_attn_kernel_params,
+            flash_attn_kernel_request, flash_attn_op_params,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let (f32_t, f16_t) = (HtpDataType::F32 as u32, HtpDataType::F16 as u32);
+        let mut q = test_session();
+        q.set_dsp_hw(1, 8 << 20);
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+        let scale = 0.125f32;
+
+        // 32 prefill rows of 16 heads over 602 KV rows of 8 kv heads, LFM2-style views of the
+        // interleaved cache and `[head_dim, n_heads, n_tokens]` output
+        let register = |q: &mut HexagonQueueSession| {
+            let qt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f32_t,
+                    [64, 32, 16, 1],
+                    [4, 4096, 256, 4096],
+                )
+                .unwrap();
+            let kt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f16_t,
+                    [64, 602, 8, 1],
+                    [2, 1024, 128, 4096],
+                )
+                .unwrap();
+            let vt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f16_t,
+                    [64, 602, 8, 1],
+                    [2, 1024, 128, 4096],
+                )
+                .unwrap();
+            let mt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f16_t,
+                    [602, 32, 1, 1],
+                    [2, 1204, 38528, 38528],
+                )
+                .unwrap();
+            let dt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f32_t,
+                    [64, 16, 32, 1],
+                    [4, 256, 4096, 4096],
+                )
+                .unwrap();
+            [qt, kt, vt, mt, dt]
+        };
+        let [qt, kt, vt, mt, dt] = register(&mut q);
+        let view = |q: &HexagonQueueSession, ti: u16| CopyTensor::from(&q.tens[ti as usize]);
+        let solve = |q: &HexagonQueueSession, host: &FlashAttnHost| {
+            let (qv, kv, vv, mv, dv) = (
+                view(q, qt),
+                view(q, kt),
+                view(q, vt),
+                view(q, mt),
+                view(q, dt),
+            );
+            build_flash_attn_kernel_params(
+                host,
+                &FlashAttnOp {
+                    q: &qv,
+                    k: &kv,
+                    v: &vv,
+                    mask: Some(&mv),
+                    sinks: None,
+                    dst: &dv,
+                    scale,
+                    max_bias: 0.0,
+                    logit_softcap: 0.0,
+                },
+            )
+            .unwrap()
+        };
+        let params = flash_attn_op_params(scale, 0.0);
+        let src = [qt, kt, vt, mt];
+        let host = FlashAttnHost::new(threads, vtcm, 1);
+
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &src,
+            &[dt],
+            params,
+            flash_attn_kernel_request(true),
+        )
+        .unwrap();
+        assert_eq!(q.ops[0].kernel_params, solve(&q, &host));
+        assert_eq!(
+            q.ops[0].kernel_params[0] & 0xff,
+            2,
+            "an HMX unit takes the chunk"
+        );
+
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &src,
+            &[dt],
+            params,
+            flash_attn_kernel_request(false),
+        )
+        .unwrap();
+        assert_eq!(q.ops[1].kernel_params, solve(&q, &host.hvx_only()));
+        assert_eq!(q.ops[1].kernel_params[0] & 0xff, 1);
+
+        // the soft cap comes from op_params[2]
+        let capped = flash_attn_op_params(scale, 50.0);
+        q.enqueue_op(HtpOpCode::FlashAttnExt as u32, &src, &[dt], capped, [0; 32])
+            .unwrap();
+        assert_eq!(
+            q.ops[2].kernel_params[5],
+            (50.0f32 * std::f32::consts::LOG2_E).to_bits() as i32
+        );
+
+        // no HMX unit on the session: HVX
+        let mut no_hmx = test_session();
+        let [qt2, kt2, vt2, mt2, dt2] = register(&mut no_hmx);
+        no_hmx
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[qt2, kt2, vt2, mt2],
+                &[dt2],
+                params,
+                [0; 32],
+            )
+            .unwrap();
+        assert_eq!(no_hmx.ops[0].kernel_params[0] & 0xff, 1);
+
+        // precomputed params are the caller's: passed through untouched
+        q.enqueue_op(HtpOpCode::FlashAttnExt as u32, &src, &[dt], params, [7; 32])
+            .unwrap();
+        assert_eq!(q.ops[3].kernel_params, [7; 32]);
+
+        // without a mask the third word-pair is unset, and an HVX-only q/k/v op still solves
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &src[..3],
+            &[dt],
+            params,
+            [0; 32],
+        )
+        .unwrap();
+        assert_ne!(q.ops[4].kernel_params, [0; 32]);
+
+        // refusals: a K/V row list, a missing operand, a dst-less op, a dtype no kernel takes
+        let err = q
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[qt, kt, vt, mt, 0xffff, qt],
+                &[dt],
+                params,
+                [0; 32],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row lists"), "{err}");
+        assert_pending_empty(&q, "kv rows");
+        for (src, dst) in [
+            (vec![0xffffu16, 1, 2], vec![3u16]),
+            (vec![0, 1], vec![2]),
+            (vec![0, 1, 2], vec![]),
+            (vec![0, 1, 2], vec![0xffff]),
+        ] {
+            let mut q = test_session();
+            register(&mut q);
+            let e = q.enqueue_op(HtpOpCode::FlashAttnExt as u32, &src, &dst, params, [0; 32]);
+            assert!(e.is_err(), "{src:?} -> {dst:?} must be refused");
+            assert_pending_empty(&q, "bad flash-attention operands");
+        }
+        let mut q = test_session();
+        let [qt, kt, vt, _, dt] = register(&mut q);
+        let bad_mask = q
+            .add_tensor(
+                &buf,
+                0,
+                4096,
+                0,
+                f32_t,
+                [602, 32, 1, 1],
+                [4, 2408, 77056, 77056],
+            )
+            .unwrap();
+        let err = q
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[qt, kt, vt, bad_mask],
+                &[dt],
+                params,
+                [0; 32],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not handle"), "{err}");
+        assert_pending_empty(&q, "f32 mask");
     }
 
     /// A batch the DSP has not answered may still be running against the
