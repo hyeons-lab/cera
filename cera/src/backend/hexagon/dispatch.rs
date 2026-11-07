@@ -14,9 +14,9 @@
 use super::{
     HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonQueueSession,
     HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
-    build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
-    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
-    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
+    build_hmx_mm_kernel_params, build_layer_norm_params, build_mul_mat_f32_kernel_params,
+    build_mul_mat_kernel_params, build_softmax_kernel_params, build_ssm_conv_kernel_params,
+    mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -168,23 +168,21 @@ fn add_f32_vector<S: OpSink>(
     )
 }
 
-/// Broadcast `dst[i] += vec[i]` over a `[len, rows]` destination.
+/// Broadcast `dst[i] += vec[i]` over a `[len, rows]` destination (the row-broadcast kernel; the
+/// queue derives its params from the two tensors).
 fn enqueue_broadcast_add<S: OpSink>(
     session: &mut S,
     dst_ti: u16,
     vec_ti: u16,
-    len: usize,
     name: &str,
 ) -> Result<(), CeraError> {
-    let kparams =
-        build_binary_kernel_params(len, len, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
     session
         .enqueue_op(
             HtpOpCode::Add as u32,
             &[dst_ti, vec_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err(name, e))
 }
@@ -330,7 +328,7 @@ pub(crate) fn linear_m_with<S: OpSink>(
             )
             .map_err(|e| op_err("linear_m", e))?;
         if let Some(b_ti) = b_ti {
-            enqueue_broadcast_add(session, dst_ti, b_ti, rows, "linear_m bias_add")?;
+            enqueue_broadcast_add(session, dst_ti, b_ti, "linear_m bias_add")?;
         }
     }
     session.end_group().map_err(|e| op_err("linear_m", e))
@@ -392,30 +390,26 @@ pub(crate) fn layer_norm<S: OpSink>(
     for (start, run) in token_runs(n_tokens, a.tile) {
         let src_ti = add_f32_rows(session, a.src, a.src_offset + start * dim * 4, dim, run)?;
         let dst_ti = add_f32_rows(session, a.dst, a.dst_offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
         session
             .enqueue_op(
                 HtpOpCode::Norm as u32,
                 &[src_ti],
                 &[dst_ti],
                 build_layer_norm_params(a.eps),
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("layer_norm norm", e))?;
 
-        let mul_kparams =
-            build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Mul as u32,
                 &[dst_ti, w_ti],
                 &[dst_ti],
                 [0i32; 16],
-                mul_kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("layer_norm mul", e))?;
-        enqueue_broadcast_add(session, dst_ti, b_ti, dim, "layer_norm add")?;
+        enqueue_broadcast_add(session, dst_ti, b_ti, "layer_norm add")?;
     }
     session.end_group().map_err(|e| op_err("layer_norm", e))
 }
@@ -448,10 +442,8 @@ fn unary_inplace_with<S: OpSink>(
     let TokenShape { dim, n_tokens } = shape;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
         session
-            .enqueue_op(opcode as u32, &[ti], &[ti], params, kparams)
+            .enqueue_op(opcode as u32, &[ti], &[ti], params, [0i32; 32])
             .map_err(|e| op_err(name, e))?;
     }
     session.end_group().map_err(|e| op_err(name, e))
@@ -625,15 +617,13 @@ pub(crate) fn mul_row_bcast<S: OpSink>(
     let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Mul as u32,
                 &[ti, vec_ti],
                 &[ti],
                 [0i32; 16],
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("mul_row_bcast", e))?;
     }
@@ -766,7 +756,7 @@ pub(crate) fn add_row_bcast<S: OpSink>(
     let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        enqueue_broadcast_add(session, ti, vec_ti, dim, "add_row_bcast")?;
+        enqueue_broadcast_add(session, ti, vec_ti, "add_row_bcast")?;
     }
     session.end_group().map_err(|e| op_err("add_row_bcast", e))
 }
@@ -785,15 +775,13 @@ pub(crate) fn mul_inplace<S: OpSink>(
     for (start, run) in token_runs(n_tokens, tile) {
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * dim * 4, dim, run)?;
         let src_ti = add_f32_rows(session, src, src_offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_binary_kernel_params(dim, dim, run, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Mul as u32,
                 &[dst_ti, src_ti],
                 &[dst_ti],
                 [0i32; 16],
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("mul_inplace", e))?;
     }
@@ -818,23 +806,13 @@ pub(crate) fn mul_to<S: OpSink>(
     let dst_ti = add_f32_rows(session, dst, dst_offset, dim, n_tokens)?;
     let a_ti = add_f32_rows(session, a, a_offset, dim, n_tokens)?;
     let b_ti = add_f32_rows(session, b, b_offset, dim, n_tokens)?;
-    let kparams = build_binary_kernel_params(
-        dim,
-        dim,
-        n_tokens,
-        1,
-        1,
-        4,
-        VTCM_BUDGET,
-        session.dsp_threads(),
-    );
     session
         .enqueue_op(
             HtpOpCode::Mul as u32,
             &[a_ti, b_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err("mul_to", e))?;
     session.end_group().map_err(|e| op_err("mul_to", e))
@@ -1139,15 +1117,13 @@ pub(crate) fn add_row_bcast_to<S: OpSink>(
     let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
     let src_ti = src.add(session, HTP_TENSOR_COMPUTE)?;
     let dst_ti = dst.add(session, HTP_TENSOR_COMPUTE)?;
-    let kparams =
-        build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
     session
         .enqueue_op(
             HtpOpCode::Add as u32,
             &[src_ti, vec_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err("add_row_bcast_to", e))?;
     session
@@ -1169,15 +1145,13 @@ pub(crate) fn add_residual<S: OpSink>(
     for (start, run) in token_runs(n_tokens, tile) {
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * dim * 4, dim, run)?;
         let src_ti = add_f32_rows(session, src, src_offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_binary_kernel_params(dim, dim, run, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Add as u32,
                 &[dst_ti, src_ti],
                 &[dst_ti],
                 [0i32; 16],
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("add_residual", e))?;
     }
@@ -1374,6 +1348,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{HTP_BINARY_KERNEL_ROW_BCAST, binary_kernel_type, solve_binary};
     use super::testing::*;
     use super::*;
 
@@ -1734,11 +1709,19 @@ mod tests {
         assert_eq!((v.buf, v.offset, v.ne), ("v", 4096, [16, 1, 1, 1]));
         assert_eq!(v.flags, HTP_TENSOR_WEIGHT);
         assert_eq!(s.src(1, 0).ne, [16, 5, 1, 1]);
-        // Same row-broadcast kernel params the bias add uses.
-        assert_eq!(
-            s.ops[1].kparams,
-            build_binary_kernel_params(16, 16, 1, 1, 1, 4, VTCM_BUDGET, 8)
-        );
+        // The queue derives the row-broadcast kernel's params from the registered tensors.
+        let want = solve_binary(
+            OP_MUL,
+            &s.src(1, 0).into(),
+            &s.src(1, 1).into(),
+            None,
+            &s.dst(1).into(),
+            8,
+            VTCM_BUDGET,
+        )
+        .expect("a row broadcast fits");
+        assert_eq!(s.ops[1].kparams, want);
+        assert_eq!(binary_kernel_type(&want), HTP_BINARY_KERNEL_ROW_BCAST);
         assert_eq!(s.ops[1].dst, vec![s.ops[1].src[0]]);
     }
 

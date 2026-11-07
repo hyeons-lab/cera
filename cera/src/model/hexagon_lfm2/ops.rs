@@ -1,8 +1,8 @@
 //! Op emitters: one `dispatch_*` associated function per DSP operation.
 
 use super::*;
-use crate::backend::hexagon::MmKernelParams;
 use crate::backend::hexagon::dispatch::{self, ConcatSrc, TokenShape, TokenTile, View};
+use crate::backend::hexagon::{CopyTensor, MmKernelParams, collapse_glu, solve_binary};
 
 impl HexagonLfmModel {
     /// Contiguous f32 vector descriptor (`[dim,1,1,1]`): the one spelling of
@@ -110,16 +110,6 @@ impl HexagonLfmModel {
         let src1_ti = Self::add_f32_vec(session, src1, src1_offset, dim, src1_flags)?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_mul",
@@ -127,7 +117,7 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -158,6 +148,10 @@ impl HexagonLfmModel {
         let b_span = span(b_row_stride);
         let dst_bytes = row * n_rows;
         let ne = [dim as u32, n_rows as u32, 1, 1];
+        // ggml's plane stride is `ne1 * nb1`, which the host's solver checks (a single row
+        // whose stride exceeds its span would otherwise read as a permuted tensor); the mapped
+        // `size` stays the span actually read.
+        let plane = |stride: usize| (n_rows * stride) as u32;
         let a_ti = session.add_tensor(
             a_buf,
             a_offset,
@@ -165,7 +159,12 @@ impl HexagonLfmModel {
             a_flags,
             HtpDataType::F32 as u32,
             ne,
-            [4, a_row_stride as u32, a_span as u32, a_span as u32],
+            [
+                4,
+                a_row_stride as u32,
+                plane(a_row_stride),
+                plane(a_row_stride),
+            ],
         )?;
         let b_ti = session.add_tensor(
             b_buf,
@@ -174,7 +173,12 @@ impl HexagonLfmModel {
             b_flags,
             HtpDataType::F32 as u32,
             ne,
-            [4, b_row_stride as u32, b_span as u32, b_span as u32],
+            [
+                4,
+                b_row_stride as u32,
+                plane(b_row_stride),
+                plane(b_row_stride),
+            ],
         )?;
         let dst_ti = session.add_tensor(
             dst_buf,
@@ -186,16 +190,6 @@ impl HexagonLfmModel {
             [4, row as u32, dst_bytes as u32, dst_bytes as u32],
         )?;
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            n_rows,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_mul_m_strided",
@@ -203,7 +197,7 @@ impl HexagonLfmModel {
             &[a_ti, b_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -223,13 +217,29 @@ impl HexagonLfmModel {
         dim: usize,
         n_rows: usize,
     ) -> Result<(), CeraError> {
-        // Sized first: a refusal then registers no tensor.
-        let kparams = build_binary_scalar_dma_kernel_params(
-            dim,
-            n_rows,
-            4,
-            8 * 1024 * 1024,
+        let bytes = dim * n_rows * 4;
+        let row = (dim * 4) as u32;
+        // Sized first: a refusal then registers no tensor. `enqueue_op` derives the same params
+        // from the tensors registered below.
+        let f32_ty = HtpDataType::F32 as u32;
+        let rows = CopyTensor {
+            dtype: f32_ty,
+            ne: [dim as u32, n_rows as u32, 1, 1],
+            nb: [4, row, bytes as u32, bytes as u32],
+        };
+        let table = CopyTensor {
+            dtype: f32_ty,
+            ne: [1, n_rows as u32, 1, 1],
+            nb: [4, 4, (n_rows * 4) as u32, (n_rows * 4) as u32],
+        };
+        solve_binary(
+            HtpOpCode::Mul as u32,
+            &rows,
+            &table,
+            None,
+            &rows,
             session.dsp_threads(),
+            session.dsp_vtcm_bytes(),
         )
         .ok_or_else(|| {
             CeraError::Backend(format!(
@@ -237,8 +247,6 @@ impl HexagonLfmModel {
                  not fit VTCM"
             ))
         })?;
-        let bytes = dim * n_rows * 4;
-        let row = (dim * 4) as u32;
         let a_ti = session.add_tensor(
             a_buf,
             a_offset,
@@ -274,7 +282,7 @@ impl HexagonLfmModel {
             &[a_ti, b_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -330,16 +338,6 @@ impl HexagonLfmModel {
         let src1_ti = Self::add_f32_vec(session, src1, src1_offset, dim, HTP_TENSOR_COMPUTE)?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_add",
@@ -347,7 +345,7 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -368,16 +366,6 @@ impl HexagonLfmModel {
         let src1_ti = Self::add_f32_vec(session, src1, src1_offset, dim, src1_flags)?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_add_with_flags",
@@ -385,7 +373,7 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -441,15 +429,9 @@ impl HexagonLfmModel {
         )?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
-        // A one-element `src1` needs the DSP's scalar-broadcast kernel; the
-        // same-shape kernel would read `dim` elements from it.
-        let kparams =
-            build_binary_scalar_kernel_params(dim, 8 * 1024 * 1024, session.dsp_threads())
-                .ok_or_else(|| {
-                    CeraError::Backend(format!(
-                        "{label}: {dim}-element scalar op does not fit VTCM"
-                    ))
-                })?;
+        // A one-element `src1` takes the DSP's scalar-broadcast kernel (the host derives its
+        // params from the registered tensors); the same-shape kernel would read `dim`
+        // elements from it.
         Self::enqueue_labeled(
             session,
             label,
@@ -457,7 +439,7 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -478,16 +460,6 @@ impl HexagonLfmModel {
         let src0_ti = Self::add_f32_vec(session, src0, src0_offset, dim, HTP_TENSOR_COMPUTE)?;
         let src1_ti = Self::add_f32_vec(session, src1, src1_offset, dim, HTP_TENSOR_COMPUTE)?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
         Self::enqueue_labeled(
             session,
             label,
@@ -495,7 +467,7 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
     }
 
@@ -609,8 +581,6 @@ impl HexagonLfmModel {
         let in_ti = Self::add_f32_vec(session, in_buf, in_offset, dim, HTP_TENSOR_COMPUTE)?;
         let out_ti = Self::add_f32_vec(session, out_buf, out_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
-        let kparams =
-            build_unary_kernel_params(dim, 1, 0, 8 * 1024 * 1024, session.dsp_threads(), false);
         Self::enqueue_labeled(
             session,
             "dispatch_unary",
@@ -618,7 +588,7 @@ impl HexagonLfmModel {
             &[in_ti],
             &[out_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -659,14 +629,6 @@ impl HexagonLfmModel {
             nb,
         )?;
         let params = [0i32; 16];
-        let kparams = build_unary_kernel_params(
-            dim,
-            n_rows,
-            0,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-            false,
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_unary_rows",
@@ -674,7 +636,7 @@ impl HexagonLfmModel {
             &[in_ti],
             &[out_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -1241,16 +1203,6 @@ impl HexagonLfmModel {
             nb,
         )?;
         let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            n_rows,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_add_m",
@@ -1258,7 +1210,7 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }
@@ -1664,44 +1616,39 @@ impl HexagonLfmModel {
         n_rows: usize,
         activation: FfnActivation,
     ) -> Result<(), CeraError> {
-        let bytes = row_dim * n_rows * 4;
-        let ne = [row_dim as u32, n_rows as u32, 1, 1];
-        let nb = [4, (row_dim * 4) as u32, bytes as u32, bytes as u32];
-        let gate_ti = session.add_tensor(
-            gate,
-            gate_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let up_ti = session.add_tensor(
-            up,
-            up_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let params = [0i32; 16];
-        // No host precompute: the DSP sizes threads/VTCM itself (llama
-        // passes zero kparams).
-        let kparams = [0i32; 32];
         let (label, opcode) = match activation {
             FfnActivation::Swiglu => ("dispatch_swiglu", HtpOpCode::GluSwiglu as u32),
             FfnActivation::Geglu => ("dispatch_geglu", HtpOpCode::GluGeglu as u32),
         };
+        let bytes = row_dim * n_rows * 4;
+        let view = CopyTensor {
+            dtype: HtpDataType::F32 as u32,
+            ne: [row_dim as u32, n_rows as u32, 1, 1],
+            nb: [4, (row_dim * 4) as u32, bytes as u32, bytes as u32],
+        };
+        // A decode-sized activation is one long row, which a single DSP thread would work
+        // through. The host registers GLU tensors collapsed (`htp_opnode_collapse`): the row is
+        // split into equal rows the threads share, over the same bytes.
+        let (gate_view, up_view, dst_view) =
+            collapse_glu(opcode, &view, Some(&view), &view, session.dsp_threads());
+        let up_view = up_view.unwrap_or(gate_view);
+        let mut add = |buf: &RpcmemBuffer, offset: usize, v: &CopyTensor| {
+            session.add_tensor(
+                buf,
+                offset,
+                bytes,
+                HTP_TENSOR_COMPUTE,
+                HtpDataType::F32 as u32,
+                v.ne,
+                v.nb,
+            )
+        };
+        let gate_ti = add(gate, gate_offset, &gate_view)?;
+        let up_ti = add(up, up_offset, &up_view)?;
+        let dst_ti = add(dst, dst_offset, &dst_view)?;
+        let params = [0i32; 16];
+        // Zero kparams: `enqueue_op` derives the GLU params from the registered tensors.
+        let kparams = [0i32; 32];
         Self::enqueue_labeled(
             session,
             label,
@@ -2050,14 +1997,6 @@ impl HexagonLfmModel {
             ],
         )?;
         let params = build_rms_norm_params(eps);
-        let kparams = build_unary_kernel_params(
-            head_dim,
-            n_heads,
-            head_dim,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-            true,
-        );
         Self::enqueue_labeled(
             session,
             "dispatch_rms_norm_mul",
@@ -2065,7 +2004,7 @@ impl HexagonLfmModel {
             &[src_ti, weight_ti],
             &[dst_ti],
             params,
-            kparams,
+            [0i32; 32],
         )?;
         Ok(())
     }

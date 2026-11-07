@@ -14,8 +14,7 @@ use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTi
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer,
-    align128, build_binary_kernel_params, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    align128, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
@@ -764,23 +763,13 @@ impl HexagonVisionEncoder {
         )?;
 
         let add_params = [0i32; 16];
-        let add_kparams = build_binary_kernel_params(
-            rows,
-            rows,
-            1,
-            1,
-            1,
-            4,
-            dispatch::VTCM_BUDGET,
-            session.dsp_threads(),
-        );
         session
             .enqueue_op(
                 HtpOpCode::Add as u32,
                 &[dst_ti, b_ti],
                 &[dst_ti],
                 add_params,
-                add_kparams,
+                [0i32; 32],
             )
             .map_err(|e| CeraError::Backend(format!("linear_bias_add: {e}")))?;
 

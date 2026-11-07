@@ -6,8 +6,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use super::eltwise::{derive_eltwise, eltwise_operand_counts, is_eltwise_opcode};
 use super::params::{
-    build_concat_kernel_params, build_copy_kernel_params, build_set_rows_kernel_params,
+    CopyTensor, build_concat_kernel_params, build_copy_kernel_params, build_set_rows_kernel_params,
 };
 use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
@@ -1672,6 +1673,39 @@ where
             })?;
         }
     }
+    // The elementwise ops (binary, unary, GLU) read their thread count, row blocking and VTCM
+    // layout from the host's kernel params and fail the batch with INVAL_PARAMS (or fault on a
+    // missing operand) without them, so the operands are checked here and the params derived
+    // from the registered tensors (`htp_kparams_solve_binary` and friends).
+    if is_eltwise_opcode(opcode) {
+        let name = HtpOpCode::from_u32(opcode).map_or("elementwise", |o| o.name());
+        let (min_src, max_src) = eltwise_operand_counts(opcode);
+        if src.len() < min_src
+            || src.len() > max_src
+            || dst.len() != 1
+            || src.contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {name}: needs {min_src}..={max_src} registered src tensors and one \
+                 registered dst tensor, got {} and {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        if kernel_params == [0i32; 32] {
+            let ins: Vec<CopyTensor> = src.iter().map(|&s| (&tensors[s as usize]).into()).collect();
+            let out: CopyTensor = (&tensors[dst[0] as usize]).into();
+            kernel_params = derive_eltwise(opcode, &ins, &out, dsp_threads, vtcm_bytes)
+                .ok_or_else(|| {
+                    let srcs: Vec<&T> = src.iter().map(|&s| &tensors[s as usize]).collect();
+                    CeraError::Backend(format!(
+                        "enqueue_op {name}: the HTP elementwise kernels do not handle {srcs:?} -> {:?}",
+                        tensors[dst[0] as usize]
+                    ))
+                })?;
+        }
+    }
     Ok(kernel_params)
 }
 
@@ -1981,6 +2015,165 @@ mod tests {
         assert_pending_empty(&q, "concat single src");
     }
 
+    /// An elementwise op (binary, unary, GLU) enqueued with empty kernel params gets them from the
+    /// registered tensors, the words llama.cpp's solvers give for those tensors; explicit params
+    /// are sent as given; a wrong operand count or a layout the kernels refuse is an error that
+    /// drops the batch.
+    #[test]
+    fn elementwise_params_are_derived_from_the_registered_tensors() {
+        use super::super::eltwise::{
+            HTP_BINARY_KERNEL_CHUNKED, HTP_BINARY_KERNEL_ROW_BCAST, binary_kernel_type,
+            solve_binary, solve_glu, solve_unary,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 16, false).unwrap();
+        let f32_t = HtpDataType::F32 as u32;
+        let mut q = test_session();
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+        let view = |t: &HtpTensor| CopyTensor::from(t);
+
+        // [64, 4] activations, a [64] row to broadcast, a [64, 4] result
+        let x = q
+            .add_tensor(&buf, 0, 1024, 0, f32_t, [64, 4, 1, 1], [4, 256, 1024, 1024])
+            .unwrap();
+        let row = q
+            .add_tensor(&buf, 1024, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        let y = q
+            .add_tensor(
+                &buf,
+                2048,
+                1024,
+                0,
+                f32_t,
+                [64, 4, 1, 1],
+                [4, 256, 1024, 1024],
+            )
+            .unwrap();
+
+        // row broadcast, and the same-shape contiguous case that streams flat chunks
+        q.enqueue_op(HtpOpCode::Mul as u32, &[x, row], &[y], [0; 16], [0; 32])
+            .unwrap();
+        q.enqueue_op(HtpOpCode::Add as u32, &[x, y], &[y], [0; 16], [0; 32])
+            .unwrap();
+        let want_bcast = solve_binary(
+            HtpOpCode::Mul as u32,
+            &view(&q.tens[x as usize]),
+            &view(&q.tens[row as usize]),
+            None,
+            &view(&q.tens[y as usize]),
+            threads,
+            vtcm,
+        )
+        .unwrap();
+        assert_eq!(q.ops[0].kernel_params, want_bcast);
+        assert_eq!(binary_kernel_type(&want_bcast), HTP_BINARY_KERNEL_ROW_BCAST);
+        assert_eq!(
+            binary_kernel_type(&q.ops[1].kernel_params),
+            HTP_BINARY_KERNEL_CHUNKED
+        );
+
+        // unary, a fused norm with its weight row, and a two-source GLU
+        q.enqueue_op(HtpOpCode::UnarySilu as u32, &[x], &[y], [0; 16], [0; 32])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::RmsNormMul as u32,
+            &[x, row],
+            &[y],
+            [0; 16],
+            [0; 32],
+        )
+        .unwrap();
+        q.enqueue_op(HtpOpCode::GluSwiglu as u32, &[x, y], &[y], [0; 16], [0; 32])
+            .unwrap();
+        let (tx, tr, ty) = (
+            view(&q.tens[x as usize]),
+            view(&q.tens[row as usize]),
+            view(&q.tens[y as usize]),
+        );
+        assert_eq!(
+            q.ops[2].kernel_params,
+            solve_unary(HtpOpCode::UnarySilu as u32, &tx, None, &ty, threads, vtcm).unwrap()
+        );
+        assert_eq!(
+            q.ops[3].kernel_params,
+            solve_unary(
+                HtpOpCode::RmsNormMul as u32,
+                &tx,
+                Some(&tr),
+                &ty,
+                threads,
+                vtcm
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            q.ops[4].kernel_params,
+            solve_glu(
+                HtpOpCode::GluSwiglu as u32,
+                &tx,
+                Some(&ty),
+                &ty,
+                threads,
+                vtcm
+            )
+            .unwrap()
+        );
+        assert!(q.ops[2..5].iter().all(|o| o.kernel_params != [0; 32]));
+
+        // explicit params are the caller's; ops that take none are left alone
+        q.enqueue_op(HtpOpCode::Add as u32, &[x, y], &[y], [0; 16], [7; 32])
+            .unwrap();
+        assert_eq!(q.ops[5].kernel_params, [7; 32]);
+        q.enqueue_op(HtpOpCode::Conv1D as u32, &[x, row], &[y], [0; 16], [0; 32])
+            .unwrap();
+        assert_eq!(q.ops[6].kernel_params, [0; 32]);
+
+        // a wrong operand count, a missing operand, and a layout the kernels refuse each drop the batch
+        for (op, src, dst) in [
+            (HtpOpCode::Add, vec![x], vec![y]),
+            (HtpOpCode::Add, vec![x, row], vec![]),
+            (HtpOpCode::UnarySilu, vec![x, row], vec![y]),
+            (HtpOpCode::RmsNormMul, vec![x], vec![y]),
+            (HtpOpCode::GluSwiglu, vec![0xffff], vec![y]),
+            (HtpOpCode::Mul, vec![x, 0xffff], vec![y]),
+        ] {
+            let e = q.enqueue_op(op as u32, &src, &dst, [0; 16], [0; 32]);
+            assert!(e.is_err(), "{op:?} {src:?} -> {dst:?} must be refused");
+            assert_pending_empty(&q, "elementwise operand check");
+            // the refusal dropped the batch; register again
+            let x2 = q
+                .add_tensor(&buf, 0, 1024, 0, f32_t, [64, 4, 1, 1], [4, 256, 1024, 1024])
+                .unwrap();
+            assert_eq!(x2, 0);
+            let row2 = q
+                .add_tensor(&buf, 1024, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+                .unwrap();
+            let y2 = q
+                .add_tensor(
+                    &buf,
+                    2048,
+                    1024,
+                    0,
+                    f32_t,
+                    [64, 4, 1, 1],
+                    [4, 256, 1024, 1024],
+                )
+                .unwrap();
+            assert_eq!((row2, y2), (1, 2));
+        }
+        // transposed source: the DSP's binary kernels need packed elements
+        let xt = q
+            .add_tensor(&buf, 0, 1024, 0, f32_t, [64, 4, 1, 1], [256, 4, 1024, 1024])
+            .unwrap();
+        let err = q
+            .enqueue_op(HtpOpCode::Add as u32, &[xt, y], &[y], [0; 16], [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not handle"), "{err}");
+        assert_pending_empty(&q, "unsupported elementwise layout");
+    }
+
     /// A batch the DSP has not answered may still be running against the
     /// buffer, so the release is withheld rather than raced.
     #[test]
@@ -2064,7 +2257,7 @@ mod tests {
         buf: &RpcmemBuffer,
     ) -> Result<(), CeraError> {
         let ti = q.add_tensor(buf, 0, 64, 0, 0, [1; 4], [4; 4])?;
-        q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])?;
+        q.enqueue_op(HtpOpCode::Add as u32, &[ti, ti], &[ti], [0; 16], [0; 32])?;
         // The group boundary is where step mode flushes.
         q.end_group()
     }
@@ -2297,7 +2490,7 @@ mod tests {
         let before = writes();
         let ti = q.add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4]).unwrap();
         for _ in 0..3 {
-            q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+            q.enqueue_op(HtpOpCode::Add as u32, &[ti, ti], &[ti], [0; 16], [0; 32])
                 .unwrap();
         }
         assert_eq!(writes(), before, "no flush inside the group");

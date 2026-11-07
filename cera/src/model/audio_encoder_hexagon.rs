@@ -2546,7 +2546,7 @@ mod tests {
             .add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4])
             .unwrap();
         session
-            .enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+            .enqueue_op(HtpOpCode::Add as u32, &[ti, ti], &[ti], [0; 16], [0; 32])
             .unwrap();
         session.end_group().unwrap();
         fake::with(|s| s.fail_read = true);
