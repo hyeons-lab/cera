@@ -257,8 +257,8 @@ pub(crate) fn linear_m_with<S: OpSink>(
     let tiled_row_bytes = cols.div_ceil(32) * tile_size;
     let w_tot = rows.div_ceil(32) * tiled_row_bytes;
     // Plan every run up front: the kernel parameters (HMX where the run is eligible and a
-    // chunking fits the budget) decide which weight descriptor the run needs.
-    let plan: Vec<(usize, usize, Option<[i32; 32]>)> = token_runs(n_tokens, tile)
+    // chunking fits the budget, else HVX) decide which weight descriptor the run needs.
+    let plan: Vec<(usize, usize, [i32; 32], bool)> = token_runs(n_tokens, tile)
         .map(|(start, run)| {
             let hmx_kparams = match hmx {
                 Some(h) if mm_is_hmx_eligible(w_dtype, cols, rows, run) => {
@@ -266,7 +266,6 @@ pub(crate) fn linear_m_with<S: OpSink>(
                         w_dtype,
                         cols,
                         rows,
-                        run.next_multiple_of(32),
                         run,
                         session.dsp_threads(),
                         h.vtcm_budget,
@@ -274,15 +273,34 @@ pub(crate) fn linear_m_with<S: OpSink>(
                 }
                 _ => None,
             };
-            (start, run, hmx_kparams)
+            match hmx_kparams {
+                Some(kparams) => Ok((start, run, kparams, true)),
+                None => build_mul_mat_kernel_params(
+                    w_dtype,
+                    cols,
+                    run as u32,
+                    1,
+                    rows * 4,
+                    session.dsp_threads(),
+                    VTCM_BUDGET,
+                )
+                .map(|kparams| (start, run, kparams, false))
+                .ok_or_else(|| {
+                    op_err(
+                        "linear_m",
+                        CeraError::Backend(format!(
+                            "no matmul kernel fits {run} rows of a {rows}x{cols} weight in the VTCM"
+                        )),
+                    )
+                }),
+            }
         })
-        .collect();
+        .collect::<Result<_, CeraError>>()?;
     // The same repacked weights feed both kernels, but HVX walks N rows of K tiles
     // (`tiled_row_bytes` apart) while HMX addresses N-tile starts as `nc * nb[1]`, so each
     // needs its own descriptor. Registered in first-use order, before anything else.
     let mut w_tis: [Option<u16>; 2] = [None, None];
-    for &(_, _, hmx_kparams) in &plan {
-        let for_hmx = hmx_kparams.is_some();
+    for &(_, _, _, for_hmx) in &plan {
         if w_tis[usize::from(for_hmx)].is_none() {
             let nb1 = if for_hmx {
                 mm_hmx_nb1(w_dtype, cols)
@@ -305,21 +323,10 @@ pub(crate) fn linear_m_with<S: OpSink>(
         None => None,
     };
 
-    for (start, run, hmx_kparams) in plan {
+    for (start, run, kparams, for_hmx) in plan {
         let x_ti = add_f32_rows(session, x, x_offset + start * cols * 4, cols, run)?;
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * rows * 4, rows, run)?;
-        let w_ti = w_tis[usize::from(hmx_kparams.is_some())].expect("registered above");
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            build_mul_mat_kernel_params(
-                w_dtype,
-                cols,
-                run as u32,
-                1,
-                rows * 4,
-                session.dsp_threads(),
-                VTCM_BUDGET,
-            )
-        });
+        let w_ti = w_tis[usize::from(for_hmx)].expect("registered above");
         session
             .enqueue_op(
                 HtpOpCode::MulMat as u32,
@@ -352,17 +359,7 @@ pub(crate) fn f16_mm_kernel_params_in(
     vtcm_budget: usize,
 ) -> Option<[i32; 32]> {
     (f16_mm_shape_ok(rows, cols) && m >= HMX_MM_MIN_NROWS)
-        .then(|| {
-            build_hmx_mm_kernel_params(
-                HtpDataType::F16,
-                cols,
-                rows,
-                m.next_multiple_of(32),
-                m,
-                threads,
-                vtcm_budget,
-            )
-        })
+        .then(|| build_hmx_mm_kernel_params(HtpDataType::F16, cols, rows, m, threads, vtcm_budget))
         .flatten()
 }
 
@@ -1041,6 +1038,7 @@ pub(crate) fn matmul_f32<S: OpSink>(
     let kparams = build_mul_mat_f32_kernel_params(
         MulMatF32Shape {
             ne00: a.ne[0],
+            ne01: a.ne[1],
             ne02: a.ne[2],
             ne03: 1,
             src0_nb1: a.nb[1],
@@ -1492,11 +1490,10 @@ mod tests {
             64usize.div_ceil(32) * 32 * 34
         );
 
-        // Too few rows for the matrix unit and unaligned dims stay HVX (a tiled batch
+        // Too few rows for the matrix unit and unaligned rows stay HVX (a tiled batch
         // takes the HMX kernel per run, see `linear_m_with_hmx_picks_the_kernel_per_run`).
         for (tokens, rows, cols, tile) in [
             (4, 96, 64, TokenTile::Whole),
-            (280, 96, 48, TokenTile::Whole),
             (280, 90, 64, TokenTile::Whole),
         ] {
             let s = run(tokens, rows, cols, tile, hmx);
@@ -1546,7 +1543,8 @@ mod tests {
         assert_eq!(s.src(0, 1).ne, [32, 130, 1, 1]);
         // ne11 (token count) reaches the kernel params unchanged.
         let expect =
-            build_mul_mat_kernel_params(HtpDataType::Q8_0, 32, 130, 1, 32 * 4, 8, VTCM_BUDGET);
+            build_mul_mat_kernel_params(HtpDataType::Q8_0, 32, 130, 1, 32 * 4, 8, VTCM_BUDGET)
+                .expect("130 rows of a 32-wide weight fit");
         assert_eq!(s.ops[0].kparams, expect);
     }
 
@@ -1609,9 +1607,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.opcodes(), vec![OP_MULMAT; 3]);
-        let hmx = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 64, 96, 64, 64, 8, VTCM_BUDGET)
+        let hmx = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 64, 96, 64, 8, VTCM_BUDGET)
             .expect("a 64-row Q8_0 matmul fits the VTCM");
-        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 64, 2, 1, 96 * 4, 8, VTCM_BUDGET);
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 64, 2, 1, 96 * 4, 8, VTCM_BUDGET)
+            .expect("2 rows fit");
         assert_eq!(s.ops[0].kparams, hmx);
         assert_eq!(s.ops[1].kparams, hmx);
         assert_eq!(s.ops[2].kparams, hvx);
@@ -1625,16 +1624,16 @@ mod tests {
         assert_eq!(s.tensors.iter().filter(|t| t.offset == 4096).count(), 2);
     }
 
-    /// Dims that are not multiples of 32 are HVX-only, whatever the caller asks.
+    /// Rows that are not a multiple of 32 are HVX-only, whatever the caller asks.
     #[test]
-    fn linear_m_with_hmx_leaves_odd_dims_on_hvx() {
+    fn linear_m_with_hmx_leaves_odd_rows_on_hvx() {
         let mut s = RecordingSink::default();
         linear_m_with(
             &mut s,
             &"x",
             0,
             &"w",
-            desc(96, 48),
+            desc(48, 96),
             None,
             &"y",
             0,
@@ -1645,8 +1644,31 @@ mod tests {
             }),
         )
         .unwrap();
-        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 48, 64, 1, 96 * 4, 8, VTCM_BUDGET);
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 96, 64, 1, 48 * 4, 8, VTCM_BUDGET)
+            .expect("64 rows fit");
         assert_eq!(s.ops[0].kparams, hvx);
+    }
+
+    /// The tiled HVX kernels walk whole 32-wide K tiles, so a weight whose K is not a multiple of
+    /// 32 has no kernel (the host would run it on the CPU): an error, not a silently short dot.
+    #[test]
+    fn linear_m_refuses_a_k_the_tiles_do_not_cover() {
+        let mut s = RecordingSink::default();
+        let err = linear_m(
+            &mut s,
+            &"x",
+            0,
+            &"w",
+            desc(96, 48),
+            None,
+            &"y",
+            0,
+            64,
+            TokenTile::Whole,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no matmul kernel"), "{err}");
+        assert!(s.ops.is_empty(), "nothing is enqueued");
     }
 
     #[test]
@@ -1784,7 +1806,7 @@ mod tests {
             &"x",
             0,
             &"w",
-            desc(8, 8),
+            desc(32, 32),
             0usize,
             &"y",
             0,
