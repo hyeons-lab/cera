@@ -29,7 +29,7 @@ use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, OpSink, TokenShape, TokenTile, View};
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HexagonDevice, HexagonWeightDesc, HtpDataType, HtpOpCode,
-    LockOrRecover, RpcmemBuffer, align128, build_rope_kernel_params, build_rope_params,
+    LockOrRecover, RpcmemBuffer, align128, build_rope_params,
 };
 use crate::model::audio_encoder_hexagon::{
     pad32, plan_linear, plan_vec, put_linear, put_vec, run_on_queue, settled,
@@ -492,15 +492,13 @@ fn emit_rope<S: OpSink>(
         theta,
         1.0,
     );
-    let nrows = n_heads * n_tokens;
-    let n_threads = s.dsp_threads().min(nrows as u32).max(1);
-    let kparams = build_rope_kernel_params(head_dim, nrows, n_heads, n_tokens, n_threads);
+    // the sink derives the kernel params from the registered tensors and `params`
     s.enqueue_op(
         HtpOpCode::Rope as u32,
         &[act_ti, pos_ti],
         &[act_ti],
         params,
-        kparams,
+        [0i32; 32],
     )
     .map_err(|e| CeraError::Backend(format!("nemotron3 rope: {e}")))?;
     s.end_group()

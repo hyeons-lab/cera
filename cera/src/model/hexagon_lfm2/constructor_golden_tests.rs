@@ -2123,9 +2123,12 @@ fn lfm3_decode_emits_the_lfm3_graph() {
             .collect();
         let (src, _) = descs(line);
         let kp = kparams(line);
+        // a theta cache and 32 rows of scratch per thread, the thread count first, then the VTCM total
+        let row = HEAD_DIM * 4;
+        let slabs = kp[0] * (row.next_multiple_of(256) + 32 * row.next_multiple_of(128)) as i64;
         if params.contains(&rope_bits(10_000.0)) {
             assert!(!params.contains(&rope_bits(1_000_000.0)), "{params:?}");
-            assert_eq!((src.len(), kp[8]), (2, 0), "sliding layer has no mask");
+            assert_eq!((src.len(), kp[1]), (2, slabs), "sliding layer has no mask");
             sliding += 1;
         } else {
             assert!(params.contains(&rope_bits(1_000_000.0)), "{params:?}");
@@ -2133,8 +2136,7 @@ fn lfm3_decode_emits_the_lfm3_graph() {
             assert_eq!(src[2].ne[..2], [HEAD_DIM / 2, 1]);
             assert_eq!(src[2].nb[0], 4);
             // the slot is 256-aligned, after the per-thread slabs, inside the VTCM total
-            assert_eq!(kp[8], 256, "{kp:?}");
-            assert_eq!(kp[3], kp[7] + kp[8], "{kp:?}");
+            assert_eq!(kp[1], slabs + 256, "{kp:?}");
             global += 1;
         }
     }
@@ -2219,22 +2221,13 @@ fn lfm3_prefill_emits_the_lfm3_graph() {
     // the chunk rotates on the DSP too: Q and K of the global layer carry the mask
     let rope_srcs: Vec<_> = op_lines(&prefill, "Rope")
         .into_iter()
-        .map(|l| (descs(l).0.len(), kparams(l)[8]))
+        .map(|l| (descs(l).0.len(), kparams(l)[1]))
         .collect();
-    assert_eq!(
-        rope_srcs
-            .iter()
-            .filter(|&&(n, ff)| n == 3 && ff == 256)
-            .count(),
-        2
-    );
-    assert_eq!(
-        rope_srcs
-            .iter()
-            .filter(|&&(n, ff)| n == 2 && ff == 0)
-            .count(),
-        2
-    );
+    let with_factors = |n| rope_srcs.iter().filter(|&&(len, _)| len == n).count();
+    assert_eq!((with_factors(3), with_factors(2)), (2, 2));
+    // the factors' slot is the only difference in VTCM between the two kinds
+    let total = |n| rope_srcs.iter().find(|&&(len, _)| len == n).unwrap().1;
+    assert_eq!(total(3) - total(2), 256);
 
     for line in op_lines(&prefill, "Concat") {
         let (src, dst) = descs(line);

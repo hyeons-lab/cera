@@ -4,7 +4,7 @@
 //! by consuming precomputed integer division constants (Granlund and Montgomery FastDiv)
 //! and layout descriptors generated on the host.
 
-use super::types::{HtpDataType, align128, align256};
+use super::types::{HtpDataType, HtpOpCode, align128};
 
 /// A value for one of the one-byte fields of the matmul params. Out-of-contract counts
 /// saturate at 255 rather than wrapping: a wrapped count aliases to a plausible but wrong
@@ -331,173 +331,285 @@ pub(crate) fn build_unary_kernel_params_with(
     kparams
 }
 
-/// Which `get_rows` kernel runs (`enum htp_get_rows_kernel_type`).
+// The solvers below port llama.cpp's `htp-kparams.cpp` and the layout helpers in `htp/*-ops.h`
+// word for word; `scripts/hexagon-golden` runs the real C++ against each of them.
+
+/// `hex_round_up` (`hex-common.h`): 32-bit like the C, so an out-of-range size wraps the same way.
+fn hex_round_up(n: u32, m: u32) -> u32 {
+    m.wrapping_mul(n.wrapping_add(m - 1) / m)
+}
+
+/// `{mp, l}` of `init_fastdiv_values(d)` as two kernel-param words.
+fn fastdiv_words(d: u32) -> [i32; 2] {
+    let f = init_fastdiv(d);
+    [f.mp as i32, f.l as i32]
+}
+
+/// `(ggml_blck_size, ggml_type_size)` of a wire dtype. `None` for a type none of the solvers below
+/// accepts: every caller refuses such an operand whether or not its layout would pass, so a missing
+/// entry never changes an answer.
+fn ggml_type_layout(dtype: u32) -> Option<(u64, u64)> {
+    use HtpDataType as T;
+    let is = |t: T| dtype == t as u32;
+    Some(if is(T::F32) || is(T::I32) {
+        (1, 4)
+    } else if is(T::F16) || is(T::Bf16) {
+        (1, 2)
+    } else if is(T::I64) {
+        (1, 8)
+    } else if is(T::Q4_0) || is(T::Iq4Nl) {
+        (32, 18)
+    } else if is(T::Q4_1) {
+        (32, 20)
+    } else if is(T::Q8_0) {
+        (32, 34)
+    } else if is(T::Mxfp4) {
+        (32, 17)
+    } else if is(T::Q2K) {
+        (256, 84)
+    } else if is(T::Q3K) {
+        (256, 110)
+    } else if is(T::Q4K) {
+        (256, 144)
+    } else if is(T::Q5K) {
+        (256, 176)
+    } else if is(T::Q6K) {
+        (256, 210)
+    } else if is(T::Q1_0) {
+        (128, 18)
+    } else if is(T::Q2_0) {
+        (64, 18)
+    } else {
+        return None;
+    })
+}
+
+/// `ggml_is_contiguous`: dense in every dimension (a dimension of 1 has no stride to check).
+fn ggml_is_contiguous(t: &CopyTensor) -> bool {
+    let Some((blck, size)) = ggml_type_layout(t.dtype) else {
+        return false;
+    };
+    if u64::from(t.ne[0]) != blck && u64::from(t.nb[0]) != size {
+        return false;
+    }
+    let mut next_nb = size * (u64::from(t.ne[0]) / blck);
+    for i in 1..4 {
+        if t.ne[i] != 1 && u64::from(t.nb[i]) != next_nb {
+            return false;
+        }
+        next_nb = next_nb.wrapping_mul(u64::from(t.ne[i]));
+    }
+    true
+}
+
+/// `ggml_is_contiguous_rows`: each row is dense, whatever the strides between rows.
+fn ggml_is_contiguous_rows(t: &CopyTensor) -> bool {
+    ggml_type_layout(t.dtype)
+        .is_some_and(|(blck, size)| u64::from(t.ne[0]) == blck || u64::from(t.nb[0]) == size)
+}
+
+/// `ggml_nelements` truncated to 32 bits, the way the solvers hold row and element counts.
+fn rows_u32(ne: &[u32]) -> u32 {
+    ne.iter().fold(1u64, |a, &n| a.wrapping_mul(u64::from(n))) as u32
+}
+
+/// `htp_tensor_get_tile_size`: bytes of one tiled weight tile, 0 for a type without tiles.
+fn htp_tile_size(dtype: u32) -> u64 {
+    use HtpDataType as T;
+    let is = |t: T| dtype == t as u32;
+    if is(T::Q4_0) || is(T::Iq4Nl) || is(T::Q1_0) || is(T::Q2_0) {
+        576
+    } else if is(T::Q4_1) || is(T::Q4K) {
+        640
+    } else if is(T::Q8_0) {
+        1088
+    } else if is(T::Q5K) {
+        768
+    } else if is(T::Q6K) {
+        896
+    } else if is(T::Q3K) {
+        512
+    } else if is(T::Q2K) {
+        336
+    } else if is(T::Mxfp4) {
+        544
+    } else if is(T::F16) {
+        2048
+    } else {
+        0
+    }
+}
+
+/// `htp_tensor_get_tile_k`: elements along K in one tile.
+fn htp_tile_k(dtype: u32) -> u32 {
+    if dtype == HtpDataType::Q1_0 as u32 {
+        128
+    } else if dtype == HtpDataType::Q2_0 as u32 {
+        64
+    } else {
+        32
+    }
+}
+
+/// `enum htp_get_rows_kernel_type`.
 const GET_ROWS_SAMETYPE: u32 = 0;
 const GET_ROWS_TILED: u32 = 1;
+const GET_ROWS_FLAT: u32 = 2;
 
-/// `htp_mm_get_weight_tile_size`: bytes of one repacked weight tile, 0 for a type without one.
-fn mm_weight_tile_size(dtype: u32) -> u64 {
-    match dtype {
-        2 | 20 => 576,  // Q4_0, IQ4_NL
-        3 | 12 => 640,  // Q4_1, Q4_K
-        8 => 1088,      // Q8_0
-        13 => 768,      // Q5_K
-        14 => 896,      // Q6_K
-        11 | 10 => 512, // Q3_K, Q2_K
-        39 => 544,      // MXFP4
-        _ => 0,
-    }
-}
-
-/// `htp_get_rows_vtcm_layout_build(...).total_bytes`.
-fn get_rows_vtcm_total(kernel: u32, dtype: u32, ne00: u32, n_threads: u32) -> u64 {
-    let align256 = |x: u64| (x + 255) & !255;
-    let n = u64::from(n_threads);
-    if kernel == GET_ROWS_SAMETYPE {
-        return 0;
-    }
-    let dst_half = align256(u64::from(ne00) * 4);
-    let src0_half = if kernel == GET_ROWS_TILED {
-        let tile_stride = (mm_weight_tile_size(dtype) + 127) & !127;
-        let n_k_tiles = u64::from(ne00 / 32);
-        align256(if n_k_tiles > 0 {
-            n_k_tiles * tile_stride
-        } else {
-            tile_stride
-        })
+/// `htp_get_rows_vtcm_layout_build(...).total_bytes`: the staged index buffer, then (for the
+/// kernels that convert) a double-buffered source row and F32 output row per thread.
+fn get_rows_vtcm_total(
+    kernel: u32,
+    dtype: u32,
+    ne00: u32,
+    total_tasks: u32,
+    idx_dtype: u32,
+    n_threads: u32,
+) -> u64 {
+    let align = |x: u64, to: u64| (x + to - 1) & !(to - 1);
+    let elem_size = if idx_dtype == HtpDataType::I64 as u32 {
+        8
     } else {
-        let row = match dtype {
-            x if x == HtpDataType::F16 as u32 => u64::from(ne00) * 2,
-            x if x == HtpDataType::Q8_0 as u32 => u64::from(ne00 / 32) * 34,
-            _ => 0,
-        };
-        align256(row)
+        4
     };
-    2 * src0_half * n + 2 * dst_half * n
+    let src1_bytes = align(u64::from(total_tasks) * elem_size, 128) + 128;
+    let src1_alloc = align(src1_bytes, 256);
+    let (mut src0_bpt, mut dst_bpt) = (0, 0);
+    if kernel != GET_ROWS_SAMETYPE {
+        let src0_row = if kernel == GET_ROWS_TILED {
+            let tile_stride = (htp_tile_size(dtype) + 127) & !127;
+            let n_k_tiles = u64::from(ne00 / htp_tile_k(dtype));
+            if n_k_tiles > 0 {
+                n_k_tiles * tile_stride
+            } else {
+                tile_stride
+            }
+        } else {
+            u64::from(htp_tensor_row_size(dtype, ne00))
+        };
+        src0_bpt = 2 * align(src0_row, 256);
+        dst_bpt = 2 * align(u64::from(ne00) * 4, 256);
+    }
+    src1_alloc + (src0_bpt + dst_bpt) * u64::from(n_threads)
 }
 
-/// What `ggml_hexagon_precompute_get_rows_params` reads of its three tensors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GetRowsShape {
-    /// `HtpDataType` of the table (`src0`) and of the output.
-    pub src0_dtype: u32,
-    pub dst_dtype: u32,
-    /// The table is stored repacked (a Q4_0 table, or one the host repacks before the op).
-    pub tiled: bool,
-    pub ne00: u32,
-    pub ne02: u32,
-    pub ne03: u32,
-    /// The I32 indices `[ne10, ne11, ne12]`.
-    pub ne10: u32,
-    pub ne11: u32,
-    pub ne12: u32,
-}
-
-/// Kernel parameters for a `GetRows` gather: port of `ggml_hexagon_precompute_get_rows_params`
-/// and `htp_get_rows_vtcm_layout_build`.
+/// Kernel parameters for a `GetRows` gather of rows of `src0` chosen by `src1` into `dst`: port of
+/// `htp_kparams_solve_repeat_get_rows` (`htp-kparams.cpp`) and `htp_get_rows_vtcm_layout_build`.
+/// `tiled` is the table's `HTP_TENSOR_TILED` flag. `None` when the DSP has no kernel for the
+/// operands, or even one thread's working set does not fit `vtcm_bytes`.
 ///
-/// The kernel is `SAMETYPE` when table and output share a type, else `TILED` for a repacked
-/// table, else `FLAT`. One task per gathered row; the thread count starts at
-/// `min(n_threads, rows)` and drops until the VTCM working set fits `vtcm_bytes`.
+/// The kernel is `TILED` for a tiled table, else `SAMETYPE` when table and output share a type, else
+/// `FLAT`. One task per gathered row; the thread count starts at `min(n_threads, rows)` (at least 128
+/// output bytes per thread) and drops until the working set fits. Every kernel stages the index
+/// vector in VTCM, so even `SAMETYPE` reports a non-zero `vtcm_size`.
 ///
-/// A zero-thread result with pending tasks mirrors the C++ precompute byte for byte (the
-/// goldens pin it); it is the caller's contract never to enqueue one. Dispatch sites skip
-/// the empty gather instead of sending `n_threads = 0` across the FastRPC boundary.
+/// A gather with no rows is accepted and reports no VTCM, as in the C++ (the DSP returns early for
+/// it); callers still skip enqueuing one, since it may carry zero threads.
 ///
-/// Words (`htp_get_rows_kernel_params`): `n_threads, kernel_type, chunks_per_row, chunk_size,
-/// total_tasks, tasks_per_thread, vtcm_size`, then the dividers `ne10, ne10 * ne11,
-/// chunks_per_row, ne02, ne03` (each `mp, l`; `{0, 0}` for a zero divisor).
+/// Words (`htp_get_rows_kernel_params`): `kernel_type, n_threads, total_tasks, vtcm_size`, then the
+/// dividers `ne10, ne10 * ne11, ne02, ne03` (each `mp, l`; `{0, 0}` for a zero divisor).
 pub fn build_get_rows_kernel_params(
-    shape: &GetRowsShape,
+    src0: &CopyTensor,
+    src1: &CopyTensor,
+    dst: &CopyTensor,
+    tiled: bool,
     n_threads: u32,
     vtcm_bytes: usize,
-) -> [i32; 32] {
-    let nr = shape.ne10.wrapping_mul(shape.ne11).wrapping_mul(shape.ne12);
-    let kernel = if shape.src0_dtype == shape.dst_dtype {
-        GET_ROWS_SAMETYPE
-    } else if shape.tiled || shape.src0_dtype == HtpDataType::Q4_0 as u32 {
-        // a Q4_0 table is always stored tiled; any other type only when the host repacked it
-        GET_ROWS_TILED
-    } else {
-        2 // FLAT
-    };
-    let (chunks_per_row, chunk_size, total_tasks) = (1u32, shape.ne00, nr);
+) -> Option<[i32; 32]> {
+    use HtpDataType as T;
+    let is = |d: u32, t: T| d == t as u32;
+    let gatherable = [
+        T::F32,
+        T::F16,
+        T::Bf16,
+        T::I32,
+        T::Q1_0,
+        T::Q2_0,
+        T::Q4_0,
+        T::Q8_0,
+        T::Q4K,
+        T::Q5K,
+        T::Q6K,
+    ];
+    if !gatherable.iter().any(|&t| is(src0.dtype, t)) {
+        return None;
+    }
+    if !ggml_is_contiguous_rows(src0)
+        || !ggml_is_contiguous_rows(src1)
+        || !ggml_is_contiguous_rows(dst)
+    {
+        return None;
+    }
+    if !is(src1.dtype, T::I32) && !is(src1.dtype, T::I64) {
+        return None;
+    }
+    if src0.dtype == dst.dtype {
+        if !is(src0.dtype, T::F32) && !is(src0.dtype, T::I32) && !is(src0.dtype, T::F16) {
+            return None;
+        }
+    } else if is(src0.dtype, T::I32) || !is(dst.dtype, T::F32) {
+        return None;
+    }
 
-    let mut threads = n_threads.min(total_tasks);
+    let (ne00, ne02, ne03) = (src0.ne[0], src0.ne[2], src0.ne[3]);
+    let (ne10, ne11, ne12) = (src1.ne[0], src1.ne[1], src1.ne[2]);
+    let nr = ne10.wrapping_mul(ne11).wrapping_mul(ne12);
+
+    // a tiled F32 or BF16 table is stored as F16 tiles
+    let wtype = if tiled && (is(src0.dtype, T::F32) || is(src0.dtype, T::Bf16)) {
+        T::F16 as u32
+    } else {
+        src0.dtype
+    };
+    let kernel = if tiled {
+        GET_ROWS_TILED
+    } else if src0.dtype == dst.dtype {
+        GET_ROWS_SAMETYPE
+    } else {
+        GET_ROWS_FLAT
+    };
+
+    let total_tasks = nr;
+    let dst_nb1 = u64::from(dst.nb[1]);
+    if dst_nb1 == 0 {
+        return None; // the C++ divides by it
+    }
+    let min_tasks_per_thread = 128u64.div_ceil(dst_nb1).max(1) as u32;
+    let max_threads = (total_tasks / min_tasks_per_thread).max(1);
+    let mut threads = n_threads.min(max_threads);
+
+    let total = |n: u32| get_rows_vtcm_total(kernel, wtype, ne00, total_tasks, src1.dtype, n);
     let mut total_bytes = 0u64;
     while threads > 0 {
-        total_bytes = get_rows_vtcm_total(kernel, shape.src0_dtype, shape.ne00, threads);
+        total_bytes = total(threads);
         if total_bytes <= vtcm_bytes as u64 {
             break;
         }
         threads -= 1;
     }
     if threads == 0 && total_tasks > 0 {
-        total_bytes = get_rows_vtcm_total(kernel, shape.src0_dtype, shape.ne00, 1);
+        total_bytes = total(1);
     }
-    let vtcm_size = if total_tasks == 0 { 0 } else { total_bytes };
-    let tasks_per_thread = if threads > 0 {
-        total_tasks.div_ceil(threads)
-    } else {
+    let vtcm_size = if total_tasks == 0 {
         0
+    } else {
+        total_bytes as u32
     };
 
+    let div = |d: u32| if d > 0 { fastdiv_words(d) } else { [0, 0] };
     let mut k = [0i32; 32];
-    k[0] = threads as i32;
-    k[1] = kernel as i32;
-    k[2] = chunks_per_row as i32;
-    k[3] = chunk_size as i32;
-    k[4] = total_tasks as i32;
-    k[5] = tasks_per_thread as i32;
-    k[6] = vtcm_size as u32 as i32;
-    let div = |d: u32| {
-        if d > 0 {
-            init_fastdiv(d)
-        } else {
-            FastDivValues { mp: 0, l: 0 }
-        }
-    };
-    let dividers = [
-        div(shape.ne10),
-        div(shape.ne10.wrapping_mul(shape.ne11)),
-        div(chunks_per_row),
-        div(shape.ne02),
-        div(shape.ne03),
-    ];
-    for (i, f) in dividers.iter().enumerate() {
-        k[7 + 2 * i] = f.mp as i32;
-        k[8 + 2 * i] = f.l as i32;
+    k[0] = kernel as i32;
+    k[1] = threads as i32;
+    k[2] = total_tasks as i32;
+    k[3] = vtcm_size as i32;
+    for (i, d) in [ne10, ne10.wrapping_mul(ne11), ne02, ne03]
+        .into_iter()
+        .enumerate()
+    {
+        k[4 + 2 * i..6 + 2 * i].copy_from_slice(&div(d));
     }
-    k
-}
-
-/// [`build_get_rows_kernel_params`] for the gather cera issues: an F32 table into an F32
-/// output of the same type, so the zero-VTCM `SAMETYPE` kernel. The arguments are the table's
-/// `ne00, ne02, ne03` and the indices' `ne10, ne11, ne12`.
-pub(crate) fn build_get_rows_f32_kernel_params(
-    ne00: usize,
-    ne02: usize,
-    ne03: usize,
-    ne10: usize,
-    ne11: usize,
-    ne12: usize,
-    dsp_threads: u32,
-) -> [i32; 32] {
-    build_get_rows_kernel_params(
-        &GetRowsShape {
-            src0_dtype: HtpDataType::F32 as u32,
-            dst_dtype: HtpDataType::F32 as u32,
-            tiled: false,
-            ne00: ne00 as u32,
-            ne02: ne02 as u32,
-            ne03: ne03 as u32,
-            ne10: ne10 as u32,
-            ne11: ne11 as u32,
-            ne12: ne12 as u32,
-        },
-        dsp_threads.max(1),
-        usize::MAX,
-    )
+    let fits = threads > 0 && u64::from(vtcm_size) <= vtcm_bytes as u64;
+    (total_tasks == 0 || fits).then_some(k)
 }
 
 /// `HTP_BINARY_KERNEL_CHUNKED`: the kernel the DSP runs for a contiguous
@@ -661,7 +773,11 @@ pub(crate) fn build_binary_scalar_dma_kernel_params(
     Some(kparams)
 }
 
-/// Host-computed parameters for RoPE positional embeddings.
+/// The 16 op-param words of a `Rope` (`struct ggml_tensor::op_params`): `n_dims` (1), `mode` (2),
+/// the truncate flag (3, 0: the only form the DSP implements), `n_ctx_orig` (4), the floats
+/// `freq_base`, `freq_scale`, `ext_factor` (0: no YaRN), `attn_factor`, `beta_fast`, `beta_slow`
+/// (5 to 10), and zero multi-axis sections (11 to 14) and row offset (15). The DSP reads them itself;
+/// the host solver ([`build_rope_kernel_params`]) reads them to size the kernel.
 pub fn build_rope_params(
     n_dims: usize,
     mode: u32,
@@ -682,59 +798,142 @@ pub fn build_rope_params(
     params
 }
 
-/// Build kernel parameters for RoPE dispatch.
-///
-/// Mirrors `htp_rope_kernel_params` plus `htp_rope_vtcm_layout_build` (plain
-/// RoPE, no YaRN scaling, no frequency factors).
-pub fn build_rope_kernel_params(
-    n_dims: usize,
-    nrows: usize,
-    ne1: usize,
-    ne2: usize,
-    n_threads: u32,
-) -> [i32; 32] {
-    build_rope_kernel_params_with_freq_factors(n_dims, nrows, ne1, ne2, n_threads, 0)
+/// Operand views for [`build_rope_kernel_params`], as `htp_kparams_solve_rope` reads them.
+#[derive(Debug, Clone, Copy)]
+pub struct RopeOperands<'a> {
+    /// The rotated activation (`src0`).
+    pub src0: &'a CopyTensor,
+    /// The I32 position vector (`src1`).
+    pub positions: &'a CopyTensor,
+    /// The optional F32 frequency factors (`src2`): each rotated pair's angle is divided by its factor.
+    pub freq_factors: Option<&'a CopyTensor>,
+    pub dst: &'a CopyTensor,
 }
 
-/// [`build_rope_kernel_params`] with the optional frequency-factor source (`lfm3`'s
-/// partial rotary on its global layers): `n_freq_factors` is its length in `f32`s (`0` =
-/// none). Its 256-aligned slot follows the per-thread slabs and the total grows by the
-/// same amount.
-pub fn build_rope_kernel_params_with_freq_factors(
-    n_dims: usize,
-    nrows: usize,
-    ne1: usize,
-    ne2: usize,
+/// Kernel parameters for a `Rope`: port of `htp_kparams_solve_rope` (`htp-kparams.cpp`) and
+/// `htp_rope_vtcm_layout_build` (`rope-ops.h`). `op_params` is the op's 16 parameter words
+/// ([`build_rope_params`]): `n_dims` (1), `mode` (2), the truncate flag (3, must be 0), `freq_base`
+/// (5), the multi-axis `sections` (11..15) and `n_offs` (15). `None` where the solver refuses:
+/// non-F32 operands, a destination of another shape, a rotated span (`n_offs + n_dims`) wider than the
+/// row, `n_offs` not a multiple of 32, unknown modes, too few positions or factors, strided rows, or
+/// a working set that does not fit `vtcm_bytes`.
+///
+/// Each thread holds a theta cache and 32 rows of VTCM, and the frequency factors (when present) get
+/// one shared 256-byte-aligned slot after the per-thread slabs.
+///
+/// Words (`htp_rope_kernel_params`): `n_threads` (the session's, capped at the row count),
+/// `vtcm_size`, then the dividers `ne2 * ne1` and `ne1` of the destination (each `mp, l`).
+pub fn build_rope_kernel_params(
+    ops: &RopeOperands<'_>,
+    op_params: &[i32; 16],
     n_threads: u32,
-    n_freq_factors: usize,
-) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    let n_threads = n_threads.max(1) as usize;
-    let row_size = n_dims * 4;
-    let row_aligned = align128(row_size);
-    let theta_aligned = align256(row_size);
-    // HTP_ROPE_SPAD_NROWS = HTP_ROPE_SPAD_BLOCK(8) * HTP_ROPE_SPAD_NSLOTS(4)
-    let bytes_per_thread = theta_aligned + 32 * row_aligned;
-    // the optional frequency-factor vector sits after the per-thread slabs
-    let freq_factors_size = align256(n_freq_factors * 4);
-    let total = bytes_per_thread * n_threads + freq_factors_size;
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    use HtpDataType as T;
+    const ROPE_NORMAL: i32 = 0;
+    const ROPE_NEOX: i32 = 2;
+    const ROPE_MROPE: i32 = 8;
+    const ROPE_VISION: i32 = 24;
+    const ROPE_IMROPE: i32 = 40;
+    let RopeOperands {
+        src0,
+        positions,
+        freq_factors,
+        dst,
+    } = *ops;
 
-    kparams[0] = n_threads as i32;
-    kparams[1] = nrows as i32;
-    kparams[2] = nrows.div_ceil(n_threads) as i32;
-    kparams[3] = total as i32;
-    kparams[4] = bytes_per_thread as i32;
-    kparams[5] = theta_aligned as i32;
-    kparams[6] = row_aligned as i32;
-    kparams[7] = (bytes_per_thread * n_threads) as i32;
-    kparams[8] = freq_factors_size as i32;
-    let div_ne2_ne1 = init_fastdiv((ne2 * ne1) as u32);
-    kparams[9] = div_ne2_ne1.mp as i32;
-    kparams[10] = div_ne2_ne1.l as i32;
-    let div_ne1 = init_fastdiv(ne1 as u32);
-    kparams[11] = div_ne1.mp as i32;
-    kparams[12] = div_ne1.l as i32;
-    kparams
+    // op_params[3]: the DSP implements only the truncating form
+    if op_params[3] != 0 {
+        return None;
+    }
+    if src0.ne != dst.ne {
+        return None;
+    }
+    if src0.dtype != T::F32 as u32 || dst.dtype != T::F32 as u32 || positions.dtype != T::I32 as u32
+    {
+        return None;
+    }
+    if src0.ne[0] == 0 {
+        return None;
+    }
+    let src0_nrows = rows_u32(&src0.ne[1..]);
+    if src0_nrows == 0 {
+        return None;
+    }
+
+    let n_dims = op_params[1];
+    let mode = op_params[2];
+    let n_offs = op_params[15];
+    if n_dims < 0 || n_dims % 2 != 0 {
+        return None;
+    }
+    if n_offs < 0
+        || n_offs % 32 != 0
+        || i64::from(n_offs) + i64::from(n_dims) > i64::from(src0.ne[0])
+    {
+        return None;
+    }
+    if f32::from_bits(op_params[5] as u32) < 0.0 {
+        return None;
+    }
+    if ![ROPE_NORMAL, ROPE_NEOX, ROPE_MROPE, ROPE_VISION, ROPE_IMROPE].contains(&mode) {
+        return None;
+    }
+    let is_mrope = mode & ROPE_MROPE != 0;
+    // vision rotates the whole row, so it takes no offset and exactly half the row as n_dims
+    if mode == ROPE_VISION && (i64::from(n_dims) != i64::from(src0.ne[0] / 2) || n_offs != 0) {
+        return None;
+    }
+    if is_mrope && op_params[11..14].iter().all(|&s| s <= 0) {
+        return None;
+    }
+    // multi-axis modes read four position streams
+    let min_pos_len = if is_mrope || mode == ROPE_VISION {
+        i64::from(src0.ne[2]) * 4
+    } else {
+        i64::from(src0.ne[2])
+    };
+    if i64::from(positions.ne[0]) < min_pos_len || !ggml_is_contiguous(positions) {
+        return None;
+    }
+    if let Some(ff) = freq_factors
+        && (ff.dtype != T::F32 as u32
+            || !ggml_is_contiguous(ff)
+            || i64::from(ff.ne[0]) < i64::from(n_dims / 2))
+    {
+        return None;
+    }
+    if src0.nb[0] != 4
+        || dst.nb[0] != 4
+        || u64::from(src0.nb[1]) < u64::from(src0.ne[0]) * 4
+        || u64::from(dst.nb[1]) < u64::from(dst.ne[0]) * 4
+    {
+        return None;
+    }
+
+    let threads = n_threads.min(src0_nrows);
+    let n_freq_factors = freq_factors.map_or(0, |ff| ff.ne[0]);
+    // htp_rope_vtcm_layout_build
+    let row = u64::from(src0.ne[0]) * 4;
+    let src0_row_aligned = u64::from(hex_round_up(row as u32, 128));
+    let theta_aligned = u64::from(hex_round_up(row as u32, 256));
+    let ff_aligned = u64::from(hex_round_up((u64::from(n_freq_factors) * 4) as u32, 256));
+    // HTP_ROPE_SPAD_NROWS = HTP_ROPE_SPAD_BLOCK (8) * HTP_ROPE_SPAD_NSLOTS (4)
+    let bytes_per_thread = theta_aligned + 32 * src0_row_aligned;
+    let total =
+        bytes_per_thread * u64::from(threads) + if n_freq_factors > 0 { ff_aligned } else { 0 };
+    if total > vtcm_bytes as u64 {
+        return None;
+    }
+
+    let mut k = [0i32; 32];
+    k[0] = threads as i32;
+    k[1] = total as u32 as i32;
+    k[2..4].copy_from_slice(&fastdiv_words(
+        (u64::from(dst.ne[2]) * u64::from(dst.ne[1])) as u32,
+    ));
+    k[4..6].copy_from_slice(&fastdiv_words(dst.ne[1]));
+    Some(k)
 }
 
 /// Bytes in one row of `ne00` elements of wire type `dtype`: port of `htp_tensor_get_row_size`
@@ -758,6 +957,8 @@ pub(crate) fn htp_tensor_row_size(dtype: u32, ne00: u32) -> u32 {
         (ne00 / 256).wrapping_mul(84)
     } else if is(T::Q2_0) {
         (ne00 / 64).wrapping_mul(18)
+    } else if is(T::Q1_0) {
+        (ne00 / 128).wrapping_mul(18)
     } else if is(T::Q3K) {
         (ne00 / 256).wrapping_mul(110)
     } else if is(T::Q4K) {
@@ -1526,77 +1727,409 @@ pub fn build_mul_mat_f32_kernel_params(
     )
 }
 
-/// Kernel parameters for `Softmax` over F32 rows
-/// (`ggml_hexagon_precompute_softmax_params`):
-/// `dst = softmax(scale * src0 + mask)` along dim 0, with an optional F32
-/// `mask` of `[ne10, ne11, ne12, ne13]` broadcast over `src0`'s dims 2 and 3.
+/// Kernel parameters for a `Softmax` over F32 rows: port of `htp_kparams_solve_softmax`
+/// (`htp-kparams.cpp`) and `htp_softmax_vtcm_layout_build` (`softmax-ops.h`).
+/// `dst = softmax(scale * src0 + slope * mask)` along dim 0, with `scale` and `max_bias` the first
+/// two words of `op_params` (as floats). The optional F32 or F16 `mask` has `src0`'s row width, at
+/// least its row count, and `ne2`/`ne3` that divide `src0`'s (it broadcasts over heads and batches).
+/// A positive `max_bias` adds ALiBi slopes `m0`/`m1` per head.
 ///
-/// `mask_dims` is `[ne10, ne12, ne13]` of the mask when there is one.
+/// `None` where the solver refuses: non-F32 `src0` or `dst`, more than 512 heads, a mask of the wrong
+/// type or shape, or non-contiguous `src0`/`dst`/`mask` (attention sinks, the solver's `src2`, are
+/// not representable here and are refused by the caller). The thread count is the session's capped
+/// at one 128-byte output chunk per thread; there is no fallback to fewer threads when the working
+/// set does not fit `vtcm_bytes`.
+///
+/// Words (`htp_softmax_kernel_params`): `kernel_type` (0 no mask, 1 F32 mask, 2 F16 mask),
+/// `n_threads`, `vtcm_size`, `n_head`, `n_head_log2`, `use_src1`, `use_f16`, `scale`, `max_bias`,
+/// `m0`, `m1`, then the dividers `ne01`, `ne02` of `src0` and `ne12`, `ne13` of the mask (each `mp, l`).
 pub fn build_softmax_kernel_params(
-    src0_ne: [usize; 4],
-    mask_dims: Option<[usize; 3]>,
-    scale: f32,
+    src0: &CopyTensor,
+    mask: Option<&CopyTensor>,
+    dst: &CopyTensor,
+    op_params: &[i32; 16],
     n_threads: u32,
-) -> [i32; 32] {
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    softmax_solve(src0, mask, dst, op_params, n_threads, vtcm_bytes, false)
+}
+
+/// [`build_softmax_kernel_params`] for a mask that is a strided view: its rows only have to be dense.
+///
+/// The host solver demands a contiguous mask, but the DSP kernel (`softmax-ops.c`) fetches one mask row
+/// per source row by DMA at `i1 * nb11 + i12 * nb12 + i13 * nb13`, so any row strides work. The audio
+/// encoder's relative-position shift is such a view (rows one element shorter than the real stride) and
+/// feeds it in place rather than copying it. Everything else is the host's answer.
+pub fn build_softmax_kernel_params_strided_mask(
+    src0: &CopyTensor,
+    mask: Option<&CopyTensor>,
+    dst: &CopyTensor,
+    op_params: &[i32; 16],
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    softmax_solve(src0, mask, dst, op_params, n_threads, vtcm_bytes, true)
+}
+
+fn softmax_solve(
+    src0: &CopyTensor,
+    mask: Option<&CopyTensor>,
+    dst: &CopyTensor,
+    op_params: &[i32; 16],
+    n_threads: u32,
+    vtcm_bytes: usize,
+    strided_mask: bool,
+) -> Option<[i32; 32]> {
+    use HtpDataType as T;
     const KERNEL_NOMASK: i32 = 0;
     const KERNEL_MASK_F32: i32 = 1;
-    let round_up = |n: usize, m: usize| n.next_multiple_of(m);
-    let [ne00, ne01, ne02, ne03] = src0_ne;
-    let src0_nrows = ne01 * ne02 * ne03;
-    let n_threads = (n_threads.max(1) as usize).min(src0_nrows.max(1));
-    let use_src1 = mask_dims.is_some();
-    let ne10 = mask_dims.map_or(1, |m| m[0]);
+    const KERNEL_MASK_F16: i32 = 2;
+    if src0.dtype != T::F32 as u32 || dst.dtype != T::F32 as u32 || src0.ne[2] > 512 {
+        return None;
+    }
+    if let Some(m) = mask {
+        if m.dtype != T::F32 as u32 && m.dtype != T::F16 as u32 {
+            return None;
+        }
+        // `ne2`/`ne3` of a mask must divide the source's; a zero count divides nothing
+        if m.ne[2] == 0 || m.ne[3] == 0 {
+            return None;
+        }
+        let rows_ok = if strided_mask {
+            ggml_is_contiguous_rows(m)
+        } else {
+            ggml_is_contiguous(m)
+        };
+        if src0.ne[0] != m.ne[0]
+            || m.ne[1] < src0.ne[1]
+            || !src0.ne[2].is_multiple_of(m.ne[2])
+            || !src0.ne[3].is_multiple_of(m.ne[3])
+            || !rows_ok
+        {
+            return None;
+        }
+    }
+    if !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) {
+        return None;
+    }
 
-    let src0_row = round_up(ne00 * 4, 128);
-    let dst_row = round_up(ne00 * 4, 128);
-    let src1_row = if use_src1 { round_up(ne10 * 4, 128) } else { 0 };
-    // Double-buffered half-buffers per thread (`htp_softmax_vtcm_layout_build`).
-    let (src0_pt, dst_pt, src1_pt) = (src0_row * 2, dst_row * 2, src1_row * 2);
-    let total = (src0_pt + dst_pt + src1_pt) * n_threads;
+    let src0_nrows = rows_u32(&src0.ne[1..]);
+    let dst_row_size = u64::from(dst.ne[0]) * 4;
+    if dst_row_size == 0 {
+        return None; // the C++ divides by it
+    }
+    let min_rows_per_thread = 128u64.div_ceil(dst_row_size).max(1) as u32;
+    let max_threads = (src0_nrows / min_rows_per_thread).max(1);
+    let threads = n_threads.min(max_threads);
 
-    let n_head = ne02;
-    let n_head_log2 = if n_head > 0 {
-        1usize << n_head.ilog2()
+    let scale = f32::from_bits(op_params[0] as u32);
+    let max_bias = f32::from_bits(op_params[1] as u32);
+
+    let n_head = src0.ne[2];
+    // `1u << (uint32_t) floor(log2(n_head))`; an empty head dim reads as 1
+    let n_head_log2 = if n_head == 0 {
+        1
+    } else {
+        1u32 << n_head.ilog2()
+    };
+    let (m0, m1) = if max_bias > 0.0 && n_head_log2 > 0 {
+        let log2 = n_head_log2 as f32;
+        (
+            2.0f32.powf(-max_bias / log2),
+            2.0f32.powf(-(max_bias / 2.0) / log2),
+        )
+    } else {
+        (1.0, 1.0)
+    };
+
+    let use_src1 = mask.is_some();
+    let use_f16 = mask.is_some_and(|m| m.dtype == T::F16 as u32);
+    // htp_softmax_vtcm_layout_build: double-buffered rows, 128-aligned, per thread
+    let ne10 = mask.map_or(1, |m| m.ne[0]);
+    let aligned = |bytes: u64| u64::from(hex_round_up(bytes as u32, 128));
+    let src0_row = aligned(u64::from(src0.ne[0]) * 4);
+    let dst_row = aligned(u64::from(src0.ne[0]) * 4);
+    let src1_row = if use_src1 {
+        aligned(u64::from(ne10) * if use_f16 { 2 } else { 4 })
     } else {
         0
     };
+    let total = (2 * src0_row + 2 * dst_row + 2 * src1_row) * u64::from(threads);
+    if total > vtcm_bytes as u64 {
+        return None;
+    }
 
-    let mut k = [0i32; 32];
-    k[0] = n_threads as i32;
-    k[1] = src0_nrows as i32;
-    k[2] = src0_nrows.div_ceil(n_threads) as i32;
-    k[3] = total as i32;
-    k[4] = src0_pt as i32;
-    k[5] = src1_pt as i32;
-    k[6] = dst_pt as i32;
-    k[7] = src0_row as i32; // src0_row_size_aligned
-    k[8] = src1_row as i32;
-    k[9] = dst_row as i32;
-    k[10] = src0_row as i32; // src0_spad_half_size
-    k[11] = src1_row as i32;
-    k[12] = dst_row as i32;
-    k[13] = n_head as i32;
-    k[14] = n_head_log2 as i32;
-    k[15] = use_src1 as i32;
-    k[16] = 0; // use_f16: the mask is F32 here
-    k[17] = if use_src1 {
-        KERNEL_MASK_F32
-    } else {
-        KERNEL_NOMASK
+    let kernel = match (use_src1, use_f16) {
+        (false, _) => KERNEL_NOMASK,
+        (true, true) => KERNEL_MASK_F16,
+        (true, false) => KERNEL_MASK_F32,
     };
-    k[18] = scale.to_bits() as i32;
-    k[19] = 0f32.to_bits() as i32; // max_bias: no ALiBi
-    k[20] = 1f32.to_bits() as i32; // m0
-    k[21] = 1f32.to_bits() as i32; // m1
-    let [_, ne12, ne13] = mask_dims.unwrap_or([1, 1, 1]);
-    for (slot, d) in [(22, ne01), (24, ne02), (26, ne12), (28, ne13)] {
-        if d > 0 {
-            let f = init_fastdiv(d as u32);
-            k[slot] = f.mp as i32;
-            k[slot + 1] = f.l as i32;
+    let div = |d: u32| if d > 0 { fastdiv_words(d) } else { [0, 0] };
+    let mut k = [0i32; 32];
+    k[0] = kernel;
+    k[1] = threads as i32;
+    k[2] = total as u32 as i32;
+    k[3] = n_head as i32;
+    k[4] = n_head_log2 as i32;
+    k[5] = i32::from(use_src1);
+    k[6] = i32::from(use_f16);
+    k[7] = scale.to_bits() as i32;
+    k[8] = max_bias.to_bits() as i32;
+    k[9] = m0.to_bits() as i32;
+    k[10] = m1.to_bits() as i32;
+    let (ne12, ne13) = mask.map_or((1, 1), |m| (m.ne[2], m.ne[3]));
+    for (i, d) in [src0.ne[1], src0.ne[2], ne12, ne13].into_iter().enumerate() {
+        k[11 + 2 * i..13 + 2 * i].copy_from_slice(&div(d));
+    }
+    Some(k)
+}
+
+/// Kernel parameters for `Sum`, `SumRows` and `Argmax` (`opcode`) over a dense F32 `src0`: port of
+/// `htp_kparams_solve_sum_rows`. `dst` is F32, or I32 for `Argmax`, and dense. `None` for any other
+/// operand types or strides, for another opcode, and for a zero-thread session where the C++ would
+/// divide by zero.
+///
+/// A `Sum` (and an `Argmax` of a single row) splits its elements across up to 10 threads once there
+/// are 1024 of them, in 32-aligned slices; other shapes split rows, at least 32 rows per thread
+/// while a row is under 1 KiB.
+///
+/// Words (`htp_sum_rows_kernel_params`): `n_threads`, `elems_per_thread`.
+pub fn build_sum_rows_kernel_params(
+    opcode: u32,
+    src0: &CopyTensor,
+    dst: &CopyTensor,
+    n_threads: u32,
+) -> Option<[i32; 32]> {
+    use HtpDataType as T;
+    /// `HTP_MAX_NTHREADS`
+    const MAX_NTHREADS: u32 = 10;
+    let is_sum = opcode == HtpOpCode::Sum as u32;
+    let is_argmax = opcode == HtpOpCode::Argmax as u32;
+    if !is_sum && !is_argmax && opcode != HtpOpCode::SumRows as u32 {
+        return None;
+    }
+    if src0.dtype != T::F32 as u32 {
+        return None;
+    }
+    let dst_want = if is_argmax { T::I32 } else { T::F32 };
+    if dst.dtype != dst_want as u32 {
+        return None;
+    }
+    if !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) {
+        return None;
+    }
+
+    let ne00 = src0.ne[0];
+    let src0_nrows = rows_u32(&src0.ne[1..]);
+    // split `n` elements into 32-aligned slices over threads
+    let slices = |n: u32| -> Option<(u32, u32)> {
+        let threads = if n >= 1024 {
+            n_threads.min(MAX_NTHREADS)
+        } else {
+            1
+        };
+        let chunk = n
+            .wrapping_add(threads.wrapping_sub(1))
+            .checked_div(threads)?;
+        Some((threads, hex_round_up(chunk, 32)))
+    };
+    let (threads, elems) = if is_sum {
+        slices(rows_u32(&src0.ne))?
+    } else if is_argmax && src0_nrows <= 1 {
+        slices(ne00)?
+    } else {
+        let min_rows_per_thread = if u64::from(src0.nb[1]) < 1024 { 32 } else { 1 };
+        let max_threads = (src0_nrows / min_rows_per_thread).max(1);
+        (n_threads.min(max_threads), 0)
+    };
+    let mut k = [0i32; 32];
+    k[0] = threads as i32;
+    k[1] = elems as i32;
+    Some(k)
+}
+
+/// `enum ggml_sort_order`: what `Argsort` reads from its first op param.
+const SORT_ORDER_DESC: u32 = 1;
+
+/// `htp_sort_vtcm_layout_build`: the working-set layout of `Argsort`/`TopK`, as the solver
+/// searches it.
+#[derive(Debug, Clone, Copy, Default)]
+struct SortLayout {
+    total_bytes: u64,
+    phase1_slot_size: u64,
+    chunk_elems: u32,
+    n_chunks: u32,
+    merge_elems: u32,
+    n_threads: u32,
+    n_slots: u32,
+}
+
+impl SortLayout {
+    fn build(
+        total_rows: u32,
+        chunk_elems: u32,
+        n_chunks: u32,
+        merge_elems: u32,
+        n_threads: u32,
+        n_slots: u32,
+    ) -> Self {
+        let align = |x: u64, to: u64| (x + to - 1) & !(to - 1);
+        let values_size = align(u64::from(chunk_elems) * 4, 128);
+        let indices_size = align(u64::from(chunk_elems) * 4, 128);
+        let phase1_slot_size = align(values_size + indices_size, 256);
+        let mut total = if total_rows > 1 {
+            phase1_slot_size * u64::from(n_slots) * u64::from(n_threads)
+        } else {
+            phase1_slot_size * u64::from(n_chunks) * u64::from(n_slots)
+        };
+        if total_rows <= 1 && n_chunks > 1 {
+            // the merge buffers: values, then indices
+            total += 2 * align(u64::from(merge_elems) * 4, 128);
+        }
+        Self {
+            total_bytes: total,
+            phase1_slot_size,
+            chunk_elems,
+            n_chunks,
+            merge_elems,
+            n_threads,
+            n_slots,
         }
     }
-    k
+
+    /// `htp_sort_solve_layout`: `None` when even the smallest layout exceeds `budget`.
+    fn solve(
+        ne00: u32,
+        total_rows: u32,
+        k: u32,
+        n_threads_max: u32,
+        budget: u64,
+        is_top_k: bool,
+    ) -> Option<Self> {
+        let pow2_vecs = |n: u32| -> u32 {
+            let n_vec = n.wrapping_add(31) / 32;
+            let mut p = 1u32;
+            while p < n_vec {
+                p <<= 1;
+            }
+            p
+        };
+        let align = |x: u64, to: u64| (x + to - 1) & !(to - 1);
+        let n_vec_pow2 = pow2_vecs(ne00);
+
+        if total_rows > 1 {
+            let mut n_threads = total_rows.min(n_threads_max);
+            let ne00_padded = n_vec_pow2.wrapping_mul(32);
+            let values_size = align(u64::from(ne00_padded) * 4, 128);
+            let indices_size = align(u64::from(ne00_padded) * 4, 128);
+            let spad_per_slot = align(values_size + indices_size, 256);
+            let n_slots = if spad_per_slot * 2 > budget { 1 } else { 2 };
+            let spad_per_thread = spad_per_slot * u64::from(n_slots);
+            while n_threads > 1 && spad_per_thread * u64::from(n_threads) > budget {
+                n_threads -= 1;
+            }
+            let layout = Self::build(total_rows, ne00_padded, 1, 0, n_threads, n_slots);
+            return (layout.total_bytes <= budget).then_some(layout);
+        }
+
+        // one row: split it across threads in power-of-two chunks, merge on one thread
+        let mut n_chunks = 1u32;
+        if ne00 > 1024 {
+            while n_chunks * 2 <= n_threads_max && n_chunks * 2 <= n_vec_pow2 {
+                n_chunks *= 2;
+            }
+        }
+        let mut chunk_elems = (n_vec_pow2 / n_chunks) * 32;
+        let mut merge_elems = 0u32;
+        if n_chunks > 1 {
+            merge_elems = if is_top_k {
+                let local_k = k.min(chunk_elems);
+                pow2_vecs(n_chunks.wrapping_mul(local_k)).wrapping_mul(32)
+            } else {
+                n_vec_pow2.wrapping_mul(32)
+            };
+        }
+        let mut layout = Self::build(1, chunk_elems, n_chunks, merge_elems, n_chunks, 1);
+        if layout.total_bytes > budget && n_chunks > 1 {
+            n_chunks = 1;
+            chunk_elems = n_vec_pow2.wrapping_mul(32);
+            merge_elems = 0;
+            layout = Self::build(1, chunk_elems, n_chunks, merge_elems, 1, 1);
+        }
+        if layout.total_bytes > budget {
+            return None;
+        }
+        if n_chunks == 1 && layout.phase1_slot_size * 2 <= budget {
+            layout = Self::build(1, chunk_elems, 1, 0, 1, 2);
+        }
+        Some(layout)
+    }
+}
+
+/// Kernel parameters for `Argsort` or `TopK` (`opcode`) of dense-or-strided F32 rows into I32 indices:
+/// port of `htp_kparams_solve_sort` and `htp_sort_solve_layout` (`argsort-ops.h`). `op_params[0]`
+/// is the sort order (an `Argsort` only; a `TopK` is always descending); `k` is `dst.ne[0]`.
+/// `None` for other operand types, another opcode, or when even the smallest layout does not fit
+/// `vtcm_bytes`. A session of 0 threads or 0 VTCM bytes is read as the host's defaults (4 threads,
+/// 8 MiB).
+///
+/// Many rows: one row per thread (fewer threads when the per-thread scratch will not fit, one slot
+/// instead of two when two will not). One long row: up to one power-of-two chunk per thread, sorted
+/// separately and merged.
+///
+/// Words (`htp_sort_kernel_params`): `n_threads`, `order`, `is_top_k`, `chunk_elems`, `n_chunks`,
+/// `vtcm_size`, `merge_elems`, `n_slots`, then the dividers `ne01` and `ne01 * ne02` (each `mp, l`).
+pub fn build_sort_kernel_params(
+    opcode: u32,
+    src0: &CopyTensor,
+    dst: &CopyTensor,
+    op_params: &[i32; 16],
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    use HtpDataType as T;
+    let is_top_k = opcode == HtpOpCode::TopK as u32;
+    if !is_top_k && opcode != HtpOpCode::Argsort as u32 {
+        return None;
+    }
+    if src0.dtype != T::F32 as u32 || dst.dtype != T::I32 as u32 {
+        return None;
+    }
+    let total_rows = rows_u32(&src0.ne[1..]);
+    let n_threads_max = if n_threads > 0 { n_threads } else { 4 };
+    let budget = if vtcm_bytes > 0 {
+        vtcm_bytes as u64
+    } else {
+        8 * 1024 * 1024
+    };
+    let order = if is_top_k {
+        SORT_ORDER_DESC
+    } else {
+        op_params[0] as u32
+    };
+    let layout = SortLayout::solve(
+        src0.ne[0],
+        total_rows,
+        dst.ne[0],
+        n_threads_max,
+        budget,
+        is_top_k,
+    )?;
+
+    let mut k = [0i32; 32];
+    k[0] = layout.n_threads as i32;
+    k[1] = order as i32;
+    k[2] = i32::from(is_top_k);
+    k[3] = layout.chunk_elems as i32;
+    k[4] = layout.n_chunks as i32;
+    k[5] = layout.total_bytes as u32 as i32;
+    k[6] = layout.merge_elems as i32;
+    k[7] = layout.n_slots as i32;
+    k[8..10].copy_from_slice(&fastdiv_words(src0.ne[1]));
+    k[10..12].copy_from_slice(&fastdiv_words(
+        (u64::from(src0.ne[1]) * u64::from(src0.ne[2])) as u32,
+    ));
+    Some(k)
 }
 
 /// Minimum M rows for HMX matmul. Upstream `HTP_MM_HMX_MIN_NROWS` is 4,
@@ -2798,60 +3331,6 @@ mod tests {
         assert!(params(MulMatF32Shape { ne02: 0, ..ok }).is_none());
     }
 
-    #[test]
-    fn softmax_params_follow_the_host_precompute() {
-        let k = build_softmax_kernel_params([126, 126, 8, 1], Some([126, 8, 1]), 0.125, 8);
-        // 126 * 8 rows over 8 threads; every row buffer is 512 B aligned and
-        // double-buffered for src0, dst and the mask.
-        assert_eq!((k[0], k[1], k[2]), (8, 1008, 126));
-        assert_eq!(k[3], (1024 * 3) * 8);
-        assert_eq!((k[4], k[5], k[6]), (1024, 1024, 1024));
-        assert_eq!((k[7], k[8], k[9]), (512, 512, 512));
-        assert_eq!((k[13], k[14], k[15], k[16], k[17]), (8, 8, 1, 0, 1));
-        assert_eq!(f32::from_bits(k[18] as u32), 0.125);
-        assert_eq!(f32::from_bits(k[19] as u32), 0.0);
-        assert_eq!(f32::from_bits(k[20] as u32), 1.0);
-        let fd = |d: u32| {
-            let f = init_fastdiv(d);
-            [f.mp as i32, f.l as i32]
-        };
-        assert_eq!(k[22..24], fd(126));
-        assert_eq!(k[24..26], fd(8));
-        assert_eq!(k[26..28], fd(8));
-        assert_eq!(k[28..30], fd(1));
-        // Without a mask the kernel is NOMASK and has no mask buffers.
-        let k = build_softmax_kernel_params([126, 126, 8, 1], None, 1.0, 8);
-        assert_eq!((k[15], k[17], k[5], k[8]), (0, 0, 0, 0));
-        // Fewer rows than threads: one thread per row.
-        let k = build_softmax_kernel_params([16, 3, 1, 1], None, 1.0, 8);
-        assert_eq!((k[0], k[2]), (3, 1));
-    }
-
-    /// The routed-FFN case: gather 4 unbiased expert weights from a 32-entry table (`src0`
-    /// `[1, 32]`, indices `[4]`): the same-type kernel, 4 tasks over 4 threads, no VTCM, no
-    /// chunking.
-    #[test]
-    fn get_rows_kparams_follow_the_host_precompute() {
-        let k = build_get_rows_f32_kernel_params(1, 1, 1, 4, 1, 1, 8);
-        // n_threads, kernel_type (SAMETYPE), chunks_per_row, chunk_size, total, per_thread, vtcm
-        assert_eq!(k[..7], [4, 0, 1, 1, 4, 1, 0]);
-        let div = |d: u32| {
-            let f = init_fastdiv(d);
-            [f.mp as i32, f.l as i32]
-        };
-        assert_eq!(k[7..9], div(4)); // ne10
-        assert_eq!(k[9..11], div(4)); // ne10 * ne11
-        assert_eq!(k[11..13], div(1)); // chunks_per_row
-        assert_eq!(k[13..15], div(1)); // ne02
-        assert_eq!(k[15..17], div(1)); // ne03
-        assert!(k[17..].iter().all(|&v| v == 0));
-        // A wide row is still one task per gathered row (no DMA split, no chunking any more).
-        let k = build_get_rows_f32_kernel_params(2048, 1, 1, 4, 1, 1, 8);
-        assert_eq!((k[0], k[1], k[2], k[3], k[4], k[5]), (4, 0, 1, 2048, 4, 1));
-        let k = build_get_rows_f32_kernel_params(1500, 1, 1, 2, 1, 1, 8);
-        assert_eq!((k[0], k[2], k[3], k[4]), (2, 1, 1500, 2));
-    }
-
     /// In-contract counts pass through untouched; 255 is the largest one-byte param.
     #[test]
     fn wire_byte_passes_through_in_contract_counts() {
@@ -2873,60 +3352,477 @@ mod tests {
         }
     }
 
-    fn golden_get_rows(line: &str) -> (GetRowsShape, u32, usize, Vec<i32>) {
-        let (inputs, want) = line.split_once("=>").unwrap();
-        let (shape, run) = inputs.split_once('|').unwrap();
-        let v: Vec<u64> = shape
-            .split_whitespace()
-            .map(|x| x.parse().unwrap())
-            .collect();
-        let mut run = run.split_whitespace();
-        let threads: u32 = run.next().unwrap().parse().unwrap();
-        let vtcm: usize = run.next().unwrap().parse().unwrap();
-        let words: Vec<i32> = want
+    /// Printed words of a golden line padded with the zeros the rest of the blob holds, or `None`
+    /// for an `unsupported` case.
+    fn golden_words(want: &str) -> Option<Vec<i32>> {
+        let want = want.trim();
+        if want == "unsupported" {
+            return None;
+        }
+        let mut words: Vec<i32> = want
             .split_whitespace()
             .map(|w| w.parse::<u32>().unwrap() as i32)
             .collect();
-        let shape = GetRowsShape {
-            src0_dtype: v[0] as u32,
-            dst_dtype: v[1] as u32,
-            ne00: v[2] as u32,
-            ne02: v[3] as u32,
-            ne03: v[4] as u32,
-            ne10: v[5] as u32,
-            ne11: v[6] as u32,
-            ne12: v[7] as u32,
-            tiled: v[8] != 0,
-        };
-        (shape, threads, vtcm, words)
+        words.resize(32, 0);
+        Some(words)
     }
 
-    /// Every case of `testdata/get_rows_golden.txt` (llama.cpp's own
-    /// `ggml_hexagon_precompute_get_rows_params`), across the same-type, tiled and flat kernels,
-    /// thread counts and VTCM budgets that force the thread count down.
+    /// A tensor side that may be a `-` (absent operand).
+    fn golden_optional_tensor(side: &str) -> Option<CopyTensor> {
+        (side.trim() != "-").then(|| golden_tensor(&mut side.split_whitespace()))
+    }
+
+    /// `<threads> <vtcm bytes>` of a golden line.
+    fn golden_session(side: &str) -> (u32, usize) {
+        let mut run = side.split_whitespace();
+        (
+            run.next().unwrap().parse().unwrap(),
+            run.next().unwrap().parse().unwrap(),
+        )
+    }
+
+    /// The case lines of a golden file as `(line, inputs, want)`.
+    fn golden_cases(golden: &str) -> impl Iterator<Item = (&str, &str, &str)> {
+        golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(|l| {
+                let (inputs, want) = l.split_once("=>").unwrap();
+                (l, inputs, want)
+            })
+    }
+
+    /// The 16 op-param words of a golden line.
+    fn golden_params(side: &str) -> [i32; 16] {
+        let mut params = [0i32; 16];
+        let words = side.split_whitespace();
+        for (p, w) in params.iter_mut().zip(words) {
+            *p = w.parse::<u32>().unwrap() as i32;
+        }
+        params
+    }
+
+    /// Every case of `testdata/rope_golden.txt`: llama.cpp's real `htp_kparams_solve` for a `ROPE`
+    /// (`scripts/hexagon-golden/gen.py rope`) over head widths, head and token counts, batches, strides,
+    /// every rope mode, partial rotary and offsets, frequency factors, session thread counts, VTCM
+    /// budgets and the operands the solver refuses.
+    #[test]
+    fn rope_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/rope_golden.txt");
+        let (mut cases, mut unsupported, mut with_ff) = (0usize, 0usize, 0usize);
+        for (line, inputs, want) in golden_cases(golden) {
+            let mut sides = inputs.split('|');
+            let mut tensor = || golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let src0 = tensor();
+            let positions = tensor();
+            let ff = golden_optional_tensor(sides.next().unwrap());
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let params = golden_params(sides.next().unwrap());
+            let (threads, vtcm) = golden_session(sides.next().unwrap());
+            let got = build_rope_kernel_params(
+                &RopeOperands {
+                    src0: &src0,
+                    positions: &positions,
+                    freq_factors: ff.as_ref(),
+                    dst: &dst,
+                },
+                &params,
+                threads,
+                vtcm,
+            );
+            let want = golden_words(want);
+            unsupported += usize::from(want.is_none());
+            with_ff += usize::from(ff.is_some());
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
+            cases += 1;
+        }
+        assert!(
+            cases > 5000 && unsupported > 1500 && with_ff > 400,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {with_ff} with factors"
+        );
+    }
+
+    /// Every case of `testdata/softmax_golden.txt` (`gen.py softmax`): mask types and shapes,
+    /// broadcasts, ALiBi head counts, the 512-head and VTCM limits and the operands the solver refuses.
+    /// `m0` and `m1` come out of the platform's `powf`, which may differ in the last bit between the
+    /// machine that made the file and the one running the test, so those two words may be one ulp off.
+    #[test]
+    fn softmax_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/softmax_golden.txt");
+        let (mut cases, mut unsupported, mut sinks, mut alibi) = (0usize, 0usize, 0usize, 0usize);
+        for (line, inputs, want) in golden_cases(golden) {
+            let mut sides = inputs.split('|');
+            let src0 = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let mask = golden_optional_tensor(sides.next().unwrap());
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let mut op = sides.next().unwrap().split_whitespace();
+            let mut params = [0i32; 16];
+            params[0] = op.next().unwrap().parse::<u32>().unwrap() as i32;
+            params[1] = op.next().unwrap().parse::<u32>().unwrap() as i32;
+            let has_sinks = op.next().unwrap() == "1";
+            let (threads, vtcm) = golden_session(sides.next().unwrap());
+            let want = golden_words(want);
+            cases += 1;
+            unsupported += usize::from(want.is_none());
+            alibi += usize::from(f32::from_bits(params[1] as u32) > 0.0);
+            if has_sinks {
+                // attention sinks have no kernel: the queue refuses a third operand
+                assert_eq!(want, None, "{line}");
+                sinks += 1;
+                continue;
+            }
+            let got =
+                build_softmax_kernel_params(&src0, mask.as_ref(), &dst, &params, threads, vtcm)
+                    .map(|k| k.to_vec());
+            match (&got, &want) {
+                (Some(g), Some(w)) => {
+                    for (i, (g, w)) in g.iter().zip(w).enumerate() {
+                        let ulps = (*g as u32).abs_diff(*w as u32);
+                        let slope = i == 9 || i == 10;
+                        assert!(
+                            if slope { ulps <= 1 } else { ulps == 0 },
+                            "word {i}: {g} != {w}: {line}"
+                        );
+                    }
+                }
+                _ => assert_eq!(got, want, "{line}"),
+            }
+        }
+        assert!(
+            cases > 5000 && unsupported > 2000 && sinks > 0 && alibi > 150,
+            "golden file looks truncated: {cases} cases"
+        );
+    }
+
+    /// The strided-mask variant differs from the host solver only in the mask's row strides: it gives
+    /// the host's answer for a contiguous mask, and for any other mask the host's answer for the
+    /// contiguous mask of the same shape, as long as its rows are dense.
+    #[test]
+    fn strided_softmax_mask_only_relaxes_the_row_stride_check() {
+        let golden = include_str!("testdata/softmax_golden.txt");
+        let (mut relaxed, mut strided_rows_refused) = (0usize, 0usize);
+        for (line, inputs, _) in golden_cases(golden) {
+            let mut sides = inputs.split('|');
+            let src0 = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let Some(mask) = golden_optional_tensor(sides.next().unwrap()) else {
+                continue;
+            };
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let mut op = sides.next().unwrap().split_whitespace();
+            let mut params = [0i32; 16];
+            params[0] = op.next().unwrap().parse::<u32>().unwrap() as i32;
+            params[1] = op.next().unwrap().parse::<u32>().unwrap() as i32;
+            let (threads, vtcm) = golden_session(sides.next().unwrap());
+            let strided = build_softmax_kernel_params_strided_mask(
+                &src0,
+                Some(&mask),
+                &dst,
+                &params,
+                threads,
+                vtcm,
+            );
+            let size = if mask.dtype == HtpDataType::F16 as u32 {
+                2
+            } else {
+                4
+            };
+            let dense = CopyTensor {
+                nb: [
+                    size,
+                    mask.ne[0] * size,
+                    mask.ne[0] * size * mask.ne[1],
+                    mask.ne[0] * size * mask.ne[1] * mask.ne[2],
+                ],
+                ..mask
+            };
+            let host =
+                build_softmax_kernel_params(&src0, Some(&dense), &dst, &params, threads, vtcm);
+            if mask.nb[0] != size && mask.ne[0] != 1 {
+                assert_eq!(strided, None, "a mask whose rows are not dense: {line}");
+                strided_rows_refused += 1;
+            } else {
+                assert_eq!(strided, host, "{line}");
+                relaxed += usize::from(
+                    build_softmax_kernel_params(&src0, Some(&mask), &dst, &params, threads, vtcm)
+                        .is_none()
+                        && host.is_some(),
+                );
+            }
+        }
+        assert!(relaxed >= 5, "no strided mask case: {relaxed}");
+        assert!(strided_rows_refused >= 6, "{strided_rows_refused}");
+    }
+
+    /// Every case of `testdata/sum_rows_golden.txt` (`gen.py sum_rows`): `Sum`, `SumRows` and `Argmax`
+    /// over one long row, many rows, strided and mistyped operands, and session thread counts.
+    #[test]
+    fn sum_rows_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/sum_rows_golden.txt");
+        let (mut cases, mut unsupported) = (0usize, 0usize);
+        for (line, inputs, want) in golden_cases(golden) {
+            let mut sides = inputs.split('|');
+            let mut src = sides.next().unwrap().split_whitespace();
+            let opcode = match src.next().unwrap() {
+                "0" => HtpOpCode::Sum,
+                "1" => HtpOpCode::SumRows,
+                _ => HtpOpCode::Argmax,
+            };
+            let src0 = golden_tensor(&mut src);
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let threads: u32 = sides.next().unwrap().trim().parse().unwrap();
+            let got = build_sum_rows_kernel_params(opcode as u32, &src0, &dst, threads);
+            let want = golden_words(want);
+            unsupported += usize::from(want.is_none());
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
+            cases += 1;
+        }
+        assert!(
+            cases > 5000 && unsupported > 1000,
+            "golden file looks truncated: {cases} cases"
+        );
+        // another opcode is not one of the three
+        let t = CopyTensor {
+            dtype: HtpDataType::F32 as u32,
+            ne: [4, 1, 1, 1],
+            nb: [4, 16, 16, 16],
+        };
+        assert_eq!(
+            build_sum_rows_kernel_params(HtpOpCode::Add as u32, &t, &t, 4),
+            None
+        );
+    }
+
+    /// Every case of `testdata/sort_golden.txt` (`gen.py sort`): `Argsort` and `TopK` over one long row
+    /// (the chunk and merge layouts at every width around a power of two) and over many rows, with
+    /// session thread counts and VTCM budgets from 4 KiB to the 8 MiB default.
+    #[test]
+    fn sort_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/sort_golden.txt");
+        let (mut cases, mut unsupported, mut chunked) = (0usize, 0usize, 0usize);
+        for (line, inputs, want) in golden_cases(golden) {
+            let mut sides = inputs.split('|');
+            let mut src = sides.next().unwrap().split_whitespace();
+            let opcode = match src.next().unwrap() {
+                "0" => HtpOpCode::Argsort,
+                _ => HtpOpCode::TopK,
+            };
+            let mut params = [0i32; 16];
+            params[0] = src.next().unwrap().parse().unwrap();
+            let src0 = golden_tensor(&mut src);
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let (threads, vtcm) = golden_session(sides.next().unwrap());
+            let got = build_sort_kernel_params(opcode as u32, &src0, &dst, &params, threads, vtcm);
+            let want = golden_words(want);
+            unsupported += usize::from(want.is_none());
+            chunked += usize::from(want.as_ref().is_some_and(|w| w[4] > 1));
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
+            cases += 1;
+        }
+        assert!(
+            cases > 5000 && unsupported > 500 && chunked > 500,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {chunked} chunked"
+        );
+        // another opcode is not a sort
+        let t = CopyTensor {
+            dtype: HtpDataType::F32 as u32,
+            ne: [4, 1, 1, 1],
+            nb: [4, 16, 16, 16],
+        };
+        assert_eq!(
+            build_sort_kernel_params(HtpOpCode::Add as u32, &t, &t, &[0; 16], 4, 1 << 20),
+            None
+        );
+    }
+
+    /// Every case of `testdata/get_rows_golden.txt` (`gen.py get_rows`): the same-type, tiled and flat
+    /// kernels over every table type, index type and shape, thread counts and VTCM budgets that force
+    /// the thread count down, and the table, index and output types the solver refuses.
     #[test]
     fn get_rows_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/get_rows_golden.txt");
-        let (mut cases, mut zero_rows, mut zero_vtcm) = (0usize, 0usize, 0usize);
-        for line in golden
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-        {
-            let (shape, threads, vtcm, mut words) = golden_get_rows(line);
-            if shape.ne10 == 0 {
-                zero_rows += 1;
+        let (mut cases, mut unsupported, mut zero_rows, mut zero_vtcm) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut kernels = [0usize; 3];
+        for (line, inputs, want) in golden_cases(golden) {
+            let mut sides = inputs.split('|');
+            let mut table = sides.next().unwrap().split_whitespace();
+            let src0 = golden_tensor(&mut table);
+            let tiled = table.next().unwrap() == "1";
+            let src1 = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let (threads, vtcm) = golden_session(sides.next().unwrap());
+            let got = build_get_rows_kernel_params(&src0, &src1, &dst, tiled, threads, vtcm);
+            let want = golden_words(want);
+            unsupported += usize::from(want.is_none());
+            zero_rows += usize::from(src1.ne[0] == 0 && want.is_some());
+            zero_vtcm += usize::from(vtcm == 0);
+            if let Some(w) = &want {
+                kernels[w[0] as usize] += 1;
             }
-            if vtcm == 0 {
-                zero_vtcm += 1;
-            }
-            words.resize(32, 0);
-            let got = build_get_rows_kernel_params(&shape, threads, vtcm);
-            assert_eq!(got.to_vec(), words, "{line}");
+            assert_eq!(got.map(|k| k.to_vec()), want, "{line}");
             cases += 1;
         }
-        assert!(cases > 5000, "golden file looks truncated: {cases} cases");
-        assert!(zero_rows > 500, "zero-row cases missing: {zero_rows}");
+        assert!(
+            cases > 5000 && unsupported > 1000,
+            "golden file looks truncated: {cases} cases"
+        );
+        assert!(zero_rows > 50, "zero-row cases missing: {zero_rows}");
         assert!(zero_vtcm > 500, "zero-VTCM cases missing: {zero_vtcm}");
+        assert!(
+            kernels.iter().all(|&n| n > 300),
+            "a kernel is missing: {kernels:?}"
+        );
+    }
+
+    fn dense(dtype: HtpDataType, ne: [u32; 4]) -> CopyTensor {
+        let size = match dtype {
+            HtpDataType::F16 => 2,
+            _ => 4,
+        };
+        CopyTensor {
+            dtype: dtype as u32,
+            ne,
+            nb: [
+                size,
+                size * ne[0],
+                size * ne[0] * ne[1],
+                size * ne[0] * ne[1] * ne[2],
+            ],
+        }
+    }
+
+    /// The routed-FFN gather: 4 expert weights from a 32-entry table of single values. The
+    /// same-type kernel still stages the index vector (128 bytes plus one vector, 256-aligned).
+    #[test]
+    fn get_rows_params_of_the_routed_ffn_gather() {
+        let table = dense(HtpDataType::F32, [1, 32, 1, 1]);
+        let idx = dense(HtpDataType::I32, [4, 1, 1, 1]);
+        let out = dense(HtpDataType::F32, [1, 4, 1, 1]);
+        let k = build_get_rows_kernel_params(&table, &idx, &out, false, 8, 8 << 20).unwrap();
+        // kernel_type SAMETYPE, n_threads (each takes at least 128 output bytes, a row is 4: one
+        // thread), tasks, vtcm
+        assert_eq!(k[..4], [0, 1, 4, 256]);
+        assert_eq!(k[4..6], fastdiv_words(4)); // ne10
+        assert_eq!(k[6..8], fastdiv_words(4)); // ne10 * ne11
+        assert_eq!(k[8..10], fastdiv_words(1)); // ne02
+        assert_eq!(k[10..12], fastdiv_words(1)); // ne03
+        assert!(k[12..].iter().all(|&v| v == 0));
+        // no VTCM at all is a refusal, not a clipped layout
+        assert_eq!(
+            build_get_rows_kernel_params(&table, &idx, &out, false, 8, 0),
+            None
+        );
+    }
+
+    /// Greedy sampling over a vocabulary: 8 threads each take a 32-aligned slice of one row.
+    #[test]
+    fn argmax_params_split_a_vocabulary_row_across_threads() {
+        let logits = dense(HtpDataType::F32, [151936, 1, 1, 1]);
+        let idx = dense(HtpDataType::I32, [1, 1, 1, 1]);
+        let k = build_sum_rows_kernel_params(HtpOpCode::Argmax as u32, &logits, &idx, 8).unwrap();
+        assert_eq!(k[..2], [8, 19008]); // ceil(151936 / 8) = 18992, rounded up to a multiple of 32
+        let k = build_sum_rows_kernel_params(HtpOpCode::Argmax as u32, &logits, &idx, 12).unwrap();
+        assert_eq!(k[..2], [10, 15200], "capped at HTP_MAX_NTHREADS (10)");
+        let small = dense(HtpDataType::F32, [1000, 1, 1, 1]);
+        let k = build_sum_rows_kernel_params(HtpOpCode::Argmax as u32, &small, &idx, 8).unwrap();
+        assert_eq!(
+            k[..2],
+            [1, 1024],
+            "under 1024 elements one thread takes the row"
+        );
+    }
+
+    /// MoE routing: one row of expert scores, sorted descending in one 32-element vector set.
+    #[test]
+    fn argsort_params_of_expert_routing() {
+        let scores = dense(HtpDataType::F32, [32, 1, 1, 1]);
+        let order = dense(HtpDataType::I32, [32, 1, 1, 1]);
+        let mut params = [0i32; 16];
+        params[0] = 1; // descending
+        let k = build_sort_kernel_params(
+            HtpOpCode::Argsort as u32,
+            &scores,
+            &order,
+            &params,
+            8,
+            8 << 20,
+        )
+        .unwrap();
+        // 1 thread, descending, not top-k, 32 elements in 1 chunk, 2 slots of 256 bytes, no merge
+        assert_eq!(k[..8], [1, 1, 0, 32, 1, 512, 0, 2]);
+        assert_eq!(k[8..10], fastdiv_words(1));
+    }
+
+    /// A decode-step rope over `[head_dim, heads]` and the same with frequency factors: one thread
+    /// per head up to the session's, a theta cache and 32 rows of scratch per thread, the factors'
+    /// 256-aligned slot after the slabs.
+    #[test]
+    fn rope_params_of_a_decode_step() {
+        let act = dense(HtpDataType::F32, [128, 8, 1, 1]);
+        let pos = dense(HtpDataType::I32, [1, 1, 1, 1]);
+        let mut params = build_rope_params(128, 2, 4096, 10000.0, 1.0);
+        params[3] = 0;
+        let ops = |ff| RopeOperands {
+            src0: &act,
+            positions: &pos,
+            freq_factors: ff,
+            dst: &act,
+        };
+        let k = build_rope_kernel_params(&ops(None), &params, 6, 8 << 20).unwrap();
+        // 512-byte rows: a 512-byte theta cache and 32 x 512 bytes of rows per thread
+        assert_eq!(k[..2], [6, 6 * (512 + 32 * 512)]);
+        assert_eq!(k[2..4], fastdiv_words(8)); // ne2 * ne1
+        assert_eq!(k[4..6], fastdiv_words(8)); // ne1
+        let ff = dense(HtpDataType::F32, [64, 1, 1, 1]);
+        let k = build_rope_kernel_params(&ops(Some(&ff)), &params, 6, 8 << 20).unwrap();
+        assert_eq!(k[1], 6 * (512 + 32 * 512) + 256);
+        // fewer factors than rotated pairs, or a truncating-off op, are refused
+        let few = dense(HtpDataType::F32, [63, 1, 1, 1]);
+        assert_eq!(
+            build_rope_kernel_params(&ops(Some(&few)), &params, 6, 8 << 20),
+            None
+        );
+        let mut off = params;
+        off[3] = 1;
+        assert_eq!(build_rope_kernel_params(&ops(None), &off, 6, 8 << 20), None);
+    }
+
+    /// The audio encoder's softmax: scores `[t, t, heads]` plus a relative-position bias that is a view
+    /// of a wider matrix. The host solver refuses the strided view; the variant the queue uses takes it.
+    #[test]
+    fn softmax_params_of_a_relative_position_bias() {
+        let t = 126u32;
+        let scores = dense(HtpDataType::F32, [t, t, 8, 1]);
+        let lp = 256u32; // 2t - 1 rounded up to 32
+        let shifted = CopyTensor {
+            dtype: HtpDataType::F32 as u32,
+            ne: [t, t, 8, 1],
+            nb: [4, (lp - 1) * 4, t * lp * 4, t * lp * 4 * 8],
+        };
+        let mut params = [0i32; 16];
+        params[0] = 0.125f32.to_bits() as i32;
+        assert_eq!(
+            build_softmax_kernel_params(&scores, Some(&shifted), &scores, &params, 8, 8 << 20),
+            None
+        );
+        let k = build_softmax_kernel_params_strided_mask(
+            &scores,
+            Some(&shifted),
+            &scores,
+            &params,
+            8,
+            8 << 20,
+        )
+        .unwrap();
+        // masked F32 kernel, 8 threads, three 512-byte double buffers per thread, 8 heads
+        assert_eq!(k[..7], [1, 8, 8 * 3 * 1024, 8, 8, 1, 0]);
+        assert_eq!(f32::from_bits(k[7] as u32), 0.125);
+        assert_eq!(f32::from_bits(k[9] as u32), 1.0);
+        assert_eq!(k[11..13], fastdiv_words(t)); // ne01
+        assert_eq!(k[13..15], fastdiv_words(8)); // ne02
+        // without a mask: the no-mask kernel and no mask buffers
+        let k = build_softmax_kernel_params(&scores, None, &scores, &params, 8, 8 << 20).unwrap();
+        assert_eq!((k[0], k[2], k[5]), (0, 8 * 2 * 2 * 512, 0));
     }
 
     /// The scalar-broadcast params the llama.cpp host precompute produces
@@ -3041,20 +3937,6 @@ mod tests {
         assert_eq!(rope[4], 4096);
         assert_eq!(rope[5], (10000.0f32).to_bits() as i32);
         assert_eq!(rope[6], (1.0f32).to_bits() as i32);
-
-        // No factors: the slot is empty and sits right after the 4 per-thread slabs.
-        let plain = build_rope_kernel_params(128, 16, 16, 1, 4);
-        assert_eq!((plain[3], plain[7], plain[8]), (4 * 16896, 4 * 16896, 0));
-        // 64 factors (one per pair of a 128-wide head): a 256-byte slot after the
-        // slabs, counted in the total VTCM size and nowhere else.
-        let ff = build_rope_kernel_params_with_freq_factors(128, 16, 16, 1, 4, 64);
-        assert_eq!((ff[3], ff[7], ff[8]), (4 * 16896 + 256, 4 * 16896, 256));
-        assert_eq!(ff[4], plain[4]);
-        // 65 factors spill into a second aligned block.
-        assert_eq!(
-            build_rope_kernel_params_with_freq_factors(128, 16, 16, 1, 4, 65)[8],
-            512
-        );
 
         let mm = build_mul_mat_kernel_params(HtpDataType::Q8_0, 1024, 1, 1, 4096, 4, 8 << 20);
         let mm = MmKernelParams::from_words(&mm);

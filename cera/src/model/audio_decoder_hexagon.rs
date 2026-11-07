@@ -17,8 +17,8 @@ use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_WEIGHT, HexagonContext, HexagonDevice,
     HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128,
     build_binary_kernel_params, build_flash_attn_kernel_params, build_rms_norm_params,
-    build_rope_kernel_params, build_rope_params, build_unary_kernel_params, repack_q4_0,
-    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    build_rope_params, build_unary_kernel_params, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::gguf::GgufFile;
@@ -2104,16 +2104,14 @@ impl HexagonAudioDecoder {
             ],
         )?;
         let params = build_rope_params(head_dim, mode, max_seq_len as u32, rope_theta, 1.0);
-        let nrows = n_heads * n_tokens;
-        let n_threads = session.dsp_threads().min(nrows as u32).max(1);
-        let kparams = build_rope_kernel_params(head_dim, nrows, n_heads, n_tokens, n_threads);
+        // the queue derives the kernel params from the registered tensors and `params`
         session
             .enqueue_op(
                 HtpOpCode::Rope as u32,
                 &[act_ti, pos_ti],
                 &[act_ti],
                 params,
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| CeraError::Backend(format!("detok_rope_m: {e}")))?;
         session.end_group()
