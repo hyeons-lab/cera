@@ -1486,13 +1486,12 @@ impl HexagonLfmModel {
     ///
     /// Falls back to N single dispatches when fusion is unsupported: N
     /// outside 2..=4, mixed K (`in_dim`) or wire dtype, HMX-eligibility
-    /// mismatch across the set, Q6_K on the HVX path (no fused HVX
-    /// kernel), or HMX chunking overflow (which retries HVX first, like
-    /// the single path), or HVX rows past the fused limit. Kernel parameters are W0's single-matmul
-    /// parameters with `n_weights` set. On the HVX path the fused kernel cannot
-    /// chunk rows, so more rows than `mm_hvx_fused_nx_max_rows` also fall back;
-    /// W0 must carry the largest N (`out_dim`) so the
-    /// m=1 dst scratch covers every output.
+    /// mismatch across the set, or no fused kernel for the shape
+    /// ([`build_mul_mat_nx_kernel_params`]): the solver takes the HMX when the
+    /// rows and budget allow and the fused HVX kernel otherwise, and that one
+    /// cannot chunk rows, so more rows than `mm_hvx_fused_nx_max_rows` also
+    /// fall back. The kernel parameters are solved for W0, which should carry
+    /// the largest N (`out_dim`); the others only need the same K.
     pub(super) fn dispatch_mul_mat_nx(
         &self,
         session: &mut HexagonQueueSession,
