@@ -301,32 +301,64 @@ fn descriptor_bytes<T>(v: &[T]) -> &[u8] {
 
 #[test]
 fn test_decode_template_flash_attn_patching() {
-    let tensor = |ti: u16, size: u32, ne: [u32; 4], nb: [u32; 4]| HtpTensor {
+    let tensor = |ti: u16, dtype: HtpDataType, size: u32, ne: [u32; 4], nb: [u32; 4]| HtpTensor {
         data: 0,
         size,
         flags: 0,
-        dtype: HtpDataType::F16 as u32,
+        dtype: dtype as u32,
         bi: 0,
         ti,
         ne,
         nb,
     };
+    let (f32t, f16t) = (HtpDataType::F32, HtpDataType::F16);
     let tens = [
-        tensor(0, 0, [64, 1, 4, 1], [2, 128, 512, 512]),
-        tensor(1, 0, [64, 1, 4, 1], [2, 128, 512, 512]),
-        tensor(2, 2, [1, 1, 1, 1], [2, 2, 2, 2]),
+        tensor(0, f32t, 1024, [64, 1, 16, 1], [4, 256, 256, 4096]),
+        tensor(1, f16t, 0, [64, 1, 4, 1], [2, 512, 128, 512]),
+        tensor(2, f16t, 0, [64, 1, 4, 1], [2, 512, 128, 512]),
+        tensor(3, f16t, 2, [1, 1, 1, 1], [2, 2, 2, 2]),
+        tensor(4, f32t, 1024, [64, 16, 1, 1], [4, 256, 4096, 4096]),
     ];
+    let scale = 0.125f32;
     let mut op = HtpOpDesc {
         opcode: HtpOpCode::FlashAttnExt as u32,
         flags: 0,
-        params: [0; 16],
+        params: flash_attn_op_params(scale, 0.0),
         kernel_params: [0; 32],
         src: [0; 10],
         dst: [0; 4],
         pad: [0; 2],
     };
-    op.kernel_params =
-        build_flash_attn_kernel_params_with_softcap(64, 16, 4, 1, 1, 0.125, 4, true, 0.0);
+    // 6 threads and an HMX unit on a 8 MiB VTCM, like an S25 Ultra session
+    let host = FlashAttnHost::new(6, 8 << 20, 1);
+    let solve = |seq_len: usize, host: &FlashAttnHost| {
+        let q = CopyTensor::from(&tens[0]);
+        let dst = CopyTensor::from(&tens[4]);
+        let kv = |t: &HtpTensor| CopyTensor {
+            ne: [t.ne[0], seq_len as u32, t.ne[2], t.ne[3]],
+            ..CopyTensor::from(t)
+        };
+        let mask = CopyTensor {
+            ne: [seq_len as u32, 1, 1, 1],
+            ..CopyTensor::from(&tens[3])
+        };
+        build_flash_attn_kernel_params(
+            host,
+            &FlashAttnOp {
+                q: &q,
+                k: &kv(&tens[1]),
+                v: &kv(&tens[2]),
+                mask: Some(&mask),
+                sinks: None,
+                dst: &dst,
+                scale,
+                max_bias: 0.0,
+                logit_softcap: 0.0,
+            },
+        )
+        .unwrap()
+    };
+    op.kernel_params = solve(1, &host);
 
     // Serialize into the same layout `export_staged_batch` produces
     // (tensors, then ops), so the descriptor accessors address real bytes.
@@ -350,29 +382,36 @@ fn test_decode_template_flash_attn_patching() {
     };
     let patch = FlashAttnPatch {
         op_idx: 0,
-        k_ti: 0,
-        v_ti: 1,
-        mask_ti: 2,
-        g: 16 / 4,
+        q_ti: 0,
+        k_ti: 1,
+        v_ti: 2,
+        mask_ti: 3,
+        dst_ti: 4,
     };
 
-    // Decode step at pos = 15 (seq_len = 16), then pos = 64 (seq_len 65:
-    // a second KV block).
-    for seq_len in [16usize, 65] {
-        apply_flash_attn_patches(&mut staged, &[patch], seq_len);
+    // Decode steps at seq_len 16 and 65 (a second KV block), then 2048 and 4096, where the
+    // solver moves the 64-wide-head GQA-4 decode from HVX to HMX (the crossover is 768 rows at
+    // 6 threads), and the HVX-only setting that never takes it.
+    let kernel = |staged: &StagedBatch| staged.op(0).kernel_params[0] & 0xff;
+    for seq_len in [16usize, 65, 700, 2048, 4096] {
+        apply_flash_attn_patches(&mut staged, &[patch], seq_len, &host).unwrap();
         let mask_bytes = (seq_len * 2) as u32;
-        assert_eq!(staged.tensor(0).ne[1], seq_len as u32);
         assert_eq!(staged.tensor(1).ne[1], seq_len as u32);
-        let mask = staged.tensor(2);
+        assert_eq!(staged.tensor(2).ne[1], seq_len as u32);
+        let mask = staged.tensor(3);
         assert_eq!(mask.ne[0], seq_len as u32);
         assert_eq!(mask.size, mask_bytes);
         assert_eq!(mask.nb[1..], [mask_bytes; 3]);
         assert_eq!(
             staged.op(0).kernel_params,
-            build_flash_attn_kernel_params_with_softcap(64, 16, 4, 1, seq_len, 0.125, 4, true, 0.0),
+            solve(seq_len, &host),
             "seq_len {seq_len}"
         );
+        assert_eq!(kernel(&staged), if seq_len >= 768 { 2 } else { 1 });
     }
+    apply_flash_attn_patches(&mut staged, &[patch], 4096, &host.hvx_only()).unwrap();
+    assert_eq!(staged.op(0).kernel_params, solve(4096, &host.hvx_only()));
+    assert_eq!(kernel(&staged), 1);
 }
 
 #[test]
@@ -440,6 +479,54 @@ fn test_hexagon_glu_opcode_selection() {
     }
 }
 
+/// A decode-sized FFN activation is one long row, which one DSP thread would work through; the
+/// GLU is registered collapsed, as the host does, so the threads share it. The kernel params
+/// are solved for the collapsed tensors and the bytes covered do not change.
+#[test]
+fn a_decode_glu_is_registered_as_rows_the_threads_share() {
+    use crate::backend::hexagon::{CopyTensor, op_capture, solve_glu};
+    let (driver, mut device) = op_capture::fresh_device();
+    let ff = 8192usize;
+    let buf = RpcmemBuffer::alloc(driver, 3 * ff * 4, false).unwrap();
+    let session = device.queue_session_mut();
+    let threads = session.dsp_threads();
+    let vtcm = session.dsp_vtcm_bytes();
+    HexagonLfmModel::dispatch_glu(
+        session,
+        &buf,
+        0,
+        &buf,
+        ff * 4,
+        &buf,
+        2 * ff * 4,
+        ff,
+        1,
+        FfnActivation::Swiglu,
+    )
+    .unwrap();
+    let (_, _, tens, ops) = session.export_batch();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(tens.len(), 3);
+    for t in &tens {
+        assert!(t.ne[0] < ff as u32 && t.ne[1] > 1, "collapsed: {:?}", t.ne);
+        assert_eq!(u64::from(t.ne[0]) * u64::from(t.ne[1]), ff as u64);
+        assert_eq!(t.nb[1], t.ne[0] * 4);
+        assert_eq!(t.size as usize, ff * 4, "the same bytes");
+    }
+    let view = |i: usize| CopyTensor::from(&tens[i]);
+    let want = solve_glu(
+        HtpOpCode::GluSwiglu as u32,
+        &view(0),
+        Some(&view(1)),
+        &view(2),
+        threads,
+        vtcm,
+    )
+    .unwrap();
+    assert_eq!(ops[0].kernel_params, want);
+    assert!(want[0] > 1, "more than one thread: {}", want[0]);
+}
+
 /// `lfm3`'s per-head gate dispatch sizes its VTCM layout before it registers anything, so a
 /// row that cannot fit is a typed refusal that leaves the pending batch untouched (the
 /// caller drops the batch on any error, but nothing half-registered should exist to drop).
@@ -469,28 +556,6 @@ fn a_scalar_gate_that_does_not_fit_vtcm_registers_nothing() {
         before,
         "a refusal registered tensors"
     );
-}
-
-#[test]
-fn test_hexagon_flash_attn_softcap_params() {
-    let softcap = 50.0f32;
-    let kparams =
-        build_flash_attn_kernel_params_with_softcap(64, 16, 4, 1, 128, 0.125, 4, true, softcap);
-    assert_eq!(kparams[5], softcap.to_bits() as i32);
-
-    let zero_softcap = 0.0f32;
-    let kparams_zero = build_flash_attn_kernel_params_with_softcap(
-        64,
-        16,
-        4,
-        1,
-        128,
-        0.125,
-        4,
-        true,
-        zero_softcap,
-    );
-    assert_eq!(kparams_zero[5], 0);
 }
 
 #[test]

@@ -170,6 +170,10 @@ jobs:
                   sys.exit(1)
           print(f"skel SONAMEs verified ({len(paths)} files)")
           PY
+          # a SONAME edited by hand passes the check above but leaves the SWIV CRC stale
+          for f in cera/src/backend/hexagon/skels/libcera-htp-v*.so; do
+            python3 -I scripts/hexagon-skels/finalize.py --check "$f" || exit 1
+          done
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build
@@ -425,8 +429,13 @@ jobs:
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
       - name: Show Vulkan adapter
         run: vulkaninfo --summary || true
+      # One test thread, here and in the model-backed step below: on runner image
+      # 20261101 the parallel lib tests killed this job with a SIGSEGV inside
+      # Mesa's llvmpipe, in a different test each run, and main failed the same
+      # way on that image. Serial tests are a mitigation; the crash itself is not
+      # root-caused.
       - name: Run wgpu kernel + host-logic tests
-        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle --test wgpu_mul_mat_parity --test audio_encoder_wgpu_parity
+        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle --test wgpu_mul_mat_parity --test audio_encoder_wgpu_parity -- --test-threads=1
       # Model-backed GPU tests need a fixture, and until now no job had both a
       # GPU and a GGUF: this one has the adapter but fetched nothing, while
       # `parity` fetches fixtures and builds without `--features gpu`. So the
@@ -463,7 +472,7 @@ jobs:
             --test gpu_lfm2_decode_passes \
             --test gpu_lfm2_greedy_submits \
             --test gpu_lfm2_prefill_pass_split \
-            -- --nocapture
+            -- --nocapture --test-threads=1
       # The GEMM microbenchmark carries `required-features = ["gpu"]`, so the
       # `check` job's `cargo clippy --all-targets` (no features) skips it and
       # nothing else in PR-time CI compiles it. Without this a change that breaks

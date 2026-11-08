@@ -672,7 +672,7 @@ impl HexagonLfmModel {
                 _ => &self.mask_buf,
             };
             let op_idx = session.ops_len();
-            let (k_ti, v_ti, mask_ti) = Self::dispatch_flash_attn_ext_typed(
+            let fa = Self::dispatch_flash_attn_ext_typed(
                 session,
                 scratch,
                 so.q,
@@ -695,10 +695,11 @@ impl HexagonLfmModel {
             if let Some(patches) = patches {
                 patches.push(FlashAttnPatch {
                     op_idx,
-                    k_ti,
-                    v_ti,
-                    mask_ti,
-                    g: (n_heads / n_kv_heads.max(1)).max(1),
+                    q_ti: fa.q_ti,
+                    k_ti: fa.k_ti,
+                    v_ti: fa.v_ti,
+                    mask_ti: fa.mask_ti,
+                    dst_ti: fa.dst_ti,
                 });
             }
         } else {

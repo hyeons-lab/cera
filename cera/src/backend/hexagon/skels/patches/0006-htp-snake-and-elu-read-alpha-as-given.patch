@@ -1,0 +1,71 @@
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+index 7022d4435..1cb055e3e 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
+@@ -1919,10 +1919,8 @@ static void snake_f32(const void * restrict src,
+                       const uint32_t num_rows,
+                       const struct htp_unary_context * uctx) {
+     htp_unary_op_preamble;
+-    float alpha = 1.0f;
+-    if (op_params[0] != 0) {
+-        memcpy(&alpha, &op_params[0], sizeof(float));
+-    }
++    float alpha;
++    memcpy(&alpha, &op_params[0], sizeof(float));
+ 
+     for (uint32_t ir = 0; ir < num_rows; ir++) {
+         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+@@ -2083,7 +2081,7 @@ static void hardswish_f32(const void * restrict src,
+     }
+ }
+ 
+-static inline void hvx_elu_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t ne0, float alpha) {
++static inline void elu_f32_row(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t ne0, float alpha) {
+     const float * restrict f_src = (const float *) src;
+     float * restrict f_dst       = (float *) dst;
+ 
+@@ -2098,24 +2096,20 @@ static void elu_f32(const void * restrict src,
+                     const uint32_t num_rows,
+                     const struct htp_unary_context * uctx) {
+     htp_unary_op_preamble;
+-    float alpha = 1.0f;
+-    if (op_params[0] != 0) {
+-        memcpy(&alpha, &op_params[0], sizeof(float));
+-    }
++    float alpha;
++    memcpy(&alpha, &op_params[0], sizeof(float));
+ 
+     for (uint32_t ir = 0; ir < num_rows; ir++) {
+         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+ 
+-        hvx_elu_f32_aa(dst_local, src_local, ne0, alpha);
++        elu_f32_row(dst_local, src_local, ne0, alpha);
+     }
+ }
+ 
+ static void tile_snake_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
+-    float alpha = 1.0f;
+-    if (uctx->octx->op_params[0] != 0) {
+-        memcpy(&alpha, &uctx->octx->op_params[0], sizeof(float));
+-    }
++    float alpha;
++    memcpy(&alpha, &uctx->octx->op_params[0], sizeof(float));
+     hvx_snake_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw, alpha);
+ }
+ 
+@@ -2140,11 +2134,9 @@ static void tile_hardswish_f32(void * restrict dst, const void * restrict src, u
+ }
+ 
+ static void tile_elu_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
+-    float alpha = 1.0f;
+-    if (uctx->octx->op_params[0] != 0) {
+-        memcpy(&alpha, &uctx->octx->op_params[0], sizeof(float));
+-    }
+-    hvx_elu_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw, alpha);
++    float alpha;
++    memcpy(&alpha, &uctx->octx->op_params[0], sizeof(float));
++    elu_f32_row((uint8_t *) dst, (const uint8_t *) src, tw, alpha);
+ }
+ 
+ static int execute_op_unary(struct htp_ops_context * octx) {

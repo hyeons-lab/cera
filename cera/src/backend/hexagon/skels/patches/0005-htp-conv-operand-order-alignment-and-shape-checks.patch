@@ -1,0 +1,142 @@
+diff --git a/ggml/src/ggml-hexagon/htp/conv1d-ops.c b/ggml/src/ggml-hexagon/htp/conv1d-ops.c
+index 40c71e8a2..3f1694a80 100644
+--- a/ggml/src/ggml-hexagon/htp/conv1d-ops.c
++++ b/ggml/src/ggml-hexagon/htp/conv1d-ops.c
+@@ -86,7 +86,7 @@ static void conv1d_worker_f32(unsigned int nth, unsigned int ith, void * data) {
+                 const uint32_t ic = oc;
+ 
+                 // When stride is 1 and w_out >= 32, vectorize across output positions
+-                if (stride == 1 && w_out >= VLEN_FP32) {
++                if (stride == 1 && w_out >= VLEN_FP32 && src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+                     const uint32_t nvec = w_out / VLEN_FP32;
+                     const uint32_t nloe = w_out % VLEN_FP32;
+                     const HVX_Vector v_bias = hvx_vec_splat_f32(bias_val);
+@@ -106,7 +106,9 @@ static void conv1d_worker_f32(unsigned int nth, unsigned int ith, void * data) {
+                             if (iw_base >= 0 && (uint32_t)(iw_base + VLEN_FP32) <= w_in) {
+                                 const float * in_p = (const float *)(in_bytes +
+                                     iw_base * src0->nb[0] + ic * src0->nb[1] + b * src0->nb[2]);
+-                                HVX_Vector v_in = *(const HVX_Vector *) in_p;
++                                // in_p sits at an arbitrary element offset: a plain HVX_Vector access would
++                                // load the 128-byte block below it
++                                HVX_Vector v_in = hvx_vmemu(in_p);
+                                 HVX_Vector v_prod = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v_in, v_w));
+                                 v_acc = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v_acc, v_prod));
+                             } else {
+@@ -121,7 +123,7 @@ static void conv1d_worker_f32(unsigned int nth, unsigned int ith, void * data) {
+                                         tmp_in[vi] = 0.0f;
+                                     }
+                                 }
+-                                HVX_Vector v_in = *(const HVX_Vector *) tmp_in;
++                                HVX_Vector v_in = hvx_vmemu(tmp_in);
+                                 HVX_Vector v_prod = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v_in, v_w));
+                                 v_acc = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v_acc, v_prod));
+                             }
+@@ -129,7 +131,7 @@ static void conv1d_worker_f32(unsigned int nth, unsigned int ith, void * data) {
+ 
+                         float * out_p = (float *)(out_bytes +
+                             ow_base * dst->nb[0] + oc * dst->nb[1] + b * dst->nb[2]);
+-                        *(HVX_Vector *) out_p = v_acc;
++                        hvx_vmemu(out_p) = v_acc;
+                     }
+ 
+                     // Trailing scalar positions
+@@ -183,7 +185,13 @@ static void conv1d_worker_f32(unsigned int nth, unsigned int ith, void * data) {
+ }
+ 
+ int op_conv1d(struct htp_ops_context * octx) {
+-    if (octx->src[0]->type != HTP_TYPE_F32 || octx->src[1]->type != HTP_TYPE_F32) {
++    const struct htp_tensor * src0 = octx->src[0];  // input:  [W_in, C_in, N]
++    const struct htp_tensor * src1 = octx->src[1];  // weight: [K, C_in/groups, C_out]
++    const struct htp_tensor * src2 = octx->src[2];  // bias:   [C_out], or NULL
++    const struct htp_tensor * dst  = octx->dst;     // output: [W_out, C_out, N]
++
++    if (src0->type != HTP_TYPE_F32 || src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
++        (src2 && src2->type != HTP_TYPE_F32)) {
+         FARF(ERROR, "op_conv1d: unsupported data type (f32 required)");
+         return HTP_STATUS_NO_SUPPORT;
+     }
+@@ -193,7 +201,17 @@ int op_conv1d(struct htp_ops_context * octx) {
+     uint32_t dilation = octx->op_params[2] > 0 ? (uint32_t) octx->op_params[2] : 1;
+     uint32_t groups   = octx->op_params[3] > 0 ? (uint32_t) octx->op_params[3] : 1;
+ 
+-    const uint32_t c_out = octx->dst->ne[1];
++    const uint32_t c_in  = src0->ne[1];
++    const uint32_t c_out = dst->ne[1];
++
++    // The worker divides by c_out / groups and indexes the weight, input and bias by these extents.
++    if (groups > c_out || c_in % groups != 0 || c_out % groups != 0 ||
++        src1->ne[1] != c_in / groups || src1->ne[2] != c_out ||
++        src0->ne[2] < dst->ne[2] || (src2 && src2->ne[0] < c_out)) {
++        FARF(ERROR, "op_conv1d: shapes do not agree (c_in %u, c_out %u, groups %u)", c_in, c_out, groups);
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
+     const uint32_t n_threads = octx->ctx->n_threads > 0 ? octx->ctx->n_threads : 1;
+ 
+     struct htp_conv1d_context cctx;
+@@ -214,8 +232,8 @@ static void conv_transpose1d_worker_f32(unsigned int nth, unsigned int ith, void
+     struct htp_conv1d_context * cctx = (struct htp_conv1d_context *) data;
+     struct htp_ops_context *    octx = cctx->octx;
+ 
+-    const struct htp_tensor * weight = (octx->src[0]->ne[0] <= 128 && octx->src[1]->ne[0] > octx->src[0]->ne[0]) ? octx->src[0] : octx->src[1];
+-    const struct htp_tensor * input  = (weight == octx->src[0]) ? octx->src[1] : octx->src[0];
++    const struct htp_tensor * weight = octx->src[0];  // [K, C_out, C_in], the ggml operand order
++    const struct htp_tensor * input  = octx->src[1];  // [L, C_in, N]
+     const struct htp_tensor * src2   = octx->src[2];
+     const struct htp_tensor * dst    = octx->dst;
+ 
+@@ -250,17 +268,18 @@ static void conv_transpose1d_worker_f32(unsigned int nth, unsigned int ith, void
+             for (uint32_t ow = 0; ow < w_out; ow++) {
+                 float sum = bias_val;
+ 
+-                for (uint32_t ic = 0; ic < c_in; ic++) {
+-                    for (uint32_t k = 0; k < k_size; k++) {
+-                        int32_t in_numer = (int32_t) ow + (int32_t) pad - (int32_t)(k * dilation);
+-                        if (in_numer < 0 || in_numer % (int32_t) stride != 0) {
+-                            continue;
+-                        }
+-                        int32_t iw = in_numer / (int32_t) stride;
+-                        if (iw >= (int32_t) w_in) {
+-                            continue;
+-                        }
++                // which input column a tap reads does not depend on the channel, so test it once per tap
++                for (uint32_t k = 0; k < k_size; k++) {
++                    int32_t in_numer = (int32_t) ow + (int32_t) pad - (int32_t)(k * dilation);
++                    if (in_numer < 0 || in_numer % (int32_t) stride != 0) {
++                        continue;
++                    }
++                    int32_t iw = in_numer / (int32_t) stride;
++                    if (iw >= (int32_t) w_in) {
++                        continue;
++                    }
+ 
++                    for (uint32_t ic = 0; ic < c_in; ic++) {
+                         const float * in_p = (const float *)(in_bytes +
+                             (uint32_t) iw * input->nb[0] + ic * input->nb[1] + b * input->nb[2]);
+                         const float * wp   = (const float *)(weight_bytes +
+@@ -279,11 +298,24 @@ static void conv_transpose1d_worker_f32(unsigned int nth, unsigned int ith, void
+ }
+ 
+ int op_conv_transpose1d(struct htp_ops_context * octx) {
+-    if (octx->src[0]->type != HTP_TYPE_F32 || octx->src[1]->type != HTP_TYPE_F32) {
++    const struct htp_tensor * weight = octx->src[0];  // [K, C_out, C_in]
++    const struct htp_tensor * input  = octx->src[1];  // [L, C_in, N]
++    const struct htp_tensor * src2   = octx->src[2];  // bias: [C_out], or NULL
++    const struct htp_tensor * dst    = octx->dst;     // [L_out, C_out, N]
++
++    if (weight->type != HTP_TYPE_F32 || input->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
++        (src2 && src2->type != HTP_TYPE_F32)) {
+         FARF(ERROR, "op_conv_transpose1d: unsupported data type (f32 required)");
+         return HTP_STATUS_NO_SUPPORT;
+     }
+ 
++    // The worker indexes the weight by (k, c_out, c_in) and writes one output slab per input batch.
++    if (weight->ne[1] != dst->ne[1] || weight->ne[2] != input->ne[1] || dst->ne[2] < input->ne[2] ||
++        (src2 && src2->ne[0] < dst->ne[1])) {
++        FARF(ERROR, "op_conv_transpose1d: shapes do not agree");
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
+     uint32_t stride   = octx->op_params[0] > 0 ? (uint32_t) octx->op_params[0] : 1;
+     uint32_t pad      = (uint32_t) octx->op_params[1];
+     uint32_t dilation = octx->op_params[2] > 0 ? (uint32_t) octx->op_params[2] : 1;

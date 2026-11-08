@@ -518,26 +518,26 @@ fn constructors_build_pinned_models() {
     assert_model(
         "ctor_dense",
         &dense,
-        (5153141503434646990, 64189687555477636),
+        (5153141503434646990, 12934653203394638101),
     );
     let lfm2 = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(false), 64).unwrap();
     assert_model(
         "ctor_lfm2",
         &lfm2,
-        (3932535791928950102, 16081593749882006606),
+        (3932535791928950102, 6849908726525516304),
     );
     let moe = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(true), 64).unwrap();
     assert_model(
         "ctor_moe",
         &moe,
-        (17415058047840074287, 4431082039610235919),
+        (17415058047840074287, 12964236396959625804),
     );
     let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
     let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();
     assert_model(
         "ctor_qwen35",
         &qwen35,
-        (3116775937788930880, 1277822656173788493),
+        (3116775937788930880, 4190262809288729821),
     );
 }
 
@@ -2093,14 +2093,10 @@ fn lfm3_decode_emits_the_lfm3_graph() {
     let scalar_muls: Vec<_> = op_lines(&decode, "Mul")
         .into_iter()
         .filter(|l| {
-            kparams(l)[0] == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR_DMA)
+            kparams(l)[0] & 0xff == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR)
         })
         .collect();
-    assert_eq!(
-        scalar_muls.len(),
-        2,
-        "SCALAR_DMA multiply per attention layer"
-    );
+    assert_eq!(scalar_muls.len(), 2, "SCALAR multiply per attention layer");
     for line in scalar_muls {
         let (src, dst) = descs(line);
         assert_eq!(src[0].ne[..2], [HEAD_DIM, N_HEADS]);
@@ -2123,9 +2119,12 @@ fn lfm3_decode_emits_the_lfm3_graph() {
             .collect();
         let (src, _) = descs(line);
         let kp = kparams(line);
+        // a theta cache and 32 rows of scratch per thread, the thread count first, then the VTCM total
+        let row = HEAD_DIM * 4;
+        let slabs = kp[0] * (row.next_multiple_of(256) + 32 * row.next_multiple_of(128)) as i64;
         if params.contains(&rope_bits(10_000.0)) {
             assert!(!params.contains(&rope_bits(1_000_000.0)), "{params:?}");
-            assert_eq!((src.len(), kp[8]), (2, 0), "sliding layer has no mask");
+            assert_eq!((src.len(), kp[1]), (2, slabs), "sliding layer has no mask");
             sliding += 1;
         } else {
             assert!(params.contains(&rope_bits(1_000_000.0)), "{params:?}");
@@ -2133,8 +2132,7 @@ fn lfm3_decode_emits_the_lfm3_graph() {
             assert_eq!(src[2].ne[..2], [HEAD_DIM / 2, 1]);
             assert_eq!(src[2].nb[0], 4);
             // the slot is 256-aligned, after the per-thread slabs, inside the VTCM total
-            assert_eq!(kp[8], 256, "{kp:?}");
-            assert_eq!(kp[3], kp[7] + kp[8], "{kp:?}");
+            assert_eq!(kp[1], slabs + 256, "{kp:?}");
             global += 1;
         }
     }
@@ -2219,22 +2217,13 @@ fn lfm3_prefill_emits_the_lfm3_graph() {
     // the chunk rotates on the DSP too: Q and K of the global layer carry the mask
     let rope_srcs: Vec<_> = op_lines(&prefill, "Rope")
         .into_iter()
-        .map(|l| (descs(l).0.len(), kparams(l)[8]))
+        .map(|l| (descs(l).0.len(), kparams(l)[1]))
         .collect();
-    assert_eq!(
-        rope_srcs
-            .iter()
-            .filter(|&&(n, ff)| n == 3 && ff == 256)
-            .count(),
-        2
-    );
-    assert_eq!(
-        rope_srcs
-            .iter()
-            .filter(|&&(n, ff)| n == 2 && ff == 0)
-            .count(),
-        2
-    );
+    let with_factors = |n| rope_srcs.iter().filter(|&&(len, _)| len == n).count();
+    assert_eq!((with_factors(3), with_factors(2)), (2, 2));
+    // the factors' slot is the only difference in VTCM between the two kinds
+    let total = |n| rope_srcs.iter().find(|&&(len, _)| len == n).unwrap().1;
+    assert_eq!(total(3) - total(2), 256);
 
     for line in op_lines(&prefill, "Concat") {
         let (src, dst) = descs(line);
@@ -2276,13 +2265,13 @@ fn lfm3_prefill_emits_the_lfm3_graph() {
     let prefill_gates: Vec<_> = op_lines(&prefill, "Mul")
         .into_iter()
         .filter(|l| {
-            kparams(l)[0] == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR_DMA)
+            kparams(l)[0] & 0xff == i64::from(crate::backend::hexagon::HTP_BINARY_KERNEL_SCALAR)
         })
         .collect();
     assert_eq!(
         prefill_gates.len(),
         2,
-        "a SCALAR_DMA multiply per attention layer"
+        "a SCALAR multiply per attention layer"
     );
     for line in prefill_gates {
         let (src, _) = descs(line);
@@ -2303,7 +2292,7 @@ fn lfm3_constructor_is_pinned() {
     assert_model(
         "ctor_lfm3",
         &model,
-        (14294067538294377481, 13080567521429679373),
+        (14294067538294377481, 5377328684519655946),
     );
 }
 

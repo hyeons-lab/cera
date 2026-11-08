@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use super::LockOrRecover;
 use super::queue::HexagonQueueSession;
 use super::sys::{FastRpcDriver, RemoteArg, RemoteBuf, RemoteHandle64, remote_scalars_make};
-use super::types::HtpHwInfo;
+use super::types::{HTP_POWER_MODE_BURST, HtpHwInfo};
 use crate::session::CeraError;
 
 /// Target Hexagon architecture generations.
@@ -147,14 +147,22 @@ pub struct HexagonDevice {
     _power_vote: PowerVote,
 }
 
+/// `htp_iface_start` (IDL Method 2) payload. QAIC packs the scalar arguments into one
+/// `uint64_t[6]` buffer with each field at its natural alignment, which is this struct's layout
+/// (48 bytes; `sess_id` at 0, `dsp_queue_id` 8, `n_hvx` 16, `n_hmx` 20, `vtcm_size` 24,
+/// `max_vmem` 32, `power_mode` 40).
 #[repr(C)]
 struct HtpStartPayload {
     sess_id: u32,
-    _pad: u32,
+    _pad0: u32,
     dsp_queue_id: u64,
     n_hvx: u32,
-    use_hmx: u32,
+    n_hmx: u32,
+    /// 0 asks the DSP for the VTCM size it reports (the pre-refresh behavior).
+    vtcm_size: u64,
     max_vmem: u64,
+    power_mode: u32,
+    _pad1: u32,
 }
 
 /// `htp_iface_profiler` (IDL Method 6) payload: mode + 8 PMU event ids.
@@ -254,11 +262,16 @@ impl HexagonDevice {
         // Start session on DSP via htp_iface_start (Method 2: 1 in, 0 out)
         let mut start_payload = HtpStartPayload {
             sess_id: 0,
-            _pad: 0,
+            _pad0: 0,
             dsp_queue_id: queue_session.queue_id(),
             n_hvx: 0,
-            use_hmx: 1,
+            n_hmx: 1,
+            vtcm_size: 0,
             max_vmem: 0xc800_0000,
+            // BURST pins every voltage corner to its maximum and disables DCVS, which is what the
+            // session always did before the DSP took a power mode.
+            power_mode: HTP_POWER_MODE_BURST,
+            _pad1: 0,
         };
 
         let mut in_args = [RemoteArg {
@@ -413,6 +426,20 @@ pub(crate) fn probe_device_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_payload_matches_the_qaic_marshalling() {
+        use super::HtpStartPayload as P;
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<P>(), 48);
+        assert_eq!(offset_of!(P, sess_id), 0);
+        assert_eq!(offset_of!(P, dsp_queue_id), 8);
+        assert_eq!(offset_of!(P, n_hvx), 16);
+        assert_eq!(offset_of!(P, n_hmx), 20);
+        assert_eq!(offset_of!(P, vtcm_size), 24);
+        assert_eq!(offset_of!(P, max_vmem), 32);
+        assert_eq!(offset_of!(P, power_mode), 40);
+    }
+
     use super::super::sys::fake;
     use super::*;
 

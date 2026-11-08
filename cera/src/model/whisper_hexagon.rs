@@ -15,12 +15,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
-    align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_hmx_fa_kernel_params, build_mul_mat_kernel_params, fa_is_hmx_eligible, hexagon_warn,
-    quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    align128, build_mul_mat_kernel_params, flash_attn_hmx_rows_ok, flash_attn_kernel_request,
+    flash_attn_op_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{
     LockOrRecover, lock_or_discard, lock_reporting_poison, report_poison,
@@ -76,6 +75,12 @@ fn encoder_hmx(session: &HexagonQueueSession) -> Option<dispatch::HmxMm> {
     (!hvx_only && session.dsp_hmx() > 0).then(|| dispatch::HmxMm {
         vtcm_budget: session.dsp_vtcm_bytes(),
     })
+}
+
+/// `CERA_HEXAGON_WHISPER_FA=hvx` keeps the encoder's flash attention on the HVX kernel instead of
+/// letting the solver pick HMX, for comparison (the decode step is always HVX).
+fn whisper_fa_hvx_only() -> bool {
+    std::env::var("CERA_HEXAGON_WHISPER_FA").is_ok_and(|v| v == "hvx")
 }
 
 /// Whether `n_ctx` encoder rows can run: the full window, or a multiple of 64 within it.
@@ -1000,7 +1005,7 @@ impl HexagonWhisperModel {
             weights,
             w_conv.w0.offset,
             w_conv.w0.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1014,7 +1019,7 @@ impl HexagonWhisperModel {
             weights,
             w_conv.w1.offset,
             w_conv.w1.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1028,7 +1033,7 @@ impl HexagonWhisperModel {
             weights,
             w_conv.w2.offset,
             w_conv.w2.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             [ne0 as u32, ne1 as u32, 1, 1],
             [
@@ -1099,7 +1104,12 @@ impl HexagonWhisperModel {
                 out_channels * 4,
                 session.dsp_threads(),
                 dispatch::VTCM_BUDGET,
-            );
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "no matmul kernel for {chunk} rows of a {out_channels}x{padded_in_channels} conv tap (K must be a multiple of 32 and the plan must fit the VTCM)"
+                ))
+            })?;
 
             // Tap 0 -> cur_dst
             let x0_off = conv_tap_input_offset(src_base_offset, row_bytes, 0, t_start, stride);
@@ -1139,22 +1149,12 @@ impl HexagonWhisperModel {
                 kparams_mm,
             )?;
 
-            let add_kparams = build_binary_kernel_params(
-                out_channels,
-                out_channels,
-                chunk,
-                1,
-                1,
-                4,
-                dispatch::VTCM_BUDGET,
-                session.dsp_threads(),
-            );
             session.enqueue_op(
                 HtpOpCode::Add as u32,
                 &[cur_dst_ti, tmp_ti],
                 &[cur_dst_ti],
                 [0i32; 16],
-                add_kparams,
+                [0i32; 32],
             )?;
 
             // Tap 2 -> tmp; cur_dst += tmp
@@ -1180,26 +1180,16 @@ impl HexagonWhisperModel {
                 &[cur_dst_ti, tmp_ti],
                 &[cur_dst_ti],
                 [0i32; 16],
-                add_kparams,
+                [0i32; 32],
             )?;
 
             // Add bias: cur_dst += bias
-            let bias_add_kparams = build_binary_kernel_params(
-                out_channels,
-                out_channels,
-                1,
-                1,
-                1,
-                4,
-                dispatch::VTCM_BUDGET,
-                session.dsp_threads(),
-            );
             session.enqueue_op(
                 HtpOpCode::Add as u32,
                 &[cur_dst_ti, b_ti],
                 &[cur_dst_ti],
                 [0i32; 16],
-                bias_add_kparams,
+                [0i32; 32],
             )?;
 
             t_start += chunk;
@@ -1292,40 +1282,15 @@ impl HexagonWhisperModel {
             [4, (head_dim * 4) as u32, (q_dim * 4) as u32, q_bytes as u32],
         )?;
 
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
+        let params = flash_attn_op_params(scale, 0.0);
 
-        // Many query rows against the same K/V: the HMX kernel when the DSP has one and a
-        // tiling fits VTCM (as the LFM2 prefill and the vision tower do), else the
-        // row-at-a-time HVX kernel. `CERA_HEXAGON_WHISPER_FA=hvx` forces the HVX one.
-        let hvx_only = std::env::var("CERA_HEXAGON_WHISPER_FA").is_ok_and(|v| v == "hvx");
-        let hmx_kparams =
-            if !hvx_only && session.dsp_hmx() > 0 && fa_is_hmx_eligible(head_dim, n_tokens) {
-                build_hmx_fa_kernel_params(
-                    head_dim,
-                    n_heads,
-                    n_heads,
-                    n_tokens,
-                    n_tokens,
-                    scale,
-                    session.dsp_threads(),
-                    session.dsp_vtcm_bytes(),
-                )
-            } else {
-                None
-            };
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            build_flash_attn_kernel_params(
-                head_dim,
-                n_heads,
-                n_heads,
-                n_tokens,
-                n_tokens,
-                scale,
-                session.dsp_threads(),
-                false,
-            )
-        });
+        // The queue solves the kernel from the tensors: HMX when the DSP has a unit and a tiling
+        // fits VTCM (as the LFM2 prefill and the vision tower do), else the HVX kernel; fewer
+        // than 5 query rows stay on HVX, the rule before the skel refresh.
+        // `CERA_HEXAGON_WHISPER_FA=hvx` forces the HVX one.
+        let kparams = flash_attn_kernel_request(
+            !whisper_fa_hvx_only() && flash_attn_hmx_rows_ok(head_dim, n_tokens),
+        );
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,
@@ -1385,15 +1350,8 @@ impl HexagonWhisperModel {
             ],
         )?;
         let params = [0i32; 16];
-        let kparams = crate::backend::hexagon::params::build_set_rows_kernel_params(
-            1,
-            1,
-            1,
-            1,
-            kv_dim,
-            true,
-            session.dsp_threads(),
-        );
+        // the queue derives the params from the registered tensors
+        let kparams = [0i32; 32];
         session.enqueue_op(
             HtpOpCode::SetRows as u32,
             &[src_ti, pos_ti],
@@ -1483,19 +1441,14 @@ impl HexagonWhisperModel {
             ],
         )?;
 
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
+        let params = flash_attn_op_params(scale, 0.0);
 
-        let kparams = build_flash_attn_kernel_params(
-            head_dim,
-            n_heads,
-            n_heads,
-            1,
-            seq_len,
-            scale,
-            session.dsp_threads(),
-            false,
-        );
+        // One query row per head: the HMX kernel pads it to a 32-row tile and measured 2.8 ms slower
+        // per step than the HVX one on a v79 (9.2 against 6.4 ms, with twice the host CPU), so the
+        // decode step stays on HVX whatever the solver would pick. The encoder
+        // (`dispatch_self_attention_bidirectional`) asks for HMX from 5 query rows up, where it is
+        // 8x faster.
+        let kparams = flash_attn_kernel_request(false);
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,

@@ -255,7 +255,16 @@ pub(super) struct Spec {
     cpu_rope: bool,
     has_deltanet: bool,
     with_swa_mask: bool,
+    attn_logit_softcapping: Option<f32>,
     final_logit_softcapping: Option<f32>,
+}
+
+impl Spec {
+    /// The same spec with a logit soft cap on every attention score.
+    fn with_attn_softcap(mut self, cap: Option<f32>) -> Self {
+        self.attn_logit_softcapping = cap;
+        self
+    }
 }
 
 fn embd_table() -> EmbeddingTable {
@@ -332,7 +341,7 @@ pub(super) fn build_with(mut spec: Spec, knobs: &HexagonKnobs) -> HexagonLfmMode
             cpu_rope: spec.cpu_rope,
             dense: spec.dense,
             activation: FfnActivation::Swiglu,
-            attn_logit_softcapping: None,
+            attn_logit_softcapping: spec.attn_logit_softcapping,
             final_logit_softcapping: spec.final_logit_softcapping,
             has_deltanet: spec.has_deltanet,
             kv_dtype: HtpDataType::F16,
@@ -376,6 +385,7 @@ pub(super) fn spec_with(
         cpu_rope: false,
         has_deltanet: deltanet,
         with_swa_mask: false,
+        attn_logit_softcapping: None,
         final_logit_softcapping: None,
     }
 }
@@ -534,32 +544,32 @@ fn forward_op_sequences_are_pinned() {
         (
             "dense",
             dense_spec,
-            (32, 550514674436499070),
-            (32, 10853267902376882227),
+            (32, 8869652289627336829),
+            (32, 3763999611626278258),
         ),
         (
             "conv",
             conv_spec,
-            (33, 12584797275809301743),
-            (32, 953390829309466638),
+            (33, 439997489579468378),
+            (32, 15421880075439186786),
         ),
         (
             "deltanet",
             deltanet_spec,
-            (32, 7660913431104920875),
-            (94, 11090755616379016208),
+            (32, 14001998924406809113),
+            (94, 3312936139267892230),
         ),
         (
             "extras_dsp",
             extras_dsp_spec,
-            (53, 15260943937542437622),
-            (53, 11815372197931265380),
+            (53, 16178507010475849948),
+            (53, 6881173537588109138),
         ),
         (
             "extras_host",
             extras_host_spec,
-            (22, 1870361462054347564),
-            (22, 12424807418726140139),
+            (22, 16570920656904817224),
+            (22, 4560576524901617856),
         ),
     ];
     for (label, spec, decode, prefill) in cases {
@@ -569,7 +579,7 @@ fn forward_op_sequences_are_pinned() {
         assert_pinned(&format!("fwd_{label}_prefill"), &p, prefill);
     }
     let greedy = decode_capture(dense_spec(), DecodeOutput::Greedy);
-    assert_pinned("fwd_dense_greedy", &greedy, (33, 11217311543508123711));
+    assert_pinned("fwd_dense_greedy", &greedy, (33, 16313879222070177891));
 }
 
 /// The Qwen 3.5 attention gate (`attn_out * sigmoid(gate)`) must see one row
@@ -615,7 +625,7 @@ fn small_m_capped_prefill_is_pinned() {
             "flush {i} carries {n} ops, above the {MAX_OPS_PER_FLUSH} cap"
         );
     }
-    assert_pinned("fwd_dense_small_m_prefill", &p, (32, 2705245229776236587));
+    assert_pinned("fwd_dense_small_m_prefill", &p, (32, 13420716391065619589));
 }
 
 /// The dense-path semantics add exactly the ops the CPU reference performs:
@@ -822,6 +832,103 @@ fn templated_decode_replay_matches_fresh_emission() {
     assert_eq!(replayed, batches.pop().unwrap());
     // The patch is doing work: position 1 differs from the step-0 text.
     assert_ne!(replayed, step0);
+}
+
+/// The numbers of `key` (`params=` or `kparams=`) on the first `FlashAttnExt` line of a batch text.
+fn flash_attn_words(text: &str, key: &str) -> Vec<i32> {
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("FlashAttnExt"))
+        .expect("a flash-attention op");
+    let from = line.find(&format!(" {key}=[")).expect(key) + key.len() + 3;
+    let list = &line[from..from + line[from..].find(']').unwrap()];
+    list.split(", ").map(|n| n.parse().unwrap()).collect()
+}
+
+/// The logit soft cap is op param 2 of the flash-attention op, and the queue hands it to the
+/// kernel in word 5 (the HVX kernel a decode step runs takes it as it is; the HMX one takes it
+/// folded with log2(e)). Every other Hexagon fixture builds its model without one.
+#[test]
+fn the_attention_soft_cap_reaches_the_flash_attention_op() {
+    let words = |cap: Option<f32>| {
+        let model = build(dense_spec().with_attn_softcap(cap));
+        let mut state = fresh_state(&model);
+        model
+            .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, 0, &mut state)
+            .unwrap();
+        let text = capture().batches.join("");
+        (
+            flash_attn_words(&text, "params")[2],
+            flash_attn_words(&text, "kparams")[5],
+        )
+    };
+    let (param, kernel) = words(Some(50.0));
+    assert_eq!(param, 50.0f32.to_bits() as i32);
+    assert_eq!(kernel, 50.0f32.to_bits() as i32);
+    let (param, kernel_plain) = words(None);
+    assert_eq!(param, 0);
+    assert_ne!(kernel_plain, kernel);
+}
+
+/// The decode template re-solves flash attention at every replay, and must solve the way the
+/// recording did: on the HVX only, even on a session with an HMX unit. At a long context the
+/// solver would otherwise pick the HMX for a single row and the replay would differ from a fresh
+/// emission (a position-0 to position-1 replay, as in the test above, never sees the difference).
+#[test]
+fn the_decode_template_re_solves_flash_attention_on_the_hvx_at_long_context() {
+    let long_spec = || {
+        spec_with(
+            |p| vec![p.attention(Extras::default())],
+            false,
+            1024,
+            DType::Q4_0,
+        )
+    };
+    let step = |model: &HexagonLfmModel, state: &mut InferenceState, pos: usize| {
+        model
+            .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, pos, state)
+            .unwrap();
+    };
+    let build_long = || {
+        let model = build(long_spec());
+        {
+            // six threads and an HMX unit: the solver's crossover to the HMX for a single row
+            let mut device = model.device.lock().unwrap();
+            let session = device.queue_session_mut();
+            session.set_dsp_hw(1, 8 << 20);
+            session.set_dsp_threads(6);
+        }
+        let state =
+            InferenceState::from_config_capped(&model.config, &KvCompression::None, 1024).unwrap();
+        (model, state)
+    };
+    let pos = 900;
+
+    let (replay, mut state) = build_long();
+    step(&replay, &mut state, 0);
+    op_capture::take();
+    step(&replay, &mut state, pos);
+    assert!(op_capture::take().is_empty(), "the second step replays");
+    let replayed = {
+        let guard = replay.decode_template.lock().unwrap();
+        staged_text(&replay, &guard.as_ref().unwrap().staged)
+    };
+
+    let (fresh, mut state) = build_long();
+    step(&fresh, &mut state, 0);
+    op_capture::take();
+    *fresh.decode_template.lock().unwrap() = None;
+    step(&fresh, &mut state, pos);
+    let mut batches = op_capture::take();
+    assert_eq!(batches.len(), 1);
+    let emitted = batches.pop().unwrap();
+
+    assert_eq!(replayed, emitted);
+    assert_eq!(
+        flash_attn_words(&emitted, "kparams")[0] & 0xff,
+        1,
+        "a single row stays on the HVX"
+    );
 }
 
 /// Make every DSP batch write fail (`true`) or succeed again (`false`).

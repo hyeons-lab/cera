@@ -12,16 +12,16 @@
 //! device is needed to check the emitted op sequence.
 
 use super::{
-    HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT,
-    HexagonQueueSession, HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode,
-    MulMatF32Shape, RpcmemBuffer, build_binary_kernel_params, build_hmx_mm_kernel_params,
-    build_layer_norm_params, build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params,
-    build_softmax_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
-    mm_hmx_nb1, mm_is_hmx_eligible,
+    HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonQueueSession,
+    HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
+    build_hmx_mm_kernel_params, build_layer_norm_params, build_mul_mat_f32_kernel_params,
+    build_mul_mat_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
-/// VTCM budget handed to every kernel-param builder (8 MB on Snapdragon 8 Elite).
+/// VTCM budget the mul-mat kernel-param builders in this module plan against (8 MB on Snapdragon 8
+/// Elite). Ops whose params the queue derives itself (elementwise, softmax, `ssm_conv`, ...) use the
+/// session's reported VTCM size instead.
 pub(crate) const VTCM_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Destination for emitted tensors and ops.
@@ -169,23 +169,21 @@ fn add_f32_vector<S: OpSink>(
     )
 }
 
-/// Broadcast `dst[i] += vec[i]` over a `[len, rows]` destination.
+/// Broadcast `dst[i] += vec[i]` over a `[len, rows]` destination (the row-broadcast kernel; the
+/// queue derives its params from the two tensors).
 fn enqueue_broadcast_add<S: OpSink>(
     session: &mut S,
     dst_ti: u16,
     vec_ti: u16,
-    len: usize,
     name: &str,
 ) -> Result<(), CeraError> {
-    let kparams =
-        build_binary_kernel_params(len, len, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
     session
         .enqueue_op(
             HtpOpCode::Add as u32,
             &[dst_ti, vec_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err(name, e))
 }
@@ -234,8 +232,9 @@ pub(crate) fn linear_m<S: OpSink>(
 /// With `hmx` set, every token run whose dims are 32 aligned and that has at least
 /// [`mm_is_hmx_eligible`]'s minimum rows runs the DSP's HMX matmul, as the LFM2 prefill
 /// does: the same repacked weights feed both kernels and only the dim-1 weight stride
-/// differs. The other runs (a short tile remainder, unaligned dims), a run whose chunking
-/// does not fit the budget, and every run when `hmx` is `None`, keep the HVX matmul.
+/// differs. The other runs (a short tile remainder, a `rows` that is not a multiple of 32), a
+/// run whose chunking does not fit the budget, and every run when `hmx` is `None`, keep the HVX
+/// matmul. A `cols` (K) that is not a multiple of 32 has no kernel and is an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn linear_m_with<S: OpSink>(
     session: &mut S,
@@ -258,8 +257,8 @@ pub(crate) fn linear_m_with<S: OpSink>(
     let tiled_row_bytes = cols.div_ceil(32) * tile_size;
     let w_tot = rows.div_ceil(32) * tiled_row_bytes;
     // Plan every run up front: the kernel parameters (HMX where the run is eligible and a
-    // chunking fits the budget) decide which weight descriptor the run needs.
-    let plan: Vec<(usize, usize, Option<[i32; 32]>)> = token_runs(n_tokens, tile)
+    // chunking fits the budget, else HVX) decide which weight descriptor the run needs.
+    let plan: Vec<(usize, usize, [i32; 32], bool)> = token_runs(n_tokens, tile)
         .map(|(start, run)| {
             let hmx_kparams = match hmx {
                 Some(h) if mm_is_hmx_eligible(w_dtype, cols, rows, run) => {
@@ -267,7 +266,6 @@ pub(crate) fn linear_m_with<S: OpSink>(
                         w_dtype,
                         cols,
                         rows,
-                        run.next_multiple_of(32),
                         run,
                         session.dsp_threads(),
                         h.vtcm_budget,
@@ -275,15 +273,34 @@ pub(crate) fn linear_m_with<S: OpSink>(
                 }
                 _ => None,
             };
-            (start, run, hmx_kparams)
+            match hmx_kparams {
+                Some(kparams) => Ok((start, run, kparams, true)),
+                None => build_mul_mat_kernel_params(
+                    w_dtype,
+                    cols,
+                    run as u32,
+                    1,
+                    rows * 4,
+                    session.dsp_threads(),
+                    VTCM_BUDGET,
+                )
+                .map(|kparams| (start, run, kparams, false))
+                .ok_or_else(|| {
+                    op_err(
+                        "linear_m",
+                        CeraError::Backend(format!(
+                            "no matmul kernel for {run} rows of a {rows}x{cols} weight (K must be a multiple of 32 and the plan must fit the VTCM)"
+                        )),
+                    )
+                }),
+            }
         })
-        .collect();
+        .collect::<Result<_, CeraError>>()?;
     // The same repacked weights feed both kernels, but HVX walks N rows of K tiles
     // (`tiled_row_bytes` apart) while HMX addresses N-tile starts as `nc * nb[1]`, so each
     // needs its own descriptor. Registered in first-use order, before anything else.
     let mut w_tis: [Option<u16>; 2] = [None, None];
-    for &(_, _, hmx_kparams) in &plan {
-        let for_hmx = hmx_kparams.is_some();
+    for &(_, _, _, for_hmx) in &plan {
         if w_tis[usize::from(for_hmx)].is_none() {
             let nb1 = if for_hmx {
                 mm_hmx_nb1(w_dtype, cols)
@@ -294,7 +311,7 @@ pub(crate) fn linear_m_with<S: OpSink>(
                 weights,
                 w_desc.offset,
                 w_desc.size_bytes,
-                HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+                HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
                 w_dtype as u32,
                 [cols as u32, rows as u32, 1, 1],
                 [block_bytes as u32, nb1 as u32, w_tot as u32, w_tot as u32],
@@ -306,21 +323,10 @@ pub(crate) fn linear_m_with<S: OpSink>(
         None => None,
     };
 
-    for (start, run, hmx_kparams) in plan {
+    for (start, run, kparams, for_hmx) in plan {
         let x_ti = add_f32_rows(session, x, x_offset + start * cols * 4, cols, run)?;
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * rows * 4, rows, run)?;
-        let w_ti = w_tis[usize::from(hmx_kparams.is_some())].expect("registered above");
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            build_mul_mat_kernel_params(
-                w_dtype,
-                cols,
-                run as u32,
-                1,
-                rows * 4,
-                session.dsp_threads(),
-                VTCM_BUDGET,
-            )
-        });
+        let w_ti = w_tis[usize::from(for_hmx)].expect("registered above");
         session
             .enqueue_op(
                 HtpOpCode::MulMat as u32,
@@ -331,20 +337,20 @@ pub(crate) fn linear_m_with<S: OpSink>(
             )
             .map_err(|e| op_err("linear_m", e))?;
         if let Some(b_ti) = b_ti {
-            enqueue_broadcast_add(session, dst_ti, b_ti, rows, "linear_m bias_add")?;
+            enqueue_broadcast_add(session, dst_ti, b_ti, "linear_m bias_add")?;
         }
     }
     session.end_group().map_err(|e| op_err("linear_m", e))
 }
 
-/// Whether a `[rows, cols]` plain-F16 weight can take [`linear_m_f16`]: the HMX tile edge
-/// divides both dimensions.
+/// Whether a `[rows, cols]` plain-F16 weight can take the HMX F16 matmul
+/// ([`f16_mm_kernel_params_in`]): the HMX tile edge divides both dimensions.
 pub(crate) fn f16_mm_shape_ok(rows: usize, cols: usize) -> bool {
     rows != 0 && cols != 0 && rows.is_multiple_of(32) && cols.is_multiple_of(32)
 }
 
-/// [`f16_mm_kernel_params`] against an explicit VTCM budget (the LFM2 engine sizes its
-/// kernels for the device's whole VTCM).
+/// Kernel params of the F16 matmul against an explicit VTCM budget (the LFM2 engine sizes its
+/// kernels for the device's whole VTCM instead of [`VTCM_BUDGET`]).
 pub(crate) fn f16_mm_kernel_params_in(
     rows: usize,
     cols: usize,
@@ -353,17 +359,7 @@ pub(crate) fn f16_mm_kernel_params_in(
     vtcm_budget: usize,
 ) -> Option<[i32; 32]> {
     (f16_mm_shape_ok(rows, cols) && m >= HMX_MM_MIN_NROWS)
-        .then(|| {
-            build_hmx_mm_kernel_params(
-                HtpDataType::F16,
-                cols,
-                rows,
-                m.next_multiple_of(32),
-                m,
-                threads,
-                vtcm_budget,
-            )
-        })
+        .then(|| build_hmx_mm_kernel_params(HtpDataType::F16, cols, rows, m, threads, vtcm_budget))
         .flatten()
 }
 
@@ -393,30 +389,26 @@ pub(crate) fn layer_norm<S: OpSink>(
     for (start, run) in token_runs(n_tokens, a.tile) {
         let src_ti = add_f32_rows(session, a.src, a.src_offset + start * dim * 4, dim, run)?;
         let dst_ti = add_f32_rows(session, a.dst, a.dst_offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
         session
             .enqueue_op(
                 HtpOpCode::Norm as u32,
                 &[src_ti],
                 &[dst_ti],
                 build_layer_norm_params(a.eps),
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("layer_norm norm", e))?;
 
-        let mul_kparams =
-            build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Mul as u32,
                 &[dst_ti, w_ti],
                 &[dst_ti],
                 [0i32; 16],
-                mul_kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("layer_norm mul", e))?;
-        enqueue_broadcast_add(session, dst_ti, b_ti, dim, "layer_norm add")?;
+        enqueue_broadcast_add(session, dst_ti, b_ti, "layer_norm add")?;
     }
     session.end_group().map_err(|e| op_err("layer_norm", e))
 }
@@ -449,10 +441,8 @@ fn unary_inplace_with<S: OpSink>(
     let TokenShape { dim, n_tokens } = shape;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
         session
-            .enqueue_op(opcode as u32, &[ti], &[ti], params, kparams)
+            .enqueue_op(opcode as u32, &[ti], &[ti], params, [0i32; 32])
             .map_err(|e| op_err(name, e))?;
     }
     session.end_group().map_err(|e| op_err(name, e))
@@ -626,15 +616,13 @@ pub(crate) fn mul_row_bcast<S: OpSink>(
     let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Mul as u32,
                 &[ti, vec_ti],
                 &[ti],
                 [0i32; 16],
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("mul_row_bcast", e))?;
     }
@@ -767,7 +755,7 @@ pub(crate) fn add_row_bcast<S: OpSink>(
     let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        enqueue_broadcast_add(session, ti, vec_ti, dim, "add_row_bcast")?;
+        enqueue_broadcast_add(session, ti, vec_ti, "add_row_bcast")?;
     }
     session.end_group().map_err(|e| op_err("add_row_bcast", e))
 }
@@ -786,15 +774,13 @@ pub(crate) fn mul_inplace<S: OpSink>(
     for (start, run) in token_runs(n_tokens, tile) {
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * dim * 4, dim, run)?;
         let src_ti = add_f32_rows(session, src, src_offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_binary_kernel_params(dim, dim, run, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Mul as u32,
                 &[dst_ti, src_ti],
                 &[dst_ti],
                 [0i32; 16],
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("mul_inplace", e))?;
     }
@@ -819,23 +805,13 @@ pub(crate) fn mul_to<S: OpSink>(
     let dst_ti = add_f32_rows(session, dst, dst_offset, dim, n_tokens)?;
     let a_ti = add_f32_rows(session, a, a_offset, dim, n_tokens)?;
     let b_ti = add_f32_rows(session, b, b_offset, dim, n_tokens)?;
-    let kparams = build_binary_kernel_params(
-        dim,
-        dim,
-        n_tokens,
-        1,
-        1,
-        4,
-        VTCM_BUDGET,
-        session.dsp_threads(),
-    );
     session
         .enqueue_op(
             HtpOpCode::Mul as u32,
             &[a_ti, b_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err("mul_to", e))?;
     session.end_group().map_err(|e| op_err("mul_to", e))
@@ -913,7 +889,8 @@ pub(crate) fn concat_time_inner<S: OpSink>(
 /// `y[t, c] = sum_j x[t + j, c] * w[j, c]` over a channel-major input of
 /// `d_conv - 1 + n_t` positions (the caller supplies the padding) and a
 /// `[d_conv, d_inner]` tap matrix, producing a time-major `[n_t, d_inner]`
-/// output. `vtcm_budget` caps the VTCM the kernel may plan for.
+/// output. The kernel's channel tile and VTCM plan come from the registered tensors
+/// (`enqueue_op` derives them), so a window the session's VTCM cannot hold is an error there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ssm_conv<S: OpSink>(
     session: &mut S,
@@ -926,7 +903,6 @@ pub(crate) fn ssm_conv<S: OpSink>(
     d_conv: usize,
     d_inner: usize,
     n_t: usize,
-    vtcm_budget: usize,
 ) -> Result<(), CeraError> {
     let ncs = d_conv - 1 + n_t;
     let x_bytes = ncs * d_inner * 4;
@@ -959,22 +935,13 @@ pub(crate) fn ssm_conv<S: OpSink>(
         [d_inner as u32, n_t as u32, 1, 1],
         [4, (d_inner * 4) as u32, dst_bytes as u32, dst_bytes as u32],
     )?;
-    let kparams = build_ssm_conv_kernel_params(
-        d_conv,
-        d_inner,
-        n_t,
-        1,
-        ncs,
-        session.dsp_threads(),
-        vtcm_budget,
-    );
     session
         .enqueue_op(
             HtpOpCode::SsmConv as u32,
             &[x_ti, w_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err("ssm_conv", e))?;
     session.end_group().map_err(|e| op_err("ssm_conv", e))
@@ -1042,8 +1009,10 @@ pub(crate) fn matmul_f32<S: OpSink>(
     let kparams = build_mul_mat_f32_kernel_params(
         MulMatF32Shape {
             ne00: a.ne[0],
+            ne01: a.ne[1],
             ne02: a.ne[2],
             ne03: 1,
+            src0_nb0: a.nb[0],
             src0_nb1: a.nb[1],
             ne11: x.ne[1],
             ne12: x.ne[2],
@@ -1086,12 +1055,6 @@ pub(crate) fn softmax<S: OpSink>(
     dst: View<'_, S::Buf>,
     scale: f32,
 ) -> Result<(), CeraError> {
-    let kparams = build_softmax_kernel_params(
-        [x.ne[0], x.ne[1], x.ne[2], 1],
-        mask.as_ref().map(|m| [m.ne[0], m.ne[2], 1]),
-        scale,
-        session.dsp_threads(),
-    );
     let x_ti = x.add(session, HTP_TENSOR_COMPUTE)?;
     let mask_ti = match &mask {
         Some(m) => Some(m.add(session, HTP_TENSOR_COMPUTE)?),
@@ -1102,7 +1065,13 @@ pub(crate) fn softmax<S: OpSink>(
     params[0] = scale.to_bits() as i32;
     let src: Vec<u16> = std::iter::once(x_ti).chain(mask_ti).collect();
     session
-        .enqueue_op(HtpOpCode::Softmax as u32, &src, &[dst_ti], params, kparams)
+        .enqueue_op(
+            HtpOpCode::Softmax as u32,
+            &src,
+            &[dst_ti],
+            params,
+            [0i32; 32],
+        )
         .map_err(|e| op_err("softmax", e))?;
     session.end_group().map_err(|e| op_err("softmax", e))
 }
@@ -1140,15 +1109,13 @@ pub(crate) fn add_row_bcast_to<S: OpSink>(
     let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
     let src_ti = src.add(session, HTP_TENSOR_COMPUTE)?;
     let dst_ti = dst.add(session, HTP_TENSOR_COMPUTE)?;
-    let kparams =
-        build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
     session
         .enqueue_op(
             HtpOpCode::Add as u32,
             &[src_ti, vec_ti],
             &[dst_ti],
             [0i32; 16],
-            kparams,
+            [0i32; 32],
         )
         .map_err(|e| op_err("add_row_bcast_to", e))?;
     session
@@ -1170,15 +1137,13 @@ pub(crate) fn add_residual<S: OpSink>(
     for (start, run) in token_runs(n_tokens, tile) {
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * dim * 4, dim, run)?;
         let src_ti = add_f32_rows(session, src, src_offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_binary_kernel_params(dim, dim, run, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
         session
             .enqueue_op(
                 HtpOpCode::Add as u32,
                 &[dst_ti, src_ti],
                 &[dst_ti],
                 [0i32; 16],
-                kparams,
+                [0i32; 32],
             )
             .map_err(|e| op_err("add_residual", e))?;
     }
@@ -1351,6 +1316,8 @@ pub(crate) mod testing {
                 &self.tensors,
                 self.dsp_threads(),
                 VTCM_BUDGET,
+                // a device with one HMX unit, like the S25 Ultra
+                1,
             )?;
             self.ops.push(RecOp {
                 opcode,
@@ -1375,6 +1342,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{HTP_BINARY_KERNEL_ROW_BCAST, binary_kernel_type, solve_binary};
     use super::testing::*;
     use super::*;
 
@@ -1432,7 +1400,7 @@ mod tests {
             vec![OP_MULMAT, OP_ADD, OP_MULMAT, OP_ADD, OP_MULMAT, OP_ADD]
         );
         // Weight first, bias second, then per tile x and dst.
-        assert_eq!(s.tensors[0].flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK);
+        assert_eq!(s.tensors[0].flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED);
         assert_eq!(s.tensors[0].ne, [64, 96, 1, 1]);
         assert_eq!(s.tensors[1].offset, 512);
         assert_eq!(s.tensors[1].ne, [96, 1, 1, 1]);
@@ -1493,11 +1461,10 @@ mod tests {
             64usize.div_ceil(32) * 32 * 34
         );
 
-        // Too few rows for the matrix unit and unaligned dims stay HVX (a tiled batch
+        // Too few rows for the matrix unit and unaligned rows stay HVX (a tiled batch
         // takes the HMX kernel per run, see `linear_m_with_hmx_picks_the_kernel_per_run`).
         for (tokens, rows, cols, tile) in [
             (4, 96, 64, TokenTile::Whole),
-            (280, 96, 48, TokenTile::Whole),
             (280, 90, 64, TokenTile::Whole),
         ] {
             let s = run(tokens, rows, cols, tile, hmx);
@@ -1547,7 +1514,8 @@ mod tests {
         assert_eq!(s.src(0, 1).ne, [32, 130, 1, 1]);
         // ne11 (token count) reaches the kernel params unchanged.
         let expect =
-            build_mul_mat_kernel_params(HtpDataType::Q8_0, 32, 130, 1, 32 * 4, 8, VTCM_BUDGET);
+            build_mul_mat_kernel_params(HtpDataType::Q8_0, 32, 130, 1, 32 * 4, 8, VTCM_BUDGET)
+                .expect("130 rows of a 32-wide weight fit");
         assert_eq!(s.ops[0].kparams, expect);
     }
 
@@ -1610,9 +1578,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.opcodes(), vec![OP_MULMAT; 3]);
-        let hmx = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 64, 96, 64, 64, 8, VTCM_BUDGET)
+        let hmx = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 64, 96, 64, 8, VTCM_BUDGET)
             .expect("a 64-row Q8_0 matmul fits the VTCM");
-        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 64, 2, 1, 96 * 4, 8, VTCM_BUDGET);
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 64, 2, 1, 96 * 4, 8, VTCM_BUDGET)
+            .expect("2 rows fit");
         assert_eq!(s.ops[0].kparams, hmx);
         assert_eq!(s.ops[1].kparams, hmx);
         assert_eq!(s.ops[2].kparams, hvx);
@@ -1622,20 +1591,20 @@ mod tests {
         assert_eq!(w_hmx.nb[1] as usize, mm_hmx_nb1(HtpDataType::Q8_0, 64));
         assert_eq!(w_hvx.nb[1] as usize, (64 / 32) * 32 * 34);
         assert_eq!(w_hmx.offset, 4096);
-        assert_eq!(w_hmx.flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK);
+        assert_eq!(w_hmx.flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED);
         assert_eq!(s.tensors.iter().filter(|t| t.offset == 4096).count(), 2);
     }
 
-    /// Dims that are not multiples of 32 are HVX-only, whatever the caller asks.
+    /// Rows that are not a multiple of 32 are HVX-only, whatever the caller asks.
     #[test]
-    fn linear_m_with_hmx_leaves_odd_dims_on_hvx() {
+    fn linear_m_with_hmx_leaves_odd_rows_on_hvx() {
         let mut s = RecordingSink::default();
         linear_m_with(
             &mut s,
             &"x",
             0,
             &"w",
-            desc(96, 48),
+            desc(48, 96),
             None,
             &"y",
             0,
@@ -1646,8 +1615,31 @@ mod tests {
             }),
         )
         .unwrap();
-        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 48, 64, 1, 96 * 4, 8, VTCM_BUDGET);
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 96, 64, 1, 48 * 4, 8, VTCM_BUDGET)
+            .expect("64 rows fit");
         assert_eq!(s.ops[0].kparams, hvx);
+    }
+
+    /// The tiled HVX kernels walk whole 32-wide K tiles, so a weight whose K is not a multiple of
+    /// 32 has no kernel (the host would run it on the CPU): an error, not a silently short dot.
+    #[test]
+    fn linear_m_refuses_a_k_the_tiles_do_not_cover() {
+        let mut s = RecordingSink::default();
+        let err = linear_m(
+            &mut s,
+            &"x",
+            0,
+            &"w",
+            desc(96, 48),
+            None,
+            &"y",
+            0,
+            64,
+            TokenTile::Whole,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no matmul kernel"), "{err}");
+        assert!(s.ops.is_empty(), "nothing is enqueued");
     }
 
     #[test]
@@ -1735,11 +1727,19 @@ mod tests {
         assert_eq!((v.buf, v.offset, v.ne), ("v", 4096, [16, 1, 1, 1]));
         assert_eq!(v.flags, HTP_TENSOR_WEIGHT);
         assert_eq!(s.src(1, 0).ne, [16, 5, 1, 1]);
-        // Same row-broadcast kernel params the bias add uses.
-        assert_eq!(
-            s.ops[1].kparams,
-            build_binary_kernel_params(16, 16, 1, 1, 1, 4, VTCM_BUDGET, 8)
-        );
+        // The queue derives the row-broadcast kernel's params from the registered tensors.
+        let want = solve_binary(
+            OP_MUL,
+            &s.src(1, 0).into(),
+            &s.src(1, 1).into(),
+            None,
+            &s.dst(1).into(),
+            8,
+            VTCM_BUDGET,
+        )
+        .expect("a row broadcast fits");
+        assert_eq!(s.ops[1].kparams, want);
+        assert_eq!(binary_kernel_type(&want), HTP_BINARY_KERNEL_ROW_BCAST);
         assert_eq!(s.ops[1].dst, vec![s.ops[1].src[0]]);
     }
 
@@ -1785,7 +1785,7 @@ mod tests {
             &"x",
             0,
             &"w",
-            desc(8, 8),
+            desc(32, 32),
             0usize,
             &"y",
             0,
@@ -1831,7 +1831,7 @@ mod tests {
         check(&s);
         add_row_bcast_to(&mut s, v(0), &"v", 0, v(1024)).unwrap();
         check(&s);
-        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4, VTCM_BUDGET).unwrap();
+        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4).unwrap();
         check(&s);
         let src = |off| ConcatSrc {
             buf: &"b",
@@ -1843,7 +1843,7 @@ mod tests {
         concat_time_inner(&mut s, src(0), src(512), &"b", 2048, 8).unwrap();
         check(&s);
         // The softmax carries the mask as its second source and the scale in
-        // both the op params and the kernel params.
+        // both the op params and the kernel params (word 7).
         let sm = s
             .ops
             .iter()
@@ -1851,7 +1851,7 @@ mod tests {
             .unwrap();
         assert_eq!(sm.src.len(), 2);
         assert_eq!(f32::from_bits(sm.params[0] as u32), 0.5);
-        assert_eq!(f32::from_bits(sm.kparams[18] as u32), 0.5);
+        assert_eq!(f32::from_bits(sm.kparams[7] as u32), 0.5);
         for code in [HtpOpCode::Cpy as u32, HtpOpCode::Concat as u32] {
             let op = s.ops.iter().find(|o| o.opcode == code).unwrap();
             assert_ne!(op.kparams, [0i32; 32], "opcode {code} kparams precomputed");
@@ -2187,6 +2187,1214 @@ mod tests {
         (0..n)
             .map(|i| lo + (hi - lo) * i as f32 / (n - 1) as f32)
             .collect()
+    }
+
+    /// A Q8_0 and a Q4_0 matmul against the CPU for output sizes that leave a partial last weight tile (the
+    /// audio depthformer's head has 2049 outputs: 64 full tiles and one row), at one token, a short
+    /// run and a full tile. Quantized activations add error everywhere, so the check is the cosine
+    /// over each token's row and, separately, the error of the last four outputs, where a kernel
+    /// that mishandles the partial tile shows first.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_linear_m_matches_the_cpu_on_partial_row_tiles() {
+        use super::super::{
+            HexagonWeightDesc, HexagonWeightFormat, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+            repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+        };
+        // ggml `Q4_0` blocks: an f16 scale `d = max / -8` (the signed extreme) and 16 bytes holding
+        // element i in the low nibble and element i + 16 in the high one
+        let quantize_q4_0 = |vals: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(vals.len() / 32 * 18);
+            for blk in vals.chunks(32) {
+                let max = blk
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+                let d = max / -8.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+                for i in 0..16 {
+                    let q = |v: f32| ((v * id + 8.5) as i32).clamp(0, 15) as u8;
+                    out.push(q(blk[i]) | (q(blk[i + 16]) << 4));
+                }
+            }
+            out
+        };
+        let mut rig = GeluRig::open();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let mut worst_cos = 1.0f64;
+        let mut worst_tail = 0.0f64;
+        for (q4, (k, n)) in [false, true].iter().flat_map(|q4| {
+            [
+                (1024usize, 2049usize),
+                (1024, 2048),
+                (1024, 2080),
+                (512, 33),
+                (2048, 65),
+                (1024, 4097),
+            ]
+            .map(move |kn| (*q4, kn))
+        }) {
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| rand() * 0.25).collect();
+            let (blocks, block_bytes, size) = if q4 {
+                (
+                    quantize_q4_0(&weights_f32),
+                    18,
+                    repacked_matrix_size_q4_0(k, n).unwrap(),
+                )
+            } else {
+                (
+                    quantize_f32_to_q8_0(&weights_f32, k, n).unwrap(),
+                    34,
+                    repacked_matrix_size_q8_0(k, n).unwrap(),
+                )
+            };
+            let mut tiled = vec![0u8; size];
+            if q4 {
+                repack_q4_0(&blocks, k, n, &mut tiled).unwrap();
+            } else {
+                repack_q8_0(&blocks, k, n, &mut tiled).unwrap();
+            }
+            // the CPU reference: the dequantized weights, so only the activation quantization differs
+            let mut dequant = vec![0f32; n * k];
+            for (row, out) in blocks
+                .chunks(k / 32 * block_bytes)
+                .zip(dequant.chunks_mut(k))
+            {
+                if q4 {
+                    crate::quant::dequantize_q4_0_row(row, out);
+                } else {
+                    crate::quant::dequantize_q8_0_row(row, out);
+                }
+            }
+            let w_buf = rig.alloc(size);
+            unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), w_buf.as_mut_ptr(), size) };
+            w_buf.flush_cpu_cache(0, size);
+            let desc = HexagonWeightDesc {
+                offset: 0,
+                size_bytes: size,
+                format: if q4 {
+                    HexagonWeightFormat::RepackedQ4_0
+                } else {
+                    HexagonWeightFormat::RepackedQ8_0
+                },
+                rows: n,
+                cols: k,
+            };
+            for &m in &[1usize, 8, 32] {
+                let x: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+                let x_buf = rig.alloc(m * k * 4);
+                let dst_buf = rig.alloc(m * n * 4);
+                gelu_upload(&x_buf, &x);
+                {
+                    let session = rig.device.queue_session_mut();
+                    linear_m(
+                        session,
+                        &x_buf,
+                        0,
+                        &w_buf,
+                        desc,
+                        None,
+                        &dst_buf,
+                        0,
+                        m,
+                        TokenTile::Whole,
+                    )
+                    .unwrap();
+                    session.flush().unwrap();
+                }
+                let got = gelu_download(&dst_buf, m * n);
+                for t in 0..m {
+                    let want: Vec<f32> = (0..n)
+                        .map(|r| {
+                            dequant[r * k..(r + 1) * k]
+                                .iter()
+                                .zip(&x[t * k..(t + 1) * k])
+                                .map(|(a, b)| a * b)
+                                .sum()
+                        })
+                        .collect();
+                    let g = &got[t * n..(t + 1) * n];
+                    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                    for (a, b) in g.iter().zip(&want) {
+                        dot += f64::from(*a) * f64::from(*b);
+                        na += f64::from(*a) * f64::from(*a);
+                        nb += f64::from(*b) * f64::from(*b);
+                    }
+                    let cos = dot / (na.sqrt() * nb.sqrt());
+                    let rms = (nb / n as f64).sqrt();
+                    let tail = (n - 4..n)
+                        .map(|r| f64::from((g[r] - want[r]).abs()))
+                        .fold(0.0f64, worst_max)
+                        / rms;
+                    worst_cos = worst_min(worst_cos, cos);
+                    worst_tail = worst_max(worst_tail, tail);
+                    if t == 0 {
+                        gelu_trace(&format!(
+                            "{} k={k} n={n} m={m}: cosine {cos:.6}, last-4 error {tail:.4} of rms, last out {:.4} want {:.4}",
+                            if q4 { "Q4_0" } else { "Q8_0" },
+                            g[n - 1],
+                            want[n - 1]
+                        ));
+                    }
+                }
+                rig.release(&[&x_buf, &dst_buf]);
+            }
+            rig.release(&[&w_buf]);
+        }
+        gelu_trace(&format!(
+            "worst cosine {worst_cos:.6}, worst last-4 error {worst_tail:.4} of rms"
+        ));
+        assert!(worst_cos > 0.999, "cosine {worst_cos}");
+        assert!(
+            worst_tail < 0.05,
+            "the last outputs are off by {worst_tail} of rms"
+        );
+    }
+
+    /// Runs `SetRows` of `src` (`rows` rows of `n` f32) into a fresh Q8_0 cache of `ctx` rows at
+    /// `positions` and returns the cache bytes.
+    fn device_set_rows_q8_0(
+        rig: &mut GeluRig,
+        src: &[f32],
+        n: usize,
+        rows: usize,
+        ctx: usize,
+        positions: &[i32],
+    ) -> Vec<u8> {
+        use super::super::{HTP_TENSOR_COMPUTE, HtpDataType};
+        let row_bytes = n / 32 * 34;
+        let src_buf = rig.alloc(src.len() * 4);
+        gelu_upload(&src_buf, src);
+        let idx_buf = rig.alloc(rows * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                positions.as_ptr().cast::<u8>(),
+                idx_buf.as_mut_ptr(),
+                rows * 4,
+            );
+        }
+        idx_buf.flush_cpu_cache(0, rows * 4);
+        let cache_bytes = ctx * row_bytes;
+        let cache_buf = rig.alloc(cache_bytes);
+        unsafe { std::ptr::write_bytes(cache_buf.as_mut_ptr(), 0x55, cache_bytes) };
+        cache_buf.flush_cpu_cache(0, cache_bytes);
+        {
+            let session = rig.device.queue_session_mut();
+            let src_ti = session
+                .add_tensor(
+                    &src_buf,
+                    0,
+                    src.len() * 4,
+                    HTP_TENSOR_COMPUTE,
+                    HtpDataType::F32 as u32,
+                    [n as u32, rows as u32, 1, 1],
+                    [
+                        4,
+                        (n * 4) as u32,
+                        (n * rows * 4) as u32,
+                        (n * rows * 4) as u32,
+                    ],
+                )
+                .unwrap();
+            let idx_ti = session
+                .add_tensor(
+                    &idx_buf,
+                    0,
+                    rows * 4,
+                    HTP_TENSOR_COMPUTE,
+                    HtpDataType::I32 as u32,
+                    [rows as u32, 1, 1, 1],
+                    [4, (rows * 4) as u32, (rows * 4) as u32, (rows * 4) as u32],
+                )
+                .unwrap();
+            let cache_ti = session
+                .add_tensor(
+                    &cache_buf,
+                    0,
+                    cache_bytes,
+                    HTP_TENSOR_COMPUTE,
+                    HtpDataType::Q8_0 as u32,
+                    [n as u32, ctx as u32, 1, 1],
+                    [34, row_bytes as u32, cache_bytes as u32, cache_bytes as u32],
+                )
+                .unwrap();
+            session
+                .enqueue_op(
+                    HtpOpCode::SetRows as u32,
+                    &[src_ti, idx_ti],
+                    &[cache_ti],
+                    [0i32; 16],
+                    [0i32; 32],
+                )
+                .unwrap();
+            session.flush().unwrap();
+        }
+        cache_buf.invalidate_cpu_cache(0, cache_bytes);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(cache_buf.as_mut_ptr(), cache_bytes) }.to_vec();
+        rig.release(&[&src_buf, &idx_buf, &cache_buf]);
+        bytes
+    }
+
+    /// `SetRows` into a Q8_0 cache (the `CERA_HEXAGON_KV_Q8` path) keeps the precision of blocks
+    /// whose largest value is tiny. The DSP's row quantizer used to scale in f16, whose reciprocal
+    /// overflows once a block's maximum is below about 2e-3, so those blocks came back wrong by
+    /// 50% or more. Rows of 288 values (nine blocks: two groups of four, then a single block) cover
+    /// the vector path and the scalar tail; the block maxima run from 1 down to 1e-5, and include
+    /// an all-zero block.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_set_rows_q8_0_keeps_small_blocks() {
+        let mut rig = GeluRig::open();
+        let (n, rows, ctx) = (288usize, 4usize, 8usize);
+        let blocks = n / 32;
+        let row_bytes = blocks * 34;
+        let maxima = [1.0f32, 3e-3, 1e-3, 3e-4, 1e-5, 0.0, 6e-2, 2e-3];
+        let amax = |r: usize, b: usize| maxima[(r * blocks + b) % maxima.len()];
+        let mut src = vec![0f32; n * rows];
+        for r in 0..rows {
+            for b in 0..blocks {
+                for i in 0..32 {
+                    // a ramp through the block, with its largest magnitude exactly at element 0
+                    let v = if i == 0 {
+                        1.0
+                    } else {
+                        ((i * 37) % 64) as f32 / 32.0 - 1.0
+                    };
+                    src[r * n + b * 32 + i] = v * amax(r, b);
+                }
+            }
+        }
+        let positions = [3i32, 0, 2, 1];
+        let bytes = device_set_rows_q8_0(&mut rig, &src, n, rows, ctx, &positions);
+        let mut worst = 0f64;
+        for (r, &pos) in positions.iter().enumerate() {
+            let row = &bytes[pos as usize * row_bytes..(pos as usize + 1) * row_bytes];
+            let mut got = vec![0f32; n];
+            crate::quant::dequantize_q8_0_row(row, &mut got);
+            for b in 0..blocks {
+                let a = f64::from(amax(r, b));
+                let err = (0..32)
+                    .map(|i| f64::from((got[b * 32 + i] - src[r * n + b * 32 + i]).abs()))
+                    .fold(0.0f64, worst_max);
+                // one quantization step of the block is 1/127 of its maximum; an all-zero block
+                // must stay zero
+                let rel = if a == 0.0 { err } else { err / a };
+                worst = worst.max(rel);
+                if rel > 1.0 / 127.0 {
+                    gelu_trace(&format!(
+                        "row {r} block {b}: max {a:e}, worst element error {err:e} ({:.1}% of the block max)",
+                        rel * 100.0
+                    ));
+                }
+            }
+        }
+        gelu_trace(&format!(
+            "worst error {:.3}% of a block's maximum (one step is {:.3}%)",
+            worst * 100.0,
+            100.0 / 127.0
+        ));
+        assert!(
+            worst <= 1.0 / 127.0,
+            "a block came back {worst} off its maximum"
+        );
+    }
+
+    use crate::backend::hexagon::HexagonQueueSession;
+
+    fn rig_f32_buf(rig: &GeluRig, values: &[f32]) -> RpcmemBuffer {
+        let buf = rig.alloc(values.len() * 4);
+        gelu_upload(&buf, values);
+        buf
+    }
+
+    /// A dense F32 compute tensor of extents `ne` over the whole of `buf`.
+    fn rig_f32_tensor(session: &mut HexagonQueueSession, buf: &RpcmemBuffer, ne: [u32; 4]) -> u16 {
+        use super::super::{HTP_TENSOR_COMPUTE, HtpDataType};
+        let nb = [4, ne[0] * 4, ne[0] * ne[1] * 4, ne[0] * ne[1] * ne[2] * 4];
+        session
+            .add_tensor(
+                buf,
+                0,
+                nb[3] as usize * ne[3] as usize,
+                HTP_TENSOR_COMPUTE,
+                HtpDataType::F32 as u32,
+                ne,
+                nb,
+            )
+            .unwrap()
+    }
+
+    /// Enqueue one op over dense F32 tensors and flush it; a refusal comes back as the error.
+    fn rig_run_f32_op(
+        rig: &mut GeluRig,
+        opcode: HtpOpCode,
+        srcs: &[(&RpcmemBuffer, [u32; 4])],
+        dst: (&RpcmemBuffer, [u32; 4]),
+        params: [i32; 16],
+    ) -> Result<(), CeraError> {
+        rig_run_f32_op_with(rig, opcode, srcs, dst, params, true)
+    }
+
+    /// [`rig_run_f32_op`] that skips the host's operand validation, so the DSP's own refusal of
+    /// an op the host would never send is what the test sees.
+    fn rig_run_f32_op_unvalidated(
+        rig: &mut GeluRig,
+        opcode: HtpOpCode,
+        srcs: &[(&RpcmemBuffer, [u32; 4])],
+        dst: (&RpcmemBuffer, [u32; 4]),
+        params: [i32; 16],
+    ) -> Result<(), CeraError> {
+        rig_run_f32_op_with(rig, opcode, srcs, dst, params, false)
+    }
+
+    fn rig_run_f32_op_with(
+        rig: &mut GeluRig,
+        opcode: HtpOpCode,
+        srcs: &[(&RpcmemBuffer, [u32; 4])],
+        dst: (&RpcmemBuffer, [u32; 4]),
+        params: [i32; 16],
+        validated: bool,
+    ) -> Result<(), CeraError> {
+        let session = rig.device.queue_session_mut();
+        let ids: Vec<u16> = srcs
+            .iter()
+            .map(|(b, ne)| rig_f32_tensor(session, b, *ne))
+            .collect();
+        let d = rig_f32_tensor(session, dst.0, dst.1);
+        if validated {
+            session.enqueue_op(opcode as u32, &ids, &[d], params, [0i32; 32])?;
+        } else {
+            session.enqueue_op_unvalidated(opcode as u32, &ids, &[d], params, [0i32; 32])?;
+        }
+        session.flush().map(|_| ())
+    }
+
+    /// `f64::min` and `f64::max` drop a NaN, so a dead kernel (NaN or all-zero output, whose
+    /// cosine is 0/0) would never lower a running worst case; a NaN is the worst case instead.
+    fn worst_min(worst: f64, v: f64) -> f64 {
+        if v.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            worst.min(v)
+        }
+    }
+
+    fn worst_max(worst: f64, v: f64) -> f64 {
+        if v.is_nan() {
+            f64::INFINITY
+        } else {
+            worst.max(v)
+        }
+    }
+
+    /// Worst absolute error of `got` against `want`, over the larger of 1 and the largest `want`.
+    /// A NaN in `got` is an infinite error.
+    fn rig_rel_error(got: &[f32], want: &[f32]) -> f32 {
+        assert_eq!(got.len(), want.len(), "output length");
+        // an infinite reference would make the scale infinite and the ratio NaN
+        assert!(
+            want.iter().all(|v| v.is_finite()),
+            "the reference must be finite"
+        );
+        let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+        got.iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(
+                0.0f32,
+                |m, d| if d.is_nan() { f32::INFINITY } else { m.max(d) },
+            )
+            / scale
+    }
+
+    /// Deterministic values in [-1, 1).
+    fn rig_values(seed: u64, n: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    struct ConvCase {
+        label: &'static str,
+        w_in: usize,
+        c_in: usize,
+        k: usize,
+        c_out: usize,
+        stride: usize,
+        pad: usize,
+        dil: usize,
+        groups: usize,
+        bias: bool,
+    }
+
+    /// `Conv1D` on the CPU: input `[w_in, c_in]`, weight `[k, c_in / groups, c_out]`, output
+    /// `[w_out, c_out]`, all row-major with the first extent fastest.
+    fn conv1d_cpu(x: &[f32], w: &[f32], bias: &[f32], c: &ConvCase) -> Vec<f32> {
+        let w_out = (c.w_in + 2 * c.pad - c.dil * (c.k - 1) - 1) / c.stride + 1;
+        let (cin_g, cout_g) = (c.c_in / c.groups, c.c_out / c.groups);
+        let mut out = vec![0f32; w_out * c.c_out];
+        for oc in 0..c.c_out {
+            let g = oc / cout_g;
+            for ow in 0..w_out {
+                let mut sum = if c.bias { bias[oc] } else { 0.0 };
+                for kk in 0..c.k {
+                    let iw = (ow * c.stride + kk * c.dil) as i64 - c.pad as i64;
+                    if iw < 0 || iw >= c.w_in as i64 {
+                        continue;
+                    }
+                    for icr in 0..cin_g {
+                        sum += x[(g * cin_g + icr) * c.w_in + iw as usize]
+                            * w[(oc * cin_g + icr) * c.k + kk];
+                    }
+                }
+                out[oc * w_out + ow] = sum;
+            }
+        }
+        out
+    }
+
+    /// The DSP's `Conv1D` against the CPU. The depthwise stride-1 shapes take a vector fast path
+    /// whose loads sit at `ow - pad + k * dilation`, almost never a 128-byte boundary, and whose
+    /// stores sit at a channel's row start; a kernel that reads or writes the aligned block below
+    /// the address computes shifted taps and tramples the neighbouring channel.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_conv1d_matches_the_cpu() {
+        let cases = [
+            ConvCase {
+                label: "depthwise k=3 pad=1",
+                w_in: 64,
+                c_in: 4,
+                k: 3,
+                c_out: 4,
+                stride: 1,
+                pad: 1,
+                dil: 1,
+                groups: 4,
+                bias: true,
+            },
+            ConvCase {
+                label: "depthwise k=7 pad=3, 40 columns (rows of 160 bytes)",
+                w_in: 40,
+                c_in: 4,
+                k: 7,
+                c_out: 4,
+                stride: 1,
+                pad: 3,
+                dil: 1,
+                groups: 4,
+                bias: true,
+            },
+            ConvCase {
+                label: "depthwise k=5 dilation 2, no bias",
+                w_in: 96,
+                c_in: 3,
+                k: 5,
+                c_out: 3,
+                stride: 1,
+                pad: 4,
+                dil: 2,
+                groups: 3,
+                bias: false,
+            },
+            ConvCase {
+                label: "grouped, stride 2",
+                w_in: 50,
+                c_in: 8,
+                k: 3,
+                c_out: 8,
+                stride: 2,
+                pad: 1,
+                dil: 1,
+                groups: 2,
+                bias: true,
+            },
+            ConvCase {
+                label: "plain conv, k=4",
+                w_in: 33,
+                c_in: 3,
+                k: 4,
+                c_out: 5,
+                stride: 1,
+                pad: 0,
+                dil: 1,
+                groups: 1,
+                bias: true,
+            },
+        ];
+        let mut rig = GeluRig::open();
+        let mut worst = 0f32;
+        for (i, c) in cases.iter().enumerate() {
+            let w_out = (c.w_in + 2 * c.pad - c.dil * (c.k - 1) - 1) / c.stride + 1;
+            let cin_g = c.c_in / c.groups;
+            let x = rig_values(11 + i as u64, c.w_in * c.c_in);
+            let w = rig_values(101 + i as u64, c.k * cin_g * c.c_out);
+            let bias = rig_values(201 + i as u64, c.c_out);
+            let want = conv1d_cpu(&x, &w, &bias, c);
+            let (x_buf, w_buf, b_buf) = (
+                rig_f32_buf(&rig, &x),
+                rig_f32_buf(&rig, &w),
+                rig_f32_buf(&rig, &bias),
+            );
+            let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; w_out * c.c_out]);
+            let mut srcs = vec![
+                (&x_buf, [c.w_in as u32, c.c_in as u32, 1, 1]),
+                (&w_buf, [c.k as u32, cin_g as u32, c.c_out as u32, 1]),
+            ];
+            if c.bias {
+                srcs.push((&b_buf, [c.c_out as u32, 1, 1, 1]));
+            }
+            rig_run_f32_op(
+                &mut rig,
+                HtpOpCode::Conv1D,
+                &srcs,
+                (&dst_buf, [w_out as u32, c.c_out as u32, 1, 1]),
+                super::super::build_conv1d_params(c.stride, c.pad, c.dil, c.groups),
+            )
+            .unwrap();
+            let got = gelu_download(&dst_buf, w_out * c.c_out);
+            let err = rig_rel_error(&got, &want);
+            gelu_trace(&format!("conv1d {}: error {err:e}", c.label));
+            worst = worst.max(err);
+            rig.release(&[&x_buf, &w_buf, &b_buf, &dst_buf]);
+        }
+        assert!(worst < 1e-4, "worst relative error {worst}");
+    }
+
+    struct ConvTransposeCase {
+        label: &'static str,
+        l: usize,
+        c_in: usize,
+        k: usize,
+        c_out: usize,
+        stride: usize,
+        pad: usize,
+        dil: usize,
+        bias: bool,
+    }
+
+    /// `ConvTranspose1D` on the CPU: input `[l, c_in]`, weight `[k, c_out, c_in]` (the ggml
+    /// order), output `[l_out, c_out]`.
+    fn conv_transpose1d_cpu(x: &[f32], w: &[f32], bias: &[f32], c: &ConvTransposeCase) -> Vec<f32> {
+        let l_out = (c.l - 1) * c.stride + c.dil * (c.k - 1) + 1 - 2 * c.pad;
+        let mut out = vec![0f32; l_out * c.c_out];
+        for oc in 0..c.c_out {
+            for ow in 0..l_out {
+                let mut sum = if c.bias { bias[oc] } else { 0.0 };
+                for kk in 0..c.k {
+                    let numer = (ow + c.pad) as i64 - (kk * c.dil) as i64;
+                    if numer < 0 || numer % c.stride as i64 != 0 {
+                        continue;
+                    }
+                    let iw = (numer / c.stride as i64) as usize;
+                    if iw >= c.l {
+                        continue;
+                    }
+                    for ic in 0..c.c_in {
+                        sum += x[ic * c.l + iw] * w[(ic * c.c_out + oc) * c.k + kk];
+                    }
+                }
+                out[oc * l_out + ow] = sum;
+            }
+        }
+        out
+    }
+
+    /// The DSP's `ConvTranspose1D` against the CPU, with inputs narrower than, equal to and wider
+    /// than the kernel. The kernel operand used to be picked by comparing widths, which swapped
+    /// the operands whenever the input was no wider than the kernel.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_conv_transpose1d_matches_the_cpu() {
+        let cases = [
+            ConvTransposeCase {
+                label: "input wider than the kernel",
+                l: 16,
+                c_in: 3,
+                k: 4,
+                c_out: 5,
+                stride: 2,
+                pad: 1,
+                dil: 1,
+                bias: true,
+            },
+            ConvTransposeCase {
+                label: "input narrower than the kernel",
+                l: 8,
+                c_in: 3,
+                k: 16,
+                c_out: 4,
+                stride: 4,
+                pad: 0,
+                dil: 1,
+                bias: true,
+            },
+            ConvTransposeCase {
+                label: "one input column",
+                l: 1,
+                c_in: 2,
+                k: 16,
+                c_out: 3,
+                stride: 1,
+                pad: 0,
+                dil: 1,
+                bias: false,
+            },
+            ConvTransposeCase {
+                label: "input as wide as the kernel",
+                l: 16,
+                c_in: 2,
+                k: 16,
+                c_out: 2,
+                stride: 2,
+                pad: 3,
+                dil: 1,
+                bias: true,
+            },
+            ConvTransposeCase {
+                label: "dilated, stride 3",
+                l: 5,
+                c_in: 3,
+                k: 7,
+                c_out: 4,
+                stride: 3,
+                pad: 1,
+                dil: 2,
+                bias: false,
+            },
+        ];
+        let mut rig = GeluRig::open();
+        let mut worst = 0f32;
+        for (i, c) in cases.iter().enumerate() {
+            let l_out = (c.l - 1) * c.stride + c.dil * (c.k - 1) + 1 - 2 * c.pad;
+            let x = rig_values(31 + i as u64, c.l * c.c_in);
+            let w = rig_values(131 + i as u64, c.k * c.c_out * c.c_in);
+            let bias = rig_values(231 + i as u64, c.c_out);
+            let want = conv_transpose1d_cpu(&x, &w, &bias, c);
+            let (x_buf, w_buf, b_buf) = (
+                rig_f32_buf(&rig, &x),
+                rig_f32_buf(&rig, &w),
+                rig_f32_buf(&rig, &bias),
+            );
+            let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; l_out * c.c_out]);
+            // ggml's operand order: the kernel first, then the input
+            let mut srcs = vec![
+                (&w_buf, [c.k as u32, c.c_out as u32, c.c_in as u32, 1]),
+                (&x_buf, [c.l as u32, c.c_in as u32, 1, 1]),
+            ];
+            if c.bias {
+                srcs.push((&b_buf, [c.c_out as u32, 1, 1, 1]));
+            }
+            rig_run_f32_op(
+                &mut rig,
+                HtpOpCode::ConvTranspose1D,
+                &srcs,
+                (&dst_buf, [l_out as u32, c.c_out as u32, 1, 1]),
+                super::super::build_conv_transpose1d_params(c.stride, c.pad, c.dil),
+            )
+            .unwrap();
+            let got = gelu_download(&dst_buf, l_out * c.c_out);
+            let err = rig_rel_error(&got, &want);
+            gelu_trace(&format!("conv_transpose1d {}: error {err:e}", c.label));
+            worst = worst.max(err);
+            rig.release(&[&x_buf, &w_buf, &b_buf, &dst_buf]);
+        }
+        assert!(worst < 1e-4, "worst relative error {worst}");
+    }
+
+    /// The DSP's own refusals. Both conv ops answer shapes that disagree with `NoSupport` instead
+    /// of dividing by zero, indexing past a tensor or leaving part of the result unwritten. The ops
+    /// are sent without the host's validation (which refuses the same shapes first, see
+    /// `conv_ops_are_refused_when_their_shapes_disagree`), and each case is refused by the rule it
+    /// names (two of them, the groups case and the swapped operands, also fail a second one).
+    /// The result-side fourth-extent clauses have no case here. A valid conv afterwards shows
+    /// the session survived each refusal.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_conv_refuses_inconsistent_shapes() {
+        use super::super::{build_conv_transpose1d_params, build_conv1d_params};
+        let mut rig = GeluRig::open();
+        let (x_buf, w_buf) = (
+            rig_f32_buf(&rig, &rig_values(1, 16 * 8 * 2)),
+            rig_f32_buf(&rig, &rig_values(2, 3 * 8 * 8 * 2)),
+        );
+        let bias_buf = rig_f32_buf(&rig, &rig_values(3, 4));
+        let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; 20 * 8 * 2 * 2]);
+        let conv = HtpOpCode::Conv1D;
+        let transposed = HtpOpCode::ConvTranspose1D;
+        // (name, op, sources, result, params): each is refused by the rule it names
+        type Case<'a> = (
+            &'static str,
+            HtpOpCode,
+            Vec<(&'a RpcmemBuffer, [u32; 4])>,
+            [u32; 4],
+            [i32; 16],
+        );
+        let cases: Vec<Case> = vec![
+            // groups (8) above the output channels (4): the worker divided by c_out / groups = 0
+            (
+                "conv groups above c_out",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 1, 4, 1])],
+                [16, 4, 1, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // 4 groups divide 8 and 8, but the weight holds 8 channels per group, not 2
+            (
+                "conv weight channels per group",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 8, 8, 1])],
+                [16, 8, 1, 1],
+                build_conv1d_params(1, 1, 1, 4),
+            ),
+            // one input batch for two result batches
+            (
+                "conv fewer input batches than result batches",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 1, 8, 1])],
+                [16, 8, 2, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // a bias with 4 entries for 8 output channels
+            (
+                "conv short bias",
+                conv,
+                vec![
+                    (&x_buf, [16, 8, 1, 1]),
+                    (&w_buf, [3, 1, 8, 1]),
+                    (&bias_buf, [4, 1, 1, 1]),
+                ],
+                [16, 8, 1, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // a fourth extent the worker does not handle
+            (
+                "conv fourth extent",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 2]), (&w_buf, [3, 1, 8, 1])],
+                [16, 8, 1, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // a transposed-conv weight [K, C_out, C_in] whose C_in (4) is not the input's (8)
+            (
+                "transposed weight input channels",
+                transposed,
+                vec![(&w_buf, [3, 8, 4, 1]), (&x_buf, [16, 8, 1, 1])],
+                [18, 8, 1, 1],
+                build_conv_transpose1d_params(1, 0, 1),
+            ),
+            // a result with two batches for one input batch: a slab would come back unwritten
+            (
+                "transposed more result batches than input",
+                transposed,
+                vec![(&w_buf, [3, 8, 8, 1]), (&x_buf, [16, 8, 1, 1])],
+                [18, 8, 2, 1],
+                build_conv_transpose1d_params(1, 0, 1),
+            ),
+            // the same input and weight in the other order
+            (
+                "transposed operands swapped",
+                transposed,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 8, 8, 1])],
+                [18, 8, 1, 1],
+                build_conv_transpose1d_params(1, 0, 1),
+            ),
+        ];
+        for (name, op, srcs, dst_ne, params) in cases {
+            let err = rig_run_f32_op_unvalidated(&mut rig, op, &srcs, (&dst_buf, dst_ne), params)
+                .expect_err(name)
+                .to_string();
+            assert!(
+                err.contains("NoSupport"),
+                "{name}: the DSP should answer NoSupport, got {err}"
+            );
+            gelu_trace(&format!("{name}: refused by the DSP"));
+        }
+        // the session is still good: a valid depthwise conv runs and is right
+        let x = rig_values(1, 16 * 8);
+        let w = rig_values(2, 3 * 8);
+        let want = conv1d_cpu(
+            &x,
+            &w,
+            &[],
+            &ConvCase {
+                label: "control",
+                w_in: 16,
+                c_in: 8,
+                k: 3,
+                c_out: 8,
+                stride: 1,
+                pad: 1,
+                dil: 1,
+                groups: 8,
+                bias: false,
+            },
+        );
+        let ok_x = rig_f32_buf(&rig, &x);
+        let ok_w = rig_f32_buf(&rig, &w);
+        let ok_dst = rig_f32_buf(&rig, &vec![123.0f32; 16 * 8]);
+        rig_run_f32_op_unvalidated(
+            &mut rig,
+            conv,
+            &[(&ok_x, [16, 8, 1, 1]), (&ok_w, [3, 1, 8, 1])],
+            (&ok_dst, [16, 8, 1, 1]),
+            build_conv1d_params(1, 1, 1, 8),
+        )
+        .unwrap();
+        let err = rig_rel_error(&gelu_download(&ok_dst, 16 * 8), &want);
+        assert!(
+            err < 1e-4,
+            "a conv after the refusals: relative error {err}"
+        );
+        rig.release(&[&x_buf, &w_buf, &bias_buf, &dst_buf, &ok_x, &ok_w, &ok_dst]);
+    }
+
+    /// The extension unary ops against the CPU, on rows that end in a partial vector (70 and 31
+    /// floats) and on a whole one (32), including the alphas the old zero-bits default could not
+    /// express: Snake and ELU with alpha 0.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_extension_unary_ops_match_the_cpu() {
+        use super::super::{build_elu_params, build_snake_params};
+        type F = fn(f64) -> f64;
+        // (name, op, params, CPU reference), owned and borrowed
+        type OwnedCase = (&'static str, HtpOpCode, [i32; 16], Box<dyn Fn(f64) -> f64>);
+        type BorrowedCase<'a> = (&'a str, HtpOpCode, [i32; 16], &'a dyn Fn(f64) -> f64);
+        let hard_sigmoid: F = |x| ((x + 3.0) / 6.0).clamp(0.0, 1.0);
+        let cases: [OwnedCase; 9] = [
+            (
+                "snake alpha 1",
+                HtpOpCode::UnarySnake,
+                build_snake_params(1.0),
+                Box::new(|x| x + x.sin().powi(2)),
+            ),
+            (
+                "snake alpha 2.5",
+                HtpOpCode::UnarySnake,
+                build_snake_params(2.5),
+                Box::new(|x| x + (2.5 * x).sin().powi(2) / 2.5),
+            ),
+            (
+                "snake alpha 0 is the identity",
+                HtpOpCode::UnarySnake,
+                build_snake_params(0.0),
+                Box::new(|x| x),
+            ),
+            (
+                "elu alpha 1",
+                HtpOpCode::UnaryElu,
+                build_elu_params(1.0),
+                Box::new(|x| if x > 0.0 { x } else { x.exp() - 1.0 }),
+            ),
+            (
+                "elu alpha 0 is a relu",
+                HtpOpCode::UnaryElu,
+                build_elu_params(0.0),
+                Box::new(|x| x.max(0.0)),
+            ),
+            (
+                "elu alpha 0.5",
+                HtpOpCode::UnaryElu,
+                build_elu_params(0.5),
+                Box::new(|x| if x > 0.0 { x } else { 0.5 * (x.exp() - 1.0) }),
+            ),
+            ("sin", HtpOpCode::UnarySin, [0; 16], Box::new(f64::sin)),
+            ("cos", HtpOpCode::UnaryCos, [0; 16], Box::new(f64::cos)),
+            (
+                "hard sigmoid",
+                HtpOpCode::UnaryHardSigmoid,
+                [0; 16],
+                Box::new(hard_sigmoid),
+            ),
+        ];
+        let hard_swish = |x: f64| x * hard_sigmoid(x);
+        let mut rig = GeluRig::open();
+        let mut worst = 0f32;
+        let rows = 3usize;
+        for ne0 in [70usize, 32, 31] {
+            let x: Vec<f32> = (0..ne0 * rows)
+                .map(|i| -6.0 + 12.0 * i as f32 / (ne0 * rows - 1) as f32)
+                .collect();
+            let mut all: Vec<BorrowedCase> = cases
+                .iter()
+                .map(|(n, op, p, f)| (*n, *op, *p, f.as_ref()))
+                .collect();
+            all.push((
+                "hard swish",
+                HtpOpCode::UnaryHardSwish,
+                [0; 16],
+                &hard_swish,
+            ));
+            for (name, op, params, f) in all {
+                let want: Vec<f32> = x.iter().map(|&v| f(f64::from(v)) as f32).collect();
+                let x_buf = rig_f32_buf(&rig, &x);
+                let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; x.len()]);
+                let ne = [ne0 as u32, rows as u32, 1, 1];
+                rig_run_f32_op(&mut rig, op, &[(&x_buf, ne)], (&dst_buf, ne), params).unwrap();
+                let got = gelu_download(&dst_buf, x.len());
+                let err = rig_rel_error(&got, &want);
+                gelu_trace(&format!("{name} on rows of {ne0}: error {err:e}"));
+                worst = worst.max(err);
+                rig.release(&[&x_buf, &dst_buf]);
+            }
+        }
+        assert!(worst < 2e-3, "worst relative error {worst}");
+    }
+
+    /// A unary op over a view whose planes (and batches) sit a gap apart, as a slice of a larger
+    /// buffer does. The host used to collapse such a view, which rewrote its plane strides as if
+    /// there were no gap and made the DSP read the wrong bytes; it is registered as it is now.
+    /// The gaps hold NaN, so a kernel that strays into one shows.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_unary_ops_read_views_with_gaps_between_planes() {
+        use super::super::{HTP_TENSOR_COMPUTE, HtpDataType};
+        let mut rig = GeluRig::open();
+        // (extents, row bytes, plane gap, batch gap)
+        for (ne, plane_gap, batch_gap) in [
+            ([30u32, 64, 3, 1], 64u32, 0u32),
+            ([30, 16, 2, 2], 64, 128),
+            ([100, 4, 3, 1], 32, 0),
+        ] {
+            let nb1 = ne[0] * 4;
+            let nb2 = nb1 * ne[1] + plane_gap;
+            let nb3 = nb2 * ne[2] + batch_gap;
+            let bytes = nb3 as usize * ne[3] as usize;
+            let mut src = vec![f32::NAN; bytes / 4];
+            let vals = rig_values(5, (ne[0] * ne[1] * ne[2] * ne[3]) as usize);
+            let at = |i0: u32, i1: u32, i2: u32, i3: u32| {
+                ((i0 * 4 + i1 * nb1 + i2 * nb2 + i3 * nb3) / 4) as usize
+            };
+            let lin = |i0: u32, i1: u32, i2: u32, i3: u32| {
+                (((i3 * ne[2] + i2) * ne[1] + i1) * ne[0] + i0) as usize
+            };
+            for i3 in 0..ne[3] {
+                for i2 in 0..ne[2] {
+                    for i1 in 0..ne[1] {
+                        for i0 in 0..ne[0] {
+                            src[at(i0, i1, i2, i3)] = vals[lin(i0, i1, i2, i3)];
+                        }
+                    }
+                }
+            }
+            for (name, op, f) in [
+                (
+                    "neg",
+                    HtpOpCode::UnaryNeg,
+                    Box::new(|x: f64| -x) as Box<dyn Fn(f64) -> f64>,
+                ),
+                ("sin", HtpOpCode::UnarySin, Box::new(f64::sin)),
+            ] {
+                let want: Vec<f32> = vals.iter().map(|&v| f(f64::from(v)) as f32).collect();
+                let src_buf = rig_f32_buf(&rig, &src);
+                let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; vals.len()]);
+                {
+                    let session = rig.device.queue_session_mut();
+                    let src_ti = session
+                        .add_tensor(
+                            &src_buf,
+                            0,
+                            bytes,
+                            HTP_TENSOR_COMPUTE,
+                            HtpDataType::F32 as u32,
+                            ne,
+                            [4, nb1, nb2, nb3],
+                        )
+                        .unwrap();
+                    let dst_ti = rig_f32_tensor(session, &dst_buf, ne);
+                    session
+                        .enqueue_op(op as u32, &[src_ti], &[dst_ti], [0i32; 16], [0i32; 32])
+                        .unwrap();
+                    session.flush().unwrap();
+                }
+                let got = gelu_download(&dst_buf, vals.len());
+                let err = rig_rel_error(&got, &want);
+                gelu_trace(&format!(
+                    "{name} over {ne:?} with gaps ({plane_gap}, {batch_gap}): error {err:e}"
+                ));
+                assert!(err < 1e-4, "{name} over {ne:?}: relative error {err}");
+                rig.release(&[&src_buf, &dst_buf]);
+            }
+        }
+    }
+
+    /// The Q8_0 row quantizer's contract for a block holding a NaN or an infinity, the same as the
+    /// CPU quantizer's: the stored scale is not finite and every int8 is zero, so the poison reaches
+    /// the attention dot product instead of vanishing. One poisoned block per row sits in the
+    /// four-block vector path and one in the single-block tail; the other blocks stay exact.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_set_rows_q8_0_poisons_non_finite_blocks() {
+        let mut rig = GeluRig::open();
+        let (n, rows, ctx) = (288usize, 4usize, 8usize);
+        let (blocks, row_bytes) = (n / 32, n / 32 * 34);
+        let mut src: Vec<f32> = (0..n * rows)
+            .map(|i| (((i % 32) * 37) % 64) as f32 / 32.0 - 1.0)
+            .collect();
+        let poison = [
+            (0usize, 1usize, f32::NAN),
+            (0, 8, f32::INFINITY),
+            (1, 2, f32::NEG_INFINITY),
+            (1, 8, f32::NAN),
+            (2, 5, f32::NAN),
+            (3, 0, f32::INFINITY),
+        ];
+        for (r, b, v) in poison {
+            src[r * n + b * 32 + 7] = v;
+        }
+        let positions = [3i32, 0, 2, 1];
+        let bytes = device_set_rows_q8_0(&mut rig, &src, n, rows, ctx, &positions);
+        let mut bad = Vec::new();
+        for (r, &pos) in positions.iter().enumerate() {
+            for b in 0..blocks {
+                let at = pos as usize * row_bytes + b * 34;
+                let d = half::f16::from_le_bytes([bytes[at], bytes[at + 1]]).to_f32();
+                let poisoned = poison.iter().any(|&(pr, pb, _)| pr == r && pb == b);
+                let zeros = bytes[at + 2..at + 34].iter().all(|&q| q == 0);
+                if poisoned && (d.is_finite() || !zeros) {
+                    bad.push(format!(
+                        "row {r} block {b}: scale {d}, int8 all zero {zeros}"
+                    ));
+                }
+                if !poisoned && !d.is_finite() {
+                    bad.push(format!("row {r} block {b} is clean but has scale {d}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("; "));
+    }
+
+    /// A Q4_1 HVX matmul quantizes its activations with the tiled Q8_1 quantizer, whose scale and
+    /// offset term follow the same rounded-up f16 rule as the Q8_0 one. Activations whose block
+    /// maxima sit well below 2e-3 (where the f16 reciprocal used to overflow) keep a cosine of at
+    /// least 0.999 against the CPU, at one to seven rows.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_q4_1_matmul_keeps_small_activation_blocks() {
+        use super::super::{
+            HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HtpDataType, repack_q4_1,
+            repacked_matrix_size_q4_1,
+        };
+        // ggml `Q4_1` blocks: f16 `d = (max - min) / 15`, f16 `m = min`, and 16 bytes holding
+        // element i in the low nibble and element i + 16 in the high one
+        let quantize_q4_1 = |vals: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(vals.len() / 32 * 20);
+            for blk in vals.chunks(32) {
+                let (mn, mx) = blk
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                let d = (mx - mn) / 15.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+                out.extend_from_slice(&half::f16::from_f32(mn).to_bits().to_le_bytes());
+                for i in 0..16 {
+                    let q = |v: f32| (((v - mn) * id + 0.5) as i32).clamp(0, 15) as u8;
+                    out.push(q(blk[i]) | (q(blk[i + 16]) << 4));
+                }
+            }
+            out
+        };
+        let (k, n) = (1024usize, 64usize);
+        let weights_f32 = rig_values(7, n * k);
+        let blocks = quantize_q4_1(&weights_f32);
+        let size = repacked_matrix_size_q4_1(k, n).unwrap();
+        let mut tiled = vec![0u8; size];
+        repack_q4_1(&blocks, k, n, &mut tiled).unwrap();
+        let mut dequant = vec![0f32; n * k];
+        for (row, out) in blocks.chunks(k / 32 * 20).zip(dequant.chunks_mut(k)) {
+            crate::quant::dequantize_q4_1_row(row, out);
+        }
+        let mut rig = GeluRig::open();
+        let w_buf = rig.alloc(size);
+        unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), w_buf.as_mut_ptr(), size) };
+        w_buf.flush_cpu_cache(0, size);
+        let tiled_row_bytes = k / 32 * 32 * 20;
+        let w_tot = n / 32 * tiled_row_bytes;
+        let mut worst_cos = 1.0f64;
+        for m in [1usize, 3, 7] {
+            // every block of every row is small: the maxima step through 1e-3, 5e-4 and 3e-4
+            let mut x = rig_values(9 + m as u64, m * k);
+            for (i, v) in x.iter_mut().enumerate() {
+                *v *= [1e-3f32, 5e-4, 3e-4][(i / 32) % 3];
+            }
+            let x_buf = rig_f32_buf(&rig, &x);
+            let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; m * n]);
+            {
+                let session = rig.device.queue_session_mut();
+                let kparams = build_mul_mat_kernel_params(
+                    HtpDataType::Q4_1,
+                    k,
+                    m as u32,
+                    1,
+                    n * 4,
+                    session.dsp_threads(),
+                    VTCM_BUDGET,
+                )
+                .expect("a Q4_1 HVX kernel");
+                let w_ti = session
+                    .add_tensor(
+                        &w_buf,
+                        0,
+                        size,
+                        HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
+                        HtpDataType::Q4_1 as u32,
+                        [k as u32, n as u32, 1, 1],
+                        [20, tiled_row_bytes as u32, w_tot as u32, w_tot as u32],
+                    )
+                    .unwrap();
+                let x_ti = add_f32_rows(session, &x_buf, 0, k, m).unwrap();
+                let dst_ti = add_f32_rows(session, &dst_buf, 0, n, m).unwrap();
+                session
+                    .enqueue_op(
+                        HtpOpCode::MulMat as u32,
+                        &[w_ti, x_ti],
+                        &[dst_ti],
+                        [0i32; 16],
+                        kparams,
+                    )
+                    .unwrap();
+                session.flush().unwrap();
+            }
+            let got = gelu_download(&dst_buf, m * n);
+            for t in 0..m {
+                let want: Vec<f32> = (0..n)
+                    .map(|r| {
+                        dequant[r * k..(r + 1) * k]
+                            .iter()
+                            .zip(&x[t * k..(t + 1) * k])
+                            .map(|(a, b)| a * b)
+                            .sum()
+                    })
+                    .collect();
+                let g = &got[t * n..(t + 1) * n];
+                let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                for (a, b) in g.iter().zip(&want) {
+                    dot += f64::from(*a) * f64::from(*b);
+                    na += f64::from(*a) * f64::from(*a);
+                    nb += f64::from(*b) * f64::from(*b);
+                }
+                let cos = dot / (na.sqrt() * nb.sqrt());
+                gelu_trace(&format!("Q4_1 k={k} n={n} m={m} row {t}: cosine {cos:.6}"));
+                worst_cos = worst_min(worst_cos, cos);
+            }
+            rig.release(&[&x_buf, &dst_buf]);
+        }
+        rig.release(&[&w_buf]);
+        assert!(worst_cos > 0.999, "worst cosine {worst_cos}");
     }
 
     /// Step 1, the harness: the known-good tanh sequence on 2 rows of 128.

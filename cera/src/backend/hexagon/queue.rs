@@ -6,7 +6,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use super::params::{build_concat_kernel_params, build_copy_kernel_params};
+use super::eltwise::{derive_eltwise, eltwise_operand_counts, is_eltwise_opcode};
+use super::params::{
+    CopyTensor, FLASH_ATTN_HVX_ONLY, FlashAttnHost, FlashAttnOp, build_concat_kernel_params,
+    build_copy_kernel_params, build_flash_attn_kernel_params, build_set_rows_kernel_params,
+    build_ssm_conv_kernel_params,
+};
 use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
 use super::types::{
@@ -937,8 +942,34 @@ impl HexagonQueueSession {
             &self.tens,
             self.dsp_threads(),
             self.dsp_vtcm_bytes(),
+            self.dsp_hmx(),
         )
         .inspect_err(|_| self.drop_pending_batch())?;
+        self.push_op(opcode, src, dst, params, kernel_params)
+    }
+
+    /// [`Self::enqueue_op`] without the host's operand validation and parameter derivation, so a
+    /// device test can send the DSP an op the host would refuse and see the DSP refuse it too.
+    #[cfg(test)]
+    pub(crate) fn enqueue_op_unvalidated(
+        &mut self,
+        opcode: u32,
+        src: &[u16],
+        dst: &[u16],
+        params: [i32; 16],
+        kernel_params: [i32; 32],
+    ) -> Result<(), CeraError> {
+        self.push_op(opcode, src, dst, params, kernel_params)
+    }
+
+    fn push_op(
+        &mut self,
+        opcode: u32,
+        src: &[u16],
+        dst: &[u16],
+        params: [i32; 16],
+        kernel_params: [i32; 32],
+    ) -> Result<(), CeraError> {
         let mut op = HtpOpDesc {
             opcode,
             flags: 0,
@@ -1537,8 +1568,12 @@ impl Drop for HexagonQueueSession {
 }
 
 /// Validate `enqueue_op` operand counts, tensor indices, and `Cpy`/`Concat` arity, and derive
-/// `Cpy`/`Concat` `kernel_params` when the caller passed `[0; 32]`. Shared with test sinks so
-/// fake and real queues enforce identical preconditions and derive identical parameter words.
+/// `Cpy`/`Concat`/`SsmConv`/`SetRows`/`FlashAttnExt` `kernel_params` and every elementwise op (binary,
+/// unary, GLU) when the caller passed `[0; 32]`
+/// (`FlashAttnExt` also for [`FLASH_ATTN_HVX_ONLY`]); likewise `Rope`, `Softmax`,
+/// `Sum`/`SumRows`/`Argmax` and `Argsort`/`TopK`. Shared with test sinks so fake and real
+/// queues enforce identical preconditions and derive identical parameter words. `dsp_hmx` is the
+/// DSP's HMX unit count (0 keeps the HMX kernels off).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_derive_op_params<T>(
     opcode: u32,
@@ -1549,6 +1584,7 @@ pub(crate) fn validate_and_derive_op_params<T>(
     tensors: &[T],
     dsp_threads: u32,
     vtcm_bytes: usize,
+    dsp_hmx: u32,
 ) -> Result<[i32; 32], CeraError>
 where
     T: std::fmt::Debug,
@@ -1634,6 +1670,289 @@ where
                     params[0]
                 ))
             })?;
+        }
+    }
+    // The conv kernels index their operands by these extents and answer NO_SUPPORT for a mismatch
+    // (they used to divide by zero or read past a tensor), so refuse it before the flush.
+    if opcode == HtpOpCode::Conv1D as u32 || opcode == HtpOpCode::ConvTranspose1D as u32 {
+        let name = if opcode == HtpOpCode::Conv1D as u32 {
+            "Conv1D"
+        } else {
+            "ConvTranspose1D"
+        };
+        if !(2..=3).contains(&src.len())
+            || dst.len() != 1
+            || src.contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {name}: needs two or three registered src tensors and one registered dst tensor"
+            )));
+        }
+        let view = |i: u16| -> super::params::CopyTensor { (&tensors[i as usize]).into() };
+        let bias = src.get(2).map(|&i| view(i));
+        let (first, second, out) = (view(src[0]), view(src[1]), view(dst[0]));
+        let ok = if opcode == HtpOpCode::Conv1D as u32 {
+            super::params::conv1d_shapes_ok(
+                &first,
+                &second,
+                bias.as_ref(),
+                &out,
+                params[3].max(1) as usize,
+            )
+        } else {
+            super::params::conv_transpose1d_shapes_ok(&first, &second, bias.as_ref(), &out)
+        };
+        if !ok {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {name}: the operand shapes do not agree ({first:?}, {second:?}, bias {bias:?} -> {out:?})"
+            )));
+        }
+    }
+    // `SsmConv` likewise: the window, taps and output decide the kernel, the channel tile and the
+    // VTCM plan (`htp_kparams_solve_ssm_conv`).
+    if opcode == HtpOpCode::SsmConv as u32 {
+        if src.len() != 2
+            || dst.len() != 1
+            || src[0] == 0xffff
+            || src[1] == 0xffff
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op SsmConv: needs two registered src tensors and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        if kernel_params == [0i32; 32] {
+            let (tx, tw, td) = (
+                &tensors[src[0] as usize],
+                &tensors[src[1] as usize],
+                &tensors[dst[0] as usize],
+            );
+            kernel_params = build_ssm_conv_kernel_params(
+                &tx.into(),
+                &tw.into(),
+                &td.into(),
+                dsp_threads,
+                vtcm_bytes,
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op SsmConv: the HTP ssm_conv kernel does not handle {tx:?} * {tw:?} -> {td:?} in {vtcm_bytes} bytes of VTCM"
+                ))
+            })?;
+        }
+    }
+    // `SetRows` likewise: the DSP derives its divisors, but the thread count, task count and VTCM
+    // working set come from the host (`htp_kparams_solve_set_rows`).
+    if opcode == HtpOpCode::SetRows as u32 {
+        if src.len() != 2
+            || dst.len() != 1
+            || src[0] == 0xffff
+            || src[1] == 0xffff
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op SetRows: needs two registered src tensors and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        if kernel_params == [0i32; 32] {
+            let (tv, ti, td) = (
+                &tensors[src[0] as usize],
+                &tensors[src[1] as usize],
+                &tensors[dst[0] as usize],
+            );
+            kernel_params = build_set_rows_kernel_params(
+                &tv.into(),
+                &ti.into(),
+                &td.into(),
+                dsp_threads,
+                vtcm_bytes,
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op SetRows: the HTP set_rows kernel does not handle {tv:?} + {ti:?} -> {td:?}"
+                ))
+            })?;
+        }
+    }
+    // `FlashAttnExt`: the DSP reads everything from the kernel params, and the kernel (HMX or HVX),
+    // tiling and VTCM working set come from the registered tensors, the op params (scale, ALiBi
+    // bias and soft cap, as in a ggml node's `op_params`) and the session's limits
+    // (`htp_kparams_solve_flash_attn`).
+    if opcode == HtpOpCode::FlashAttnExt as u32 {
+        if src.len() < 3
+            || src.len() > 6
+            || dst.len() != 1
+            || src[..3].contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op FlashAttnExt: needs registered q, k, v src tensors (then an optional \
+                 mask and attention sinks) and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        // the DSP kernels take no K/V row lists (src[5])
+        if src.get(5).is_some_and(|&s| s != 0xffff) {
+            return Err(CeraError::Backend(
+                "enqueue_op FlashAttnExt: K/V row lists are not supported".into(),
+            ));
+        }
+        let hvx_only = kernel_params == FLASH_ATTN_HVX_ONLY;
+        if kernel_params == [0i32; 32] || hvx_only {
+            let operand = |i: usize| -> Option<CopyTensor> {
+                src.get(i)
+                    .filter(|&&s| s != 0xffff)
+                    .map(|&s| (&tensors[s as usize]).into())
+            };
+            let (q, k, v) = (
+                operand(0).unwrap(),
+                operand(1).unwrap(),
+                operand(2).unwrap(),
+            );
+            let (mask, sinks) = (operand(3), operand(4));
+            let d: CopyTensor = (&tensors[dst[0] as usize]).into();
+            let mut host = FlashAttnHost::new(dsp_threads, vtcm_bytes, dsp_hmx);
+            if hvx_only {
+                host = host.hvx_only();
+            }
+            let f = |i: usize| f32::from_bits(params[i] as u32);
+            kernel_params = build_flash_attn_kernel_params(
+                &host,
+                &FlashAttnOp {
+                    q: &q,
+                    k: &k,
+                    v: &v,
+                    mask: mask.as_ref(),
+                    sinks: sinks.as_ref(),
+                    dst: &d,
+                    scale: f(0),
+                    max_bias: f(1),
+                    logit_softcap: f(2),
+                },
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op FlashAttnExt: the HTP flash-attention kernels do not handle q {q:?}, \
+                     k {k:?}, v {v:?}, mask {mask:?}, sinks {sinks:?} -> {d:?} within {vtcm_bytes} \
+                     bytes of VTCM"
+                ))
+            })?;
+        }
+    }
+    // `Rope`, `Softmax`, the reductions and the sorts take every word from the registered tensors
+    // and the op's own params (llama.cpp's `htp_kparams_solve_*`); the DSP answers NO_SUPPORT or
+    // reads garbage without them.
+    if let Some(
+        op @ (HtpOpCode::Rope
+        | HtpOpCode::Softmax
+        | HtpOpCode::Argmax
+        | HtpOpCode::Sum
+        | HtpOpCode::SumRows
+        | HtpOpCode::Argsort
+        | HtpOpCode::TopK),
+    ) = HtpOpCode::from_u32(opcode)
+    {
+        use super::params as p;
+        // Rope may carry frequency factors, Softmax a mask (its attention sinks have no kernel)
+        let max_src = match op {
+            HtpOpCode::Rope => 3,
+            HtpOpCode::Softmax => 2,
+            _ => 1,
+        };
+        let min_src = if op == HtpOpCode::Rope { 2 } else { 1 };
+        if !(min_src..=max_src).contains(&src.len())
+            || dst.len() != 1
+            || src.contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {}: needs {min_src} to {max_src} registered src tensors and one registered dst tensor",
+                op.name()
+            )));
+        }
+        if kernel_params == [0i32; 32] {
+            let view = |i: u16| -> super::params::CopyTensor { (&tensors[usize::from(i)]).into() };
+            let first = view(src[0]);
+            let second = src.get(1).map(|&i| view(i));
+            let third = src.get(2).map(|&i| view(i));
+            let out = view(dst[0]);
+            let derived = match op {
+                HtpOpCode::Rope => p::build_rope_kernel_params(
+                    &p::RopeOperands {
+                        src0: &first,
+                        positions: second.as_ref().expect("two sources checked above"),
+                        freq_factors: third.as_ref(),
+                        dst: &out,
+                    },
+                    params,
+                    dsp_threads,
+                    vtcm_bytes,
+                ),
+                HtpOpCode::Softmax => p::build_softmax_kernel_params_strided_mask(
+                    &first,
+                    second.as_ref(),
+                    &out,
+                    params,
+                    dsp_threads,
+                    vtcm_bytes,
+                ),
+                HtpOpCode::Argsort | HtpOpCode::TopK => p::build_sort_kernel_params(
+                    opcode,
+                    &first,
+                    &out,
+                    params,
+                    dsp_threads,
+                    vtcm_bytes,
+                ),
+                _ => p::build_sum_rows_kernel_params(opcode, &first, &out, dsp_threads),
+            };
+            kernel_params = derived.ok_or_else(|| {
+                let operands: Vec<&T> = src
+                    .iter()
+                    .chain(dst)
+                    .map(|&i| &tensors[usize::from(i)])
+                    .collect();
+                CeraError::Backend(format!(
+                    "enqueue_op {}: the HTP kernel does not handle {operands:?}",
+                    op.name()
+                ))
+            })?;
+        }
+    }
+    // The elementwise ops (binary, unary, GLU) read their thread count, row blocking and VTCM
+    // layout from the host's kernel params and fail the batch with INVAL_PARAMS (or fault on a
+    // missing operand) without them, so the operands are checked here and the params derived
+    // from the registered tensors (`htp_kparams_solve_binary` and friends).
+    if is_eltwise_opcode(opcode) {
+        let name = HtpOpCode::from_u32(opcode).map_or("elementwise", |o| o.name());
+        let (min_src, max_src) = eltwise_operand_counts(opcode);
+        if src.len() < min_src
+            || src.len() > max_src
+            || dst.len() != 1
+            || src.contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {name}: needs {min_src}..={max_src} registered src tensors and one \
+                 registered dst tensor, got {} and {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        if kernel_params == [0i32; 32] {
+            let ins: Vec<CopyTensor> = src.iter().map(|&s| (&tensors[s as usize]).into()).collect();
+            let out: CopyTensor = (&tensors[dst[0] as usize]).into();
+            kernel_params = derive_eltwise(opcode, &ins, &out, dsp_threads, vtcm_bytes)
+                .ok_or_else(|| {
+                    let srcs: Vec<&T> = src.iter().map(|&s| &tensors[s as usize]).collect();
+                    CeraError::Backend(format!(
+                        "enqueue_op {name}: the HTP elementwise kernels do not handle {srcs:?} -> {:?}",
+                        tensors[dst[0] as usize]
+                    ))
+                })?;
         }
     }
     Ok(kernel_params)
@@ -1945,6 +2264,914 @@ mod tests {
         assert_pending_empty(&q, "concat single src");
     }
 
+    /// The conv ops are refused at enqueue when their operands disagree, instead of reaching a DSP
+    /// kernel that divided by zero or read past a tensor. A refusal drops the pending batch, so
+    /// each case runs on a fresh session.
+    #[test]
+    fn conv_ops_are_refused_when_their_shapes_disagree() {
+        use super::super::params::{build_conv_transpose1d_params, build_conv1d_params};
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 16, false).unwrap();
+        let tensor = |q: &mut HexagonQueueSession, ne: [u32; 4]| {
+            let nb = [4, ne[0] * 4, ne[0] * ne[1] * 4, ne[0] * ne[1] * ne[2] * 4];
+            q.add_tensor(
+                &buf,
+                0,
+                nb[3] as usize * ne[3] as usize,
+                0,
+                HtpDataType::F32 as u32,
+                ne,
+                nb,
+            )
+            .unwrap()
+        };
+        let conv = HtpOpCode::Conv1D as u32;
+        let transposed = HtpOpCode::ConvTranspose1D as u32;
+        let depthwise = build_conv1d_params(1, 1, 1, 8);
+        let strided = build_conv_transpose1d_params(1, 0, 1);
+
+        // a depthwise conv is accepted and carries no derived params
+        let mut q = test_session();
+        let (x, w, y) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+        );
+        q.enqueue_op(conv, &[x, w], &[y], depthwise, [0; 32])
+            .unwrap();
+        assert_eq!(
+            q.ops[0].kernel_params, [0; 32],
+            "a conv has no derived params"
+        );
+
+        // groups above the output channels
+        let mut q = test_session();
+        let (x, w, y4) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 4, 1, 1]),
+        );
+        let err = q
+            .enqueue_op(conv, &[x, w], &[y4], depthwise, [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shapes do not agree"), "{err}");
+        assert_pending_empty(&q, "conv groups");
+
+        // an operand count no conv takes
+        let mut q = test_session();
+        let (x, y) = (tensor(&mut q, [16, 8, 1, 1]), tensor(&mut q, [16, 8, 1, 1]));
+        assert!(q.enqueue_op(conv, &[x], &[y], depthwise, [0; 32]).is_err());
+        assert_pending_empty(&q, "conv operand count");
+
+        // the bias is the third source: one entry per output channel passes, a short one is refused
+        let mut q = test_session();
+        let (x, w, y, bias) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [8, 1, 1, 1]),
+        );
+        q.enqueue_op(conv, &[x, w, bias], &[y], depthwise, [0; 32])
+            .unwrap();
+        let mut q = test_session();
+        let (x, w, y, short) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [4, 1, 1, 1]),
+        );
+        assert!(
+            q.enqueue_op(conv, &[x, w, short], &[y], depthwise, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv short bias");
+
+        // a fourth extent the worker does not handle
+        let mut q = test_session();
+        let (x4, w, y) = (
+            tensor(&mut q, [16, 8, 1, 2]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+        );
+        assert!(
+            q.enqueue_op(conv, &[x4, w], &[y], depthwise, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv fourth extent");
+
+        // a transposed conv: weight first and input second is accepted; the other order, and a
+        // result with the wrong channels, are refused
+        let transposed_tensors = |q: &mut HexagonQueueSession, out_channels: u32| {
+            (
+                tensor(q, [4, 5, 3, 1]),
+                tensor(q, [8, 3, 1, 1]),
+                tensor(q, [11, out_channels, 1, 1]),
+            )
+        };
+        let mut q = test_session();
+        let (wt, xt, yt) = transposed_tensors(&mut q, 5);
+        q.enqueue_op(transposed, &[wt, xt], &[yt], strided, [0; 32])
+            .unwrap();
+        let mut q = test_session();
+        let (wt, xt, yt) = transposed_tensors(&mut q, 5);
+        let err = q
+            .enqueue_op(transposed, &[xt, wt], &[yt], strided, [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shapes do not agree"), "{err}");
+        assert_pending_empty(&q, "conv transpose operand order");
+        let mut q = test_session();
+        let (wt, xt, yt) = transposed_tensors(&mut q, 6);
+        assert!(
+            q.enqueue_op(transposed, &[wt, xt], &[yt], strided, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv transpose channels");
+        // a result with more batches than the input would come back with slabs never written
+        let mut q = test_session();
+        let (wt, xt, y2) = (
+            tensor(&mut q, [4, 5, 3, 1]),
+            tensor(&mut q, [8, 3, 1, 1]),
+            tensor(&mut q, [11, 5, 2, 1]),
+        );
+        assert!(
+            q.enqueue_op(transposed, &[wt, xt], &[y2], strided, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv transpose batches");
+    }
+
+    /// A `FlashAttnExt` enqueued with empty kernel params gets them from the registered tensors,
+    /// the op params and the session's limits (thread count, VTCM, HMX units); the HVX-only
+    /// request keeps the HMX kernel off; precomputed params pass through; K/V row lists, missing
+    /// operands and shapes no kernel takes are errors that drop the batch.
+    #[test]
+    fn flash_attn_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{
+            CopyTensor, FlashAttnHost, FlashAttnOp, build_flash_attn_kernel_params,
+            flash_attn_kernel_request, flash_attn_op_params,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let (f32_t, f16_t) = (HtpDataType::F32 as u32, HtpDataType::F16 as u32);
+        let mut q = test_session();
+        q.set_dsp_hw(1, 8 << 20);
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+        let scale = 0.125f32;
+
+        // 32 prefill rows of 16 heads over 602 KV rows of 8 kv heads, LFM2-style views of the
+        // interleaved cache and `[head_dim, n_heads, n_tokens]` output
+        let register = |q: &mut HexagonQueueSession| {
+            let qt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f32_t,
+                    [64, 32, 16, 1],
+                    [4, 4096, 256, 4096],
+                )
+                .unwrap();
+            let kt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f16_t,
+                    [64, 602, 8, 1],
+                    [2, 1024, 128, 4096],
+                )
+                .unwrap();
+            let vt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f16_t,
+                    [64, 602, 8, 1],
+                    [2, 1024, 128, 4096],
+                )
+                .unwrap();
+            let mt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f16_t,
+                    [602, 32, 1, 1],
+                    [2, 1204, 38528, 38528],
+                )
+                .unwrap();
+            let dt = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    4096,
+                    0,
+                    f32_t,
+                    [64, 16, 32, 1],
+                    [4, 256, 4096, 4096],
+                )
+                .unwrap();
+            [qt, kt, vt, mt, dt]
+        };
+        let [qt, kt, vt, mt, dt] = register(&mut q);
+        let view = |q: &HexagonQueueSession, ti: u16| CopyTensor::from(&q.tens[ti as usize]);
+        let solve = |q: &HexagonQueueSession, host: &FlashAttnHost| {
+            let (qv, kv, vv, mv, dv) = (
+                view(q, qt),
+                view(q, kt),
+                view(q, vt),
+                view(q, mt),
+                view(q, dt),
+            );
+            build_flash_attn_kernel_params(
+                host,
+                &FlashAttnOp {
+                    q: &qv,
+                    k: &kv,
+                    v: &vv,
+                    mask: Some(&mv),
+                    sinks: None,
+                    dst: &dv,
+                    scale,
+                    max_bias: 0.0,
+                    logit_softcap: 0.0,
+                },
+            )
+            .unwrap()
+        };
+        let params = flash_attn_op_params(scale, 0.0);
+        let src = [qt, kt, vt, mt];
+        let host = FlashAttnHost::new(threads, vtcm, 1);
+
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &src,
+            &[dt],
+            params,
+            flash_attn_kernel_request(true),
+        )
+        .unwrap();
+        assert_eq!(q.ops[0].kernel_params, solve(&q, &host));
+        assert_eq!(
+            q.ops[0].kernel_params[0] & 0xff,
+            2,
+            "an HMX unit takes the chunk"
+        );
+
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &src,
+            &[dt],
+            params,
+            flash_attn_kernel_request(false),
+        )
+        .unwrap();
+        assert_eq!(q.ops[1].kernel_params, solve(&q, &host.hvx_only()));
+        assert_eq!(q.ops[1].kernel_params[0] & 0xff, 1);
+
+        // the soft cap comes from op_params[2]
+        let capped = flash_attn_op_params(scale, 50.0);
+        q.enqueue_op(HtpOpCode::FlashAttnExt as u32, &src, &[dt], capped, [0; 32])
+            .unwrap();
+        assert_eq!(
+            q.ops[2].kernel_params[5],
+            (50.0f32 * std::f32::consts::LOG2_E).to_bits() as i32
+        );
+
+        // no HMX unit on the session: HVX
+        let mut no_hmx = test_session();
+        let [qt2, kt2, vt2, mt2, dt2] = register(&mut no_hmx);
+        no_hmx
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[qt2, kt2, vt2, mt2],
+                &[dt2],
+                params,
+                [0; 32],
+            )
+            .unwrap();
+        assert_eq!(no_hmx.ops[0].kernel_params[0] & 0xff, 1);
+
+        // precomputed params are the caller's: passed through untouched
+        q.enqueue_op(HtpOpCode::FlashAttnExt as u32, &src, &[dt], params, [7; 32])
+            .unwrap();
+        assert_eq!(q.ops[3].kernel_params, [7; 32]);
+
+        // without a mask the divisor pair of the mask's rows stays unset, and the op solves like
+        // the mask-less one (an HMX unit takes this chunk, as above)
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &src[..3],
+            &[dt],
+            params,
+            [0; 32],
+        )
+        .unwrap();
+        let (qv, kv, vv, dv) = (view(&q, qt), view(&q, kt), view(&q, vt), view(&q, dt));
+        let flash_op = |mask, sinks| FlashAttnOp {
+            q: &qv,
+            k: &kv,
+            v: &vv,
+            mask,
+            sinks,
+            dst: &dv,
+            scale,
+            max_bias: 0.0,
+            logit_softcap: 0.0,
+        };
+        let no_mask = build_flash_attn_kernel_params(&host, &flash_op(None, None)).unwrap();
+        assert_eq!(q.ops[4].kernel_params, no_mask);
+        assert_eq!(q.ops[4].kernel_params[0] & 0xff, 2);
+        assert_eq!(q.ops[4].kernel_params[10..12], [0, 0]);
+        assert_ne!(q.ops[4].kernel_params, q.ops[0].kernel_params);
+
+        // the attention sinks (a fifth source) reach the solver
+        let sinks_t = q
+            .add_tensor(&buf, 0, 4096, 0, f32_t, [16, 1, 1, 1], [4, 64, 64, 64])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &[qt, kt, vt, mt, sinks_t],
+            &[dt],
+            params,
+            [0; 32],
+        )
+        .unwrap();
+        let (mv, sv) = (view(&q, mt), view(&q, sinks_t));
+        let with_sinks =
+            build_flash_attn_kernel_params(&host, &flash_op(Some(&mv), Some(&sv))).unwrap();
+        assert_eq!(q.ops[5].kernel_params, with_sinks);
+        assert_ne!(
+            q.ops[5].kernel_params, q.ops[0].kernel_params,
+            "dropping the sinks operand must show"
+        );
+
+        // refusals: a K/V row list, a missing operand, a dst-less op, a dtype no kernel takes
+        let err = q
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[qt, kt, vt, mt, 0xffff, qt],
+                &[dt],
+                params,
+                [0; 32],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row lists"), "{err}");
+        assert_pending_empty(&q, "kv rows");
+        for (src, dst) in [
+            (vec![0xffffu16, 1, 2], vec![3u16]),
+            (vec![0, 1], vec![2]),
+            (vec![0, 1, 2], vec![]),
+            (vec![0, 1, 2], vec![0xffff]),
+        ] {
+            let mut q = test_session();
+            register(&mut q);
+            let e = q.enqueue_op(HtpOpCode::FlashAttnExt as u32, &src, &dst, params, [0; 32]);
+            assert!(e.is_err(), "{src:?} -> {dst:?} must be refused");
+            assert_pending_empty(&q, "bad flash-attention operands");
+        }
+        let mut q = test_session();
+        let [qt, kt, vt, _, dt] = register(&mut q);
+        let bad_mask = q
+            .add_tensor(
+                &buf,
+                0,
+                4096,
+                0,
+                f32_t,
+                [602, 32, 1, 1],
+                [4, 2408, 77056, 77056],
+            )
+            .unwrap();
+        let err = q
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[qt, kt, vt, bad_mask],
+                &[dt],
+                params,
+                [0; 32],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not handle"), "{err}");
+        assert_pending_empty(&q, "f32 mask");
+    }
+
+    /// `Rope`, `Softmax`, `Argmax`, `Argsort` and the other reductions and sorts enqueued with empty
+    /// kernel params get them from the registered tensors and the op's params (the DSP refuses
+    /// zero threads); a shape or operand count the kernels cannot take is an error that drops the
+    /// batch.
+    #[test]
+    fn rope_softmax_reduction_and_sort_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{
+            CopyTensor, RopeOperands, build_rope_kernel_params, build_rope_params,
+            build_softmax_kernel_params_strided_mask, build_sort_kernel_params,
+            build_sum_rows_kernel_params,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 20, false).unwrap();
+        let (f32_t, i32_t) = (HtpDataType::F32 as u32, HtpDataType::I32 as u32);
+        let mut q = test_session();
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+        let view = |q: &HexagonQueueSession, t: u16| CopyTensor::from(&q.tens[t as usize]);
+
+        // Rope: 8 heads of 64 over one token, positions, and frequency factors.
+        let act = q
+            .add_tensor(&buf, 0, 2048, 0, f32_t, [64, 8, 1, 1], [4, 256, 2048, 2048])
+            .unwrap();
+        let pos = q
+            .add_tensor(&buf, 2048, 4, 0, i32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        let ff = q
+            .add_tensor(&buf, 4096, 128, 1, f32_t, [32, 1, 1, 1], [4, 128, 128, 128])
+            .unwrap();
+        let params = build_rope_params(64, 2, 4096, 10000.0, 1.0);
+        q.enqueue_op(HtpOpCode::Rope as u32, &[act, pos], &[act], params, [0; 32])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::Rope as u32,
+            &[act, pos, ff],
+            &[act],
+            params,
+            [0; 32],
+        )
+        .unwrap();
+        let (a, p, f) = (view(&q, act), view(&q, pos), view(&q, ff));
+        let rope = |ff| {
+            build_rope_kernel_params(
+                &RopeOperands {
+                    src0: &a,
+                    positions: &p,
+                    freq_factors: ff,
+                    dst: &a,
+                },
+                &params,
+                threads,
+                vtcm,
+            )
+            .unwrap()
+        };
+        assert_eq!(q.ops[0].kernel_params, rope(None));
+        assert_eq!(q.ops[1].kernel_params, rope(Some(&f)));
+        assert_ne!(q.ops[0].kernel_params, [0; 32]);
+
+        // Softmax over [32, 4, 8] with an F32 mask, scale in the op params.
+        let sx = q
+            .add_tensor(
+                &buf,
+                8192,
+                4096,
+                0,
+                f32_t,
+                [32, 4, 8, 1],
+                [4, 128, 512, 4096],
+            )
+            .unwrap();
+        let sm = q
+            .add_tensor(
+                &buf,
+                16384,
+                4096,
+                0,
+                f32_t,
+                [32, 4, 8, 1],
+                [4, 128, 512, 4096],
+            )
+            .unwrap();
+        let sd = q
+            .add_tensor(
+                &buf,
+                24576,
+                4096,
+                0,
+                f32_t,
+                [32, 4, 8, 1],
+                [4, 128, 512, 4096],
+            )
+            .unwrap();
+        let mut sp = [0i32; 16];
+        sp[0] = 0.25f32.to_bits() as i32;
+        q.enqueue_op(HtpOpCode::Softmax as u32, &[sx, sm], &[sd], sp, [0; 32])
+            .unwrap();
+        let want = build_softmax_kernel_params_strided_mask(
+            &view(&q, sx),
+            Some(&view(&q, sm)),
+            &view(&q, sd),
+            &sp,
+            threads,
+            vtcm,
+        )
+        .unwrap();
+        assert_eq!(q.ops[2].kernel_params, want);
+        assert_eq!(f32::from_bits(want[7] as u32), 0.25);
+
+        // Argmax over a vocabulary row, and Argsort descending over expert scores.
+        let logits = q
+            .add_tensor(
+                &buf,
+                32768,
+                4096,
+                0,
+                f32_t,
+                [1024, 1, 1, 1],
+                [4, 4096, 4096, 4096],
+            )
+            .unwrap();
+        let tok = q
+            .add_tensor(&buf, 36864, 4, 0, i32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::Argmax as u32,
+            &[logits],
+            &[tok],
+            [0; 16],
+            [0; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            q.ops[3].kernel_params,
+            build_sum_rows_kernel_params(
+                HtpOpCode::Argmax as u32,
+                &view(&q, logits),
+                &view(&q, tok),
+                threads
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            q.ops[3].kernel_params[0], 0,
+            "a zero-thread op is refused by the DSP"
+        );
+        let scores = q
+            .add_tensor(
+                &buf,
+                40960,
+                128,
+                0,
+                f32_t,
+                [32, 1, 1, 1],
+                [4, 128, 128, 128],
+            )
+            .unwrap();
+        let order = q
+            .add_tensor(
+                &buf,
+                41088,
+                128,
+                0,
+                i32_t,
+                [32, 1, 1, 1],
+                [4, 128, 128, 128],
+            )
+            .unwrap();
+        let mut desc = [0i32; 16];
+        desc[0] = 1;
+        q.enqueue_op(
+            HtpOpCode::Argsort as u32,
+            &[scores],
+            &[order],
+            desc,
+            [0; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            q.ops[4].kernel_params,
+            build_sort_kernel_params(
+                HtpOpCode::Argsort as u32,
+                &view(&q, scores),
+                &view(&q, order),
+                &desc,
+                threads,
+                vtcm
+            )
+            .unwrap()
+        );
+
+        // Params the caller computed are left alone.
+        q.enqueue_op(
+            HtpOpCode::Argmax as u32,
+            &[logits],
+            &[tok],
+            [0; 16],
+            [7; 32],
+        )
+        .unwrap();
+        assert_eq!(q.ops[5].kernel_params, [7; 32]);
+
+        // Refusals, each over freshly registered operands (a refusal drops the batch): a Softmax
+        // with attention sinks (a third source), a Rope over F16, an Argsort into F32, a Rope without
+        // positions, and the "no operand" sentinel.
+        type Operand = (u32, [u32; 4], [u32; 4]);
+        let f32_row: Operand = (f32_t, [32, 4, 8, 1], [4, 128, 512, 4096]);
+        let f16_act: Operand = (HtpDataType::F16 as u32, [64, 8, 1, 1], [2, 128, 1024, 1024]);
+        let positions: Operand = (i32_t, [1, 1, 1, 1], [4, 4, 4, 4]);
+        let f32_vec: Operand = (f32_t, [32, 1, 1, 1], [4, 128, 128, 128]);
+        let mut refuse = |op: HtpOpCode, operands: &[Operand], src: &[usize], dst: usize| {
+            let ids: Vec<u16> = operands
+                .iter()
+                .map(|&(d, ne, nb)| q.add_tensor(&buf, 0, 4096, 0, d, ne, nb).unwrap())
+                .collect();
+            let src: Vec<u16> = src.iter().map(|&i| ids[i]).collect();
+            let err = q
+                .enqueue_op(op as u32, &src, &[ids[dst]], params, [0; 32])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(op.name()), "{err}");
+            assert_pending_empty(&q, "refused op");
+        };
+        refuse(HtpOpCode::Softmax, &[f32_row; 3], &[0, 1, 2], 0);
+        refuse(HtpOpCode::Rope, &[f16_act, positions], &[0, 1], 0);
+        refuse(HtpOpCode::Argsort, &[f32_vec, f32_vec], &[0], 1);
+        refuse(
+            HtpOpCode::Rope,
+            &[(f32_t, [64, 8, 1, 1], [4, 256, 2048, 2048])],
+            &[0],
+            0,
+        );
+        let dst = q
+            .add_tensor(&buf, 0, 4, 0, i32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        let err = q
+            .enqueue_op(
+                HtpOpCode::Argmax as u32,
+                &[0xffff],
+                &[dst],
+                [0; 16],
+                [0; 32],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Argmax"), "{err}");
+        assert_pending_empty(&q, "argmax sentinel");
+    }
+
+    /// An `SsmConv` enqueued with empty kernel params gets them from the registered window, taps
+    /// and output at the session's thread count and VTCM size; a window the VTCM cannot hold, an
+    /// operand that is not registered and a wrong operand count are errors that drop the batch.
+    #[test]
+    fn ssm_conv_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{CopyTensor, build_ssm_conv_kernel_params};
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 20, false).unwrap();
+        let f32_t = HtpDataType::F32 as u32;
+        let (d_conv, d_inner, n_t) = (3u32, 1024u32, 32u32);
+        let ncs = d_conv - 1 + n_t;
+        let mut q = test_session();
+        let register = |q: &mut HexagonQueueSession| {
+            let x = q
+                .add_tensor(
+                    &buf,
+                    0,
+                    (ncs * d_inner * 4) as usize,
+                    0,
+                    f32_t,
+                    [ncs, d_inner, 1, 1],
+                    [4, ncs * 4, ncs * d_inner * 4, ncs * d_inner * 4],
+                )
+                .unwrap();
+            let w = q
+                .add_tensor(
+                    &buf,
+                    1 << 17,
+                    (d_conv * d_inner * 4) as usize,
+                    0,
+                    f32_t,
+                    [d_conv, d_inner, 1, 1],
+                    [4, d_conv * 4, d_conv * d_inner * 4, d_conv * d_inner * 4],
+                )
+                .unwrap();
+            let y = q
+                .add_tensor(
+                    &buf,
+                    1 << 18,
+                    (d_inner * n_t * 4) as usize,
+                    0,
+                    f32_t,
+                    [d_inner, n_t, 1, 1],
+                    [4, d_inner * 4, d_inner * n_t * 4, d_inner * n_t * 4],
+                )
+                .unwrap();
+            (x, w, y)
+        };
+
+        let (x, w, y) = register(&mut q);
+        q.enqueue_op(HtpOpCode::SsmConv as u32, &[x, w], &[y], [0; 16], [0; 32])
+            .unwrap();
+        let view = |t: &HtpTensor| CopyTensor::from(t);
+        let want = build_ssm_conv_kernel_params(
+            &view(&q.tens[x as usize]),
+            &view(&q.tens[w as usize]),
+            &view(&q.tens[y as usize]),
+            q.dsp_threads(),
+            q.dsp_vtcm_bytes(),
+        )
+        .expect("an LFM2 conv chunk fits the default VTCM");
+        assert_eq!(q.ops[0].kernel_params, want);
+        assert_ne!(want, [0; 32]);
+        assert_eq!(
+            want[0] as u32,
+            q.dsp_threads(),
+            "one thread per 32 channels"
+        );
+
+        // The caller's own params pass through untouched.
+        q.enqueue_op(HtpOpCode::SsmConv as u32, &[x, w], &[y], [0; 16], [7; 32])
+            .unwrap();
+        assert_eq!(q.ops[1].kernel_params, [7; 32]);
+
+        // Operand counts and unregistered operands.
+        for (src, dst) in [
+            (vec![x], vec![y]),
+            (vec![x, w], vec![]),
+            (vec![x, 0xffff], vec![y]),
+            (vec![x, w], vec![0xffff]),
+            (vec![x, 99], vec![y]),
+        ] {
+            let e = q.enqueue_op(HtpOpCode::SsmConv as u32, &src, &dst, [0; 16], [0; 32]);
+            assert!(e.is_err(), "{src:?} -> {dst:?} must be refused");
+            assert_pending_empty(&q, "ssm_conv operands");
+            register(&mut q);
+        }
+        q.drop_pending_batch();
+
+        // A VTCM too small for the plan: the error names the budget, and the batch is dropped.
+        q.set_dsp_hw(0, 64 * 1024);
+        let (x, w, y) = register(&mut q);
+        let err = q
+            .enqueue_op(HtpOpCode::SsmConv as u32, &[x, w], &[y], [0; 16], [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("65536 bytes of VTCM"), "{err}");
+        assert_pending_empty(&q, "ssm_conv vtcm");
+    }
+
+    /// An elementwise op (binary, unary, GLU) enqueued with empty kernel params gets them from the
+    /// registered tensors, the words llama.cpp's solvers give for those tensors; explicit params
+    /// are sent as given; a wrong operand count or a layout the kernels refuse is an error that
+    /// drops the batch.
+    #[test]
+    fn elementwise_params_are_derived_from_the_registered_tensors() {
+        use super::super::eltwise::{
+            HTP_BINARY_KERNEL_CHUNKED, HTP_BINARY_KERNEL_ROW_BCAST, binary_kernel_type,
+            solve_binary, solve_glu, solve_unary,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 16, false).unwrap();
+        let f32_t = HtpDataType::F32 as u32;
+        let mut q = test_session();
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+        let view = |t: &HtpTensor| CopyTensor::from(t);
+
+        // [64, 4] activations, a [64] row to broadcast, a [64, 4] result
+        let x = q
+            .add_tensor(&buf, 0, 1024, 0, f32_t, [64, 4, 1, 1], [4, 256, 1024, 1024])
+            .unwrap();
+        let row = q
+            .add_tensor(&buf, 1024, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        let y = q
+            .add_tensor(
+                &buf,
+                2048,
+                1024,
+                0,
+                f32_t,
+                [64, 4, 1, 1],
+                [4, 256, 1024, 1024],
+            )
+            .unwrap();
+
+        // row broadcast, and the same-shape contiguous case that streams flat chunks
+        q.enqueue_op(HtpOpCode::Mul as u32, &[x, row], &[y], [0; 16], [0; 32])
+            .unwrap();
+        q.enqueue_op(HtpOpCode::Add as u32, &[x, y], &[y], [0; 16], [0; 32])
+            .unwrap();
+        let want_bcast = solve_binary(
+            HtpOpCode::Mul as u32,
+            &view(&q.tens[x as usize]),
+            &view(&q.tens[row as usize]),
+            None,
+            &view(&q.tens[y as usize]),
+            threads,
+            vtcm,
+        )
+        .unwrap();
+        assert_eq!(q.ops[0].kernel_params, want_bcast);
+        assert_eq!(binary_kernel_type(&want_bcast), HTP_BINARY_KERNEL_ROW_BCAST);
+        assert_eq!(
+            binary_kernel_type(&q.ops[1].kernel_params),
+            HTP_BINARY_KERNEL_CHUNKED
+        );
+
+        // unary, a fused norm with its weight row, and a two-source GLU
+        q.enqueue_op(HtpOpCode::UnarySilu as u32, &[x], &[y], [0; 16], [0; 32])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::RmsNormMul as u32,
+            &[x, row],
+            &[y],
+            [0; 16],
+            [0; 32],
+        )
+        .unwrap();
+        q.enqueue_op(HtpOpCode::GluSwiglu as u32, &[x, y], &[y], [0; 16], [0; 32])
+            .unwrap();
+        let (tx, tr, ty) = (
+            view(&q.tens[x as usize]),
+            view(&q.tens[row as usize]),
+            view(&q.tens[y as usize]),
+        );
+        assert_eq!(
+            q.ops[2].kernel_params,
+            solve_unary(HtpOpCode::UnarySilu as u32, &tx, None, &ty, threads, vtcm).unwrap()
+        );
+        assert_eq!(
+            q.ops[3].kernel_params,
+            solve_unary(
+                HtpOpCode::RmsNormMul as u32,
+                &tx,
+                Some(&tr),
+                &ty,
+                threads,
+                vtcm
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            q.ops[4].kernel_params,
+            solve_glu(
+                HtpOpCode::GluSwiglu as u32,
+                &tx,
+                Some(&ty),
+                &ty,
+                threads,
+                vtcm
+            )
+            .unwrap()
+        );
+        assert!(q.ops[2..5].iter().all(|o| o.kernel_params != [0; 32]));
+
+        // explicit params are the caller's; ops that take none are left alone
+        q.enqueue_op(HtpOpCode::Add as u32, &[x, y], &[y], [0; 16], [7; 32])
+            .unwrap();
+        assert_eq!(q.ops[5].kernel_params, [7; 32]);
+        q.enqueue_op(HtpOpCode::Upscale as u32, &[x, row], &[y], [0; 16], [0; 32])
+            .unwrap();
+        assert_eq!(q.ops[6].kernel_params, [0; 32]);
+
+        // a wrong operand count, a missing operand, and a layout the kernels refuse each drop the batch
+        for (op, src, dst) in [
+            (HtpOpCode::Add, vec![x], vec![y]),
+            (HtpOpCode::Add, vec![x, row], vec![]),
+            (HtpOpCode::UnarySilu, vec![x, row], vec![y]),
+            (HtpOpCode::RmsNormMul, vec![x], vec![y]),
+            (HtpOpCode::GluSwiglu, vec![0xffff], vec![y]),
+            (HtpOpCode::Mul, vec![x, 0xffff], vec![y]),
+        ] {
+            let e = q.enqueue_op(op as u32, &src, &dst, [0; 16], [0; 32]);
+            assert!(e.is_err(), "{op:?} {src:?} -> {dst:?} must be refused");
+            assert_pending_empty(&q, "elementwise operand check");
+            // the refusal dropped the batch; register again
+            let x2 = q
+                .add_tensor(&buf, 0, 1024, 0, f32_t, [64, 4, 1, 1], [4, 256, 1024, 1024])
+                .unwrap();
+            assert_eq!(x2, 0);
+            let row2 = q
+                .add_tensor(&buf, 1024, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+                .unwrap();
+            let y2 = q
+                .add_tensor(
+                    &buf,
+                    2048,
+                    1024,
+                    0,
+                    f32_t,
+                    [64, 4, 1, 1],
+                    [4, 256, 1024, 1024],
+                )
+                .unwrap();
+            assert_eq!((row2, y2), (1, 2));
+        }
+        // transposed source: the DSP's binary kernels need packed elements
+        let xt = q
+            .add_tensor(&buf, 0, 1024, 0, f32_t, [64, 4, 1, 1], [256, 4, 1024, 1024])
+            .unwrap();
+        let err = q
+            .enqueue_op(HtpOpCode::Add as u32, &[xt, y], &[y], [0; 16], [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not handle"), "{err}");
+        assert_pending_empty(&q, "unsupported elementwise layout");
+    }
+
     /// A batch the DSP has not answered may still be running against the
     /// buffer, so the release is withheld rather than raced.
     #[test]
@@ -2028,7 +3255,7 @@ mod tests {
         buf: &RpcmemBuffer,
     ) -> Result<(), CeraError> {
         let ti = q.add_tensor(buf, 0, 64, 0, 0, [1; 4], [4; 4])?;
-        q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])?;
+        q.enqueue_op(HtpOpCode::Add as u32, &[ti, ti], &[ti], [0; 16], [0; 32])?;
         // The group boundary is where step mode flushes.
         q.end_group()
     }
@@ -2261,7 +3488,7 @@ mod tests {
         let before = writes();
         let ti = q.add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4]).unwrap();
         for _ in 0..3 {
-            q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+            q.enqueue_op(HtpOpCode::Add as u32, &[ti, ti], &[ti], [0; 16], [0; 32])
                 .unwrap();
         }
         assert_eq!(writes(), before, "no flush inside the group");

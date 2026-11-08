@@ -698,17 +698,7 @@ pub(crate) fn emit_conv_module<S: OpSink>(
         n,
     )?;
     dispatch::ssm_conv(
-        s,
-        weights,
-        conv.dw_w,
-        scratch,
-        so.conv_x,
-        scratch,
-        so.conv_y,
-        kernel,
-        n,
-        t,
-        dispatch::VTCM_BUDGET,
+        s, weights, conv.dw_w, scratch, so.conv_x, scratch, so.conv_y, kernel, n, t,
     )?;
     // Depthwise bias, the per-channel affine "conv_norm", then SiLU.
     dispatch::add_row_bcast(s, scratch, so.conv_y, weights, conv.dw_b, embd, TILE)?;
@@ -2546,7 +2536,7 @@ mod tests {
             .add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4])
             .unwrap();
         session
-            .enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+            .enqueue_op(HtpOpCode::Add as u32, &[ti, ti], &[ti], [0; 16], [0; 32])
             .unwrap();
         session.end_group().unwrap();
         fake::with(|s| s.fail_read = true);

@@ -187,6 +187,11 @@ required-features = ["hexagon", "mmap"]
 name = "hexagon_decode_probe"
 required-features = ["hexagon", "mmap"]
 
+# NPU logits against the CPU's, step by step, short and long context (device only).
+[[example]]
+name = "hexagon_logit_parity"
+required-features = ["hexagon", "mmap"]
+
 # The NPU Conformer encoder, stage by stage against the CPU one (device only).
 [[example]]
 name = "hexagon_conformer_probe"

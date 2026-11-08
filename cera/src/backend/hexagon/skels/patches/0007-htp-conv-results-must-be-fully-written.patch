@@ -1,0 +1,32 @@
+diff --git a/ggml/src/ggml-hexagon/htp/conv1d-ops.c b/ggml/src/ggml-hexagon/htp/conv1d-ops.c
+index 3f1694a80..512095e95 100644
+--- a/ggml/src/ggml-hexagon/htp/conv1d-ops.c
++++ b/ggml/src/ggml-hexagon/htp/conv1d-ops.c
+@@ -205,9 +205,12 @@ int op_conv1d(struct htp_ops_context * octx) {
+     const uint32_t c_out = dst->ne[1];
+ 
+     // The worker divides by c_out / groups and indexes the weight, input and bias by these extents.
++    // It handles three dimensions only: a fourth would be read as slab 0 and leave the rest of the
++    // result unwritten.
+     if (groups > c_out || c_in % groups != 0 || c_out % groups != 0 ||
+         src1->ne[1] != c_in / groups || src1->ne[2] != c_out ||
+-        src0->ne[2] < dst->ne[2] || (src2 && src2->ne[0] < c_out)) {
++        src0->ne[2] < dst->ne[2] || (src2 && src2->ne[0] < c_out) ||
++        src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1) {
+         FARF(ERROR, "op_conv1d: shapes do not agree (c_in %u, c_out %u, groups %u)", c_in, c_out, groups);
+         return HTP_STATUS_NO_SUPPORT;
+     }
+@@ -309,8 +312,11 @@ int op_conv_transpose1d(struct htp_ops_context * octx) {
+         return HTP_STATUS_NO_SUPPORT;
+     }
+ 
+-    // The worker indexes the weight by (k, c_out, c_in) and writes one output slab per input batch.
+-    if (weight->ne[1] != dst->ne[1] || weight->ne[2] != input->ne[1] || dst->ne[2] < input->ne[2] ||
++    // The worker indexes the weight by (k, c_out, c_in) and writes exactly one output slab per input
++    // batch: a result with more batches would come back "successful" with slabs never written, and
++    // a fourth dimension is not handled.
++    if (weight->ne[1] != dst->ne[1] || weight->ne[2] != input->ne[1] || dst->ne[2] != input->ne[2] ||
++        weight->ne[3] != 1 || input->ne[3] != 1 || dst->ne[3] != 1 ||
+         (src2 && src2->ne[0] < dst->ne[1])) {
+         FARF(ERROR, "op_conv_transpose1d: shapes do not agree");
+         return HTP_STATUS_NO_SUPPORT;

@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer,
-    align128, build_binary_kernel_params, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    align128, flash_attn_hmx_rows_ok, flash_attn_kernel_request, flash_attn_op_params, repack_q4_0,
+    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
@@ -764,23 +764,13 @@ impl HexagonVisionEncoder {
         )?;
 
         let add_params = [0i32; 16];
-        let add_kparams = build_binary_kernel_params(
-            rows,
-            rows,
-            1,
-            1,
-            1,
-            4,
-            dispatch::VTCM_BUDGET,
-            session.dsp_threads(),
-        );
         session
             .enqueue_op(
                 HtpOpCode::Add as u32,
                 &[dst_ti, b_ti],
                 &[dst_ti],
                 add_params,
-                add_kparams,
+                [0i32; 32],
             )
             .map_err(|e| CeraError::Backend(format!("linear_bias_add: {e}")))?;
 
@@ -841,7 +831,6 @@ impl HexagonVisionEncoder {
                     HtpDataType::F16,
                     ne0,
                     ne1,
-                    n_tokens.next_multiple_of(32),
                     n_tokens,
                     session.dsp_threads(),
                     h.vtcm_budget,
@@ -945,16 +934,34 @@ impl HexagonVisionEncoder {
                     n_tokens,
                 )
             });
-        let Some((w_dtype, block_bytes, tile_size)) = fused_quant.filter(|_| {
-            fits_fused
-                && !hmx_matmul
-                && q_w.cols == k_w.cols
-                && k_w.cols == v_w.cols
-                && q_w.rows == k_w.rows
-                && k_w.rows == v_w.rows
-                && q_w.format == k_w.format
-                && k_w.format == v_w.format
-        }) else {
+        // The fused HVX kernel (the HMX matmul above takes the rows it can feed): the solver's
+        // params for the first weight, which the other two match in shape.
+        let fused = fused_quant
+            .filter(|_| {
+                fits_fused
+                    && !hmx_matmul
+                    && q_w.cols == k_w.cols
+                    && k_w.cols == v_w.cols
+                    && q_w.rows == k_w.rows
+                    && k_w.rows == v_w.rows
+                    && q_w.format == k_w.format
+                    && k_w.format == v_w.format
+            })
+            .and_then(|quant| {
+                crate::backend::hexagon::build_mul_mat_nx_kernel_params(
+                    quant.0,
+                    q_w.cols,
+                    q_w.cols,
+                    q_w.rows,
+                    3,
+                    n_tokens,
+                    session.dsp_threads(),
+                    dispatch::VTCM_BUDGET,
+                    false,
+                )
+                .map(|kparams| (quant, kparams))
+            });
+        let Some(((w_dtype, block_bytes, tile_size), kparams)) = fused else {
             Self::dispatch_linear_m(
                 session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens,
             )?;
@@ -983,7 +990,7 @@ impl HexagonVisionEncoder {
             weights,
             q_w.offset,
             q_w.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             w_ne,
             w_nb,
@@ -992,7 +999,7 @@ impl HexagonVisionEncoder {
             weights,
             k_w.offset,
             k_w.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             w_ne,
             w_nb,
@@ -1001,7 +1008,7 @@ impl HexagonVisionEncoder {
             weights,
             v_w.offset,
             v_w.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED,
             w_dtype as u32,
             w_ne,
             w_nb,
@@ -1051,25 +1058,6 @@ impl HexagonVisionEncoder {
             dst_ne,
             dst_nb,
         )?;
-
-        let mut mm = crate::backend::hexagon::MmKernelParams::from_words(
-            &crate::backend::hexagon::build_mul_mat_kernel_params(
-                w_dtype,
-                ne0,
-                n_tokens as u32,
-                1,
-                ne1 * 4,
-                session.dsp_threads(),
-                dispatch::VTCM_BUDGET,
-            ),
-        );
-        // `fits_fused` above keeps the rows inside what the fused layout holds,
-        // which implies the plain layout needs no chunk; the fused kernel could
-        // not honour one.
-        debug_assert_eq!(mm.m_chunk, 0, "fused QKV must not need a row chunk");
-        mm.kernel_type = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
-        mm.n_weights = 3;
-        let kparams = mm.to_words();
 
         let params = [0i32; 16];
         session
@@ -1161,42 +1149,15 @@ impl HexagonVisionEncoder {
             [4, (head_dim * 4) as u32, (q_dim * 4) as u32, q_bytes as u32],
         )?;
 
-        let mut params = [0i32; 16];
-        params[0] = scale.to_bits() as i32;
+        let params = flash_attn_op_params(scale, 0.0);
 
-        // Many query rows against the same K/V: run the HMX kernel when the DSP has one
-        // and a tiling fits VTCM, as the LFM2 prefill does; `CERA_HEXAGON_VIT_FA=hvx`
-        // keeps the row-at-a-time HVX kernel for comparison.
+        // Many query rows against the same K/V: the queue solves the kernel from the tensors,
+        // HMX when the DSP has a unit and a tiling fits VTCM, as the LFM2 prefill does (and only
+        // from 5 query rows, the rule before the skel refresh);
+        // `CERA_HEXAGON_VIT_FA=hvx` keeps the row-at-a-time HVX kernel for comparison.
         let hvx_only = std::env::var("CERA_HEXAGON_VIT_FA").is_ok_and(|v| v == "hvx");
-        let hmx_kparams = if !hvx_only
-            && session.dsp_hmx() > 0
-            && crate::backend::hexagon::fa_is_hmx_eligible(head_dim, n_tokens)
-        {
-            crate::backend::hexagon::build_hmx_fa_kernel_params(
-                head_dim,
-                n_heads,
-                n_heads,
-                n_tokens,
-                n_tokens,
-                scale,
-                session.dsp_threads(),
-                session.dsp_vtcm_bytes(),
-            )
-        } else {
-            None
-        };
-        let kparams = hmx_kparams.unwrap_or_else(|| {
-            crate::backend::hexagon::build_flash_attn_kernel_params(
-                head_dim,
-                n_heads,
-                n_heads,
-                n_tokens,
-                n_tokens,
-                scale,
-                session.dsp_threads(),
-                false,
-            )
-        });
+        let kparams =
+            flash_attn_kernel_request(!hvx_only && flash_attn_hmx_rows_ok(head_dim, n_tokens));
 
         session
             .enqueue_op(

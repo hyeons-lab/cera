@@ -4,13 +4,13 @@ cera-ffi-android third-party notices
 This library embeds prebuilt Qualcomm Hexagon DSP worker libraries
 (`libcera-htp-v73.so`, `libcera-htp-v75.so`, `libcera-htp-v79.so`,
 `libcera-htp-v81.so`, `libcera-htp-v85.so`, inside libcera_ffi.so). They are compiled from
-llama.cpp sources plus one patch to the Q8 activation quantizer
-(in the cera repository under
+llama.cpp sources plus seven patches (a fix to the Q8 activation quantizer and the
+Conv1D, ConvTranspose1D and additional unary operations; in the cera repository under
 `cera/src/backend/hexagon/skels/patches/`):
 
   Copyright (c) 2023-2026 The ggml authors
   License: MIT (full text below)
-  Source: https://github.com/ggml-org/llama.cpp at 00ccd6970,
+  Source: https://github.com/ggml-org/llama.cpp at e95426f16,
   ggml/src/ggml-hexagon/htp/
 
 --------------------------------------------------------------------------------
