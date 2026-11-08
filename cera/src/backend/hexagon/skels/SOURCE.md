@@ -110,7 +110,8 @@ vendoring them.
   quantization step (0.58% of the block maximum) after it. The tiled quantizers were only
   refactored onto the shared helper: full-logit cosines against the CPU are unchanged to six digits
   on four models (including a 1,300-token context), and decode replays stay bit-identical.
-  v73, v75, v81 and v85 are the same C code rebuilt; only v79 has been run on hardware.
+  v73, v75 and v81 are the same C code rebuilt and have not been run on hardware; v79 (Galaxy S25
+  Ultra) and v85 (an SM8975, below) have.
 - Extension patches `0005` and `0006` (the ops `0002` and `0003` added): ConvTranspose1D took its
   kernel from `src[0]` or `src[1]` by comparing widths, so an input no wider than the kernel swapped
   the roles and returned garbage; it is now always `src[0]` `[K, C_out, C_in]` and the input
@@ -132,6 +133,12 @@ vendoring them.
   that sends these ops yet, so those device tests are their only numeric coverage; the same tests
   pin the Q8_0 row quantizer's NaN and infinity contract and a Q4_1 matmul over activations with
   block maxima down to 3e-4 (cosine 0.99999), which the quantizer patch fixed earlier.
+  The v85 skel has run on an SM8975 (Android 17, `DSP architecture V85`): the same 14 device tests
+  pass with the same numbers as on the v79 (conv within 1.2e-7, alpha 0 exact, Q8_0 SetRows within
+  0.58% of a block's maximum, Q4_1 and partial-tile matmuls at cosine 0.99999), and against the
+  CPU the full-logit cosine is 0.9997 or better over 12 decode steps of LFM2-700M, 0.9985 at a
+  1,300-token context and 0.9985 for LFM3, with the argmax agreeing on every step and decode
+  replays bit-identical.
   The v85 skel is built with the newer toolchain below, so the same sources were also built for
   v79 with it and run on the same device: Q8_0 SetRows test, full-logit cosines against the CPU
   (four models, including a 1,300-token context), decode replays and throughput all match the v0.7

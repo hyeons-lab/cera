@@ -135,10 +135,11 @@ type DspqueueReadNoblockFn = extern "C" fn(
     msg: *mut u8,
 ) -> i32;
 
-/// Dynamically loaded FastRPC library handle and dispatch table.
+/// Dynamically loaded FastRPC dispatch table. The library itself is never unloaded: FastRPC
+/// registers pthread-key destructors on every thread that calls it, and `dlclose` would unmap them
+/// (the thread's exit then jumps into unmapped memory: SIGSEGV in `pthread_key_clean_all` on an
+/// Android 17 build, after every device test and for any caller whose threads outlive the driver).
 pub struct FastRpcDriver {
-    handle: *mut c_void,
-
     // Memory allocation
     rpcmem_alloc: RpcmemAllocFn,
     rpcmem_alloc2: Option<RpcmemAlloc2Fn>,
@@ -271,7 +272,6 @@ impl FastRpcDriver {
                 }
 
                 let driver = Self {
-                    handle: lib_handle,
                     rpcmem_alloc: resolve!("rpcmem_alloc", RpcmemAllocFn),
                     rpcmem_alloc2: resolve_opt!("rpcmem_alloc2", RpcmemAlloc2Fn),
                     rpcmem_free: resolve!("rpcmem_free", RpcmemFreeFn),
@@ -827,16 +827,6 @@ impl FastRpcDriver {
     }
 }
 
-impl Drop for FastRpcDriver {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                libc::dlclose(self.handle);
-            }
-        }
-    }
-}
-
 /// Host-side fake FastRPC driver for unit tests: every entry point is an
 /// `extern "C"` fn recording into a thread-local log, so tests (one thread
 /// each) stay isolated and the Hexagon paths that only need the driver's
@@ -1134,8 +1124,6 @@ pub(crate) mod fake {
 
     fn build(oppoll: bool, noblock: bool) -> Arc<FastRpcDriver> {
         Arc::new(FastRpcDriver {
-            #[cfg(unix)]
-            handle: std::ptr::null_mut(),
             rpcmem_alloc: alloc,
             rpcmem_alloc2: None,
             rpcmem_free: free,
