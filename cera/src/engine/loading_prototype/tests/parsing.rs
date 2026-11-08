@@ -88,6 +88,126 @@ fn file_kind_and_inference_gates_keep_auxiliary_error_order() {
     );
 }
 
+// A failed open must say why (missing, unreadable); `anyhow`'s plain `Display`
+// prints only the outermost "opening <path>" context.
+#[cfg(feature = "mmap")]
+#[test]
+fn failed_primary_open_reports_the_os_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.gguf");
+    let os_error = std::fs::File::open(&missing).unwrap_err();
+    let shown = missing.display();
+    // An explicit inference type opens the primary at assembly; `None` opens
+    // it first to read the architecture.
+    for (inference, expected) in [
+        (
+            Some(InferenceType::LlamaCppTextToText),
+            format!("opening `{shown}`: opening {shown}: {os_error}"),
+        ),
+        (
+            None,
+            format!(
+                "opening `{shown}` for inference-type auto-detect: opening {shown}: {os_error}"
+            ),
+        ),
+    ] {
+        let mut files = crate::ModelFiles::text(&missing);
+        files.inference_type = inference;
+        let legacy = CeraEngine::from_files(files.clone(), cpu_config())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&legacy, CeraError::Backend(message) if *message == expected),
+            "{legacy}"
+        );
+        let typed = error(
+            ModelLoader::new(ModelSource::files(files))
+                .config(cpu_config())
+                .build_generative(),
+        );
+        assert!(
+            matches!(&typed, LoadError::Source { source_kind: "files", error: CeraError::Backend(message) } if *message == expected),
+            "{typed}"
+        );
+    }
+}
+
+// `Manifest::from_file` wraps the OS error of a failed read in its own context; plain `{e}` would
+// stop at "reading manifest file".
+#[cfg(feature = "mmap")]
+#[test]
+fn failed_manifest_read_reports_the_os_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let os_error = std::fs::read(&missing).unwrap_err();
+    let shown = missing.display();
+    let expected =
+        format!("parsing manifest `{shown}`: reading manifest file: {shown}: {os_error}");
+    let legacy = CeraEngine::from_path(&missing, cpu_config()).err().unwrap();
+    assert!(
+        matches!(&legacy, CeraError::Backend(message) if *message == expected),
+        "{legacy}"
+    );
+    let typed = error(
+        ModelLoader::new(ModelSource::path(&missing))
+            .config(cpu_config())
+            .build_generative(),
+    );
+    assert!(
+        matches!(&typed, LoadError::Source { error: CeraError::Backend(message), .. } if *message == expected),
+        "{typed}"
+    );
+}
+
+// A stream that fails to read must say why, not only that it did.
+#[test]
+fn failed_stream_read_reports_the_cause() {
+    struct Broken;
+    impl std::io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("connection reset"))
+        }
+    }
+    let failure = CeraEngine::from_reader(Broken, cpu_config()).err().unwrap();
+    assert!(
+        matches!(&failure, CeraError::Backend(message) if message == "reading GGUF stream: reading GGUF stream: connection reset"),
+        "{failure}"
+    );
+}
+
+// `GgufFile::open` puts the path in the error only for the `File::open` step. A file that opens
+// but does not parse is named by the engine's own "opening <path>" prefix, so that prefix is not
+// redundant with the one `open` adds; this test fails if either side changes.
+#[cfg(feature = "mmap")]
+#[test]
+fn a_corrupt_primary_is_reported_with_its_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let corrupt = directory.path().join("corrupt.gguf");
+    std::fs::write(&corrupt, b"this is text, not a GGUF file").unwrap();
+    let shown = corrupt.display().to_string();
+    let opened = crate::gguf::GgufFile::open(&corrupt).err().unwrap();
+    let inner = format!("{opened:#}");
+    assert!(!inner.contains(&shown), "{inner}");
+    for (inference, prefix) in [
+        (
+            Some(InferenceType::LlamaCppTextToText),
+            format!("opening `{shown}`: "),
+        ),
+        (
+            None,
+            format!("opening `{shown}` for inference-type auto-detect: "),
+        ),
+    ] {
+        let mut files = crate::ModelFiles::text(&corrupt);
+        files.inference_type = inference;
+        let failure = CeraEngine::from_files(files, cpu_config()).err().unwrap();
+        assert!(
+            matches!(&failure, CeraError::Backend(message) if message.starts_with(&prefix) && message.len() > prefix.len()),
+            "{failure}"
+        );
+    }
+}
+
 // APFS rejects these filenames. Linux exercises the legacy distinction between
 // a manifest's lossy string path and ModelFiles' original byte path.
 #[cfg(all(feature = "mmap", target_os = "linux"))]
