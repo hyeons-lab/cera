@@ -33,8 +33,8 @@ vendoring them.
 
 ## Provenance
 
-- Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus the six patches in `patches/`,
-  applied in filename order with `git apply`. They are exported from seven commits of a local,
+- Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus the seven patches in `patches/`,
+  applied in filename order with `git apply`. They are exported from eight commits of a local,
   unpublished llama.cpp branch (`feat/hexagon-nov-rebase`), and the series applied to a bare
   `e95426f16` gives exactly that branch's tree (compared by tree hash):
   - `0001` is the quantizer patch below (`93b1163c9` and `b5d25b652`, as one combined diff);
@@ -45,10 +45,12 @@ vendoring them.
     (`c2d4a889a`);
   - `0005` pins the ConvTranspose1D operand order, makes the depthwise Conv1D vector path
     alignment-safe and makes both conv ops refuse inconsistent shapes (`d8b012aee`);
-  - `0006` makes Snake and ELU read their alpha as given (`3cf6cd686`).
+  - `0006` makes Snake and ELU read their alpha as given (`3cf6cd686`);
+  - `0007` makes both conv ops refuse results the worker would leave partly unwritten
+    (`95e217f83`).
 
   `0001` shares no file with the others, so its place in the order does not matter; `0002` to
-  `0006` all touch `conv1d-ops.c` or `unary-ops.c` and must stay in order. The previous skels were
+  `0007` all touch `conv1d-ops.c` or `unary-ops.c` and must stay in order. The previous skels were
   built from upstream `de7fa0a3c` with the same extensions.
 - Host contract: every op's `kernel_params` come from the host, and every layout changed with the
   refresh (the FastRPC `start` call also gained `vtcm_size` and `power_mode`; `HtpOpCode` is
@@ -73,6 +75,9 @@ vendoring them.
     accepted, since `softmax-ops.c` DMAs mask rows by stride;
   - a session with no threads counts as one in the matmul and elementwise solvers and is refused
     by the row-sum and row-gather layouts, where the C divides by the count;
+  - an elementwise (binary, unary, GLU) operand whose extent from first to last byte exceeds the
+    `u32` size of a registered descriptor is refused; the C holds sizes in 32 bits and would plan
+    on wrapped, smaller ones;
   - a unary or GLU operand whose planes or batches sit a gap apart (a slice of a larger buffer) is
     not collapsed: upstream's merge and split steps rewrite the plane strides from the row stride
     and the new extents, so such a view came out addressing other bytes than it went in with. The
@@ -112,24 +117,29 @@ vendoring them.
   on four models (including a 1,300-token context), and decode replays stay bit-identical.
   v73, v75 and v81 are the same C code rebuilt and have not been run on hardware; v79 (Galaxy S25
   Ultra) and v85 (an SM8975, below) have.
-- Extension patches `0005` and `0006` (the ops `0002` and `0003` added): ConvTranspose1D took its
+- Extension patches `0005` to `0007` (the ops `0002` and `0003` added): ConvTranspose1D took its
   kernel from `src[0]` or `src[1]` by comparing widths, so an input no wider than the kernel swapped
   the roles and returned garbage; it is now always `src[0]` `[K, C_out, C_in]` and the input
   `src[1]`, the ggml order. The depthwise stride-1 Conv1D vector path loaded and stored through
   plain `HVX_Vector` pointers at arbitrary element offsets, which hit the 128-byte block below the
   address; it goes through `hvx_vmemu` now and only runs for contiguous rows. Both conv ops return
   `NO_SUPPORT` when the groups do not divide the channels or the weight, input, bias and result
-  extents disagree (the host refuses the same shapes first, `conv1d_shapes_ok`). Snake and ELU
+  extents disagree, when a fourth extent is not 1, and (ConvTranspose1D) when the result has other
+  batches than the input, whose slabs would come back unwritten (`0007`). The host refuses the
+  same shapes first (`conv1d_shapes_ok`, `conv_transpose1d_shapes_ok`). Snake and ELU
   used to read an all-zero alpha as "not supplied" and take 1.0; they read it as given (Snake with
   alpha 0 is the identity, ELU with alpha 0 a ReLU), so callers pass 1.0 for the default.
   Evidence on a v79 (`dispatch.rs` device tests): against the skel before the patches the
   depthwise Conv1D cases were off by 0.7 to 37 (relative to the largest output), ConvTranspose1D
   with an input no wider than the kernel by about 1, Snake and ELU with alpha 0 by 17%, and shapes
   with more groups than output channels were accepted; with the patched skel every conv case is
-  within 1.2e-7, alpha 0 is exact, the three inconsistent shapes are refused, and Sin, Cos, Snake,
+  within 1.2e-7, alpha 0 is exact, and Sin, Cos, Snake,
   ELU, HardSigmoid and HardSwish stay within 4e-7 on rows ending in a partial vector. Full-logit
   cosines against the CPU (LFM2.5-350M at 11 and 1,300 prompt tokens, LFM2.5-2.6B, LFM3-1.7B),
-  argmax agreement and decode replays are the same as before the patches. cera has no host path
+  argmax agreement and decode replays are the same as before the patches. The DSP's own refusals
+  are tested with ops sent past the host's validation (`enqueue_op_unvalidated`, eight cases, each
+  breaking one rule, then a valid conv): all refused with `NoSupport`, and the skel before `0007`
+  accepts the fourth-extent case. cera has no host path
   that sends these ops yet, so those device tests are their only numeric coverage; the same tests
   pin the Q8_0 row quantizer's NaN and infinity contract and a Q4_1 matmul over activations with
   block maxima down to 3e-4 (cosine 0.99999), which the quantizer patch fixed earlier.
@@ -157,16 +167,16 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: 292d68c70f746a0441e183121b87514d
-- v75: 4ef589b3a93f967b969a167a6576e3e6
-- v79: bdc1e3fd3f0efb0349524a0aa42a5691
-- v81: 8b5a5f02923163869029fd2baa250577
-- v85: 0a6078313477f87e098bfd579231573b
+- v73: 76c72db29fae2ecc6b47a32a955abbb4
+- v75: ab2eb03f4ae3ae5329911456ce853a97
+- v79: 06b17ec6e60dabdbb2ec2135d16c2c65
+- v81: 1f0d967ff00122fa977317aa30e048c5
+- v85: 6b159fca504a9b984dc588108d88274e
 
 These are the md5s of the shipped, renamed files. The unrenamed build outputs were
-v73 9e6ed46ed37393c82c58c5da9d028957, v75 ad8adc37543dd72d98b8b513bace4c15,
-v79 416b9c39ef0612562a8c65a06fba65f5, v81 9cde9d7b40262b7080d1edc961645e9e and
-v85 a2a2a097e360f7dd9d809766cd9b937b. `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
+v73 377925c5e8768578e8ae3a945805d8c7, v75 4482706490c14c933b0bcbe72e3e2045,
+v79 d6ff8c37af1094ffeb18476596d894c7, v81 9e17813855cc6e0a3ffc0956abd35708 and
+v85 d188dbd182bc6978e0d7ee046b9d100a. `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
 file's SWIV CRC and lists the SONAME inside.
 
 ## Rebuilding
