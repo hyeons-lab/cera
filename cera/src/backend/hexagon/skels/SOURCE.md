@@ -33,8 +33,8 @@ vendoring them.
 
 ## Provenance
 
-- Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus the four patches in `patches/`,
-  applied in filename order with `git apply`. They are exported from five commits of a local,
+- Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus the six patches in `patches/`,
+  applied in filename order with `git apply`. They are exported from seven commits of a local,
   unpublished llama.cpp branch (`feat/hexagon-nov-rebase`), and the series applied to a bare
   `e95426f16` gives exactly that branch's tree (compared by tree hash):
   - `0001` is the quantizer patch below (`93b1163c9` and `b5d25b652`, as one combined diff);
@@ -42,11 +42,14 @@ vendoring them.
   - `0003` adds ConvTranspose1D, Sin, Cos, HardSigmoid, HardSwish and ELU, with the op-remap
     entries for these extensions in `htp-kparams.cpp` (`cf01d2b60`);
   - `0004` corrects the HVX float clamping intrinsics and pointer arithmetic in `unary-ops.c`
-    (`c2d4a889a`).
+    (`c2d4a889a`);
+  - `0005` pins the ConvTranspose1D operand order, makes the depthwise Conv1D vector path
+    alignment-safe and makes both conv ops refuse inconsistent shapes (`d8b012aee`);
+  - `0006` makes Snake and ELU read their alpha as given (`3cf6cd686`).
 
-  `0001` shares no file with the other three, so its place in the order does not matter; `0002`
-  to `0004` all touch `unary-ops.c` and must stay in order. The previous skels were built from
-  upstream `de7fa0a3c` with the same extensions.
+  `0001` shares no file with the others, so its place in the order does not matter; `0002` to
+  `0006` all touch `conv1d-ops.c` or `unary-ops.c` and must stay in order. The previous skels were
+  built from upstream `de7fa0a3c` with the same extensions.
 - Host contract: every op's `kernel_params` come from the host, and every layout changed with the
   refresh (the FastRPC `start` call also gained `vtcm_size` and `power_mode`; `HtpOpCode` is
   regenerated from `htp-ops.h`). `params.rs`, `matmul_params.rs` and `eltwise.rs` port llama.cpp's
@@ -58,13 +61,26 @@ vendoring them.
   on-device runs below matter. Deliberate deviations from the C++ (each pinned by a test):
   - a copy whose source view overlaps itself (cera builds a conv's K-window that way) skips the
     tiled-transpose kernel, whose input DMA faulted the DSP, and takes the generic reshape kernel;
-  - HMX matmul needs 8 rows (upstream: 5), because the HMX path is racy below 8 on a v79;
-  - single-row flash attention stays on HVX and HMX attention needs 5 query rows, as before the
-    refresh: the solver's long-KV crossover to HMX for one row measured slower on a v79 (LFM2
-    decode at 2048 tokens about 10% down, a Whisper decode step 9.2 ms against 6.4 ms);
+  - HMX matmul needs 8 rows (upstream: 5), because the HMX path is racy below 8 on a v79; a
+    session from `MmSession::new` carries that floor (`hmx_min_rows`), so every solver applies it,
+    and the golden tests build their sessions with upstream's floor to pin the unmodified solver;
+  - short chunks of small heads stay on HVX: `flash_attn_hmx_rows_ok` allows HMX attention from 5
+    query rows for head dims up to 128 (larger heads keep the solver's choice), and decode asks for
+    HVX only, as before the refresh: the solver's long-KV crossover to HMX for one row measured
+    slower on a v79 (LFM2 decode at 2048 tokens about 10% down, a Whisper decode step 9.2 ms
+    against 6.4 ms);
   - a softmax mask given as a strided view (the audio encoder's relative-position shift) is
     accepted, since `softmax-ops.c` DMAs mask rows by stride;
-  - session thread counts of 0 are treated as 1 where the C divides by zero.
+  - a session with no threads counts as one in the matmul and elementwise solvers and is refused
+    by the row-sum and row-gather layouts, where the C divides by the count;
+  - a unary or GLU operand whose planes or batches sit a gap apart (a slice of a larger buffer) is
+    not collapsed: upstream's merge and split steps rewrite the plane strides from the row stride
+    and the new extents, so such a view came out addressing other bytes than it went in with. The
+    DSP reads the uncollapsed descriptor correctly (`device_unary_ops_read_views_with_gaps_between_planes`).
+  Kept as upstream, not deviations: the HMX flash-attention layout's VTCM size is recomputed with
+  the final pipeline flag and is not re-checked against the budget. The fusion pass's kernel checks
+  (`is_supported_mul_mat_nx_kernel` and its routed twin in `htp-fusion.cpp`) are copied by hand
+  into the `mmnx` and `mmidnx` oracles; `gen.py` fails when their upstream text changes.
 - Quantizer patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
   (`hvx-mm-kernels-tiled.h`, the `q8_0` and `q8_1` tiled activation
   quantizers, including the Q2_K `sums16` path that shares one scale per 256-element
@@ -95,6 +111,27 @@ vendoring them.
   refactored onto the shared helper: full-logit cosines against the CPU are unchanged to six digits
   on four models (including a 1,300-token context), and decode replays stay bit-identical.
   v73, v75, v81 and v85 are the same C code rebuilt; only v79 has been run on hardware.
+- Extension patches `0005` and `0006` (the ops `0002` and `0003` added): ConvTranspose1D took its
+  kernel from `src[0]` or `src[1]` by comparing widths, so an input no wider than the kernel swapped
+  the roles and returned garbage; it is now always `src[0]` `[K, C_out, C_in]` and the input
+  `src[1]`, the ggml order. The depthwise stride-1 Conv1D vector path loaded and stored through
+  plain `HVX_Vector` pointers at arbitrary element offsets, which hit the 128-byte block below the
+  address; it goes through `hvx_vmemu` now and only runs for contiguous rows. Both conv ops return
+  `NO_SUPPORT` when the groups do not divide the channels or the weight, input, bias and result
+  extents disagree (the host refuses the same shapes first, `conv1d_shapes_ok`). Snake and ELU
+  used to read an all-zero alpha as "not supplied" and take 1.0; they read it as given (Snake with
+  alpha 0 is the identity, ELU with alpha 0 a ReLU), so callers pass 1.0 for the default.
+  Evidence on a v79 (`dispatch.rs` device tests): against the skel before the patches the
+  depthwise Conv1D cases were off by 0.7 to 37 (relative to the largest output), ConvTranspose1D
+  with an input no wider than the kernel by about 1, Snake and ELU with alpha 0 by 17%, and shapes
+  with more groups than output channels were accepted; with the patched skel every conv case is
+  within 1.2e-7, alpha 0 is exact, the three inconsistent shapes are refused, and Sin, Cos, Snake,
+  ELU, HardSigmoid and HardSwish stay within 4e-7 on rows ending in a partial vector. Full-logit
+  cosines against the CPU (LFM2.5-350M at 11 and 1,300 prompt tokens, LFM2.5-2.6B, LFM3-1.7B),
+  argmax agreement and decode replays are the same as before the patches. cera has no host path
+  that sends these ops yet, so those device tests are their only numeric coverage; the same tests
+  pin the Q8_0 row quantizer's NaN and infinity contract and a Q4_1 matmul over activations with
+  block maxima down to 3e-4 (cosine 0.99999), which the quantizer patch fixed earlier.
   The v85 skel is built with the newer toolchain below, so the same sources were also built for
   v79 with it and run on the same device: Q8_0 SetRows test, full-logit cosines against the CPU
   (four models, including a 1,300-token context), decode replays and throughput all match the v0.7
@@ -113,16 +150,16 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: 8089a9c1c6de3e34d4ad989b04a3a8d3
-- v75: c33d7288d58e0e23d5573fc0b3f9e775
-- v79: d0f7324da78d2fffbf3cf25639fa6890
-- v81: a1c31cd344e31f0a96b04d61adc2dc3c
-- v85: 756d4cdcf6573351b454c76de3139b57
+- v73: 292d68c70f746a0441e183121b87514d
+- v75: 4ef589b3a93f967b969a167a6576e3e6
+- v79: bdc1e3fd3f0efb0349524a0aa42a5691
+- v81: 8b5a5f02923163869029fd2baa250577
+- v85: 0a6078313477f87e098bfd579231573b
 
 These are the md5s of the shipped, renamed files. The unrenamed build outputs were
-v73 7961e516e3744fa9d4f5c6d2ad3bae04, v75 041365ae69f9fcc0a4567f7118ba2377,
-v79 36a6fa4c73efbb6cec7d29ab8545145e, v81 0a8519321dc95621ff3b2398a04b9a12 and
-v85 b9b676dcd658872d2d9610d1bbe980b4. `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
+v73 9e6ed46ed37393c82c58c5da9d028957, v75 ad8adc37543dd72d98b8b513bace4c15,
+v79 416b9c39ef0612562a8c65a06fba65f5, v81 9cde9d7b40262b7080d1edc961645e9e and
+v85 a2a2a097e360f7dd9d809766cd9b937b. `scripts/hexagon-skels/finalize.py --check <skel>` verifies a
 file's SWIV CRC and lists the SONAME inside.
 
 ## Rebuilding
