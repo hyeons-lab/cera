@@ -474,7 +474,7 @@ impl CeraEngine {
     /// "no encoder attached" error at first use.
     pub fn from_parts(parts: ModelBytes, cfg: EngineConfig) -> Result<Self, CeraError> {
         let gguf = GgufFile::from_bytes(Arc::clone(&parts.model))
-            .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e}")))?;
+            .map_err(|e| backend_chain("parsing GGUF bytes", &e))?;
         Self::from_parts_with_primary(gguf, parts, cfg)
     }
 
@@ -657,8 +657,8 @@ impl CeraEngine {
     /// coming from a source other than a filesystem path (decrypted
     /// blob, network stream, archive entry).
     pub fn from_reader<R: Read>(reader: R, cfg: EngineConfig) -> Result<Self, CeraError> {
-        let gguf = GgufFile::from_reader(reader)
-            .map_err(|e| CeraError::Backend(format!("reading GGUF stream: {e}")))?;
+        let gguf =
+            GgufFile::from_reader(reader).map_err(|e| backend_chain("reading GGUF stream", &e))?;
         let manifest = Manifest::synthetic_text(Path::new("<reader>"));
         Self::from_gguf(gguf, manifest, cfg, None, AuxWeights::default())
     }
@@ -791,7 +791,7 @@ impl CeraEngine {
 
         let gguf_arc = Arc::new(gguf);
         let tokenizer = BpeTokenizer::from_gguf(&gguf_arc)
-            .map_err(|e| CeraError::Backend(format!("loading tokenizer: {e}")))?;
+            .map_err(|e| backend_chain("loading tokenizer", &e))?;
         // Extract `general.file_type` BEFORE `load_text_model` consumes
         // the gguf — that's the only place this metadata exists, and
         // we need it for the metadata's quantization label.
@@ -1189,7 +1189,7 @@ impl CeraEngine {
             },
         ];
         let formatted = apply_chat_template(tok, &messages, true)
-            .map_err(|e| CeraError::Backend(format!("chat template render failed: {e}")))?;
+            .map_err(|e| backend_chain("chat template render failed", &e))?;
         let toks = tok.encode(&formatted);
 
         let split = Self::split_tokens_at_marker(&toks, marker_id, marker_name)?;
@@ -1513,10 +1513,10 @@ fn resolve_bundle_source(
             // would be threaded through from manifest-file resolution.
             let manifest_path = repo.resolve_url(&manifest_url, None)?;
             let m = Manifest::from_file(&manifest_path).map_err(|e| {
-                CeraError::Backend(format!(
-                    "parsing manifest `{}`: {e}",
-                    manifest_path.display()
-                ))
+                backend_chain(
+                    format_args!("parsing manifest `{}`", manifest_path.display()),
+                    &e,
+                )
             })?;
             (m, manifest_path.parent().map(|p| p.to_path_buf()))
         };
@@ -1572,10 +1572,8 @@ impl ResolvedPathSource {
         check_inference_type_supported(&self.manifest.inference_type)?;
         match self.gguf.take() {
             Some(gguf) => Ok(gguf),
-            // `{e:#}` keeps the OS error; plain `{e}` prints only the outermost
-            // "opening <path>" context and hides why the open failed.
             None => GgufFile::open(&self.primary).map_err(|e| {
-                CeraError::Backend(format!("opening `{}`: {e:#}", self.primary.display()))
+                backend_chain(format_args!("opening `{}`", self.primary.display()), &e)
             }),
         }
     }
@@ -1696,7 +1694,7 @@ fn resolve_manifest_file_source(
     cfg: &EngineConfig,
 ) -> Result<ResolvedPathSource, CeraError> {
     let manifest = Manifest::from_file(path)
-        .map_err(|e| CeraError::Backend(format!("parsing manifest `{}`: {e}", path.display())))?;
+        .map_err(|e| backend_chain(format_args!("parsing manifest `{}`", path.display()), &e))?;
     resolve_manifest_source(manifest, path.parent(), cfg)
 }
 
@@ -2437,6 +2435,13 @@ fn try_parse_vision_encoder(
 /// (`Session::append_image`) is not yet wired — phase 1 of the VL
 /// pipeline only opens the gate and mmaps the mmproj GGUF. Calling
 /// generate against a VL bundle today behaves as text-only chat.
+/// A [`CeraError::Backend`] that says `what` failed and why. `anyhow`'s plain `Display` prints only
+/// the outermost context, which hides the root cause (the OS error of a failed open, the missing
+/// tensor of a failed model load); `{:#}` prints the whole chain.
+fn backend_chain(what: impl std::fmt::Display, e: &anyhow::Error) -> CeraError {
+    CeraError::Backend(format!("{what}: {e:#}"))
+}
+
 fn check_inference_type_supported(it: &InferenceType) -> Result<(), CeraError> {
     match it {
         InferenceType::LlamaCppTextToText
@@ -2448,12 +2453,14 @@ fn check_inference_type_supported(it: &InferenceType) -> Result<(), CeraError> {
 
 #[cfg(feature = "mmap")]
 fn open_for_inference_type(model_path: &Path) -> Result<GgufFile, CeraError> {
-    // `{e:#}` for the same reason as `ResolvedPathSource::open_primary`.
     GgufFile::open(model_path).map_err(|e| {
-        CeraError::Backend(format!(
-            "opening `{}` for inference-type auto-detect: {e:#}",
-            model_path.display()
-        ))
+        backend_chain(
+            format_args!(
+                "opening `{}` for inference-type auto-detect",
+                model_path.display()
+            ),
+            &e,
+        )
     })
 }
 
@@ -2544,24 +2551,24 @@ fn load_text_model(
     match cfg.backend {
         BackendPreference::Auto => load_text_model_auto(gguf, path, cfg.context_size),
         BackendPreference::Cpu => model::load_model(gguf, path, cfg.context_size)
-            .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}"))),
+            .map_err(|e| backend_chain("CPU model load failed", &e)),
         #[cfg(feature = "gpu")]
         BackendPreference::Gpu => model::load_model_gpu(gguf, path, cfg.context_size)
-            .map_err(|e| CeraError::Backend(format!("GPU model load failed: {e}"))),
+            .map_err(|e| backend_chain("GPU model load failed", &e)),
         #[cfg(not(feature = "gpu"))]
         BackendPreference::Gpu => Err(CeraError::Backend(
             "GPU backend not available (compile with --features gpu)".into(),
         )),
         #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
         BackendPreference::Metal => model::load_model_metal(gguf, path, cfg.context_size)
-            .map_err(|e| CeraError::Backend(format!("Metal model load failed: {e}"))),
+            .map_err(|e| backend_chain("Metal model load failed", &e)),
         #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
         BackendPreference::Metal => Err(CeraError::Backend(
             "Metal backend not available (compile with --features metal on macOS or iOS)".into(),
         )),
         #[cfg(feature = "hexagon")]
         BackendPreference::Hexagon => model::load_model_hexagon(gguf, path, cfg.context_size)
-            .map_err(|e| CeraError::Backend(format!("Hexagon model load failed: {e}"))),
+            .map_err(|e| backend_chain("Hexagon model load failed", &e)),
         #[cfg(not(feature = "hexagon"))]
         BackendPreference::Hexagon => Err(CeraError::Backend(
             "Hexagon backend not available (compile with --features hexagon)".into(),
@@ -2597,7 +2604,7 @@ fn load_text_model_npu(
             tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (npu)");
             return Ok(m);
         }
-        Err(e) => tried.push(format!("Hexagon: {e}")),
+        Err(e) => tried.push(format!("Hexagon: {e:#}")),
     }
 
     if tried.is_empty() {
@@ -2687,7 +2694,7 @@ fn load_text_model_auto(
 
     tracing::debug!("cera::engine: using CPU backend (auto)");
     model::load_model(gguf, path, context_size)
-        .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
+        .map_err(|e| backend_chain("CPU model load failed", &e))
 }
 
 /// Total bytes of tensor data in `gguf`: what a backend that copies the
@@ -2794,6 +2801,19 @@ pub use loading_prototype::{
 
 #[cfg(test)]
 mod tests {
+    // Plain `{e}` would print only "outer".
+    #[test]
+    fn backend_chain_prints_the_whole_anyhow_chain() {
+        let e = anyhow::anyhow!("os error")
+            .context("middle")
+            .context("outer");
+        let error = super::backend_chain("loading X", &e);
+        assert!(
+            matches!(&error, super::CeraError::Backend(m) if m == "loading X: outer: middle: os error"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn wgpu_skipped_when_the_upload_cannot_fit() {
         const GIB: u64 = 1 << 30;
