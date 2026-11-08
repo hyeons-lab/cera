@@ -2,7 +2,7 @@
 
 `libcera-htp-v{73,75,79,81,85}.so` are the DSP-side (Hexagon ELF) worker
 libraries the NPU backend loads into the CDSP unsigned PD at runtime.
-They are built from llama.cpp sources plus one patch (`patches/0001-*.patch`, described
+They are built from llama.cpp sources plus a patch series (`patches/`, described
 under Provenance); the host side
 (`sys.rs`, `queue.rs`, `params.rs`) speaks their `htp_iface` IDL, so the
 skel and host versions must move together: that is why they are
@@ -33,14 +33,20 @@ vendoring them.
 
 ## Provenance
 
-- Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus three local Hexagon commits on
-  top (`ead90bfd3`, `cf01d2b60`, `c2d4a889a`: the extended Conv1D, ConvTranspose1D, Snake and unary
-  operations, and the HVX float-clamp fix), then the quantizer patch below as `93b1163c9` and
-  `b5d25b652`.
-  These commits live in a local, unpublished llama.cpp branch (`feat/hexagon-nov-rebase`;
-  `ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`, plus the op-remap entries for our extensions in
-  `htp-kparams.cpp`); the previous skels were built from upstream `de7fa0a3c` with the same
-  extensions.
+- Source: llama.cpp at upstream commit `e95426f16` (2026-11-07) plus the four patches in `patches/`,
+  applied in filename order with `git apply`. They are exported from five commits of a local,
+  unpublished llama.cpp branch (`feat/hexagon-nov-rebase`), and the series applied to a bare
+  `e95426f16` gives exactly that branch's tree (compared by tree hash):
+  - `0001` is the quantizer patch below (`93b1163c9` and `b5d25b652`, as one combined diff);
+  - `0002` adds the Conv1D op and the Snake activation (`ead90bfd3`);
+  - `0003` adds ConvTranspose1D, Sin, Cos, HardSigmoid, HardSwish and ELU, with the op-remap
+    entries for these extensions in `htp-kparams.cpp` (`cf01d2b60`);
+  - `0004` corrects the HVX float clamping intrinsics and pointer arithmetic in `unary-ops.c`
+    (`c2d4a889a`).
+
+  `0001` shares no file with the other three, so its place in the order does not matter; `0002`
+  to `0004` all touch `unary-ops.c` and must stay in order. The previous skels were built from
+  upstream `de7fa0a3c` with the same extensions.
 - Host contract: every op's `kernel_params` come from the host, and every layout changed with the
   refresh (the FastRPC `start` call also gained `vtcm_size` and `power_mode`; `HtpOpCode` is
   regenerated from `htp-ops.h`). `params.rs`, `matmul_params.rs` and `eltwise.rs` port llama.cpp's
@@ -59,7 +65,7 @@ vendoring them.
   - a softmax mask given as a strided view (the audio encoder's relative-position shift) is
     accepted, since `softmax-ops.c` DMAs mask rows by stride;
   - session thread counts of 0 are treated as 1 where the C divides by zero.
-- Patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
+- Quantizer patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
   (`hvx-mm-kernels-tiled.h`, the `q8_0` and `q8_1` tiled activation
   quantizers, including the Q2_K `sums16` path that shares one scale per 256-element
   super-block, and `hvx-quant.h`, the Q8_0 row quantizer; the shared scale rule lives in the new
@@ -122,7 +128,11 @@ file's SWIV CRC and lists the SONAME inside.
 ## Rebuilding
 
 ```bash
-# in the llama.cpp checkout described under Source (commit b5d25b652), Docker toolchain image
+# in a llama.cpp checkout of upstream e95426f16 with the series from patches/ applied
+# (CERA is this repository's root):
+git checkout e95426f16
+for p in "$CERA"/cera/src/backend/hexagon/skels/patches/*.patch; do git apply "$p"; done
+# Docker toolchain image
 # ghcr.io/snapdragon-toolchain/arm64-android:v0.7 (Hexagon SDK 6.6.0.0, Tools 19.0.07):
 cp docs/backend/snapdragon/CMakeUserPresets.json .
 docker run --rm --platform linux/amd64 -v "$PWD":/workspace -w /workspace <image> bash -lc \
@@ -158,8 +168,8 @@ done
 The tool first recomputes the input's CRC and refuses to continue unless it equals the one
 upstream's script stored, so its CRC computation is checked against the real one on every run.
 
-Without the quantizer patch (the commit before `93b1163c9`) the skels carry the f16-reciprocal
-quantizer bug, and their md5s differ from the ones above.
+Without the quantizer patch (`0001`) the skels carry the f16-reciprocal quantizer bug, and their
+md5s differ from the ones above.
 
 After replacing any skel: update the md5s above and re-run the on-device checks. Skel/host skew
 fails silently as wrong numerics, and a golden file cannot see a shape the DSP rejects:

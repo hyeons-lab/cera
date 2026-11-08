@@ -1,0 +1,398 @@
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index cf7c2f297..32cc64fb4 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -52,6 +52,7 @@ add_library(${HTP_LIB} SHARED
+     allreduce-ops.c
+     dsv4-hc-ops.c
+     lightning-indexer-ops.c
++    conv1d-ops.c
+ )
+ 
+ target_compile_definitions(${HTP_LIB} PRIVATE
+diff --git a/ggml/src/ggml-hexagon/htp/conv1d-ops.c b/ggml/src/ggml-hexagon/htp/conv1d-ops.c
+new file mode 100644
+index 000000000..01fdcd995
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/conv1d-ops.c
+@@ -0,0 +1,210 @@
++#pragma clang diagnostic ignored "-Wunused-variable"
++#pragma clang diagnostic ignored "-Wunused-function"
++#pragma clang diagnostic ignored "-Wunused-but-set-variable"
++
++#include <HAP_farf.h>
++#include <hexagon_protos.h>
++#include <hexagon_types.h>
++#include <string.h>
++
++#include "hex-common.h"
++
++#define GGML_COMMON_DECL_C
++#include "ggml-common.h"
++#include "htp-ctx.h"
++#include "htp-ops.h"
++#include "hvx-utils.h"
++#include "dma-queue.h"
++#include "hex-profile.h"
++#include "htp-vtcm.h"
++#include "htp-tensor.h"
++#include "work-queue.h"
++#include "conv1d-ops.h"
++
++struct htp_conv1d_context {
++    struct htp_ops_context * octx;
++    uint32_t                 stride;
++    uint32_t                 pad;
++    uint32_t                 dilation;
++    uint32_t                 groups;
++    uint32_t                 cout_per_thread;
++};
++
++static void conv1d_worker_f32(unsigned int nth, unsigned int ith, void * data) {
++    struct htp_conv1d_context * cctx = (struct htp_conv1d_context *) data;
++    struct htp_ops_context *    octx = cctx->octx;
++
++    const struct htp_tensor * src0 = octx->src[0]; // input: [W_in, C_in, N, 1]
++    const struct htp_tensor * src1 = octx->src[1]; // weight: [K, C_in/groups, C_out, 1]
++    const struct htp_tensor * src2 = octx->src[2]; // bias: [C_out, 1, 1, 1] (NULL if none)
++    const struct htp_tensor * dst  = octx->dst;    // output: [W_out, C_out, N, 1]
++
++    const uint32_t w_in   = src0->ne[0];
++    const uint32_t c_in   = src0->ne[1];
++    const uint32_t n_in   = src0->ne[2];
++
++    const uint32_t k_size = src1->ne[0];
++    const uint32_t c_out  = dst->ne[1];
++    const uint32_t w_out  = dst->ne[0];
++    const uint32_t n_out  = dst->ne[2];
++
++    const uint32_t stride   = cctx->stride;
++    const uint32_t pad      = cctx->pad;
++    const uint32_t dilation = cctx->dilation;
++    const uint32_t groups   = cctx->groups;
++
++    const uint32_t cin_per_group  = c_in / groups;
++    const uint32_t cout_per_group = c_out / groups;
++
++    const uint32_t cout_start = ith * cctx->cout_per_thread;
++    const uint32_t cout_end   = (cout_start + cctx->cout_per_thread < c_out) ?
++                                (cout_start + cctx->cout_per_thread) : c_out;
++
++    if (cout_start >= c_out) {
++        return;
++    }
++
++    const uint8_t * in_bytes     = (const uint8_t *) src0->data;
++    const uint8_t * weight_bytes = (const uint8_t *) src1->data;
++    const uint8_t * bias_bytes   = src2 ? (const uint8_t *) src2->data : NULL;
++    uint8_t *       out_bytes    = (uint8_t *) dst->data;
++
++    for (uint32_t b = 0; b < n_out; b++) {
++        for (uint32_t oc = cout_start; oc < cout_end; oc++) {
++            const uint32_t g        = oc / cout_per_group;
++            const uint32_t oc_rel   = oc % cout_per_group;
++            const uint32_t ic_start = g * cin_per_group;
++
++            float bias_val = 0.0f;
++            if (bias_bytes) {
++                const float * bp = (const float *)(bias_bytes + oc * src2->nb[0]);
++                bias_val = *bp;
++            }
++
++            // Depthwise fast path (groups == c_in == c_out, cin_per_group == 1)
++            if (groups == c_in && groups == c_out && cin_per_group == 1) {
++                const uint32_t ic = oc;
++
++                // When stride is 1 and w_out >= 32, vectorize across output positions
++                if (stride == 1 && w_out >= VLEN_FP32) {
++                    const uint32_t nvec = w_out / VLEN_FP32;
++                    const uint32_t nloe = w_out % VLEN_FP32;
++                    const HVX_Vector v_bias = hvx_vec_splat_f32(bias_val);
++
++                    for (uint32_t iv = 0; iv < nvec; iv++) {
++                        const uint32_t ow_base = iv * VLEN_FP32;
++                        HVX_Vector v_acc = v_bias;
++
++                        for (uint32_t k = 0; k < k_size; k++) {
++                            const float * wp = (const float *)(weight_bytes +
++                                k * src1->nb[0] + oc * src1->nb[2]);
++                            const float w_val = *wp;
++                            const HVX_Vector v_w = hvx_vec_splat_f32(w_val);
++
++                            int32_t iw_base = (int32_t) ow_base - (int32_t) pad + (int32_t)(k * dilation);
++
++                            if (iw_base >= 0 && (uint32_t)(iw_base + VLEN_FP32) <= w_in) {
++                                const float * in_p = (const float *)(in_bytes +
++                                    iw_base * src0->nb[0] + ic * src0->nb[1] + b * src0->nb[2]);
++                                HVX_Vector v_in = *(const HVX_Vector *) in_p;
++                                HVX_Vector v_prod = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v_in, v_w));
++                                v_acc = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v_acc, v_prod));
++                            } else {
++                                // Boundary fallback: elementwise accumulation for this vector
++                                float tmp_in[VLEN_FP32];
++                                for (uint32_t vi = 0; vi < VLEN_FP32; vi++) {
++                                    int32_t iw = iw_base + (int32_t) vi;
++                                    if (iw >= 0 && (uint32_t) iw < w_in) {
++                                        tmp_in[vi] = *(const float *)(in_bytes +
++                                            iw * src0->nb[0] + ic * src0->nb[1] + b * src0->nb[2]);
++                                    } else {
++                                        tmp_in[vi] = 0.0f;
++                                    }
++                                }
++                                HVX_Vector v_in = *(const HVX_Vector *) tmp_in;
++                                HVX_Vector v_prod = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v_in, v_w));
++                                v_acc = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v_acc, v_prod));
++                            }
++                        }
++
++                        float * out_p = (float *)(out_bytes +
++                            ow_base * dst->nb[0] + oc * dst->nb[1] + b * dst->nb[2]);
++                        *(HVX_Vector *) out_p = v_acc;
++                    }
++
++                    // Trailing scalar positions
++                    for (uint32_t ow = nvec * VLEN_FP32; ow < w_out; ow++) {
++                        float sum = bias_val;
++                        for (uint32_t k = 0; k < k_size; k++) {
++                            int32_t iw = (int32_t)(ow * stride) - (int32_t) pad + (int32_t)(k * dilation);
++                            if (iw >= 0 && (uint32_t) iw < w_in) {
++                                const float * in_p = (const float *)(in_bytes +
++                                    iw * src0->nb[0] + ic * src0->nb[1] + b * src0->nb[2]);
++                                const float * wp   = (const float *)(weight_bytes +
++                                    k * src1->nb[0] + oc * src1->nb[2]);
++                                sum += (*in_p) * (*wp);
++                            }
++                        }
++                        float * out_p = (float *)(out_bytes +
++                            ow * dst->nb[0] + oc * dst->nb[1] + b * dst->nb[2]);
++                        *out_p = sum;
++                    }
++                    continue;
++                }
++            }
++
++            // General Conv1D path
++            for (uint32_t ow = 0; ow < w_out; ow++) {
++                float sum = bias_val;
++
++                for (uint32_t k = 0; k < k_size; k++) {
++                    int32_t iw = (int32_t)(ow * stride) - (int32_t) pad + (int32_t)(k * dilation);
++                    if (iw < 0 || (uint32_t) iw >= w_in) {
++                        continue;
++                    }
++
++                    for (uint32_t ic_rel = 0; ic_rel < cin_per_group; ic_rel++) {
++                        const uint32_t ic = ic_start + ic_rel;
++                        const float * in_p = (const float *)(in_bytes +
++                            iw * src0->nb[0] + ic * src0->nb[1] + b * src0->nb[2]);
++                        const float * wp   = (const float *)(weight_bytes +
++                            k * src1->nb[0] + ic_rel * src1->nb[1] + oc * src1->nb[2]);
++
++                        sum += (*in_p) * (*wp);
++                    }
++                }
++
++                float * out_p = (float *)(out_bytes +
++                    ow * dst->nb[0] + oc * dst->nb[1] + b * dst->nb[2]);
++                *out_p = sum;
++            }
++        }
++    }
++}
++
++int op_conv1d(struct htp_ops_context * octx) {
++    if (octx->src[0]->type != HTP_TYPE_F32 || octx->src[1]->type != HTP_TYPE_F32) {
++        FARF(ERROR, "op_conv1d: unsupported data type (f32 required)");
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
++    uint32_t stride   = octx->op_params[0] > 0 ? (uint32_t) octx->op_params[0] : 1;
++    uint32_t pad      = (uint32_t) octx->op_params[1];
++    uint32_t dilation = octx->op_params[2] > 0 ? (uint32_t) octx->op_params[2] : 1;
++    uint32_t groups   = octx->op_params[3] > 0 ? (uint32_t) octx->op_params[3] : 1;
++
++    const uint32_t c_out = octx->dst->ne[1];
++    const uint32_t n_threads = octx->ctx->n_threads > 0 ? octx->ctx->n_threads : 1;
++
++    struct htp_conv1d_context cctx;
++    cctx.octx            = octx;
++    cctx.stride          = stride;
++    cctx.pad             = pad;
++    cctx.dilation        = dilation;
++    cctx.groups          = groups;
++    cctx.cout_per_thread = (c_out + n_threads - 1) / n_threads;
++
++    work_queue_run(octx->ctx->work_queue, conv1d_worker_f32, &cctx, n_threads);
++
++    return HTP_STATUS_OK;
++}
+diff --git a/ggml/src/ggml-hexagon/htp/conv1d-ops.h b/ggml/src/ggml-hexagon/htp/conv1d-ops.h
+new file mode 100644
+index 000000000..b5014e006
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/conv1d-ops.h
+@@ -0,0 +1,8 @@
++#ifndef HTP_CONV1D_OPS_H
++#define HTP_CONV1D_OPS_H
++
++#include "htp-ops.h"
++
++int op_conv1d(struct htp_ops_context * octx);
++
++#endif /* HTP_CONV1D_OPS_H */
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 5c35cd988..d466d2976 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -204,5 +204,6 @@ int op_allreduce(struct htp_ops_context * octx);
+ int op_roll(struct htp_ops_context * octx);
+ int op_upscale(struct htp_ops_context * octx);
+ int op_lightning_indexer(struct htp_ops_context * octx);
++int op_conv1d(struct htp_ops_context * octx);
+ 
+ #endif /* HTP_CTX_H */
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index a3ff51ebe..caabfd77f 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -123,6 +123,8 @@ enum htp_op_code {
+     HTP_OP_DSV4_HC_POST,
+     HTP_OP_TOP_K_MASK,
+     HTP_OP_LIGHTNING_INDEXER,
++    HTP_OP_CONV1D,
++    HTP_OP_UNARY_SNAKE,
+ 
+     HTP_OP_INVALID
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 1424f1213..4acbe82ae 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -954,6 +954,7 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_UNARY_SGN:
+         case HTP_OP_L2_NORM:
+         case HTP_OP_HADAMARD:
++        case HTP_OP_UNARY_SNAKE:
+             return op_unary(octx);
+ 
+         case HTP_OP_GLU_SWIGLU:
+@@ -1066,6 +1067,8 @@ static int execute_op(struct htp_ops_context * octx) {
+ 
+         case HTP_OP_UPSCALE:
+             return op_upscale(octx);
++        case HTP_OP_CONV1D:
++            return op_conv1d(octx);
+ 
+         case HTP_OP_INVALID:
+             break;
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+index 3a6840169..ca3a2ac47 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
+@@ -13,6 +13,7 @@
+ #include "hvx-exp.h"
+ #include "hvx-sigmoid.h"
+ #include "hvx-utils.h"
++#include "hvx-sin-cos.h"
+ #include "unary-ops.h"
+ 
+ #define GGML_COMMON_DECL_C
+@@ -1883,6 +1884,62 @@ static void unary_thread_tiled_tri_f32(unsigned int nth, unsigned int ith, void
+     dma_queue_flush(dma_q);
+ }
+ 
++static inline void hvx_snake_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t ne0, float alpha) {
++    const HVX_Vector * restrict v_src = (const HVX_Vector *) src;
++    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
++    const uint32_t num_vectors        = ne0 / VLEN_FP32;
++    const uint32_t leftovers          = ne0 % VLEN_FP32;
++    const float inv_alpha             = 1.0f / (alpha != 0.0f ? alpha : 1.0f);
++
++    const HVX_Vector v_alpha     = hvx_vec_splat_f32(alpha);
++    const HVX_Vector v_inv_alpha = hvx_vec_splat_f32(inv_alpha);
++
++    for (uint32_t i = 0; i < num_vectors; i++) {
++        HVX_Vector x    = v_src[i];
++        HVX_Vector ax   = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(x, v_alpha));
++        HVX_Vector s    = hvx_vec_sin_f32(ax);
++        HVX_Vector s2   = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s, s));
++        HVX_Vector term = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s2, v_inv_alpha));
++        v_dst[i]        = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(x, term));
++    }
++
++    if (leftovers) {
++        const float * restrict f_src = (const float *)(src + num_vectors * VLEN_BYTES);
++        float * restrict f_dst       = (float *)(dst + num_vectors * VLEN_BYTES);
++        for (uint32_t i = 0; i < leftovers; i++) {
++            float x = f_src[i];
++            float s = sinf(alpha * x);
++            f_dst[i] = x + inv_alpha * (s * s);
++        }
++    }
++}
++
++static void snake_f32(const void * restrict src,
++                      void * restrict dst,
++                      const uint32_t num_rows,
++                      const struct htp_unary_context * uctx) {
++    htp_unary_op_preamble;
++    float alpha = 1.0f;
++    if (op_params[0] != 0) {
++        memcpy(&alpha, &op_params[0], sizeof(float));
++    }
++
++    for (uint32_t ir = 0; ir < num_rows; ir++) {
++        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
++        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
++
++        hvx_snake_f32_aa(dst_local, src_local, ne0, alpha);
++    }
++}
++
++static void tile_snake_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
++    float alpha = 1.0f;
++    if (uctx->octx->op_params[0] != 0) {
++        memcpy(&alpha, &uctx->octx->op_params[0], sizeof(float));
++    }
++    hvx_snake_f32_aa((uint8_t *) dst, (const uint8_t *) src, tw, alpha);
++}
++
+ static int execute_op_unary(struct htp_ops_context * octx) {
+     int err = HTP_STATUS_OK;
+ 
+@@ -1921,6 +1978,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+         case HTP_OP_L2_NORM:         op_type = is_f16 ? "l2norm-f16"   : "l2norm-f32";       break;
+         case HTP_OP_TRI:             op_type = "tri-f32";                                    break;
+         case HTP_OP_HADAMARD:        op_type = is_f16 ? "hadamard-f16" : "hadamard-f32";     break;
++        case HTP_OP_UNARY_SNAKE:     op_type = "snake-f32";                                  break;
+         default:
+             FARF(ERROR, "Unsupported unary Op %u\n", octx->op);
+             return HTP_STATUS_NO_SUPPORT;
+@@ -2063,6 +2121,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+                 task_func    = unary_thread_tiled_tri_f32;
+                 compute_func = (void *) tri_apply_tile_f32;
+                 break;
++            case HTP_OP_UNARY_SNAKE:     compute_func = (void *) tile_snake_f32;          break;
+             default:                     break;
+         }
+     } else if (is_f16) {
+@@ -2122,6 +2181,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+                 task_func    = unary_thread_tri_f32;
+                 compute_func = (void *) tri_f32;
+                 break;
++            case HTP_OP_UNARY_SNAKE:     compute_func = (void *) snake_f32;               break;
+             default:                     break;
+         }
+     }
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.h b/ggml/src/ggml-hexagon/htp/unary-ops.h
+index 8699a1403..89f2f9365 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.h
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.h
+@@ -61,6 +61,7 @@ static inline bool htp_op_is_unary(uint32_t opcode) {
+         case HTP_OP_L2_NORM:
+         case HTP_OP_TRI:
+         case HTP_OP_HADAMARD:
++        case HTP_OP_UNARY_SNAKE:
+             return true;
+         default:
+             return false;
