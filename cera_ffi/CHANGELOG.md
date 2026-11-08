@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.4
+
+- Add `CeraEngine.fromFiles` (and `fromFilesAsync`): load a model and its multimodal projector from paths by memory mapping, so a bundle larger than the host runtime's heap limit can be loaded.
+- Release the CPU pool's pin on the calling thread when an FFI call returns, so a recycled host thread (a Kotlin coroutine worker, a Dart isolate worker) no longer stays confined to one core and starves native thread pools started from it later.
+- Refresh the Hexagon NPU skels and host to llama.cpp `e95426f16`: a real v85 skel, an exact Q8_0 activation quantizer, Conv1D, ConvTranspose1D, Snake and further unary ops on the DSP, and a host solver for every op word for word. The FastRPC library is no longer unloaded, which crashed some devices at thread exit.
+- Report why a load failed: opening a model file, reading a manifest or a GGUF stream, loading a tokenizer or a model now put the whole error chain (including the operating system's reason, such as a missing or unreadable file) in the error message instead of only its outermost context.
+- Align package and native artifact versions at 0.7.4.
+
 ## 0.7.3
 
 - Harden the LFM3 GGUF and safetensors converters and the mmproj loaders: zero-extent shapes, incomplete expert groups, truncated per-expert data, oversized tensor spans and inconsistent audio stem or attention geometry are refused with an error instead of panicking or allocating.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.4
+
+- Include the `cera_ffi` 0.7.4 changes: `CeraEngine.fromFiles` for memory-mapped multimodal loading, the CPU pool pin released when a call returns, the refreshed Hexagon NPU skels, and load errors that carry the whole error chain.
+- Align platform manifests and the dependency on `cera_ffi` at 0.7.4.
+
 ## 0.7.3
 
 - Include the `cera_ffi` 0.7.3 fixes: stricter LFM3 converter and mmproj validation (including config values the loaders would refuse), stricter legacy audio decoder loading, LFM3 tool-call parsing fixes and LFM3 runtime edge-case fixes.
