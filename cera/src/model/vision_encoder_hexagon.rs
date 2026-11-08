@@ -14,8 +14,8 @@ use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTi
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer,
-    align128, flash_attn_kernel_request, flash_attn_op_params, repack_q4_0, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    align128, flash_attn_hmx_rows_ok, flash_attn_kernel_request, flash_attn_op_params, repack_q4_0,
+    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
@@ -1152,10 +1152,12 @@ impl HexagonVisionEncoder {
         let params = flash_attn_op_params(scale, 0.0);
 
         // Many query rows against the same K/V: the queue solves the kernel from the tensors,
-        // HMX when the DSP has a unit and a tiling fits VTCM, as the LFM2 prefill does;
+        // HMX when the DSP has a unit and a tiling fits VTCM, as the LFM2 prefill does (and only
+        // from 5 query rows, the rule before the skel refresh);
         // `CERA_HEXAGON_VIT_FA=hvx` keeps the row-at-a-time HVX kernel for comparison.
         let hvx_only = std::env::var("CERA_HEXAGON_VIT_FA").is_ok_and(|v| v == "hvx");
-        let kparams = flash_attn_kernel_request(!hvx_only);
+        let kparams =
+            flash_attn_kernel_request(!hvx_only && flash_attn_hmx_rows_ok(head_dim, n_tokens));
 
         session
             .enqueue_op(

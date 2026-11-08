@@ -17,9 +17,9 @@ use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTi
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_TILED, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
-    align128, build_mul_mat_kernel_params, flash_attn_kernel_request, flash_attn_op_params,
-    hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    align128, build_mul_mat_kernel_params, flash_attn_hmx_rows_ok, flash_attn_kernel_request,
+    flash_attn_op_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{
     LockOrRecover, lock_or_discard, lock_reporting_poison, report_poison,
@@ -1285,9 +1285,12 @@ impl HexagonWhisperModel {
         let params = flash_attn_op_params(scale, 0.0);
 
         // The queue solves the kernel from the tensors: HMX when the DSP has a unit and a tiling
-        // fits VTCM (as the LFM2 prefill and the vision tower do), else the HVX kernel.
+        // fits VTCM (as the LFM2 prefill and the vision tower do), else the HVX kernel; fewer
+        // than 5 query rows stay on HVX, the rule before the skel refresh.
         // `CERA_HEXAGON_WHISPER_FA=hvx` forces the HVX one.
-        let kparams = flash_attn_kernel_request(!whisper_fa_hvx_only());
+        let kparams = flash_attn_kernel_request(
+            !whisper_fa_hvx_only() && flash_attn_hmx_rows_ok(head_dim, n_tokens),
+        );
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,
@@ -1442,8 +1445,9 @@ impl HexagonWhisperModel {
 
         // One query row per head: the HMX kernel pads it to a 32-row tile and measured 2.8 ms slower
         // per step than the HVX one on a v79 (9.2 against 6.4 ms, with twice the host CPU), so the
-        // decode step stays on HVX whatever the solver would pick. The encoder keeps the solver's
-        // choice (`dispatch_flash_attn`), where HMX is 8x faster.
+        // decode step stays on HVX whatever the solver would pick. The encoder
+        // (`dispatch_self_attention_bidirectional`) asks for HMX from 5 query rows up, where it is
+        // 8x faster.
         let kparams = flash_attn_kernel_request(false);
 
         session.enqueue_op(

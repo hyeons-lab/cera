@@ -38,10 +38,6 @@ uint32_t     htp_session_n_threads(const struct ggml_hexagon_session * s) { retu
 uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * s) { return s->n_hmx; }
 uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * s) { return s->mdev_count; }
 
-void * oracle_addr(int slot) {
-    return (void *) (uintptr_t) (0x10000000ull + (uint64_t) slot * 0x10000000ull);
-}
-
 ggml_tensor oracle_tensor_nb(ggml_type type, const int64_t * ne, const size_t * nb) {
     ggml_tensor t = {};
     t.type = type;

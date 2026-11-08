@@ -41,8 +41,10 @@ vendoring them.
   - `0002` adds the Conv1D op and the Snake activation (`ead90bfd3`);
   - `0003` adds ConvTranspose1D, Sin, Cos, HardSigmoid, HardSwish and ELU, with the op-remap
     entries for these extensions in `htp-kparams.cpp` (`cf01d2b60`);
-  - `0004` corrects the HVX float clamping intrinsics and pointer arithmetic in `unary-ops.c`
-    (`c2d4a889a`);
+  - `0004` fixes the HVX HardSigmoid and HardSwish clamps in `unary-ops.c` (single-float
+    `Q6_Vsf_vmax` and `Q6_Vsf_vmin` instead of the qf32 forms applied to float operands) and spells
+    the leftover-lane pointers of the Snake, Sin, Cos, HardSigmoid and HardSwish tails as float
+    offsets, which are the same addresses (`c2d4a889a`);
   - `0005` pins the ConvTranspose1D operand order, makes the depthwise Conv1D vector path
     alignment-safe and makes both conv ops refuse inconsistent shapes (`d8b012aee`);
   - `0006` makes Snake and ELU read their alpha as given (`3cf6cd686`);
@@ -70,11 +72,14 @@ vendoring them.
     query rows for head dims up to 128 (larger heads keep the solver's choice), and decode asks for
     HVX only, as before the refresh: the solver's long-KV crossover to HMX for one row measured
     slower on a v79 (LFM2 decode at 2048 tokens about 10% down, a Whisper decode step 9.2 ms
-    against 6.4 ms);
+    against 6.4 ms); the audio detokenizer's attention stays on HVX at every row count, as before
+    the refresh (its HMX kernel has not been checked against that model's spectrum);
   - a softmax mask given as a strided view (the audio encoder's relative-position shift) is
     accepted, since `softmax-ops.c` DMAs mask rows by stride;
-  - a session with no threads counts as one in the matmul and elementwise solvers and is refused
-    by the row-sum and row-gather layouts, where the C divides by the count;
+  - a session with no threads counts as one in the matmul, elementwise and SSM-conv solvers and is
+    refused by the row-sum and row-gather layouts, where the C divides by the count;
+  - the matmul builders (the routed one included) refuse an empty extent instead of solving a
+    zero-sized matmul;
   - an elementwise (binary, unary, GLU) operand whose extent from first to last byte exceeds the
     `u32` size of a registered descriptor is refused; the C holds sizes in 32 bits and would plan
     on wrapped, smaller ones;
@@ -138,8 +143,11 @@ vendoring them.
   cosines against the CPU (LFM2.5-350M at 11 and 1,300 prompt tokens, LFM2.5-2.6B, LFM3-1.7B),
   argmax agreement and decode replays are the same as before the patches. The DSP's own refusals
   are tested with ops sent past the host's validation (`enqueue_op_unvalidated`, eight cases, each
-  breaking one rule, then a valid conv): all refused with `NoSupport`, and the skel before `0007`
-  accepts the fourth-extent case. cera has no host path
+  refused by its own rule except that the groups case and the swapped-operands case also fail a
+  second one, then a valid conv): all refused with `NoSupport`. The skel before `0007` accepts the
+  fourth-extent case, where the test stops, so the cases after it were checked against the C text
+  (a host build of the two ops' checks), not against that skel; the result-side `ne[3]` clauses of
+  `0007` have no device case. cera has no host path
   that sends these ops yet, so those device tests are their only numeric coverage; the same tests
   pin the Q8_0 row quantizer's NaN and infinity contract and a Q4_1 matmul over activations with
   block maxima down to 3e-4 (cosine 0.99999), which the quantizer patch fixed earlier.

@@ -125,7 +125,7 @@ int main() {
         ggml_tensor f32 = mk(GGML_TYPE_F32, 64, 4, 1, 1), f16 = mk(GGML_TYPE_F16, 64, 4, 1, 1);
         ggml_tensor i32 = mk(GGML_TYPE_I32, 64, 4, 1, 1), q8 = mk(GGML_TYPE_Q8_0, 64, 4, 1, 1);
         ggml_tensor big = mk(GGML_TYPE_F32, 64, 8, 1, 1), odd = mk(GGML_TYPE_F32, 48, 4, 1, 1);
-        ggml_tensor oddr = mk(GGML_TYPE_F32, 64, 3, 1, 1), z = mk(GGML_TYPE_F32, 64, 4, 1, 1);
+        ggml_tensor oddr = mk(GGML_TYPE_F32, 64, 3, 1, 1);
         emit(HTP_OP_ADD, GGML_OP_ADD, f32, f16, nullptr, f32, 6, 8u << 20);
         emit(HTP_OP_ADD, GGML_OP_ADD, f32, f32, nullptr, f16, 6, 8u << 20);
         emit(HTP_OP_ADD, GGML_OP_ADD, f16, f32, nullptr, f16, 6, 8u << 20);
@@ -136,7 +136,6 @@ int main() {
         emit(HTP_OP_MUL, GGML_OP_MUL, f32, oddr, nullptr, f32, 6, 8u << 20);  // 4 % 3 != 0
         emit(HTP_OP_SUB, GGML_OP_SUB, big, f32, nullptr, big, 6, 8u << 20);   // src1 broadcast over rows, ne1 % ne1' == 0
         emit(HTP_OP_DIV, GGML_OP_DIV, f32, big, nullptr, f32, 6, 8u << 20);   // src1 larger than src0
-        (void) z;
     }
 
     // 6. empty and single-element tensors that stay on the flat chunked kernel

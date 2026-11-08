@@ -1,6 +1,8 @@
 // Helpers shared by the elementwise oracles (binary, unary, glu): layouts beyond `oracle_tensor`'s
-// four, op names for the opcode check, and the node-path driver that mirrors what the real host does
-// (`htp_opnode`, collapse, `htp_kparams_solve(sess, node)`).
+// four, op names for the opcode check, and the print helpers. The unary and glu oracles run the
+// node path the real host takes (`htp_opnode`, collapse, `htp_kparams_solve(sess, node)`) and check
+// it against the direct entry points; binary has no collapse step and calls
+// `htp_kparams_solve(sess, op, k)` directly.
 #pragma once
 
 #include "common.h"
@@ -56,12 +58,5 @@ static inline void print_tensor_or_dash(const ggml_tensor * t) {
         oracle_print_tensor(*t);
     } else {
         printf("-");
-    }
-}
-
-static inline void check_same_words(const void * a, const void * b, size_t bytes, const char * what) {
-    if (memcmp(a, b, bytes) != 0) {
-        fprintf(stderr, "oracle bug: %s: the node path and the direct path disagree\n", what);
-        abort();
     }
 }

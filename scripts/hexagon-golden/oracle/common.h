@@ -36,6 +36,3 @@ void oracle_print_tensor(const ggml_tensor & t);
 // "unsupported" instead. Pass n = 32 for the whole `[i32; 32]` blob.
 void oracle_print_words(bool ok, const void * kparams, size_t bytes, int n = 32);
 
-// A fake buffer address range so overlap/alignment checks that read `data` see distinct, 128-byte
-// aligned allocations. `slot` selects which one.
-void * oracle_addr(int slot);
