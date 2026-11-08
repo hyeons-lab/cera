@@ -2469,7 +2469,7 @@ pub fn build_copy_kernel_params(
     let sameshape = same_extents && !transposed;
     let src_cont = src.is_contiguous(src_ts);
     let dst_cont = dst.is_contiguous(dst_ts);
-    let rows = (u64::from(src.ne[1]) * u64::from(src.ne[2]) * u64::from(src.ne[3])) as u32;
+    let rows = rows_u32(&src.ne[1..]);
     // the C narrows the byte budget to 32 bits wherever it hands it to a gather plan
     let vtcm_size = vtcm_bytes as u64;
 
@@ -2652,7 +2652,7 @@ pub fn build_concat_kernel_params(
     let mut k = [0i32; 32];
 
     let nb0 = |t: &CopyTensor| u64::from(t.nb[0]);
-    let total_rows = (u64::from(dst.ne[1]) * u64::from(dst.ne[2]) * u64::from(dst.ne[3])) as u32;
+    let total_rows = rows_u32(&dst.ne[1..]);
     let b_dense = nb0(src1) == ts;
     let gather_strides_ok = u64::from(src0.nb[1]) >= u64::from(src0.ne[0]) * ts
         && if b_dense {
@@ -3930,18 +3930,20 @@ mod tests {
     #[test]
     fn flash_attn_thread_byte_saturates_instead_of_wrapping() {
         let operands = fa_operands(64, 16, 8, 32, 602);
+        // a budget the working set of 256 threads fits, so only the byte field decides the result
         let solve = |threads: u32, hmx: u32| {
             fa_solve(
-                &FlashAttnHost::new(threads, 8 << 20, hmx),
+                &FlashAttnHost::new(threads, 1 << 30, hmx),
                 &operands,
                 0.125,
                 0.0,
             )
-            .map(|w| (w[0] >> 24) as u8)
+            .map(|w| ((w[0] & 0xff) as u8, (w[0] >> 24) as u8))
         };
-        // in contract: the HMX chunk pipelines and carries the count, the HVX kernel too
-        assert_eq!(solve(6, 1), Some(6));
-        assert_eq!(solve(6, 0), Some(6));
+        // in contract: the HMX chunk pipelines and carries the count, the HVX kernel too; the
+        // kernel type is part of the answer so the HMX case cannot turn into a second HVX case
+        assert_eq!(solve(6, 1), Some((FA_KERNEL_HMX, 6)));
+        assert_eq!(solve(6, 0), Some((FA_KERNEL_HVX, 6)));
         if cfg!(debug_assertions) {
             for hmx in [1, 0] {
                 let panicked = std::panic::catch_unwind(|| solve(256, hmx)).is_err();
@@ -3951,19 +3953,23 @@ mod tests {
                 );
             }
         } else {
-            for hmx in [1, 0] {
-                assert_eq!(solve(256, hmx), Some(255));
-                assert_eq!(solve(257, hmx), Some(255));
+            for threads in [256, 257] {
+                assert_eq!(solve(threads, 1), Some((FA_KERNEL_HMX, 255)));
+                assert_eq!(solve(threads, 0), Some((FA_KERNEL_HVX, 255)));
             }
         }
     }
 
     /// Hostile operands (zero and enormous extents, strides that match nothing, odd thread counts
-    /// and budgets) must never panic a solver. A debug build trips on any unchecked arithmetic
-    /// that the C would let wrap, so this finds what a descriptor with inconsistent fields could
-    /// do to the host. Deterministic: a failure names its inputs.
+    /// and budgets) must never panic the elementwise, copy, sum_rows, sort and concat solvers (the
+    /// others have their goldens and refusal tests). A debug build trips on any unchecked
+    /// arithmetic that the C would let wrap, so this finds what a descriptor with inconsistent
+    /// fields could do to the host. The solvers reject independent draws at the top, so half of
+    /// the elementwise and concat draws get operands that agree with each other, and the test
+    /// asserts a floor on how often each solver, elementwise opcode and concat kernel was reached.
+    /// Deterministic: a failure names its inputs.
     #[test]
-    fn solvers_never_panic_on_hostile_operands() {
+    fn eltwise_copy_reduce_and_concat_solvers_never_panic_on_hostile_operands() {
         use super::super::eltwise::{derive_eltwise, eltwise_operand_counts};
         use std::panic::{AssertUnwindSafe, catch_unwind};
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -4072,6 +4078,27 @@ mod tests {
             HtpOpCode::GluReglu,
         ];
         let budgets = [0usize, 4096, 1 << 16, 1 << 20, 8 << 20, 12 << 20];
+        // tensors whose strides pack the rows densely, wrapping in 32 bits
+        let packed = |dtype: HtpDataType, ne: [u32; 4]| {
+            let ts = match dtype {
+                HtpDataType::F16 => 2u32,
+                HtpDataType::I64 => 8,
+                _ => 4,
+            };
+            let nb1 = ts.wrapping_mul(ne[0]);
+            let nb2 = nb1.wrapping_mul(ne[1]);
+            CopyTensor {
+                dtype: dtype as u32,
+                ne,
+                nb: [ts, nb1, nb2, nb2.wrapping_mul(ne[2])],
+            }
+        };
+        // How often each solver answered `Some`, i.e. got past its shape and type guards into the
+        // arithmetic: eltwise, copy, sum/argmax, sort, concat; and which elementwise opcode and
+        // which concat kernel it was.
+        let mut answered = [0usize; 5];
+        let mut by_op = vec![0usize; eltwise.len()];
+        let mut by_concat_kernel = [0usize; 4];
         let mut failures = Vec::new();
         for i in 0..400_000u32 {
             // at most 255: a larger count trips `wire_byte`'s debug assertion by design
@@ -4090,36 +4117,137 @@ mod tests {
                 d
             };
             let family = next() % 5;
-            let op = eltwise[next() as usize % eltwise.len()];
+            let op_idx = next() as usize % eltwise.len();
+            let op = eltwise[op_idx];
+            let (lo, hi) = eltwise_operand_counts(op as u32);
+            let n_srcs = lo + next() as usize % (hi - lo + 1);
+            let dim = (next() % 6) as i32 - 1;
+            // Half of the eltwise and concat cases get operands that agree with each other, in
+            // the shapes the solver accepts: one element type and one shape (a GLU with one
+            // source halves it), `AddId` with its row table and I32 ids, the fused norms with an
+            // F32 weight and their own input as the residual, a concat adding its operands along
+            // `dim` (with `b` transposed now and then, for the transposed kernel), dense strides.
+            let (a, b, c, d) = if next().is_multiple_of(2) && (family < 2 || family == 4) {
+                let ne = a.ne;
+                if family == 4 {
+                    let dtype =
+                        [HtpDataType::F32, HtpDataType::F16, HtpDataType::I32][next() as usize % 3];
+                    let axis = dim.rem_euclid(4) as usize;
+                    let mut b_ne = ne;
+                    b_ne[axis] = extents[next() as usize % 8];
+                    let mut d_ne = ne;
+                    d_ne[axis] = ne[axis].wrapping_add(b_ne[axis]);
+                    let mut b = packed(dtype, b_ne);
+                    if axis == 0 && next().is_multiple_of(2) {
+                        let ts = b.nb[0];
+                        let col = ts.wrapping_mul(b_ne[1]).wrapping_add(ts);
+                        let plane = col.wrapping_mul(b_ne[0]);
+                        b.nb = [col, ts, plane, plane.wrapping_mul(b_ne[2])];
+                    }
+                    (packed(dtype, ne), b, c, packed(dtype, d_ne))
+                } else {
+                    let dtype = [
+                        HtpDataType::F32,
+                        HtpDataType::F32,
+                        HtpDataType::F16,
+                        HtpDataType::I32,
+                    ][next() as usize % 4];
+                    match op {
+                        HtpOpCode::AddId => {
+                            let ne = [ne[0], ne[1], ne[2], 1];
+                            let table = [ne[0], extents[next() as usize % 8], 1, 1];
+                            (
+                                packed(HtpDataType::F32, ne),
+                                packed(HtpDataType::F32, table),
+                                packed(HtpDataType::I32, [ne[1], ne[2], 1, 1]),
+                                packed(HtpDataType::F32, ne),
+                            )
+                        }
+                        HtpOpCode::RmsNormMul | HtpOpCode::RmsNormMulAdd => {
+                            let x = packed(HtpDataType::F32, ne);
+                            let w_ne = if next().is_multiple_of(2) {
+                                [ne[0], 1, 1, 1]
+                            } else {
+                                ne
+                            };
+                            (x, packed(HtpDataType::F32, w_ne), x, x)
+                        }
+                        _ => {
+                            let glu = matches!(
+                                op,
+                                HtpOpCode::GluSwiglu | HtpOpCode::GluGeglu | HtpOpCode::GluReglu
+                            );
+                            let mut src_ne = ne;
+                            if glu && n_srcs == 1 {
+                                src_ne[0] = ne[0].wrapping_mul(2);
+                            }
+                            (
+                                packed(dtype, src_ne),
+                                packed(dtype, ne),
+                                packed(dtype, ne),
+                                packed(dtype, ne),
+                            )
+                        }
+                    }
+                }
+            } else {
+                (a, b, c, d)
+            };
             let params = [0i32; 16];
-            let result = catch_unwind(AssertUnwindSafe(|| match family {
-                0 | 1 => {
-                    let (n, _) = eltwise_operand_counts(op as u32);
-                    let srcs = [a, b, c];
-                    let _ = derive_eltwise(op as u32, &srcs[..n.min(3)], &d, threads, vtcm);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut some = [false; 5];
+                let mut concat_kernel = None;
+                match family {
+                    0 | 1 => {
+                        let srcs = [a, b, c];
+                        some[0] =
+                            derive_eltwise(op as u32, &srcs[..n_srcs.min(3)], &d, threads, vtcm)
+                                .is_some();
+                    }
+                    2 => {
+                        some[1] = build_copy_kernel_params(&a, &d, threads, vtcm).is_some();
+                    }
+                    3 => {
+                        let sum_op = [HtpOpCode::Sum, HtpOpCode::SumRows, HtpOpCode::Argmax]
+                            [next() as usize % 3];
+                        some[2] =
+                            build_sum_rows_kernel_params(sum_op as u32, &a, &d, threads).is_some();
+                        let sort_op = [HtpOpCode::Argsort, HtpOpCode::TopK][next() as usize % 2];
+                        some[3] = build_sort_kernel_params(
+                            sort_op as u32,
+                            &a,
+                            &d,
+                            &params,
+                            threads,
+                            vtcm,
+                        )
+                        .is_some();
+                    }
+                    _ => {
+                        let k = build_concat_kernel_params(&a, &b, &d, dim, threads, vtcm);
+                        some[4] = k.is_some();
+                        concat_kernel = k.map(|k| k[0] as u32 & 0xff);
+                    }
                 }
-                2 => {
-                    let _ = build_copy_kernel_params(&a, &d, threads, vtcm);
-                }
-                3 => {
-                    let sum_op = [HtpOpCode::Sum, HtpOpCode::SumRows, HtpOpCode::Argmax]
-                        [next() as usize % 3];
-                    let _ = build_sum_rows_kernel_params(sum_op as u32, &a, &d, threads);
-                    let sort_op = [HtpOpCode::Argsort, HtpOpCode::TopK][next() as usize % 2];
-                    let _ =
-                        build_sort_kernel_params(sort_op as u32, &a, &d, &params, threads, vtcm);
-                }
-                _ => {
-                    let dim = (next() % 6) as i32 - 1;
-                    let _ = build_concat_kernel_params(&a, &b, &d, dim, threads, vtcm);
-                }
+                (some, concat_kernel)
             }));
-            if result.is_err() {
-                failures.push(format!(
-                    "case {i} family {family} {op:?} threads {threads} vtcm {vtcm}: a {a:?} b {b:?} c {c:?} d {d:?}"
-                ));
-                if failures.len() >= 6 {
-                    break;
+            match result {
+                Ok((some, concat_kernel)) => {
+                    for (count, hit) in answered.iter_mut().zip(some) {
+                        *count += usize::from(hit);
+                    }
+                    by_op[op_idx] += usize::from(some[0]);
+                    if let Some(kernel) = concat_kernel {
+                        by_concat_kernel[(kernel as usize).min(3)] += 1;
+                    }
+                }
+                Err(_) => {
+                    failures.push(format!(
+                        "case {i} family {family} {op:?} threads {threads} vtcm {vtcm}: a {a:?} b {b:?} c {c:?} d {d:?}"
+                    ));
+                    if failures.len() >= 6 {
+                        break;
+                    }
                 }
             }
         }
@@ -4128,6 +4256,41 @@ mod tests {
             "solver panics:\n{}",
             failures.join("\n")
         );
+        // The generator must keep reaching the solvers' bodies (a fuzz that is rejected at the
+        // top of every call proves nothing), every elementwise opcode and every concat kernel.
+        println!("solvers answered (eltwise, copy, sum, sort, concat): {answered:?}");
+        println!(
+            "eltwise opcodes answered: {by_op:?}; concat kernels (by type): {by_concat_kernel:?}"
+        );
+        for (name, count, floor) in [
+            ("eltwise", answered[0], 5_000),
+            ("copy", answered[1], 1_000),
+            ("sum_rows", answered[2], 100),
+            ("sort", answered[3], 500),
+            ("concat", answered[4], 5_000),
+        ] {
+            assert!(
+                count >= floor,
+                "the generator reached the {name} solver only {count} times (floor {floor})"
+            );
+        }
+        for (op, count) in eltwise.iter().zip(&by_op) {
+            assert!(
+                *count >= 100,
+                "the generator reached {op:?} only {count} times (floor 100)"
+            );
+        }
+        for (name, kernel) in [
+            ("regular", CONCAT_KERNEL_REGULAR),
+            ("transposed", CONCAT_KERNEL_TRANSPOSED),
+            ("gather rows", CONCAT_KERNEL_GATHER_ROWS),
+        ] {
+            let count = by_concat_kernel[kernel as usize];
+            assert!(
+                count >= 100,
+                "the generator reached the {name} concat kernel only {count} times (floor 100)"
+            );
+        }
     }
 
     /// A single sort row wider than 2^31 elements multiplies its chunk size past 32 bits. The C
@@ -4150,6 +4313,33 @@ mod tests {
                     0,
                 );
             }
+        }
+    }
+
+    /// Three enormous extents multiply past 64 bits. The C holds the row count in 32 bits and
+    /// wraps; a plain 64-bit multiply in the concat solver panicked a debug build, for shapes
+    /// whose operands agree with each other. The wrapped count does not show in the regular
+    /// kernel's words, so this guards debug builds only: the shape must still reach the count.
+    #[test]
+    fn a_row_count_of_three_enormous_extents_wraps_like_the_c() {
+        let big = 1u32 << 30;
+        // strides wrap in 32 bits like the descriptor fields they model (`dense` would overflow)
+        let packed = |ne: [u32; 4]| {
+            let nb1 = 4u32.wrapping_mul(ne[0]);
+            let nb2 = nb1.wrapping_mul(ne[1]);
+            CopyTensor {
+                dtype: HtpDataType::F32 as u32,
+                ne,
+                nb: [4, nb1, nb2, nb2.wrapping_mul(ne[2])],
+            }
+        };
+        let wide = packed([8, big, big, big]);
+        let halves = packed([4, big, big, big]);
+        for threads in [1, 6] {
+            assert!(
+                build_concat_kernel_params(&halves, &halves, &wide, 0, threads, 8 << 20).is_some(),
+                "the shape must reach the row count"
+            );
         }
     }
 
@@ -4384,6 +4574,19 @@ mod tests {
         assert_eq!(ssm1[0], 4); // n_threads
         assert_eq!(ssm1[5], 256); // d_inner_tile (scalar: the full per-thread range)
         assert_eq!(ssm32[5], 64); // a quarter of the 256 channels per thread, within 32..=128
+    }
+
+    /// The C divides by the session's thread count in the SSM-conv layout; a session without
+    /// threads counts as one here, in both kernels (a single step and a chunk).
+    #[test]
+    fn an_ssm_conv_session_without_threads_counts_as_one() {
+        for n_t in [1, 32] {
+            let [x, w, y] = ssm_conv_tensors(3, 1024, n_t, 1);
+            let solve = |threads| build_ssm_conv_kernel_params(&x, &w, &y, threads, 8 << 20);
+            assert!(solve(1).is_some());
+            assert_eq!(solve(0), solve(1), "n_t {n_t}");
+            assert_eq!(solve(0).unwrap()[0], 1, "n_t {n_t}");
+        }
     }
 
     #[test]

@@ -13,7 +13,8 @@
 //! The solvers see tensors the way ggml does: dense, up to four dimensions, byte strides, and
 //! (here) one of the element types the kernels take, F32 or F16 (plus I32 for the `AddId` index
 //! tensor). Arithmetic mirrors the C++ integer widths, including its 32-bit truncations, so an
-//! out-of-range size gives the same answer rather than a panic.
+//! out-of-range size does not panic; an operand whose extent no descriptor can hold is refused
+//! (`Gg::fits_descriptor`) instead of being planned on a wrapped size.
 
 use super::params::{CopyTensor, FastDivValues, init_fastdiv};
 use super::types::{HtpDataType, HtpOpCode};
@@ -1398,6 +1399,18 @@ mod tests {
             ..w
         };
         assert!(derive(HtpOpCode::RmsNormMul, &[x, f16_weight], &x).is_none());
+        // four-byte weights of another type (or an F16 view with F32's stride) pass the stride
+        // check, so only the dtype clause refuses them
+        let i32_weight = CopyTensor {
+            dtype: HtpDataType::I32 as u32,
+            ..w
+        };
+        let f16_view_weight = CopyTensor {
+            dtype: HtpDataType::F16 as u32,
+            ..w
+        };
+        assert!(derive(HtpOpCode::RmsNormMul, &[x, i32_weight], &x).is_none());
+        assert!(derive(HtpOpCode::RmsNormMul, &[x, f16_view_weight], &x).is_none());
         let strided_weight = CopyTensor {
             nb: [8, 512, 512, 512],
             ..w
@@ -1459,17 +1472,51 @@ mod tests {
         // one element fewer is the largest row a descriptor can hold; it must not panic
         let _ = derive(HtpOpCode::UnarySilu, &[just_under], &just_under, 6);
         let _ = derive(HtpOpCode::Add, &[just_under, just_under], &just_under, 6);
-        // a destination of 2^31 or more columns for a single-source GLU
-        let wide = CopyTensor {
+        // a destination of 2^31 or more columns for a single-source GLU: twice its width wraps to
+        // 0 in 32 bits, which an empty source matches, so the shape check must not panic on it
+        let wide_dst = CopyTensor {
             ne: [0x8000_0000, 1, 1, 1],
             ..huge
         };
-        assert!(derive(HtpOpCode::GluSwiglu, &[wide], &x, 6).is_none());
+        let empty_src = CopyTensor {
+            ne: [0, 1, 1, 1],
+            ..huge
+        };
+        assert!(derive(HtpOpCode::GluSwiglu, &[empty_src], &wide_dst, 6).is_none());
 
-        // empty operands of the binary and the matmul-free solvers
-        let none = f32_tensor([0, 128, 1, 1]);
+        // rows that are small but spread over more than 4 GiB (a plane stride of nearly 4 GiB):
+        // every row and stride check passes, so only the descriptor-extent guard refuses them
+        let spread = CopyTensor {
+            dtype: x.dtype,
+            ne: [8, 3, 1, 1],
+            nb: [4, 0xFFFF_FFF0, u32::MAX, u32::MAX],
+        };
+        let small = f32_tensor([8, 3, 1, 1]);
+        assert!(derive(HtpOpCode::Add, &[small, small], &small, 6).is_some());
+        assert!(derive(HtpOpCode::UnarySilu, &[small], &small, 6).is_some());
+        assert!(derive(HtpOpCode::GluSwiglu, &[small, small], &small, 6).is_some());
+        assert!(derive(HtpOpCode::RmsNormMul, &[small, small], &small, 6).is_some());
+        assert!(derive(HtpOpCode::Add, &[spread, small], &small, 6).is_none());
+        assert!(derive(HtpOpCode::UnarySilu, &[spread], &small, 6).is_none());
+        assert!(derive(HtpOpCode::GluSwiglu, &[spread, small], &small, 6).is_none());
+        assert!(derive(HtpOpCode::RmsNormMul, &[small, spread], &small, 6).is_none());
+
+        // empty operands of the binary and the matmul-free solvers, with strides that pass the
+        // permutation check so the empty row is what refuses them
+        let none = CopyTensor {
+            dtype: x.dtype,
+            ne: [0, 128, 1, 1],
+            nb: [4, 4, 512, 65536],
+        };
         assert!(derive(HtpOpCode::Add, &[none, none], &none, 6).is_none());
-        assert!(derive(HtpOpCode::Mul, &[none, f32_tensor([1, 1, 1, 1])], &none, 6).is_none());
+        let scalar = f32_tensor([1, 1, 1, 1]);
+        assert!(derive(HtpOpCode::Mul, &[none, scalar], &none, 6).is_none());
+        // the same strides over one column are accepted: the empty row is what refuses `none`
+        let one_col = CopyTensor {
+            ne: [1, 128, 1, 1],
+            ..none
+        };
+        assert!(derive(HtpOpCode::Add, &[one_col, one_col], &one_col, 6).is_some());
     }
 
     #[test]

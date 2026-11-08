@@ -232,8 +232,9 @@ pub(crate) fn linear_m<S: OpSink>(
 /// With `hmx` set, every token run whose dims are 32 aligned and that has at least
 /// [`mm_is_hmx_eligible`]'s minimum rows runs the DSP's HMX matmul, as the LFM2 prefill
 /// does: the same repacked weights feed both kernels and only the dim-1 weight stride
-/// differs. The other runs (a short tile remainder, unaligned dims), a run whose chunking
-/// does not fit the budget, and every run when `hmx` is `None`, keep the HVX matmul.
+/// differs. The other runs (a short tile remainder, a `rows` that is not a multiple of 32), a
+/// run whose chunking does not fit the budget, and every run when `hmx` is `None`, keep the HVX
+/// matmul. A `cols` (K) that is not a multiple of 32 has no kernel and is an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn linear_m_with<S: OpSink>(
     session: &mut S,
@@ -342,14 +343,14 @@ pub(crate) fn linear_m_with<S: OpSink>(
     session.end_group().map_err(|e| op_err("linear_m", e))
 }
 
-/// Whether a `[rows, cols]` plain-F16 weight can take [`linear_m_f16`]: the HMX tile edge
-/// divides both dimensions.
+/// Whether a `[rows, cols]` plain-F16 weight can take the HMX F16 matmul
+/// ([`f16_mm_kernel_params_in`]): the HMX tile edge divides both dimensions.
 pub(crate) fn f16_mm_shape_ok(rows: usize, cols: usize) -> bool {
     rows != 0 && cols != 0 && rows.is_multiple_of(32) && cols.is_multiple_of(32)
 }
 
-/// [`f16_mm_kernel_params`] against an explicit VTCM budget (the LFM2 engine sizes its
-/// kernels for the device's whole VTCM).
+/// Kernel params of the F16 matmul against an explicit VTCM budget (the LFM2 engine sizes its
+/// kernels for the device's whole VTCM instead of [`VTCM_BUDGET`]).
 pub(crate) fn f16_mm_kernel_params_in(
     rows: usize,
     cols: usize,
@@ -2598,6 +2599,11 @@ mod tests {
     /// A NaN in `got` is an infinite error.
     fn rig_rel_error(got: &[f32], want: &[f32]) -> f32 {
         assert_eq!(got.len(), want.len(), "output length");
+        // an infinite reference would make the scale infinite and the ratio NaN
+        assert!(
+            want.iter().all(|v| v.is_finite()),
+            "the reference must be finite"
+        );
         let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
         got.iter()
             .zip(want)
@@ -2913,8 +2919,10 @@ mod tests {
     /// The DSP's own refusals. Both conv ops answer shapes that disagree with `NoSupport` instead
     /// of dividing by zero, indexing past a tensor or leaving part of the result unwritten. The ops
     /// are sent without the host's validation (which refuses the same shapes first, see
-    /// `conv_ops_are_refused_when_their_shapes_disagree`), and every case breaks one rule alone.
-    /// A valid conv afterwards shows the session survived each refusal.
+    /// `conv_ops_are_refused_when_their_shapes_disagree`), and each case is refused by the rule it
+    /// names (two of them, the groups case and the swapped operands, also fail a second one).
+    /// The result-side fourth-extent clauses have no case here. A valid conv afterwards shows
+    /// the session survived each refusal.
     #[test]
     #[ignore = "needs a Hexagon NPU"]
     fn device_conv_refuses_inconsistent_shapes() {
@@ -2928,7 +2936,7 @@ mod tests {
         let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; 20 * 8 * 2 * 2]);
         let conv = HtpOpCode::Conv1D;
         let transposed = HtpOpCode::ConvTranspose1D;
-        // (name, op, sources, result, params): each breaks exactly one rule
+        // (name, op, sources, result, params): each is refused by the rule it names
         type Case<'a> = (
             &'static str,
             HtpOpCode,

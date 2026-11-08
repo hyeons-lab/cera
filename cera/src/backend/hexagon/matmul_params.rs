@@ -1997,6 +1997,10 @@ pub fn build_mul_mat_id_kernel_params(
     n_threads: u32,
     vtcm_budget: usize,
 ) -> Option<[i32; 32]> {
+    // like the other cera builders: an empty extent is refused, not solved as a zero-sized matmul
+    if [src0, src1, ids, dst].iter().any(|t| t.ne.contains(&0)) {
+        return None;
+    }
     let sess = builder_session(n_threads, vtcm_budget, false);
     solve_mul_mat_id(&sess, src0, src1, ids, dst, false)
         .as_ref()
@@ -2706,6 +2710,18 @@ mod tests {
         assert!(nx(1024, 1024, 0, 3, 1).is_none());
         assert!(nx(1024, 1024, 1024, 0, 1).is_none());
         assert!(nx(1024, 1024, 1024, 3, 0).is_none());
+        // the routed builder too: no tokens, or no experts used per token
+        let routed = |tokens: usize, used: usize| {
+            let u = |v: usize| v as u64;
+            let w = MmTensor::tiled_weight(Q8_0, [u(1024), u(512), u(8), 1]);
+            let x = MmTensor::f32_rows([u(1024), 1, u(tokens), 1], u(1024) * 4);
+            let ids = MmTensor::contiguous(I32, [u(used), u(tokens), 1, 1]);
+            let d = MmTensor::f32_rows([u(512), u(used), u(tokens), 1], u(512) * 4);
+            build_mul_mat_id_kernel_params(&w, &x, &ids, &d, 8, 8 << 20)
+        };
+        assert!(routed(1, 2).is_some());
+        assert!(routed(0, 2).is_none());
+        assert!(routed(1, 0).is_none());
     }
 
     /// A per-head attention-score matmul worked out from the host solver: K as `[64, 126, 8]`

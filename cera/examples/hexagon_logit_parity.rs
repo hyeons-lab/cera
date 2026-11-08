@@ -59,7 +59,16 @@ fn main() {
             })
             .0
     };
+    // `zip` stops at the shorter vector: a backend that returned fewer logits must fail the run
+    let same_len = |a: &[f32], b: &[f32]| {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "CPU and NPU logit vectors differ in length"
+        );
+    };
     let cosine = |a: &[f32], b: &[f32]| {
+        same_len(a, b);
         let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
         for (&x, &y) in a.iter().zip(b) {
             let (x, y) = (f64::from(x), f64::from(y));
@@ -70,10 +79,18 @@ fn main() {
         dot / (na.sqrt() * nb.sqrt())
     };
     let max_diff = |a: &[f32], b: &[f32]| {
+        same_len(a, b);
         a.iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
+            // `f32::max` drops a NaN; carry it through to the printed value
+            .fold(0.0f32, |m, d| {
+                if m.is_nan() || d.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            })
     };
 
     cpu.append_tokens(&prompt).expect("cpu prefill");
