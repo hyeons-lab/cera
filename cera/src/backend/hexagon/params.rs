@@ -4,6 +4,7 @@
 //! by consuming precomputed integer division constants (Granlund and Montgomery FastDiv)
 //! and layout descriptors generated on the host.
 
+use super::matmul_params::{row_size, tile_k, tile_size, type_info};
 use super::types::{HtpDataType, HtpOpCode};
 
 /// A value for one of the one-byte fields of the matmul params. Out-of-contract counts
@@ -14,6 +15,11 @@ pub(super) fn wire_byte(v: usize) -> u8 {
         v <= usize::from(u8::MAX),
         "{v} does not fit a one-byte kernel param"
     );
+    saturate_byte(v)
+}
+
+/// The release-profile half of [`wire_byte`], on its own so a test reaches it in a debug build.
+fn saturate_byte(v: usize) -> u8 {
     v.min(usize::from(u8::MAX)) as u8
 }
 
@@ -57,7 +63,9 @@ pub fn build_layer_norm_params(eps: f32) -> [i32; 16] {
 
 /// Host-computed parameters for 1D convolution (`Conv1D`).
 ///
-/// Encodes stride, padding, dilation, and channel groups into `op.params[0..4]`.
+/// Encodes stride, padding, dilation, and channel groups into `op.params[0..4]`. The op's sources
+/// are the input `[w_in, c_in, n]`, the weight `[k, c_in / groups, c_out]` and an optional F32
+/// bias `[c_out]`; [`conv1d_shapes_ok`] is what the DSP checks of them.
 pub fn build_conv1d_params(stride: usize, pad: usize, dilation: usize, groups: usize) -> [i32; 16] {
     let mut params = [0i32; 16];
     params[0] = stride.max(1) as i32;
@@ -69,7 +77,8 @@ pub fn build_conv1d_params(stride: usize, pad: usize, dilation: usize, groups: u
 
 /// Host-computed parameters for Snake activation (`UnarySnake`).
 ///
-/// Encodes frequency parameter `alpha` (default 1.0) into `op.params[0]`.
+/// Encodes the frequency parameter `alpha` into `op.params[0]`; the DSP reads it as it is, so pass
+/// 1.0 for the default (zeroed params mean `alpha = 0`, where Snake is the identity).
 pub fn build_snake_params(alpha: f32) -> [i32; 16] {
     let mut params = [0i32; 16];
     params[0] = alpha.to_bits() as i32;
@@ -78,7 +87,9 @@ pub fn build_snake_params(alpha: f32) -> [i32; 16] {
 
 /// Host-computed parameters for 1D transposed convolution (`ConvTranspose1D`).
 ///
-/// Encodes stride, padding, and dilation into `op.params[0..3]`.
+/// Encodes stride, padding, and dilation into `op.params[0..3]`. The op's sources are, in the ggml
+/// order, the weight `[k, c_out, c_in]` first and the input `[l, c_in, n]` second, then an optional
+/// F32 bias `[c_out]`; [`conv_transpose1d_shapes_ok`] is what the DSP checks of them.
 pub fn build_conv_transpose1d_params(stride: usize, pad: usize, dilation: usize) -> [i32; 16] {
     let mut params = [0i32; 16];
     params[0] = stride.max(1) as i32;
@@ -89,11 +100,57 @@ pub fn build_conv_transpose1d_params(stride: usize, pad: usize, dilation: usize)
 
 /// Host-computed parameters for Exponential Linear Unit (`UnaryElu`).
 ///
-/// Encodes negative slope scale parameter `alpha` into `op.params[0]`.
+/// Encodes the negative-side scale `alpha` into `op.params[0]`; the DSP reads it as it is, so pass
+/// 1.0 for the default (zeroed params mean `alpha = 0`, where ELU is a ReLU).
 pub fn build_elu_params(alpha: f32) -> [i32; 16] {
     let mut params = [0i32; 16];
     params[0] = alpha.to_bits() as i32;
     params
+}
+
+/// Whether the operands of a `Conv1D` agree the way the DSP's `op_conv1d` needs: F32 throughout,
+/// `groups` dividing both channel counts and not above the output channels, a weight of
+/// `[k, c_in / groups, c_out]`, at least as many input batches as output ones, and a bias with an
+/// entry per output channel. The DSP answers `NO_SUPPORT` for anything else.
+pub fn conv1d_shapes_ok(
+    input: &CopyTensor,
+    weight: &CopyTensor,
+    bias: Option<&CopyTensor>,
+    dst: &CopyTensor,
+    groups: usize,
+) -> bool {
+    let f32t = HtpDataType::F32 as u32;
+    let groups = u32::try_from(groups.max(1)).unwrap_or(u32::MAX);
+    let (c_in, c_out) = (input.ne[1], dst.ne[1]);
+    [input.dtype, weight.dtype, dst.dtype]
+        .iter()
+        .all(|&d| d == f32t)
+        && bias.is_none_or(|b| b.dtype == f32t && b.ne[0] >= c_out)
+        && groups <= c_out
+        && c_in.is_multiple_of(groups)
+        && c_out.is_multiple_of(groups)
+        && weight.ne[1] == c_in / groups
+        && weight.ne[2] == c_out
+        && input.ne[2] >= dst.ne[2]
+}
+
+/// [`conv1d_shapes_ok`] for a `ConvTranspose1D` (`op_conv_transpose1d`): F32 throughout, a weight
+/// `[k, c_out, c_in]` whose channels match the result's and the input's, one output slab per input
+/// batch, and a bias with an entry per output channel.
+pub fn conv_transpose1d_shapes_ok(
+    weight: &CopyTensor,
+    input: &CopyTensor,
+    bias: Option<&CopyTensor>,
+    dst: &CopyTensor,
+) -> bool {
+    let f32t = HtpDataType::F32 as u32;
+    [weight.dtype, input.dtype, dst.dtype]
+        .iter()
+        .all(|&d| d == f32t)
+        && bias.is_none_or(|b| b.dtype == f32t && b.ne[0] >= dst.ne[1])
+        && weight.ne[1] == dst.ne[1]
+        && weight.ne[2] == input.ne[1]
+        && dst.ne[2] >= input.ne[2]
 }
 
 // The solvers below port llama.cpp's `htp-kparams.cpp` and the layout helpers in `htp/*-ops.h`
@@ -110,43 +167,11 @@ fn fastdiv_words(d: u32) -> [i32; 2] {
     [f.mp as i32, f.l as i32]
 }
 
-/// `(ggml_blck_size, ggml_type_size)` of a wire dtype. `None` for a type none of the solvers below
-/// accepts: every caller refuses such an operand whether or not its layout would pass, so a missing
-/// entry never changes an answer.
+/// `(ggml_blck_size, ggml_type_size)` of a wire dtype: the matmul module's table, plus the I64 the
+/// index tensors use. `None` for a type none of the solvers below accepts: every caller refuses
+/// such an operand whether or not its layout would pass, so a missing entry never changes an answer.
 fn ggml_type_layout(dtype: u32) -> Option<(u64, u64)> {
-    use HtpDataType as T;
-    let is = |t: T| dtype == t as u32;
-    Some(if is(T::F32) || is(T::I32) {
-        (1, 4)
-    } else if is(T::F16) || is(T::Bf16) {
-        (1, 2)
-    } else if is(T::I64) {
-        (1, 8)
-    } else if is(T::Q4_0) || is(T::Iq4Nl) {
-        (32, 18)
-    } else if is(T::Q4_1) {
-        (32, 20)
-    } else if is(T::Q8_0) {
-        (32, 34)
-    } else if is(T::Mxfp4) {
-        (32, 17)
-    } else if is(T::Q2K) {
-        (256, 84)
-    } else if is(T::Q3K) {
-        (256, 110)
-    } else if is(T::Q4K) {
-        (256, 144)
-    } else if is(T::Q5K) {
-        (256, 176)
-    } else if is(T::Q6K) {
-        (256, 210)
-    } else if is(T::Q1_0) {
-        (128, 18)
-    } else if is(T::Q2_0) {
-        (64, 18)
-    } else {
-        return None;
-    })
+    type_info(dtype).or_else(|| (dtype == HtpDataType::I64 as u32).then_some((1, 8)))
 }
 
 /// `ggml_is_contiguous`: dense in every dimension (a dimension of 1 has no stride to check).
@@ -180,40 +205,12 @@ fn rows_u32(ne: &[u32]) -> u32 {
 
 /// `htp_tensor_get_tile_size`: bytes of one tiled weight tile, 0 for a type without tiles.
 fn htp_tile_size(dtype: u32) -> u64 {
-    use HtpDataType as T;
-    let is = |t: T| dtype == t as u32;
-    if is(T::Q4_0) || is(T::Iq4Nl) || is(T::Q1_0) || is(T::Q2_0) {
-        576
-    } else if is(T::Q4_1) || is(T::Q4K) {
-        640
-    } else if is(T::Q8_0) {
-        1088
-    } else if is(T::Q5K) {
-        768
-    } else if is(T::Q6K) {
-        896
-    } else if is(T::Q3K) {
-        512
-    } else if is(T::Q2K) {
-        336
-    } else if is(T::Mxfp4) {
-        544
-    } else if is(T::F16) {
-        2048
-    } else {
-        0
-    }
+    tile_size(dtype)
 }
 
 /// `htp_tensor_get_tile_k`: elements along K in one tile.
 fn htp_tile_k(dtype: u32) -> u32 {
-    if dtype == HtpDataType::Q1_0 as u32 {
-        128
-    } else if dtype == HtpDataType::Q2_0 as u32 {
-        64
-    } else {
-        32
-    }
+    tile_k(dtype) as u32
 }
 
 /// Which `get_rows` kernel runs (`enum htp_get_rows_kernel_type`).
@@ -380,7 +377,8 @@ pub fn build_get_rows_kernel_params(
 /// The 16 op-param words of a `Rope` (`struct ggml_tensor::op_params`): `n_dims` (1), `mode` (2),
 /// the truncate flag (3, 0: the only form the DSP implements), `n_ctx_orig` (4), the floats
 /// `freq_base`, `freq_scale`, `ext_factor` (0: no YaRN), `attn_factor`, `beta_fast`, `beta_slow`
-/// (5 to 10), and zero multi-axis sections (11 to 14) and row offset (15). The DSP reads them itself;
+/// (5 to 10), and zero multi-axis sections (11 to 14; the host solver checks the first three) and
+/// row offset (15). The DSP reads them itself;
 /// the host solver ([`build_rope_kernel_params`]) reads them to size the kernel.
 pub fn build_rope_params(
     n_dims: usize,
@@ -417,7 +415,8 @@ pub struct RopeOperands<'a> {
 /// Kernel parameters for a `Rope`: port of `htp_kparams_solve_rope` (`htp-kparams.cpp`) and
 /// `htp_rope_vtcm_layout_build` (`rope-ops.h`). `op_params` is the op's 16 parameter words
 /// ([`build_rope_params`]): `n_dims` (1), `mode` (2), the truncate flag (3, must be 0), `freq_base`
-/// (5), the multi-axis `sections` (11..15) and `n_offs` (15). `None` where the solver refuses:
+/// (5), the multi-axis `sections` (11..15, of which only the first three are checked: a multi-axis
+/// mode whose first three are all non-positive is refused) and `n_offs` (15). `None` where the solver refuses:
 /// non-F32 operands, a destination of another shape, a rotated span (`n_offs + n_dims`) wider than the
 /// row, `n_offs` not a multiple of 32, unknown modes, too few positions or factors, strided rows, or
 /// a working set that does not fit `vtcm_bytes`.
@@ -541,41 +540,10 @@ pub fn build_rope_kernel_params(
 }
 
 /// Bytes in one row of `ne00` elements of wire type `dtype`: port of `htp_tensor_get_row_size`
-/// (`htp-tensor.h`), 0 for a type it does not know. 32-bit arithmetic, like the C.
+/// (`htp-tensor.h`), 0 for a type it does not know. Held in 32 bits like the C, so an out-of-range
+/// row wraps the same way.
 pub(crate) fn htp_tensor_row_size(dtype: u32, ne00: u32) -> u32 {
-    use HtpDataType as T;
-    let is = |t: T| dtype == t as u32;
-    if is(T::F32) || is(T::I32) {
-        ne00.wrapping_mul(4)
-    } else if is(T::F16) || is(T::Bf16) {
-        ne00.wrapping_mul(2)
-    } else if is(T::Q8_0) {
-        (ne00 / 32).wrapping_mul(34)
-    } else if is(T::Q4_0) || is(T::Iq4Nl) {
-        (ne00 / 32).wrapping_mul(18)
-    } else if is(T::Q4_1) {
-        (ne00 / 32).wrapping_mul(20)
-    } else if is(T::Mxfp4) {
-        (ne00 / 32).wrapping_mul(17)
-    } else if is(T::Q2K) {
-        (ne00 / 256).wrapping_mul(84)
-    } else if is(T::Q2_0) {
-        (ne00 / 64).wrapping_mul(18)
-    } else if is(T::Q1_0) {
-        (ne00 / 128).wrapping_mul(18)
-    } else if is(T::Q3K) {
-        (ne00 / 256).wrapping_mul(110)
-    } else if is(T::Q4K) {
-        (ne00 / 256).wrapping_mul(144)
-    } else if is(T::Q5K) {
-        (ne00 / 256).wrapping_mul(176)
-    } else if is(T::Q6K) {
-        (ne00 / 256).wrapping_mul(210)
-    } else if is(T::I64) {
-        ne00.wrapping_mul(8)
-    } else {
-        0
-    }
+    row_size(dtype, u64::from(ne00)) as u32
 }
 
 /// Kernel parameters for a `SetRows` that scatters `src0` (F32 value rows, `ne[1]` of them) into
@@ -1760,7 +1728,7 @@ impl SortLayout {
                 n_chunks *= 2;
             }
         }
-        let mut chunk_elems = (n_vec_pow2 / n_chunks) * 32;
+        let mut chunk_elems = (n_vec_pow2 / n_chunks).wrapping_mul(32);
         let mut merge_elems = 0u32;
         if n_chunks > 1 {
             merge_elems = if is_top_k {
@@ -1853,10 +1821,13 @@ pub fn build_sort_kernel_params(
     Some(k)
 }
 
-/// One side of a `Cpy`, as `ggml_hexagon_precompute_cpy_params` sees it.
+/// A tensor operand as the host solvers read it: element type, extents and byte strides. Every
+/// solver in this module takes its operands this way (copies, softmax, sorts, row gathers, rope,
+/// concat, flash attention and more), not only `Cpy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyTensor {
-    /// `HtpDataType` value; only F32, F16 and I32 are copyable.
+    /// `HtpDataType` value. `CopyTensor::type_size` knows only F32, F16 and I32, the types a
+    /// copy accepts; solvers that take other types size their rows themselves.
     pub dtype: u32,
     pub ne: [u32; 4],
     /// Byte strides.
@@ -1910,12 +1881,12 @@ impl CopyTensor {
         if self.ne[0] != 1 && u64::from(self.nb[0]) != type_size {
             return false;
         }
-        let mut next_nb = type_size * u64::from(self.ne[0]);
+        let mut next_nb = type_size.wrapping_mul(u64::from(self.ne[0]));
         for i in 1..4 {
             if self.ne[i] != 1 && u64::from(self.nb[i]) != next_nb {
                 return false;
             }
-            next_nb *= u64::from(self.ne[i]);
+            next_nb = next_nb.wrapping_mul(u64::from(self.ne[i]));
         }
         true
     }
@@ -2407,6 +2378,8 @@ fn copy_transpose_plan(
         .wrapping_mul(u64::from(tp.nkb))
         .wrapping_mul(u64::from(tp.ne[2]))
         .wrapping_mul(ne3);
+    // Mirrors the C's check. With `u32` byte strides a source that does not overlap holds at most
+    // 2^32 bytes, so the tile count stays far below this and no test can reach the refusal.
     if total_tiles > u64::from(u32::MAX) {
         return None;
     }
@@ -3895,6 +3868,197 @@ mod tests {
                 "{n_heads}/{n_kv_heads}"
             );
         }
+    }
+
+    /// `flash_attn_hmx_rows_ok` is the one flash-attention rule that differs from upstream's solver
+    /// (short chunks of small heads stay on HVX), so its boundaries and its effect on the kernel the
+    /// solver picks are pinned here rather than by a golden.
+    #[test]
+    fn flash_attn_hmx_rows_ok_keeps_short_chunks_of_small_heads_on_hvx() {
+        for rows in [1, 2, 4] {
+            assert!(!flash_attn_hmx_rows_ok(64, rows), "64 x {rows}");
+            assert!(!flash_attn_hmx_rows_ok(128, rows), "128 x {rows}");
+        }
+        for rows in [5, 8, 512] {
+            assert!(flash_attn_hmx_rows_ok(64, rows), "64 x {rows}");
+            assert!(flash_attn_hmx_rows_ok(128, rows), "128 x {rows}");
+        }
+        // heads above 128 keep the solver's choice at any row count, as before the refresh
+        assert!(flash_attn_hmx_rows_ok(256, 1));
+        // a head dim that does not tile by 8 has no HMX path
+        assert!(!flash_attn_hmx_rows_ok(70, 32));
+
+        // what the rule feeds: the request constant, and a solver that obeys it
+        assert_eq!(flash_attn_kernel_request(false), FLASH_ATTN_HVX_ONLY);
+        assert_eq!(flash_attn_kernel_request(true), [0; 32]);
+        let host = FlashAttnHost::new(6, 8 << 20, 1);
+        let decode = fa_operands(64, 16, 8, 1, 768);
+        // upstream's own pick for one row over a long cache is HMX; the HVX-only host keeps it off
+        assert_eq!(fa_solve(&host, &decode, 0.125, 0.0).unwrap()[0] & 0xff, 2);
+        assert_eq!(
+            fa_solve(&host.hvx_only(), &decode, 0.125, 0.0).unwrap()[0] & 0xff,
+            1
+        );
+    }
+
+    /// The saturating half of `wire_byte` runs in every profile; the combined test above can only
+    /// reach it in a release build.
+    #[test]
+    fn saturate_byte_clamps_at_255_in_every_profile() {
+        for (v, want) in [
+            (0, 0),
+            (1, 1),
+            (255, 255),
+            (256, 255),
+            (1000, 255),
+            (usize::MAX, 255),
+        ] {
+            assert_eq!(saturate_byte(v), want, "{v}");
+        }
+    }
+
+    /// A single sort row wider than 2^31 elements multiplies its chunk size past 32 bits. The C
+    /// wraps; a plain multiply here panicked in a debug build.
+    #[test]
+    fn a_sort_row_wider_than_2_pow_31_wraps_like_the_c() {
+        let row = |dtype: HtpDataType| CopyTensor {
+            dtype: dtype as u32,
+            ne: [0x8000_0001, 1, 1, 1],
+            nb: [4, 0, 0, 0],
+        };
+        for threads in [1, 6] {
+            for opcode in [HtpOpCode::Argsort, HtpOpCode::TopK] {
+                let _ = build_sort_kernel_params(
+                    opcode as u32,
+                    &row(HtpDataType::F32),
+                    &row(HtpDataType::I32),
+                    &[0; 16],
+                    threads,
+                    0,
+                );
+            }
+        }
+    }
+
+    /// A session without threads (or devices) divides by zero in the C, which never sees one; the
+    /// ports that would divide refuse it, and the matmul and elementwise solvers clamp it to one.
+    #[test]
+    fn a_zero_thread_session_is_refused_where_the_c_divides_by_it() {
+        let src = dense(HtpDataType::F32, [2048, 1, 1, 1]);
+        let dst = dense(HtpDataType::F32, [1, 1, 1, 1]);
+        let sum =
+            |threads| build_sum_rows_kernel_params(HtpOpCode::Sum as u32, &src, &dst, threads);
+        assert!(sum(1).is_some());
+        assert_eq!(sum(0), None);
+
+        let layout = |threads, devices| {
+            gather_rows_solve_layout(16, 64, 0, 0, true, 4, 64, threads, devices, 8 << 20)
+        };
+        assert!(layout(4, 1).is_some());
+        assert_eq!(layout(0, 1), None);
+        assert_eq!(layout(4, 0), None);
+    }
+
+    /// The kernel moves an element block of at most 128 bytes with one DMA descriptor; the guard
+    /// that refuses a wider one is also what keeps the tile layout from dividing by zero.
+    #[test]
+    fn copy_transpose_refuses_an_element_block_wider_than_128_bytes() {
+        // dst dense [ne0, 8, 16], src the same extents with dims 1 and 2 swapped in memory
+        let swapped = |dtype: HtpDataType, ne0: u32| {
+            let ts: u32 = if dtype == HtpDataType::F16 { 2 } else { 4 };
+            let dst = dense(dtype, [ne0, 8, 16, 1]);
+            let src = CopyTensor {
+                dtype: dtype as u32,
+                ne: [ne0, 8, 16, 1],
+                nb: [ts, ne0 * ts * 16, ne0 * ts, ne0 * ts * 16 * 8],
+            };
+            (src, dst, u64::from(ts))
+        };
+        // 128 bytes: the widest block
+        for (dtype, ne0) in [(HtpDataType::F32, 32), (HtpDataType::F16, 64)] {
+            let (src, dst, ts) = swapped(dtype, ne0);
+            assert!(
+                copy_transpose_plan(&src, &dst, ts, 6, 8 << 20).is_some(),
+                "{dtype:?} x {ne0}"
+            );
+        }
+        // 256 bytes: refused
+        for (dtype, ne0) in [(HtpDataType::F32, 64), (HtpDataType::F16, 128)] {
+            let (src, dst, ts) = swapped(dtype, ne0);
+            assert!(
+                copy_transpose_plan(&src, &dst, ts, 6, 8 << 20).is_none(),
+                "{dtype:?} x {ne0}"
+            );
+        }
+    }
+
+    /// What `op_conv1d` insists on: groups that divide the channels, a weight with the matching
+    /// channel counts, a long enough F32 bias, and enough input batches.
+    #[test]
+    fn conv1d_shape_checks_follow_the_dsp() {
+        let f = |ne: [u32; 4]| dense(HtpDataType::F32, ne);
+        // depthwise: 8 channels, 3 taps, 16 columns
+        let (x, w, b, y) = (
+            f([16, 8, 1, 1]),
+            f([3, 1, 8, 1]),
+            f([8, 1, 1, 1]),
+            f([16, 8, 1, 1]),
+        );
+        assert!(conv1d_shapes_ok(&x, &w, Some(&b), &y, 8));
+        assert!(conv1d_shapes_ok(&x, &w, None, &y, 8));
+        // groups above the output channels (the worker divided by c_out / groups = 0)
+        assert!(!conv1d_shapes_ok(&x, &w, None, &f([16, 4, 1, 1]), 8));
+        // groups that do not divide the channels
+        assert!(!conv1d_shapes_ok(&x, &w, None, &y, 3));
+        // a weight with the wrong channels per group, or the wrong output channels
+        assert!(!conv1d_shapes_ok(&x, &f([3, 8, 8, 1]), None, &y, 8));
+        assert!(!conv1d_shapes_ok(&x, &f([3, 1, 7, 1]), None, &y, 8));
+        // a bias that is too short or not F32, fewer input batches than output ones, a non-F32 input
+        assert!(!conv1d_shapes_ok(&x, &w, Some(&f([4, 1, 1, 1])), &y, 8));
+        let f16_bias = dense(HtpDataType::F16, [8, 1, 1, 1]);
+        assert!(!conv1d_shapes_ok(&x, &w, Some(&f16_bias), &y, 8));
+        assert!(!conv1d_shapes_ok(&x, &w, None, &f([16, 8, 2, 1]), 8));
+        assert!(!conv1d_shapes_ok(
+            &dense(HtpDataType::F16, [16, 8, 1, 1]),
+            &w,
+            None,
+            &y,
+            8
+        ));
+        // zero groups count as one: a plain conv
+        assert!(conv1d_shapes_ok(
+            &x,
+            &f([3, 8, 4, 1]),
+            None,
+            &f([16, 4, 1, 1]),
+            0
+        ));
+    }
+
+    /// The same for `op_conv_transpose1d`, whose weight is the first source.
+    #[test]
+    fn conv_transpose1d_shape_checks_follow_the_dsp() {
+        let f = |ne: [u32; 4]| dense(HtpDataType::F32, ne);
+        // weight [k=4, c_out=5, c_in=3], input [l=8, c_in=3], result [l_out=11, c_out=5]
+        let (w, x, y, b) = (
+            f([4, 5, 3, 1]),
+            f([8, 3, 1, 1]),
+            f([11, 5, 1, 1]),
+            f([5, 1, 1, 1]),
+        );
+        assert!(conv_transpose1d_shapes_ok(&w, &x, Some(&b), &y));
+        assert!(conv_transpose1d_shapes_ok(&w, &x, None, &y));
+        // the operands in the other order are a different op (the input is no weight)
+        assert!(!conv_transpose1d_shapes_ok(&x, &w, None, &y));
+        assert!(!conv_transpose1d_shapes_ok(&w, &x, None, &f([11, 6, 1, 1])));
+        assert!(!conv_transpose1d_shapes_ok(&f([4, 5, 2, 1]), &x, None, &y));
+        assert!(!conv_transpose1d_shapes_ok(&w, &f([8, 3, 2, 1]), None, &y));
+        assert!(!conv_transpose1d_shapes_ok(
+            &w,
+            &x,
+            Some(&f([4, 1, 1, 1])),
+            &y
+        ));
     }
 
     #[test]

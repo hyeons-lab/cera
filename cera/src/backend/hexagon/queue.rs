@@ -1647,6 +1647,43 @@ where
             })?;
         }
     }
+    // The conv kernels index their operands by these extents and answer NO_SUPPORT for a mismatch
+    // (they used to divide by zero or read past a tensor), so refuse it before the flush.
+    if opcode == HtpOpCode::Conv1D as u32 || opcode == HtpOpCode::ConvTranspose1D as u32 {
+        let name = if opcode == HtpOpCode::Conv1D as u32 {
+            "Conv1D"
+        } else {
+            "ConvTranspose1D"
+        };
+        if !(2..=3).contains(&src.len())
+            || dst.len() != 1
+            || src.contains(&0xffff)
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {name}: needs two or three registered src tensors and one registered dst tensor"
+            )));
+        }
+        let view = |i: u16| -> super::params::CopyTensor { (&tensors[i as usize]).into() };
+        let bias = src.get(2).map(|&i| view(i));
+        let (first, second, out) = (view(src[0]), view(src[1]), view(dst[0]));
+        let ok = if opcode == HtpOpCode::Conv1D as u32 {
+            super::params::conv1d_shapes_ok(
+                &first,
+                &second,
+                bias.as_ref(),
+                &out,
+                params[3].max(1) as usize,
+            )
+        } else {
+            super::params::conv_transpose1d_shapes_ok(&first, &second, bias.as_ref(), &out)
+        };
+        if !ok {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op {name}: the operand shapes do not agree ({first:?}, {second:?}, bias {bias:?} -> {out:?})"
+            )));
+        }
+    }
     // `SsmConv` likewise: the window, taps and output decide the kernel, the channel tile and the
     // VTCM plan (`htp_kparams_solve_ssm_conv`).
     if opcode == HtpOpCode::SsmConv as u32 {
@@ -2206,6 +2243,96 @@ mod tests {
     /// the op params and the session's limits (thread count, VTCM, HMX units); the HVX-only
     /// request keeps the HMX kernel off; precomputed params pass through; K/V row lists, missing
     /// operands and shapes no kernel takes are errors that drop the batch.
+    /// The conv ops are refused at enqueue when their operands disagree, instead of reaching a DSP
+    /// kernel that divided by zero or read past a tensor. A refusal drops the pending batch, so
+    /// each case runs on a fresh session.
+    #[test]
+    fn conv_ops_are_refused_when_their_shapes_disagree() {
+        use super::super::params::{build_conv_transpose1d_params, build_conv1d_params};
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 1 << 16, false).unwrap();
+        let tensor = |q: &mut HexagonQueueSession, ne: [u32; 4]| {
+            let nb = [4, ne[0] * 4, ne[0] * ne[1] * 4, ne[0] * ne[1] * ne[2] * 4];
+            q.add_tensor(
+                &buf,
+                0,
+                nb[3] as usize * ne[3] as usize,
+                0,
+                HtpDataType::F32 as u32,
+                ne,
+                nb,
+            )
+            .unwrap()
+        };
+        let conv = HtpOpCode::Conv1D as u32;
+        let transposed = HtpOpCode::ConvTranspose1D as u32;
+        let depthwise = build_conv1d_params(1, 1, 1, 8);
+        let strided = build_conv_transpose1d_params(1, 0, 1);
+
+        // a depthwise conv is accepted and carries no derived params
+        let mut q = test_session();
+        let (x, w, y) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+        );
+        q.enqueue_op(conv, &[x, w], &[y], depthwise, [0; 32])
+            .unwrap();
+        assert_eq!(
+            q.ops[0].kernel_params, [0; 32],
+            "a conv has no derived params"
+        );
+
+        // groups above the output channels
+        let mut q = test_session();
+        let (x, w, y4) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 4, 1, 1]),
+        );
+        let err = q
+            .enqueue_op(conv, &[x, w], &[y4], depthwise, [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shapes do not agree"), "{err}");
+        assert_pending_empty(&q, "conv groups");
+
+        // an operand count no conv takes
+        let mut q = test_session();
+        let (x, y) = (tensor(&mut q, [16, 8, 1, 1]), tensor(&mut q, [16, 8, 1, 1]));
+        assert!(q.enqueue_op(conv, &[x], &[y], depthwise, [0; 32]).is_err());
+        assert_pending_empty(&q, "conv operand count");
+
+        // a transposed conv: weight first and input second is accepted; the other order, and a
+        // result with the wrong channels, are refused
+        let transposed_tensors = |q: &mut HexagonQueueSession, out_channels: u32| {
+            (
+                tensor(q, [4, 5, 3, 1]),
+                tensor(q, [8, 3, 1, 1]),
+                tensor(q, [11, out_channels, 1, 1]),
+            )
+        };
+        let mut q = test_session();
+        let (wt, xt, yt) = transposed_tensors(&mut q, 5);
+        q.enqueue_op(transposed, &[wt, xt], &[yt], strided, [0; 32])
+            .unwrap();
+        let mut q = test_session();
+        let (wt, xt, yt) = transposed_tensors(&mut q, 5);
+        let err = q
+            .enqueue_op(transposed, &[xt, wt], &[yt], strided, [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shapes do not agree"), "{err}");
+        assert_pending_empty(&q, "conv transpose operand order");
+        let mut q = test_session();
+        let (wt, xt, yt) = transposed_tensors(&mut q, 6);
+        assert!(
+            q.enqueue_op(transposed, &[wt, xt], &[yt], strided, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv transpose channels");
+    }
+
     #[test]
     fn flash_attn_params_are_filled_from_the_registered_tensors() {
         use super::super::params::{
@@ -2364,7 +2491,8 @@ mod tests {
             .unwrap();
         assert_eq!(q.ops[3].kernel_params, [7; 32]);
 
-        // without a mask the third word-pair is unset, and an HVX-only q/k/v op still solves
+        // without a mask the divisor pair of the mask's rows stays unset, and the op solves like
+        // the mask-less one (an HMX unit takes this chunk, as above)
         q.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,
             &src[..3],
@@ -2373,7 +2501,44 @@ mod tests {
             [0; 32],
         )
         .unwrap();
-        assert_ne!(q.ops[4].kernel_params, [0; 32]);
+        let (qv, kv, vv, dv) = (view(&q, qt), view(&q, kt), view(&q, vt), view(&q, dt));
+        let flash_op = |mask, sinks| FlashAttnOp {
+            q: &qv,
+            k: &kv,
+            v: &vv,
+            mask,
+            sinks,
+            dst: &dv,
+            scale,
+            max_bias: 0.0,
+            logit_softcap: 0.0,
+        };
+        let no_mask = build_flash_attn_kernel_params(&host, &flash_op(None, None)).unwrap();
+        assert_eq!(q.ops[4].kernel_params, no_mask);
+        assert_eq!(q.ops[4].kernel_params[0] & 0xff, 2);
+        assert_eq!(q.ops[4].kernel_params[10..12], [0, 0]);
+        assert_ne!(q.ops[4].kernel_params, q.ops[0].kernel_params);
+
+        // the attention sinks (a fifth source) reach the solver
+        let sinks_t = q
+            .add_tensor(&buf, 0, 4096, 0, f32_t, [16, 1, 1, 1], [4, 64, 64, 64])
+            .unwrap();
+        q.enqueue_op(
+            HtpOpCode::FlashAttnExt as u32,
+            &[qt, kt, vt, mt, sinks_t],
+            &[dt],
+            params,
+            [0; 32],
+        )
+        .unwrap();
+        let (mv, sv) = (view(&q, mt), view(&q, sinks_t));
+        let with_sinks =
+            build_flash_attn_kernel_params(&host, &flash_op(Some(&mv), Some(&sv))).unwrap();
+        assert_eq!(q.ops[5].kernel_params, with_sinks);
+        assert_ne!(
+            q.ops[5].kernel_params, q.ops[0].kernel_params,
+            "dropping the sinks operand must show"
+        );
 
         // refusals: a K/V row list, a missing operand, a dst-less op, a dtype no kernel takes
         let err = q
@@ -2885,7 +3050,7 @@ mod tests {
         q.enqueue_op(HtpOpCode::Add as u32, &[x, y], &[y], [0; 16], [7; 32])
             .unwrap();
         assert_eq!(q.ops[5].kernel_params, [7; 32]);
-        q.enqueue_op(HtpOpCode::Conv1D as u32, &[x, row], &[y], [0; 16], [0; 32])
+        q.enqueue_op(HtpOpCode::Upscale as u32, &[x, row], &[y], [0; 16], [0; 32])
             .unwrap();
         assert_eq!(q.ops[6].kernel_params, [0; 32]);
 

@@ -159,6 +159,15 @@ impl Gg {
         self.ne == o.ne
     }
 
+    /// Planes and batches follow one another with no gap: `nb[2] == nb[1] * ne[1]` and
+    /// `nb[3] == nb[2] * ne[2]`. A stride only counts where something sits above it: with a single
+    /// plane the plane stride says nothing, unless there are batches, whose distance it sets.
+    fn planes_packed(&self) -> bool {
+        let above_rows = self.ne[2] > 1 || self.ne[3] > 1;
+        (!above_rows || self.nb[2] == self.nb[1].wrapping_mul(self.ne[1]))
+            && (self.ne[3] == 1 || self.nb[3] == self.nb[2].wrapping_mul(self.ne[2]))
+    }
+
     /// `ggml_is_permuted`.
     fn is_permuted(&self) -> bool {
         self.nb[0] > self.nb[1] || self.nb[1] > self.nb[2] || self.nb[2] > self.nb[3]
@@ -592,6 +601,15 @@ fn collapse_dims(t: &mut [Gg], elem: u64, n_threads: u32) {
         }
     }
 
+    // The steps below rewrite the plane and batch strides from the row stride and the new extents,
+    // which describes the same bytes only when the planes and batches follow one another with no
+    // gap. Upstream does not check, so a view with a gap (a slice of a larger buffer, a padded
+    // batch) comes out addressing other planes than it went in with. Such a tensor is left as it
+    // is: the DSP reads strides from the descriptor, and the uncollapsed ones are the true ones.
+    if t.iter().any(|x| !x.planes_packed()) {
+        return;
+    }
+
     while t[0].ne[1] > 1 || t[0].ne[2] > 1 || t[0].ne[3] > 1 {
         let row_size = t[0].ne[0].wrapping_mul(elem);
         let rows_contig = t.iter().all(|x| x.nb[1] == x.ne[0].wrapping_mul(elem));
@@ -1008,20 +1026,21 @@ pub fn solve_unary(
         let src1_total = nt * src1_ra;
         let avail = vtcm.saturating_sub(src1_total);
         let per_row = 2 * (2 * src0_ra + dst_ra);
-        avail / (nt * per_row)
+        avail.checked_div(nt * per_row)?
     } else if opcode == O::RmsNormMul as u32 {
         if broadcast_weight {
             let src1_total = nt * src1_ra;
             let avail = vtcm.saturating_sub(src1_total);
             let per_row = 2 * (src0_ra + dst_ra);
-            avail / (nt * per_row)
+            avail.checked_div(nt * per_row)?
         } else {
             let per_row = 2 * (src0_ra + dst_ra + src1_ra);
-            vtcm / (nt * per_row)
+            vtcm.checked_div(nt * per_row)?
         }
     } else {
         let per_row = 2 * (src0_ra + dst_ra);
-        vtcm / (nt * per_row)
+        // a row of 2^32 bytes or more wraps its aligned size to 0, which the C divides by
+        vtcm.checked_div(nt * per_row)?
     };
     if max_block > 0 && rpt > u64::from(max_block) {
         rpt = u64::from(max_block);
@@ -1131,7 +1150,7 @@ pub fn solve_glu(
 
     let row_aligned = u64::from(round_up(dst_row, 128));
     let nt = u64::from(n_threads);
-    let mut rpt = (vtcm / (nt * 3 * row_aligned)) as u32;
+    let mut rpt = vtcm.checked_div(nt * 3 * row_aligned)? as u32;
     if rpt < 2 {
         return None;
     }
@@ -1322,6 +1341,42 @@ mod tests {
         assert!(derive(HtpOpCode::Conv1D, &[x, w], &x).is_none());
     }
 
+    /// The C divides by the session's thread count and by a result row's size, and keeps a row's
+    /// bytes in 32 bits. A session without threads counts as one here, an empty row is refused, and
+    /// a row of 2^30 floats (2^32 bytes) must not panic.
+    #[test]
+    fn solvers_handle_zero_threads_empty_rows_and_enormous_rows() {
+        let x = f32_tensor([2048, 4, 1, 1]);
+        let derive = |op: HtpOpCode, src: &[CopyTensor], dst: &CopyTensor, threads: u32| {
+            derive_eltwise(op as u32, src, dst, threads, 8 << 20)
+        };
+        let one = derive(HtpOpCode::UnarySilu, &[x], &x, 1);
+        assert!(one.is_some());
+        assert_eq!(derive(HtpOpCode::UnarySilu, &[x], &x, 0), one);
+        let glu = derive(HtpOpCode::GluSwiglu, &[x, x], &x, 1);
+        assert!(glu.is_some());
+        assert_eq!(derive(HtpOpCode::GluSwiglu, &[x, x], &x, 0), glu);
+
+        let empty = f32_tensor([0, 4, 1, 1]);
+        assert!(derive(HtpOpCode::UnarySilu, &[empty], &empty, 6).is_none());
+        assert!(derive(HtpOpCode::GluSwiglu, &[empty, empty], &empty, 6).is_none());
+
+        let huge = CopyTensor {
+            dtype: x.dtype,
+            ne: [1 << 30, 1, 1, 1],
+            nb: [4, 0, 0, 0],
+        };
+        let _ = derive(HtpOpCode::UnarySilu, &[huge], &huge, 6);
+        let _ = derive(HtpOpCode::GluSwiglu, &[huge, huge], &huge, 6);
+        let _ = derive(HtpOpCode::RmsNorm, &[huge], &huge, 6);
+        let _ = derive(HtpOpCode::RmsNormMul, &[huge, huge], &huge, 6);
+        let scale = CopyTensor {
+            ne: [1 << 30, 1, 1, 1],
+            ..huge
+        };
+        let _ = derive(HtpOpCode::RmsNormMulAdd, &[huge, scale, scale], &huge, 6);
+    }
+
     #[test]
     fn binary_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/binary_golden.txt");
@@ -1356,8 +1411,8 @@ mod tests {
     #[test]
     fn unary_kernel_params_and_collapse_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/unary_golden.txt");
-        let (mut cases, mut unsupported, mut collapsed, mut tiled) =
-            (0usize, 0usize, 0usize, 0usize);
+        let (mut cases, mut unsupported, mut collapsed, mut tiled, mut deviations) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for (inputs, want) in golden_lines(golden) {
             let mut sides = inputs.split('|');
             let s0 = tensor(&mut sides.next().unwrap().split_whitespace());
@@ -1376,6 +1431,14 @@ mod tests {
 
             let line = format!("{inputs}=>{want}");
             let (c0, cd) = collapse_unary(opcode, &s0, &d, threads);
+            if !(Gg::from(&s0).planes_packed() && Gg::from(&d).planes_packed())
+                && (want_s0, want_d) != (s0, d)
+            {
+                // upstream rewrote the strides of a view with a gap between planes; see collapse_dims
+                assert_eq!((c0, cd), (s0, d), "left alone: {line}");
+                deviations += 1;
+                continue;
+            }
             assert_eq!((c0, cd), (want_s0, want_d), "collapse: {line}");
             let got = solve_unary(opcode, &c0, s1.as_ref(), &cd, threads, vtcm);
             assert_eq!(got, want_words, "{line}");
@@ -1387,16 +1450,16 @@ mod tests {
             cases += 1;
         }
         assert!(
-            cases > 5000 && unsupported > 1000 && collapsed > 1000 && tiled > 50,
-            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {collapsed} collapsed, {tiled} tiled"
+            cases > 5000 && unsupported > 1000 && collapsed > 1000 && tiled > 50 && deviations > 0,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {collapsed} collapsed, {tiled} tiled, {deviations} deviations"
         );
     }
 
     #[test]
     fn glu_kernel_params_and_collapse_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/glu_golden.txt");
-        let (mut cases, mut unsupported, mut collapsed, mut direct) =
-            (0usize, 0usize, 0usize, 0usize);
+        let (mut cases, mut unsupported, mut collapsed, mut direct, mut deviations) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for (inputs, want) in golden_lines(golden) {
             let mut sides = inputs.split('|');
             let s0 = tensor(&mut sides.next().unwrap().split_whitespace());
@@ -1421,6 +1484,15 @@ mod tests {
             } else {
                 collapse_glu(opcode, &s0, s1.as_ref(), &d, threads)
             };
+            let packed = Gg::from(&s0).planes_packed()
+                && s1.is_none_or(|s| Gg::from(&s).planes_packed())
+                && Gg::from(&d).planes_packed();
+            if !packed && (want_s0, want_s1, want_d) != (s0, s1, d) {
+                // upstream rewrote the strides of a view with a gap between planes; see collapse_dims
+                assert_eq!((c0, c1, cd), (s0, s1, d), "left alone: {line}");
+                deviations += 1;
+                continue;
+            }
             assert_eq!((c0, c1, cd), (want_s0, want_s1, want_d), "collapse: {line}");
             let got = solve_glu(opcode, &c0, c1.as_ref(), &cd, threads, vtcm);
             assert_eq!(got, want_words, "{line}");
@@ -1430,8 +1502,113 @@ mod tests {
             cases += 1;
         }
         assert!(
-            cases > 5000 && unsupported > 1000 && collapsed > 1000 && direct > 500,
-            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {collapsed} collapsed, {direct} direct"
+            cases > 5000
+                && unsupported > 1000
+                && collapsed > 1000
+                && direct > 500
+                && deviations > 0,
+            "golden file looks truncated: {cases} cases, {unsupported} unsupported, {collapsed} collapsed, {direct} direct, {deviations} deviations"
+        );
+    }
+
+    /// The byte offset of every element of `t`, in linear element order.
+    fn element_offsets(t: &CopyTensor) -> Vec<u64> {
+        let mut out = Vec::new();
+        for i3 in 0..u64::from(t.ne[3]) {
+            for i2 in 0..u64::from(t.ne[2]) {
+                for i1 in 0..u64::from(t.ne[1]) {
+                    for i0 in 0..u64::from(t.ne[0]) {
+                        out.push(
+                            i0 * u64::from(t.nb[0])
+                                + i1 * u64::from(t.nb[1])
+                                + i2 * u64::from(t.nb[2])
+                                + i3 * u64::from(t.nb[3]),
+                        );
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Collapsing a unary or GLU operand must leave every element at the byte it was at, whether
+    /// or not the planes and batches carry a gap. Upstream's merge and split steps rewrote the
+    /// plane strides of a padded view and moved elements; this port leaves such views alone.
+    #[test]
+    fn collapse_keeps_every_element_where_it_was() {
+        let (mut moved_by_a_gap, mut collapsed_packed) = (0usize, 0usize);
+        for dtype in [HtpDataType::F32, HtpDataType::F16] {
+            let ts: u32 = if dtype == HtpDataType::F16 { 2 } else { 4 };
+            for ne0 in [3u32, 30, 64, 100] {
+                for ne1 in [1u32, 2, 17, 64] {
+                    for ne2 in [1u32, 3] {
+                        for ne3 in [1u32, 2] {
+                            for (gap_plane, gap_batch) in
+                                [(0u32, 0u32), (64, 0), (0, 128), (64, 128)]
+                            {
+                                for threads in [1u32, 6] {
+                                    let nb1 = ts * ne0;
+                                    let nb2 = nb1 * ne1 + gap_plane;
+                                    let nb3 = nb2 * ne2 + gap_batch;
+                                    let src = CopyTensor {
+                                        dtype: dtype as u32,
+                                        ne: [ne0, ne1, ne2, ne3],
+                                        nb: [ts, nb1, nb2, nb3],
+                                    };
+                                    let dst = CopyTensor {
+                                        nb: [ts, nb1, nb1 * ne1, nb1 * ne1 * ne2],
+                                        ..src
+                                    };
+                                    let (c0, cd) = collapse_unary(
+                                        HtpOpCode::UnarySilu as u32,
+                                        &src,
+                                        &dst,
+                                        threads,
+                                    );
+                                    assert_eq!(
+                                        element_offsets(&c0),
+                                        element_offsets(&src),
+                                        "{src:?}"
+                                    );
+                                    assert_eq!(
+                                        element_offsets(&cd),
+                                        element_offsets(&dst),
+                                        "{dst:?}"
+                                    );
+                                    let (g0, g1, gd) = collapse_glu(
+                                        HtpOpCode::GluSwiglu as u32,
+                                        &src,
+                                        Some(&src),
+                                        &dst,
+                                        threads,
+                                    );
+                                    assert_eq!(
+                                        element_offsets(&g0),
+                                        element_offsets(&src),
+                                        "{src:?}"
+                                    );
+                                    assert_eq!(
+                                        element_offsets(&g1.unwrap()),
+                                        element_offsets(&src)
+                                    );
+                                    assert_eq!(element_offsets(&gd), element_offsets(&dst));
+                                    // a gap only exists between planes that exist
+                                    if !Gg::from(&src).planes_packed() {
+                                        moved_by_a_gap += 1;
+                                        assert_eq!(c0, src, "a view with a gap is left alone");
+                                    } else if c0 != src {
+                                        collapsed_packed += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            moved_by_a_gap > 100 && collapsed_packed > 100,
+            "the grid should hold both kinds: {moved_by_a_gap} with a gap, {collapsed_packed} collapsed"
         );
     }
 }

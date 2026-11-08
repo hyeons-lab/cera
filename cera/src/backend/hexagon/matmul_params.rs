@@ -17,7 +17,9 @@
 //!   device buffer at load (`opt_rt_repack`); cera uploads its own layout and never relies on it.
 //! - `ggml_is_view` is not visible from a descriptor, so a view is never refused for being one.
 //! - The HMX path needs [`HMX_MM_MIN_NROWS`] activation rows here (upstream: more than 4). Below
-//!   that the HMX worker is racy on device, so the `plan_*` entry points solve with HMX off.
+//!   that the HMX worker is racy on device, so a session from [`MmSession::new`] keeps the HMX off
+//!   there, for the `build_*` entry points and the `solve_*` solvers alike. The golden tests build
+//!   their sessions with upstream's floor (`hmx_min_rows`) to pin the unmodified solver.
 
 use super::params::{FastDivValues, init_fastdiv, wire_byte};
 use super::types::{HTP_TENSOR_TILED, HtpDataType, HtpTensor};
@@ -75,8 +77,9 @@ const Q2_0: u32 = HtpDataType::Q2_0 as u32;
 
 // --- ggml / HTP type facts -------------------------------------------------------------------
 
-/// `(ggml_blck_size, ggml_type_size)` for the types a matmul can see.
-fn type_info(dtype: u32) -> Option<(u64, u64)> {
+/// `(ggml_blck_size, ggml_type_size)` for the types a matmul can see. The one table of block sizes
+/// and type sizes in this module tree: `params.rs` reads its operands through it too.
+pub(super) fn type_info(dtype: u32) -> Option<(u64, u64)> {
     Some(match dtype {
         F32 | I32 => (1, 4),
         F16 | BF16 => (1, 2),
@@ -121,7 +124,7 @@ fn is_tiled_weight_type(dtype: u32) -> bool {
 }
 
 /// `htp_tensor_get_tile_size`: bytes of one 32 x tile_k weight tile, 0 for untiled types.
-fn tile_size(dtype: u32) -> u64 {
+pub(super) fn tile_size(dtype: u32) -> u64 {
     match dtype {
         Q4_0 | IQ4_NL | Q1_0 | Q2_0 => 576,
         Q4_1 | Q4_K => 640,
@@ -137,7 +140,7 @@ fn tile_size(dtype: u32) -> u64 {
 }
 
 /// `htp_tensor_get_tile_k`: weight elements along K per tile.
-fn tile_k(dtype: u32) -> u64 {
+pub(super) fn tile_k(dtype: u32) -> u64 {
     match dtype {
         Q1_0 => 128,
         Q2_0 => 64,
@@ -151,7 +154,7 @@ fn tile_padded_size(dtype: u32) -> u64 {
 }
 
 /// `htp_tensor_get_row_size`: bytes of one row of `ne00` elements, 0 for an unknown type.
-fn row_size(dtype: u32, ne00: u64) -> u64 {
+pub(super) fn row_size(dtype: u32, ne00: u64) -> u64 {
     match dtype {
         F32 | I32 => ne00 * 4,
         F16 | BF16 => ne00 * 2,
@@ -369,6 +372,10 @@ pub struct MmSession {
     pub n_hmx: u32,
     /// DSP devices the op is split over (1 for every cera session).
     pub mdev_count: u32,
+    /// The fewest activation rows that may take the HMX: cera's [`HMX_MM_MIN_NROWS`] for
+    /// [`MmSession::new`], upstream's `UPSTREAM_HMX_MIN_NROWS + 1` for the sessions that pin the
+    /// unmodified solver.
+    pub hmx_min_rows: u64,
 }
 
 impl MmSession {
@@ -378,19 +385,14 @@ impl MmSession {
             vtcm_bytes,
             n_hmx,
             mdev_count: 1,
+            hmx_min_rows: HMX_MM_MIN_NROWS as u64,
         }
     }
 
-    /// The same session with the HMX off when `rows` is under cera's floor.
-    fn for_rows(self, rows: u64) -> Self {
-        Self {
-            n_hmx: if rows >= HMX_MM_MIN_NROWS as u64 {
-                self.n_hmx
-            } else {
-                0
-            },
-            ..self
-        }
+    /// The thread count the solvers divide by: a session without threads divides by zero in the
+    /// C, which never sees one, so it counts as one thread here.
+    fn threads(&self) -> u32 {
+        self.n_threads.max(1)
     }
 }
 
@@ -1034,7 +1036,13 @@ fn hvx_solve_vtcm_params(
 
 /// `htp_matmul_is_hmx_eligible`: whether the tensors may run on the HMX at all (the solver may
 /// still find no chunking that fits).
-fn hmx_eligible(src0: &MmTensor, src1: &MmTensor, is_matmul_id: bool, is_batched: bool) -> bool {
+fn hmx_eligible(
+    src0: &MmTensor,
+    src1: &MmTensor,
+    is_matmul_id: bool,
+    is_batched: bool,
+    min_rows: u64,
+) -> bool {
     if src1.dtype != F32 && (src1.dtype != F16 || is_matmul_id) {
         return false;
     }
@@ -1057,7 +1065,7 @@ fn hmx_eligible(src0: &MmTensor, src1: &MmTensor, is_matmul_id: bool, is_batched
         return false;
     }
     let m = if is_matmul_id { ne12 } else { ne11 };
-    m > UPSTREAM_HMX_MIN_NROWS
+    m >= min_rows
 }
 
 /// `htp_kparams_solve_hmx_mm`. `dst` is `None` for the fused `MulMatNx`, which has no single
@@ -1078,7 +1086,7 @@ fn solve_hmx_mm(
 ) -> Option<MmKernelParams> {
     let is_tiled = src0.tiled;
     let aligned_tile_size = if is_tiled { tile_padded_size(wtype) } else { 0 };
-    let n_threads = sess.n_threads as i32;
+    let n_threads = sess.threads() as i32;
     let mdev_count = u64::from(sess.mdev_count);
     let (ne02, ne11, ne12, ne10) = (src0.ne[2], act.ne[1], act.ne[2], act.ne[0]);
     let vtcm_budget = sess.vtcm_bytes as u64;
@@ -1152,7 +1160,7 @@ fn solve_hmx_mm(
         },
         pipeline: u8::from(pipeline),
         n_hmx: 1,
-        n_threads: wire_byte(sess.n_threads as usize),
+        n_threads: wire_byte(sess.threads() as usize),
         n_act_threads: wire_byte(act_threads as usize),
         m_chunk: m_chunk as i32,
         n_chunk: n_chunk as i32,
@@ -1181,10 +1189,10 @@ fn solve_hvx_mm(
     src2_row_size: u64,
     kp: &mut MmKernelParams,
 ) {
-    let n_threads = u64::from(sess.n_threads);
+    let n_threads = u64::from(sess.threads());
     let vtcm_budget = sess.vtcm_bytes as u64;
     kp.n_hmx = 0;
-    kp.n_threads = wire_byte(sess.n_threads as usize);
+    kp.n_threads = wire_byte(sess.threads() as usize);
 
     let ne10 = src1.ne[0];
     let src1_nrows = src1.ne[1] * src1.ne[2] * src1.ne[3];
@@ -1377,7 +1385,7 @@ fn solve_matmul_impl(
     let vtcm_budget = sess.vtcm_bytes as u64;
 
     let mut kp = None;
-    if sess.n_hmx > 0 && hmx_eligible(src0, src1, is_matmul_id, is_batched) {
+    if sess.n_hmx > 0 && hmx_eligible(src0, src1, is_matmul_id, is_batched, sess.hmx_min_rows) {
         kp = solve_hmx_mm(
             sess,
             src0,
@@ -1621,7 +1629,7 @@ pub fn solve_mmnx(
     act: &MmTensor,
     n_weights: u32,
 ) -> Option<MmKernelParams> {
-    let n_threads = u64::from(sess.n_threads);
+    let n_threads = u64::from(sess.threads());
     let vtcm_budget = sess.vtcm_bytes as u64;
     let (ne00, ne01, ne02, ne03) = (src0.ne[0], src0.ne[1], src0.ne[2], src0.ne[3]);
     let (ne10, ne11, ne12, ne13) = (act.ne[0], act.ne[1], act.ne[2], act.ne[3]);
@@ -1637,12 +1645,12 @@ pub fn solve_mmnx(
     let is_batched = ne02 * ne03 > 1 || ne12 * ne13 > 1;
 
     let mut kp = MmKernelParams {
-        n_threads: wire_byte(sess.n_threads as usize),
+        n_threads: wire_byte(sess.threads() as usize),
         ..Default::default()
     };
     let mut done = false;
     if sess.n_hmx > 0
-        && hmx_eligible(src0, act, false, is_batched)
+        && hmx_eligible(src0, act, false, is_batched, sess.hmx_min_rows)
         && let Some(mut hmx) = solve_hmx_mm(
             sess,
             src0,
@@ -1782,8 +1790,11 @@ pub fn build_mul_mat_kernel_params(
     n_threads: u32,
     vtcm_budget: usize,
 ) -> Option<[i32; 32]> {
+    if ne10 == 0 || ne11 == 0 || ne12 == 0 || dst_row_size < 4 {
+        return None;
+    }
     let sess = builder_session(n_threads, vtcm_budget, false);
-    let n = (dst_row_size / 4).max(1) as u64;
+    let n = (dst_row_size / 4) as u64;
     let k_padded = (ne10 as u64).next_multiple_of(32);
     let src0 = MmTensor::tiled_weight(wtype as u32, [k_padded, n.next_multiple_of(32), 1, 1]);
     let src1 = MmTensor::f32_rows(
@@ -1809,7 +1820,7 @@ pub fn build_hmx_mm_kernel_params(
     n_threads: u32,
     vtcm_budget: usize,
 ) -> Option<[i32; 32]> {
-    let sess = builder_session(n_threads, vtcm_budget, true).for_rows(m as u64);
+    let sess = builder_session(n_threads, vtcm_budget, true);
     let ne = [k as u64, n as u64, 1, 1];
     let src0 = if wtype == HtpDataType::F16 {
         MmTensor::contiguous(wtype as u32, ne)
@@ -1835,7 +1846,7 @@ pub fn mm_is_hmx_eligible(wtype: HtpDataType, k: usize, n: usize, m: usize) -> b
         MmTensor::tiled_weight(wtype as u32, ne)
     };
     let src1 = MmTensor::f32_rows([k as u64, m as u64, 1, 1], k as u64 * 4);
-    hmx_eligible(&src0, &src1, false, false)
+    hmx_eligible(&src0, &src1, false, false, HMX_MM_MIN_NROWS as u64)
 }
 
 /// The weight's `nb[1]` as the HMX kernel strides it: one tiled row (`htp_tiled_row_size`), or
@@ -1861,7 +1872,10 @@ pub fn build_mul_mat_nx_kernel_params(
     vtcm_budget: usize,
     hmx: bool,
 ) -> Option<[i32; 32]> {
-    let sess = builder_session(n_threads, vtcm_budget, hmx).for_rows(rows as u64);
+    if [ne00, ne10, n0, n_weights, rows].contains(&0) {
+        return None;
+    }
+    let sess = builder_session(n_threads, vtcm_budget, hmx);
     let src0 = MmTensor::tiled_weight(wtype as u32, [ne00 as u64, n0 as u64, 1, 1]);
     let act = MmTensor::f32_rows([ne10 as u64, rows as u64, 1, 1], ne10 as u64 * 4);
     let kp = solve_mmnx(&sess, &src0, &act, n_weights as u32)?;
@@ -2017,6 +2031,7 @@ mod tests {
             vtcm_bytes: n[1] as usize,
             n_hmx: n[2] as u32,
             mdev_count: n[3] as u32,
+            hmx_min_rows: UPSTREAM_HMX_MIN_NROWS + 1,
         }
     }
 
@@ -2502,19 +2517,34 @@ mod tests {
         }
         assert!(mm_is_hmx_eligible(q8, 1024, 1024, HMX_MM_MIN_NROWS));
         assert!(build_hmx_mm_kernel_params(q8, 1024, 1024, HMX_MM_MIN_NROWS, 8, 8 << 20).is_some());
-        // the unmodified solver is happy with 5
-        let sess = MmSession::new(8, 8 << 20, 1);
+        // the unmodified solver, given upstream's floor, is happy with 5 ...
+        let upstream = MmSession {
+            hmx_min_rows: UPSTREAM_HMX_MIN_NROWS + 1,
+            ..MmSession::new(8, 8 << 20, 1)
+        };
         let w = MmTensor::tiled_weight(Q8_0, [1024, 1024, 1, 1]);
         let (x, d) = (
             MmTensor::f32_rows([1024, 5, 1, 1], 4096),
             MmTensor::f32_rows([1024, 5, 1, 1], 4096),
         );
-        assert_eq!(solve_mul_mat(&sess, &w, &x, &d).unwrap().n_hmx, 1);
-        // dims that are not whole tiles, and types with no tiles, stay off the HMX
+        assert_eq!(solve_mul_mat(&upstream, &w, &x, &d).unwrap().n_hmx, 1);
+        // ... and a session from `new` keeps cera's floor in the solver itself, not only in the builders
+        let cera = MmSession::new(8, 8 << 20, 1);
+        assert_eq!(solve_mul_mat(&cera, &w, &x, &d).unwrap().n_hmx, 0);
+        let (x8, d8) = (
+            MmTensor::f32_rows([1024, 8, 1, 1], 4096),
+            MmTensor::f32_rows([1024, 8, 1, 1], 4096),
+        );
+        assert_eq!(solve_mul_mat(&cera, &w, &x8, &d8).unwrap().n_hmx, 1);
+        // dims that are not whole tiles, and types the HMX has no path for, stay off it; a tiled
+        // type that does have one (Q4_1) takes it once the rows are there
         assert!(!mm_is_hmx_eligible(q8, 1000, 1024, 64));
         assert!(!mm_is_hmx_eligible(q8, 1024, 1000, 64));
+        assert!(!mm_is_hmx_eligible(q8, 1024, 0, 64));
+        assert!(!mm_is_hmx_eligible(q8, 0, 1024, 64));
         assert!(mm_is_hmx_eligible(HtpDataType::F16, 1024, 1024, 64));
-        assert!(!mm_is_hmx_eligible(HtpDataType::Q4_1, 1024, 1024, 0));
+        assert!(mm_is_hmx_eligible(HtpDataType::Q4_1, 1024, 1024, 64));
+        assert!(!mm_is_hmx_eligible(HtpDataType::I32, 1024, 1024, 64));
     }
 
     /// The HMX weight stride is one tiled row: the ggml row for Q4_0 / Q8_0, a wider one for the
@@ -2598,6 +2628,84 @@ mod tests {
         let wrong_ids = MmTensor::contiguous(HtpDataType::I64 as u32, [u(used), 1, 1, 1]);
         assert!(build_mul_mat_id_kernel_params(&w, &x, &wrong_ids, &d, 8, 8 << 20).is_none());
         assert!(build_mul_mat_id_kernel_params(&w, &x, &ids, &d, 8, 64 << 10).is_none());
+
+        // with enough tokens to reach the HMX row floor it is still HVX only
+        let x64 = MmTensor::f32_rows([u(k), 1, 64, 1], u(k) * 4);
+        let ids64 = MmTensor::contiguous(I32, [u(used), 64, 1, 1]);
+        let d64 = MmTensor::f32_rows([u(n), u(used), 64, 1], u(n) * 4);
+        let kp64 = MmKernelParams::from_words(
+            &build_mul_mat_id_kernel_params(&w, &x64, &ids64, &d64, 8, 8 << 20).unwrap(),
+        );
+        assert_eq!(kp64.n_hmx, 0);
+    }
+
+    /// The fusion pass's support check says no to a weight that is not tiled and to an HVX kernel
+    /// the fused ops do not have; the golden files only ever see supported kernels.
+    #[test]
+    fn fused_kernel_support_checks_refuse_untiled_weights_and_other_kernels() {
+        let u = |v: usize| v as u64;
+        let (k, n, experts, used) = (1024usize, 512usize, 8usize, 2usize);
+        let w = MmTensor::tiled_weight(Q8_0, [u(k), u(n), u(experts), 1]);
+        let x = MmTensor::f32_rows([u(k), 1, 1, 1], u(k) * 4);
+        let ids = MmTensor::contiguous(I32, [u(used), 1, 1, 1]);
+        let d = MmTensor::f32_rows([u(n), u(used), 1, 1], u(n) * 4);
+        let kp = MmKernelParams::from_words(
+            &build_mul_mat_id_kernel_params(&w, &x, &ids, &d, 8, 8 << 20).unwrap(),
+        );
+        assert_eq!(kp.kernel_type, MM_KERNEL_HVX_QUANT_BLOCK);
+        assert!(mmidnx_kernel_supported(&w, &kp));
+        let untiled = MmTensor::contiguous(Q8_0, [u(k), u(n), u(experts), 1]);
+        assert!(!mmidnx_kernel_supported(&untiled, &kp));
+        let other = MmKernelParams {
+            kernel_type: MM_KERNEL_HVX_F32_F32_VTCM,
+            ..kp
+        };
+        assert!(!mmidnx_kernel_supported(&w, &other));
+        // the plain fused kernel has the row kernel only, not the block one
+        assert!(!mmnx_kernel_supported(&w, &kp));
+        let row = MmKernelParams {
+            kernel_type: MM_KERNEL_HVX_QUANT_ROW,
+            ..kp
+        };
+        assert!(mmnx_kernel_supported(&w, &row));
+        assert!(!mmnx_kernel_supported(&untiled, &row));
+    }
+
+    /// A session without threads divides by zero in the C, which never sees one; here it counts
+    /// as one thread in every solver, so the result is the one-thread result.
+    #[test]
+    fn a_zero_thread_session_solves_as_one_thread() {
+        let w = MmTensor::tiled_weight(Q8_0, [1024, 1024, 1, 1]);
+        let (x, d) = (
+            MmTensor::f32_rows([1024, 1, 1, 1], 4096),
+            MmTensor::f32_rows([1024, 1, 1, 1], 4096),
+        );
+        let (none, one) = (MmSession::new(0, 8 << 20, 1), MmSession::new(1, 8 << 20, 1));
+        let solved = solve_mul_mat(&none, &w, &x, &d);
+        assert!(solved.is_some());
+        assert_eq!(solved, solve_mul_mat(&one, &w, &x, &d));
+        assert_eq!(solve_mmnx(&none, &w, &x, 3), solve_mmnx(&one, &w, &x, 3));
+        assert_eq!(solved.unwrap().n_threads, 1);
+    }
+
+    /// The cera builders refuse an empty extent instead of solving a zero-sized matmul.
+    #[test]
+    fn the_builders_refuse_empty_extents() {
+        let q8 = HtpDataType::Q8_0;
+        assert!(build_mul_mat_kernel_params(q8, 1024, 1, 1, 4096, 8, 8 << 20).is_some());
+        assert!(build_mul_mat_kernel_params(q8, 0, 1, 1, 4096, 8, 8 << 20).is_none());
+        assert!(build_mul_mat_kernel_params(q8, 1024, 0, 1, 4096, 8, 8 << 20).is_none());
+        assert!(build_mul_mat_kernel_params(q8, 1024, 1, 0, 4096, 8, 8 << 20).is_none());
+        assert!(build_mul_mat_kernel_params(q8, 1024, 1, 1, 0, 8, 8 << 20).is_none());
+        let nx = |ne00, ne10, n0, weights, rows| {
+            build_mul_mat_nx_kernel_params(q8, ne00, ne10, n0, weights, rows, 8, 8 << 20, false)
+        };
+        assert!(nx(1024, 1024, 1024, 3, 1).is_some());
+        assert!(nx(0, 1024, 1024, 3, 1).is_none());
+        assert!(nx(1024, 0, 1024, 3, 1).is_none());
+        assert!(nx(1024, 1024, 0, 3, 1).is_none());
+        assert!(nx(1024, 1024, 1024, 0, 1).is_none());
+        assert!(nx(1024, 1024, 1024, 3, 0).is_none());
     }
 
     /// A per-head attention-score matmul worked out from the host solver: K as `[64, 126, 8]`
@@ -2703,6 +2811,10 @@ mod tests {
         );
         assert!(params(MulMatF32Shape { ne12: 0, ..ok }).is_none());
         assert!(params(MulMatF32Shape { ne02: 0, ..ok }).is_none());
+        assert!(params(MulMatF32Shape { ne00: 0, ..ok }).is_none());
+        assert!(params(MulMatF32Shape { ne01: 0, ..ok }).is_none());
+        assert!(params(MulMatF32Shape { ne03: 0, ..ok }).is_none());
+        assert!(params(MulMatF32Shape { ne13: 0, ..ok }).is_none());
     }
 
     /// A tiled weight's registered descriptor carries the tiled strides; the solver wants the

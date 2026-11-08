@@ -1107,7 +1107,7 @@ impl HexagonWhisperModel {
             )
             .ok_or_else(|| {
                 CeraError::Backend(format!(
-                    "no matmul kernel fits {chunk} rows of a {out_channels}x{padded_in_channels} conv tap in the VTCM"
+                    "no matmul kernel for {chunk} rows of a {out_channels}x{padded_in_channels} conv tap (K must be a multiple of 32 and the plan must fit the VTCM)"
                 ))
             })?;
 

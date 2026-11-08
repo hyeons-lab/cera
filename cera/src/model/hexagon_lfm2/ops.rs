@@ -2347,7 +2347,7 @@ impl super::pager::PagerHost for SessionHost<'_> {
 
 fn no_matmul_kernel(rows: usize, cols: usize, n_rows: usize) -> CeraError {
     CeraError::Backend(format!(
-        "no matmul kernel fits {n_rows} activation rows of a {rows}x{cols} weight in the VTCM"
+        "no matmul kernel for {n_rows} activation rows of a {rows}x{cols} weight (K must be a multiple of 32 and the plan must fit the VTCM)"
     ))
 }
 

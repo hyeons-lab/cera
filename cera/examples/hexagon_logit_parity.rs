@@ -4,7 +4,8 @@
 //! teacher-forces its tokens into the NPU, so every step compares the two on identical inputs
 //! (text comparison alone drifts as soon as one near-tie flips). Per step it prints the cosine
 //! between the two logit vectors, whether the argmax agrees, and the largest absolute difference;
-//! the summary gives the minimum and mean cosine and the argmax agreement.
+//! the summary gives the minimum and mean cosine and the argmax agreement. The exit status is 1
+//! when any step's cosine is not finite (the NPU returned NaN or all-zero logits).
 //!
 //! ```text
 //! cargo ndk -t arm64-v8a build --release -p cera --example hexagon_logit_parity --features hexagon
@@ -99,11 +100,27 @@ fn main() {
         npu.append_tokens(&[next]).expect("npu decode");
     }
     let mean = cosines.iter().sum::<f64>() / cosines.len() as f64;
-    let min = cosines.iter().cloned().fold(f64::INFINITY, f64::min);
+    // `f64::min` drops a NaN, so an NPU that returns dead logits (a NaN cosine every step) would
+    // print `cosine min inf`; carry the NaN through and fail the run instead
+    let non_finite = cosines.iter().filter(|c| !c.is_finite()).count();
+    let min = cosines.iter().cloned().fold(f64::INFINITY, |a, b| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.min(b)
+        }
+    });
     println!(
         "{} prompt tokens, {} decode steps: cosine min {min:.6} mean {mean:.6}; argmax agrees on {agree}/{}",
         prompt.len(),
         steps,
         cosines.len()
     );
+    if non_finite > 0 {
+        eprintln!(
+            "{non_finite} of {} steps have a non-finite cosine",
+            cosines.len()
+        );
+        std::process::exit(1);
+    }
 }
