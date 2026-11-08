@@ -116,6 +116,14 @@ int main() {
         rope_args neg = a;
         neg.sections[0] = -1; neg.sections[1] = 0; neg.sections[2] = 8;
         emit_basic(ne00, 8, nt, 1, 0, neg, multi ? nt * 4 : nt, 0, 6, 8u << 20);
+        // the solver looks at the first three section words only: a positive fourth does not count,
+        // a positive third does
+        rope_args fourth = none;
+        fourth.sections[3] = 8;
+        emit_basic(ne00, 8, nt, 1, 0, fourth, multi ? nt * 4 : nt, 0, 6, 8u << 20);
+        rope_args third = none;
+        third.sections[2] = 8;
+        emit_basic(ne00, 8, nt, 1, 0, third, multi ? nt * 4 : nt, 0, 6, 8u << 20);
     }
     // vision rotates the full row: any other n_dims or an offset is refused
     for (int n_dims : { 16, 32, 48, 64 }) for (int n_offs : { 0, 32 }) {

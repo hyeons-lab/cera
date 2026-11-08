@@ -109,16 +109,17 @@ int main() {
         };
         for (const Case & c : bad) emit_tensors(f32(c.a), f32(c.b), f32(c.c), 4, 8u << 20);
         // strides: a transposed or padded operand the DMA cannot read as rows
-        const int64_t a[4] = { 34, 1024, 1, 1 }, b[4] = { 3, 1024, 1, 1 }, c[4] = { 1024, 32, 2, 1 };
-        const int64_t a2[4] = { 34, 1024, 2, 1 };
+        // two sequences in the window and the dst alike, so the extent checks pass and only the stride
+        // gate under test can refuse a case
+        const int64_t a[4] = { 34, 1024, 2, 1 }, b[4] = { 3, 1024, 1, 1 }, c[4] = { 1024, 32, 2, 1 };
         emit_tensors(f32(a, 16), f32(b), f32(c), 4, 8u << 20);   // padded window rows
         emit_tensors(f32(a), f32(b, 16), f32(c), 4, 8u << 20);   // padded tap rows
-        emit_tensors(f32(a2, 0), f32(b), f32(c, 16), 4, 8u << 20);   // padded dst rows: accepted
+        emit_tensors(f32(a, 0), f32(b), f32(c, 16), 4, 8u << 20);   // padded dst rows: accepted
         emit_tensors(oracle_tensor(GGML_TYPE_F32, a, 2), f32(b), f32(c), 4, 8u << 20);  // transposed window
         emit_tensors(f32(a), oracle_tensor(GGML_TYPE_F32, b, 2), f32(c), 4, 8u << 20);  // transposed taps
         emit_tensors(f32(a), f32(b), oracle_tensor(GGML_TYPE_F32, c, 2), 4, 8u << 20);  // transposed dst
         {   // the sequence stride is the kernel's own business, whatever it is
-            ggml_tensor s0 = f32(a2), s1 = f32(b), d = f32(c);
+            ggml_tensor s0 = f32(a), s1 = f32(b), d = f32(c);
             s0.nb[2] = s0.nb[2] * 3 + 128;
             d.nb[2]  = d.nb[2] + 64;
             emit_tensors(s0, s1, d, 4, 8u << 20);

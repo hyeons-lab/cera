@@ -1,7 +1,7 @@
 // Case table for the fused matmuls sharing one activation (MUL_MAT_NX: a fused Q/K/V or gate/up):
 // `htp_kparams_solve_mmnx` on the first weight and the activation, then the DSP-kernel check the
-// fusion pass applies (`is_supported_mul_mat_nx_kernel`, mirrored here: the HMX 2-D kernel or the
-// row-parallel tiled HVX one). Line format:
+// fusion pass applies (`is_supported_mul_mat_nx_kernel` in `htp-fusion.cpp`, mirrored here; gen.py fails
+// when the upstream text drifts: the HMX 2-D kernel or the row-parallel tiled HVX one). Line format:
 //   <weight0> | <act> | <n_weights> | <threads> <vtcm> <hmx> <mdev> => <supported 0|1> <params> | unsupported
 #include "mm_common.h"
 
@@ -43,8 +43,9 @@ int main() {
     }
 
     // 2. Session sweep.
-    for (ggml_type t : types) for (const int64_t * s : { (const int64_t[]) { 1024, 1024 }, (const int64_t[]) { 1024, 4608 },
-                                                         (const int64_t[]) { 2048, 8192 } })
+    // a static table: braced lists of compound literals are temporaries that die before the loop body
+    static const int64_t SESSION_SHAPES[][2] = { { 1024, 1024 }, { 1024, 4608 }, { 2048, 8192 } };
+    for (ggml_type t : types) for (const auto & s : SESSION_SHAPES)
     for (int64_t rows : { 1, 5, 33, 130, 512 }) for (uint32_t th : { 1, 4, 6 }) for (size_t vt : MM_VTCMS)
     for (uint32_t hmx : { 0u, 1u }) for (uint32_t mdev : { 1u, 2u }) {
         emit(mm_w(t, s[0], s[1]), mm_f(s[0], rows), 3, { th, vt, hmx, mdev });

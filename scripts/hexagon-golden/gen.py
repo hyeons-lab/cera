@@ -13,7 +13,7 @@ read those files, so a port is checked against the C++ it mirrors, word for word
 With no `op` arguments every oracle runs. ggml-base is built on first use into
 `$LLAMA_CPP/build-host` (CMake + Ninja, no GPU backends, a few seconds).
 """
-import os, pathlib, shutil, subprocess, sys, tempfile
+import hashlib, os, pathlib, re, shutil, subprocess, sys, tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ORACLE = HERE / "oracle"
@@ -22,6 +22,13 @@ LLAMA = pathlib.Path(os.environ.get("LLAMA_CPP") or sys.exit("set LLAMA_CPP to a
 HOST = LLAMA / "ggml/src/ggml-hexagon"
 BUILD = LLAMA / "build-host"
 SOLVERS = ["htp-kparams.cpp", "htp-opnode.cpp", "htp-repack.cpp"]
+# The fusion pass's kernel checks live in `htp-fusion.cpp`, which is not linked; oracle/mmnx.cpp and
+# oracle/mmidnx.cpp copy them by hand. These are the sha256 of their upstream text: when it changes,
+# update the copies and then the hashes.
+MIRRORED = {
+    "is_supported_mul_mat_nx_kernel": "1895e557b83d297d90ec383fcc5529df42d4975edb12ed1afbd6839efc2c6f1c",
+    "is_supported_mul_mat_id_nx_kernel": "a8dad6e21dbbfe5cdc369da86361da4fb4aa4c0822637fe6e7cd23165f05a3a6",
+}
 INCLUDES = [LLAMA / "ggml/include", LLAMA / "ggml/src", HOST, HOST / "htp"]
 
 
@@ -29,20 +36,35 @@ def run(*cmd, **kw):
     return subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
+def check_mirrors():
+    text = (HOST / "htp-fusion.cpp").read_text()
+    for name, want in MIRRORED.items():
+        m = re.search(rf"static bool {name}\(.*?\n}}\n", text, re.S)
+        if m is None:
+            sys.exit(f"{name} is gone from htp-fusion.cpp: update the copies in oracle/mmnx.cpp and mmidnx.cpp")
+        if hashlib.sha256(m.group(0).encode()).hexdigest() != want:
+            sys.exit(f"{name} changed in htp-fusion.cpp: update its copy in oracle/mmnx.cpp or mmidnx.cpp, then MIRRORED in gen.py")
+
+
 def ggml_base() -> pathlib.Path:
     lib = BUILD / "bin"
-    if not list(lib.glob("libggml-base*")):
+    # configure once, but build every run: after the checkout moves, a stale libggml-base would be
+    # linked against the new headers
+    if not (BUILD / "CMakeCache.txt").exists():
         run("cmake", "-S", LLAMA, "-B", BUILD, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
             "-DGGML_METAL=OFF", "-DGGML_BLAS=OFF", "-DGGML_OPENMP=OFF", "-DLLAMA_BUILD_TESTS=OFF",
             "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_SERVER=OFF", "-DLLAMA_BUILD_TOOLS=OFF",
             "-DLLAMA_CURL=OFF")
-        run("cmake", "--build", BUILD, "--target", "ggml-base")
+    run("cmake", "--build", BUILD, "--target", "ggml-base")
     return lib
 
 
-def compile_obj(src: pathlib.Path, obj: pathlib.Path):
+def compile_obj(src: pathlib.Path, obj: pathlib.Path, ours: bool = False):
     flags = [f"-I{i}" for i in INCLUDES]
-    run("clang++", "-std=c++17", "-O1", "-w", *flags, "-c", src, "-o", obj)
+    # upstream's sources keep their warnings quiet; ours must not hold a temporary past its
+    # full-expression (a range-for over braced compound literals did, and printed garbage cases)
+    warn = ["-Wno-everything", "-Werror=dangling"] if ours else ["-w"]
+    run("clang++", "-std=c++17", "-O1", *warn, *flags, "-c", src, "-o", obj)
 
 
 def main(ops):
@@ -51,6 +73,7 @@ def main(ops):
     for op in ops:
         if op not in available:
             sys.exit(f"no oracle for {op!r}; have: {', '.join(available)}")
+    check_mirrors()
     lib = ggml_base()
     sha = subprocess.check_output(["git", "-C", LLAMA, "rev-parse", "--short=9", "HEAD"], text=True).strip()
     OUT.mkdir(parents=True, exist_ok=True)
@@ -59,11 +82,11 @@ def main(ops):
         objs = []
         for src in [ORACLE / "common.cpp"] + [HOST / s for s in SOLVERS]:
             obj = d / (src.stem + ".o")
-            compile_obj(src, obj)
+            compile_obj(src, obj, ours=src.parent == ORACLE)
             objs.append(obj)
         for op in ops:
             op_obj = d / f"op_{op}.o"
-            compile_obj(ORACLE / f"{op}.cpp", op_obj)
+            compile_obj(ORACLE / f"{op}.cpp", op_obj, ours=True)
             exe = d / op
             run("clang++", op_obj, *objs, f"-L{lib}", "-lggml-base", f"-Wl,-rpath,{lib}", "-o", exe)
             body = subprocess.check_output([exe], text=True)

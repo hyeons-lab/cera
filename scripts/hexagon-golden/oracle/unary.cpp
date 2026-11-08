@@ -107,6 +107,7 @@ static void emit(const UOp & u, const ggml_tensor & s0, const ggml_tensor * s1, 
     }
     if (fused) {
         htp_unary_kernel_params k2;
+        memset(&k2, 0xAA, sizeof(k2));  // poison, as the other oracles do
         const bool ok2 = u.op == HTP_OP_RMS_NORM_MUL ? htp_kparams_solve_rms_norm_mul(&sess, &s0, s1, &d, &k2)
                                                       : htp_kparams_solve_rms_norm_mul_add(&sess, &s0, s1, &d, &k2);
         if (ok != ok2 || (ok && memcmp(&k2, node.kernel_params, sizeof(k2)) != 0)) {

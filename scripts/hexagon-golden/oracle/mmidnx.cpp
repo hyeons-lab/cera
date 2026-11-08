@@ -1,6 +1,7 @@
 // Case table for the fused routed matmuls (MUL_MAT_ID_NX): `htp_kparams_solve_mmidnx` on the first
 // weight, the activation and the first output, then the fusion pass's kernel check
-// (`is_supported_mul_mat_id_nx_kernel`, mirrored here). Line format:
+// (`is_supported_mul_mat_id_nx_kernel` in `htp-fusion.cpp`, mirrored here; gen.py fails when the upstream
+// text drifts). Line format:
 //   <weight0> | <act> | <dst0> | <n_weights> | <threads> <vtcm> <hmx> <mdev> => <supported 0|1> <params> | unsupported
 #include "mm_common.h"
 

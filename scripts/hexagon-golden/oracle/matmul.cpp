@@ -82,7 +82,6 @@ int main() {
         const uint32_t ths[]      = { 1, 4, 6 };
         for (ggml_type t : main_types) for (auto & s : shapes) for (int64_t m : ms)
         for (uint32_t th : ths) for (size_t vt : MM_VTCMS) for (uint32_t hmx : { 0u, 1u }) {
-            if (vt == (8u << 20) && th == 6 && hmx == 1) continue;  // the shipped session is in part 1 (8 threads)
             mm(t, s[0], s[1], m, { th, vt, hmx, 1 });
         }
     }

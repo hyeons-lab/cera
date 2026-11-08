@@ -69,6 +69,7 @@ static bool src1_for(Pat pat, ggml_type t, int64_t w, int64_t r, int64_t p, int6
 static const uint32_t OPS[4]     = { HTP_OP_ADD, HTP_OP_MUL, HTP_OP_SUB, HTP_OP_DIV };
 static const ggml_op  GOPS[4]    = { GGML_OP_ADD, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_DIV };
 static int            op_rot     = 0;
+static int            force_op   = -1;  // >= 0: this op for every case, instead of the rotation
 
 static void emit_bin(ggml_type t, int64_t w, int64_t r, int64_t p, int64_t b, Pat pat, int k0, int k1, int kd,
                      uint32_t th, size_t vt) {
@@ -76,7 +77,7 @@ static void emit_bin(ggml_type t, int64_t w, int64_t r, int64_t p, int64_t b, Pa
     if (!src1_for(pat, t, w, r, p, b, k1, &s1)) return;
     ggml_tensor s0 = mk(t, w, r, p, b, k0);
     ggml_tensor d  = mk(t, w, r, p, b, kd);
-    const int   i  = op_rot++ % 4;
+    const int   i  = force_op >= 0 ? force_op : op_rot++ % 4;
     emit(OPS[i], GOPS[i], s0, s1, nullptr, d, th, vt);
 }
 
@@ -94,10 +95,15 @@ int main() {
         for (const Run & ru : lite)
             emit_bin(t, w, s[0], s[1], s[2], (Pat) pat, 0, 0, 0, ru.th, ru.vt);
 
-    // 2. the full thread-count by VTCM-budget grid on a spread of shapes
-    for (int64_t w : std::vector<int64_t>{ 100, 2048 }) for (int si : { 0, 2, 5, 7 }) for (int pat = 0; pat < N_PAT; pat++)
-        for (uint32_t th : ths) for (size_t vt : vts)
-            emit_bin(GGML_TYPE_F32, w, shapes[si][0], shapes[si][1], shapes[si][2], (Pat) pat, 0, 0, 0, th, vt);
+    // 2. the full thread-count by VTCM-budget grid on a spread of shapes, for every op (the rotation in
+    //    emit_bin would alias with the VTCM loop and give each budget one op)
+    for (int op = 0; op < 4; op++) {
+        force_op = op;
+        for (int64_t w : std::vector<int64_t>{ 100, 2048 }) for (int si : { 0, 2, 5, 7 }) for (int pat = 0; pat < N_PAT; pat++)
+            for (uint32_t th : ths) for (size_t vt : vts)
+                emit_bin(GGML_TYPE_F32, w, shapes[si][0], shapes[si][1], shapes[si][2], (Pat) pat, 0, 0, 0, th, vt);
+    }
+    force_op = -1;
 
     // 3. padded, strided, transposed and permuted layouts on every operand
     for (int64_t w : std::vector<int64_t>{ 96, 1024 }) for (int si : { 2, 5, 6 }) for (int pat : { SAME, ROW, SCALAR, SCALROW, PLANEBC, REP2 })

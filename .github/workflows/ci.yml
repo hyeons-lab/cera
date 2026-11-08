@@ -170,6 +170,10 @@ jobs:
                   sys.exit(1)
           print(f"skel SONAMEs verified ({len(paths)} files)")
           PY
+          # a SONAME edited by hand passes the check above but leaves the SWIV CRC stale
+          for f in cera/src/backend/hexagon/skels/libcera-htp-v*.so; do
+            python3 -I scripts/hexagon-skels/finalize.py --check "$f" || exit 1
+          done
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build

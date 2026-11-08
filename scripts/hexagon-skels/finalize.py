@@ -2,7 +2,6 @@
 """Turn a freshly built llama.cpp DSP skel into the file cera bundles.
 
     finalize.py libggml-htp-v79.so cera/src/backend/hexagon/skels/libcera-htp-v79.so
-    finalize.py --as v85 libggml-htp-v81.so .../libcera-htp-v85.so     # v85 = renamed v81 build
     finalize.py --check cera/src/backend/hexagon/skels/libcera-htp-v79.so
 
 llama.cpp ships the same skel names as cera, so an app embedding both would have one overwrite the
@@ -77,7 +76,6 @@ def soname(data):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="verify the SWIV CRC of one file and exit")
-    ap.add_argument("--as", dest="as_arch", help="architecture to name the output after (default: the input's)")
     ap.add_argument("src")
     ap.add_argument("dst", nargs="?")
     a = ap.parse_args()
@@ -96,7 +94,7 @@ def main():
     if not m:
         sys.exit("no libggml-htp-vNN.so SONAME found in the input")
     old = m.group(0)
-    new = b"libcera-htp-" + (a.as_arch.encode() if a.as_arch else m.group(1)) + b".so"
+    new = b"libcera-htp-" + m.group(1) + b".so"
     assert len(old) == len(new), (old, new)
     count = data.count(old)
     data = bytearray(bytes(data).replace(old, new))
