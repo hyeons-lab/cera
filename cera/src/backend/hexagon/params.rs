@@ -110,8 +110,9 @@ pub fn build_elu_params(alpha: f32) -> [i32; 16] {
 
 /// Whether the operands of a `Conv1D` agree the way the DSP's `op_conv1d` needs: F32 throughout,
 /// `groups` dividing both channel counts and not above the output channels, a weight of
-/// `[k, c_in / groups, c_out]`, at least as many input batches as output ones, and a bias with an
-/// entry per output channel. The DSP answers `NO_SUPPORT` for anything else.
+/// `[k, c_in / groups, c_out]`, at least as many input batches as output ones, a fourth extent of
+/// 1 everywhere, and a bias with an entry per output channel. The DSP answers `NO_SUPPORT` for
+/// anything else.
 pub fn conv1d_shapes_ok(
     input: &CopyTensor,
     weight: &CopyTensor,
@@ -132,11 +133,12 @@ pub fn conv1d_shapes_ok(
         && weight.ne[1] == c_in / groups
         && weight.ne[2] == c_out
         && input.ne[2] >= dst.ne[2]
+        && [input.ne[3], weight.ne[3], dst.ne[3]] == [1, 1, 1]
 }
 
 /// [`conv1d_shapes_ok`] for a `ConvTranspose1D` (`op_conv_transpose1d`): F32 throughout, a weight
-/// `[k, c_out, c_in]` whose channels match the result's and the input's, one output slab per input
-/// batch, and a bias with an entry per output channel.
+/// `[k, c_out, c_in]` whose channels match the result's and the input's, exactly one output slab
+/// per input batch, a fourth extent of 1 everywhere, and a bias with an entry per output channel.
 pub fn conv_transpose1d_shapes_ok(
     weight: &CopyTensor,
     input: &CopyTensor,
@@ -150,7 +152,8 @@ pub fn conv_transpose1d_shapes_ok(
         && bias.is_none_or(|b| b.dtype == f32t && b.ne[0] >= dst.ne[1])
         && weight.ne[1] == dst.ne[1]
         && weight.ne[2] == input.ne[1]
-        && dst.ne[2] >= input.ne[2]
+        && dst.ne[2] == input.ne[2]
+        && [weight.ne[3], input.ne[3], dst.ne[3]] == [1, 1, 1]
 }
 
 // The solvers below port llama.cpp's `htp-kparams.cpp` and the layout helpers in `htp/*-ops.h`
@@ -1333,7 +1336,11 @@ fn solve_flash_attn(host: &FlashAttnHost, op: &FlashAttnOp<'_>) -> Option<FaKern
             kp.bc = bc as u16;
             kp.n_kv_blocks = (nek1 as usize).div_ceil(bc) as u16;
             let pipeline = kp.n_kv_blocks >= 3 && n_threads >= 2;
-            kp.n_threads = if pipeline { n_threads as u8 } else { 1 };
+            kp.n_threads = if pipeline {
+                wire_byte(n_threads as usize)
+            } else {
+                1
+            };
             kp.vtcm_size = fa_hmx_layout_total(
                 g as usize,
                 dk_pad as usize,
@@ -1364,7 +1371,7 @@ fn solve_flash_attn(host: &FlashAttnHost, op: &FlashAttnOp<'_>) -> Option<FaKern
     kp.br = 1;
     kp.bc = FA_HVX_BLOCK_SIZE as u16;
     kp.n_kv_blocks = (u64::from(k.ne[1]).div_ceil(FA_HVX_BLOCK_SIZE as u64)) as u16;
-    kp.n_threads = n_threads as u8;
+    kp.n_threads = wire_byte(n_threads as usize);
 
     kp.vtcm_size = fa_hvx_layout_total(
         dk as usize,
@@ -3917,6 +3924,212 @@ mod tests {
         }
     }
 
+    /// The flash-attention solver puts the session's thread count in a one-byte field; an
+    /// out-of-contract count saturates (debug builds trip the assertion) instead of wrapping into
+    /// a plausible kernel with 0 or 1 threads.
+    #[test]
+    fn flash_attn_thread_byte_saturates_instead_of_wrapping() {
+        let operands = fa_operands(64, 16, 8, 32, 602);
+        let solve = |threads: u32, hmx: u32| {
+            fa_solve(
+                &FlashAttnHost::new(threads, 8 << 20, hmx),
+                &operands,
+                0.125,
+                0.0,
+            )
+            .map(|w| (w[0] >> 24) as u8)
+        };
+        // in contract: the HMX chunk pipelines and carries the count, the HVX kernel too
+        assert_eq!(solve(6, 1), Some(6));
+        assert_eq!(solve(6, 0), Some(6));
+        if cfg!(debug_assertions) {
+            for hmx in [1, 0] {
+                let panicked = std::panic::catch_unwind(|| solve(256, hmx)).is_err();
+                assert!(
+                    panicked,
+                    "256 threads must trip the debug assertion (hmx {hmx})"
+                );
+            }
+        } else {
+            for hmx in [1, 0] {
+                assert_eq!(solve(256, hmx), Some(255));
+                assert_eq!(solve(257, hmx), Some(255));
+            }
+        }
+    }
+
+    /// Hostile operands (zero and enormous extents, strides that match nothing, odd thread counts
+    /// and budgets) must never panic a solver. A debug build trips on any unchecked arithmetic
+    /// that the C would let wrap, so this finds what a descriptor with inconsistent fields could
+    /// do to the host. Deterministic: a failure names its inputs.
+    #[test]
+    fn solvers_never_panic_on_hostile_operands() {
+        use super::super::eltwise::{derive_eltwise, eltwise_operand_counts};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let extents = [
+            0u32,
+            1,
+            1,
+            2,
+            3,
+            7,
+            31,
+            32,
+            33,
+            64,
+            100,
+            128,
+            4096,
+            1 << 20,
+            1 << 30,
+            0x7fff_ffff,
+            0x8000_0000,
+            0x8000_0001,
+            u32::MAX,
+        ];
+        let strides = [
+            0u32,
+            1,
+            2,
+            4,
+            8,
+            64,
+            128,
+            1 << 12,
+            1 << 20,
+            1 << 31,
+            u32::MAX,
+        ];
+        let dtypes = [
+            HtpDataType::F32,
+            HtpDataType::F16,
+            HtpDataType::I32,
+            HtpDataType::I64,
+            HtpDataType::Q8_0,
+        ];
+        let tensor = |next: &mut dyn FnMut() -> u64| {
+            let dtype = dtypes[next() as usize % dtypes.len()];
+            // half of the extents come from the small end, where the shapes are plausible
+            let mut ne = [0u32; 4];
+            for e in &mut ne {
+                let pool = if next().is_multiple_of(2) {
+                    8
+                } else {
+                    extents.len()
+                };
+                *e = extents[next() as usize % pool];
+            }
+            let ts = match dtype {
+                HtpDataType::F16 => 2u32,
+                HtpDataType::I64 => 8,
+                _ => 4,
+            };
+            let nb = if next().is_multiple_of(2) {
+                let nb1 = ts.wrapping_mul(ne[0]);
+                let nb2 = nb1.wrapping_mul(ne[1]);
+                [ts, nb1, nb2, nb2.wrapping_mul(ne[2])]
+            } else {
+                let mut nb = [0u32; 4];
+                for b in &mut nb {
+                    *b = strides[next() as usize % strides.len()];
+                }
+                nb
+            };
+            CopyTensor {
+                dtype: dtype as u32,
+                ne,
+                nb,
+            }
+        };
+        let eltwise = [
+            HtpOpCode::Add,
+            HtpOpCode::Mul,
+            HtpOpCode::Sub,
+            HtpOpCode::Div,
+            HtpOpCode::AddId,
+            HtpOpCode::UnarySilu,
+            HtpOpCode::UnaryGelu,
+            HtpOpCode::UnaryNeg,
+            HtpOpCode::Scale,
+            HtpOpCode::Clamp,
+            HtpOpCode::RmsNorm,
+            HtpOpCode::Norm,
+            HtpOpCode::L2Norm,
+            HtpOpCode::Tri,
+            HtpOpCode::RmsNormMul,
+            HtpOpCode::RmsNormMulAdd,
+            HtpOpCode::UnarySnake,
+            HtpOpCode::UnaryElu,
+            HtpOpCode::GluSwiglu,
+            HtpOpCode::GluGeglu,
+            HtpOpCode::GluReglu,
+        ];
+        let budgets = [0usize, 4096, 1 << 16, 1 << 20, 8 << 20, 12 << 20];
+        let mut failures = Vec::new();
+        for i in 0..400_000u32 {
+            // at most 255: a larger count trips `wire_byte`'s debug assertion by design
+            let threads = [0u32, 1, 2, 4, 6, 8, 13, 255][next() as usize % 8];
+            let vtcm = budgets[next() as usize % budgets.len()];
+            let (a, b, c, d) = (
+                tensor(&mut next),
+                tensor(&mut next),
+                tensor(&mut next),
+                tensor(&mut next),
+            );
+            // a same-shaped destination now and then, where the solvers get past their shape checks
+            let d = if next().is_multiple_of(3) {
+                CopyTensor { ne: a.ne, ..d }
+            } else {
+                d
+            };
+            let family = next() % 5;
+            let op = eltwise[next() as usize % eltwise.len()];
+            let params = [0i32; 16];
+            let result = catch_unwind(AssertUnwindSafe(|| match family {
+                0 | 1 => {
+                    let (n, _) = eltwise_operand_counts(op as u32);
+                    let srcs = [a, b, c];
+                    let _ = derive_eltwise(op as u32, &srcs[..n.min(3)], &d, threads, vtcm);
+                }
+                2 => {
+                    let _ = build_copy_kernel_params(&a, &d, threads, vtcm);
+                }
+                3 => {
+                    let sum_op = [HtpOpCode::Sum, HtpOpCode::SumRows, HtpOpCode::Argmax]
+                        [next() as usize % 3];
+                    let _ = build_sum_rows_kernel_params(sum_op as u32, &a, &d, threads);
+                    let sort_op = [HtpOpCode::Argsort, HtpOpCode::TopK][next() as usize % 2];
+                    let _ =
+                        build_sort_kernel_params(sort_op as u32, &a, &d, &params, threads, vtcm);
+                }
+                _ => {
+                    let dim = (next() % 6) as i32 - 1;
+                    let _ = build_concat_kernel_params(&a, &b, &d, dim, threads, vtcm);
+                }
+            }));
+            if result.is_err() {
+                failures.push(format!(
+                    "case {i} family {family} {op:?} threads {threads} vtcm {vtcm}: a {a:?} b {b:?} c {c:?} d {d:?}"
+                ));
+                if failures.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "solver panics:\n{}",
+            failures.join("\n")
+        );
+    }
+
     /// A single sort row wider than 2^31 elements multiplies its chunk size past 32 bits. The C
     /// wraps; a plain multiply here panicked in a debug build.
     #[test]
@@ -4033,6 +4246,40 @@ mod tests {
             &f([16, 4, 1, 1]),
             0
         ));
+
+        // each clause alone: these shapes pass every other check
+        // c_in 8 is not divisible by 3 groups (c_out 9 is, and the weight fits both)
+        assert!(!conv1d_shapes_ok(
+            &x,
+            &f([3, 2, 9, 1]),
+            None,
+            &f([16, 9, 1, 1]),
+            3
+        ));
+        // c_out 6 is not divisible by 4 groups (c_in 8 is)
+        assert!(!conv1d_shapes_ok(
+            &x,
+            &f([3, 2, 6, 1]),
+            None,
+            &f([16, 6, 1, 1]),
+            4
+        ));
+        // no output channels at all
+        assert!(!conv1d_shapes_ok(
+            &x,
+            &f([3, 8, 0, 1]),
+            None,
+            &f([16, 0, 1, 1]),
+            1
+        ));
+        // one non-F32 operand at a time
+        let f16 = |ne: [u32; 4]| dense(HtpDataType::F16, ne);
+        assert!(!conv1d_shapes_ok(&x, &f16([3, 1, 8, 1]), None, &y, 8));
+        assert!(!conv1d_shapes_ok(&x, &w, None, &f16([16, 8, 1, 1]), 8));
+        // a fourth extent anywhere
+        assert!(!conv1d_shapes_ok(&f([16, 8, 1, 2]), &w, None, &y, 8));
+        assert!(!conv1d_shapes_ok(&x, &f([3, 1, 8, 2]), None, &y, 8));
+        assert!(!conv1d_shapes_ok(&x, &w, None, &f([16, 8, 1, 2]), 8));
     }
 
     /// The same for `op_conv_transpose1d`, whose weight is the first source.
@@ -4059,6 +4306,45 @@ mod tests {
             Some(&f([4, 1, 1, 1])),
             &y
         ));
+
+        // each clause alone
+        let f16 = |ne: [u32; 4]| dense(HtpDataType::F16, ne);
+        assert!(!conv_transpose1d_shapes_ok(
+            &f16([4, 5, 3, 1]),
+            &x,
+            None,
+            &y
+        ));
+        assert!(!conv_transpose1d_shapes_ok(
+            &w,
+            &f16([8, 3, 1, 1]),
+            None,
+            &y
+        ));
+        assert!(!conv_transpose1d_shapes_ok(
+            &w,
+            &x,
+            None,
+            &f16([11, 5, 1, 1])
+        ));
+        assert!(!conv_transpose1d_shapes_ok(
+            &w,
+            &x,
+            Some(&f16([5, 1, 1, 1])),
+            &y
+        ));
+        // a result with more batches than the input leaves slabs unwritten; fewer would overrun
+        assert!(!conv_transpose1d_shapes_ok(&w, &x, None, &f([11, 5, 2, 1])));
+        assert!(conv_transpose1d_shapes_ok(
+            &w,
+            &f([8, 3, 2, 1]),
+            None,
+            &f([11, 5, 2, 1])
+        ));
+        // a fourth extent anywhere
+        assert!(!conv_transpose1d_shapes_ok(&f([4, 5, 3, 2]), &x, None, &y));
+        assert!(!conv_transpose1d_shapes_ok(&w, &f([8, 3, 1, 2]), None, &y));
+        assert!(!conv_transpose1d_shapes_ok(&w, &x, None, &f([11, 5, 1, 2])));
     }
 
     #[test]

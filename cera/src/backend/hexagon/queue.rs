@@ -945,6 +945,31 @@ impl HexagonQueueSession {
             self.dsp_hmx(),
         )
         .inspect_err(|_| self.drop_pending_batch())?;
+        self.push_op(opcode, src, dst, params, kernel_params)
+    }
+
+    /// [`Self::enqueue_op`] without the host's operand validation and parameter derivation, so a
+    /// device test can send the DSP an op the host would refuse and see the DSP refuse it too.
+    #[cfg(test)]
+    pub(crate) fn enqueue_op_unvalidated(
+        &mut self,
+        opcode: u32,
+        src: &[u16],
+        dst: &[u16],
+        params: [i32; 16],
+        kernel_params: [i32; 32],
+    ) -> Result<(), CeraError> {
+        self.push_op(opcode, src, dst, params, kernel_params)
+    }
+
+    fn push_op(
+        &mut self,
+        opcode: u32,
+        src: &[u16],
+        dst: &[u16],
+        params: [i32; 16],
+        kernel_params: [i32; 32],
+    ) -> Result<(), CeraError> {
         let mut op = HtpOpDesc {
             opcode,
             flags: 0,
@@ -2239,10 +2264,6 @@ mod tests {
         assert_pending_empty(&q, "concat single src");
     }
 
-    /// A `FlashAttnExt` enqueued with empty kernel params gets them from the registered tensors,
-    /// the op params and the session's limits (thread count, VTCM, HMX units); the HVX-only
-    /// request keeps the HMX kernel off; precomputed params pass through; K/V row lists, missing
-    /// operands and shapes no kernel takes are errors that drop the batch.
     /// The conv ops are refused at enqueue when their operands disagree, instead of reaching a DSP
     /// kernel that divided by zero or read past a tensor. A refusal drops the pending batch, so
     /// each case runs on a fresh session.
@@ -2303,6 +2324,42 @@ mod tests {
         assert!(q.enqueue_op(conv, &[x], &[y], depthwise, [0; 32]).is_err());
         assert_pending_empty(&q, "conv operand count");
 
+        // the bias is the third source: one entry per output channel passes, a short one is refused
+        let mut q = test_session();
+        let (x, w, y, bias) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [8, 1, 1, 1]),
+        );
+        q.enqueue_op(conv, &[x, w, bias], &[y], depthwise, [0; 32])
+            .unwrap();
+        let mut q = test_session();
+        let (x, w, y, short) = (
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+            tensor(&mut q, [4, 1, 1, 1]),
+        );
+        assert!(
+            q.enqueue_op(conv, &[x, w, short], &[y], depthwise, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv short bias");
+
+        // a fourth extent the worker does not handle
+        let mut q = test_session();
+        let (x4, w, y) = (
+            tensor(&mut q, [16, 8, 1, 2]),
+            tensor(&mut q, [3, 1, 8, 1]),
+            tensor(&mut q, [16, 8, 1, 1]),
+        );
+        assert!(
+            q.enqueue_op(conv, &[x4, w], &[y], depthwise, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv fourth extent");
+
         // a transposed conv: weight first and input second is accepted; the other order, and a
         // result with the wrong channels, are refused
         let transposed_tensors = |q: &mut HexagonQueueSession, out_channels: u32| {
@@ -2331,8 +2388,24 @@ mod tests {
                 .is_err()
         );
         assert_pending_empty(&q, "conv transpose channels");
+        // a result with more batches than the input would come back with slabs never written
+        let mut q = test_session();
+        let (wt, xt, y2) = (
+            tensor(&mut q, [4, 5, 3, 1]),
+            tensor(&mut q, [8, 3, 1, 1]),
+            tensor(&mut q, [11, 5, 2, 1]),
+        );
+        assert!(
+            q.enqueue_op(transposed, &[wt, xt], &[y2], strided, [0; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "conv transpose batches");
     }
 
+    /// A `FlashAttnExt` enqueued with empty kernel params gets them from the registered tensors,
+    /// the op params and the session's limits (thread count, VTCM, HMX units); the HVX-only
+    /// request keeps the HMX kernel off; precomputed params pass through; K/V row lists, missing
+    /// operands and shapes no kernel takes are errors that drop the batch.
     #[test]
     fn flash_attn_params_are_filled_from_the_registered_tensors() {
         use super::super::params::{

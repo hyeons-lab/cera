@@ -151,6 +151,25 @@ impl Gg {
         self.ne.iter().fold(1u64, |a, &n| a.wrapping_mul(n))
     }
 
+    /// Whether the tensor, from its first byte to its last, fits the `u32` size of a registered
+    /// descriptor (`add_tensor` refuses a larger one). The solvers hold row and plane sizes in 32
+    /// bits like the C, so an operand past that would be planned on wrapped, smaller sizes.
+    fn fits_descriptor(&self) -> bool {
+        let Some(ts) = self.type_size() else {
+            return true; // a type no solver takes is refused on its type
+        };
+        if self.is_empty() {
+            return true;
+        }
+        let span: u128 = self
+            .ne
+            .iter()
+            .zip(&self.nb)
+            .map(|(&n, &b)| u128::from(n - 1) * u128::from(b))
+            .sum();
+        span + u128::from(ts) <= u128::from(u32::MAX)
+    }
+
     fn is_empty(&self) -> bool {
         self.ne.contains(&0)
     }
@@ -370,6 +389,13 @@ pub fn solve_binary(
     let (s0, s1, d) = (Gg::from(src0), Gg::from(src1), Gg::from(dst));
     let is_add_id = opcode == HtpOpCode::AddId as u32;
     let s2 = src2.map(Gg::from);
+    if ![&s0, &s1, &d]
+        .into_iter()
+        .chain(s2.as_ref())
+        .all(|t| t.fits_descriptor())
+    {
+        return None;
+    }
     if is_add_id {
         let s2 = s2.as_ref()?;
         if !s0.is(HtpDataType::F32)
@@ -931,6 +957,13 @@ pub fn solve_unary(
     if (!s0.is(HtpDataType::F32) && !s0.is(HtpDataType::F16)) || d.dtype != s0.dtype {
         return None;
     }
+    if ![&s0, &d]
+        .into_iter()
+        .chain(src1.map(Gg::from).as_ref())
+        .all(|t| t.fits_descriptor())
+    {
+        return None;
+    }
     if opcode == O::Tri as u32 && (!s0.is(HtpDataType::F32) || !s0.is_contiguous(4)) {
         return None;
     }
@@ -1118,6 +1151,13 @@ pub fn solve_glu(
     if (!s0.is(HtpDataType::F32) && !s0.is(HtpDataType::F16)) || d.dtype != s0.dtype {
         return None;
     }
+    if ![&s0, &d]
+        .into_iter()
+        .chain(src1.map(Gg::from).as_ref())
+        .all(|t| t.fits_descriptor())
+    {
+        return None;
+    }
     if (opcode == O::GluGegluQuick as u32 || opcode == O::GluGegluErf as u32)
         && !s0.is(HtpDataType::F32)
     {
@@ -1224,11 +1264,20 @@ pub(crate) fn derive_eltwise(
         if src.len() != want {
             return None;
         }
-        // The fused norms read the weight as one row of `src0`'s width, and the residual with
-        // `src0`'s own strides (llama.cpp's fusion pass only fuses such nodes; ggml gives no such
-        // guarantee for a node built by hand).
-        if want > 1 && src[1].ne[0] != src[0].ne[0] {
-            return None;
+        // The fused norms read the weight as F32 values, one row of `src0`'s width (or one such
+        // row per row of `src0`, when it has `src0`'s shape), and the residual with `src0`'s own
+        // strides (llama.cpp's fusion pass only fuses such nodes; ggml gives no such guarantee for
+        // a node built by hand, and the solver sizes the weight's staging from its extents alone).
+        if want > 1 {
+            let (x, w) = (&src[0], &src[1]);
+            let one_row = w.ne[1..] == [1, 1, 1];
+            if w.ne[0] != x.ne[0]
+                || w.dtype != HtpDataType::F32 as u32
+                || w.nb[0] != 4
+                || !(one_row || w.ne == x.ne)
+            {
+                return None;
+            }
         }
         if want == 3 && src[2] != src[0] {
             return None;
@@ -1246,7 +1295,7 @@ pub(crate) fn derive_eltwise(
         let shape_ok = if src.len() == 2 {
             s.ne == d.ne
         } else {
-            s.ne[0] == 2 * d.ne[0] && s.ne[1..] == d.ne[1..]
+            s.ne[0] == d.ne[0].wrapping_mul(2) && s.ne[1..] == d.ne[1..]
         };
         if !shape_ok {
             return None;
@@ -1330,6 +1379,31 @@ mod tests {
             ..x
         };
         assert!(derive(HtpOpCode::RmsNormMulAdd, &[x, w, padded], &x).is_none());
+        // the weight is one F32 row of src0's width, or one per row of src0: anything else would
+        // be staged for a layout it does not have
+        assert!(derive(HtpOpCode::RmsNormMul, &[x, f32_tensor([64, 4, 1, 1])], &x).is_some());
+        assert!(derive(HtpOpCode::RmsNormMul, &[x, f32_tensor([64, 2, 1, 1])], &x).is_none());
+        let planes = f32_tensor([64, 4, 3, 1]);
+        assert!(
+            derive(
+                HtpOpCode::RmsNormMul,
+                &[planes, f32_tensor([64, 1, 3, 1])],
+                &planes
+            )
+            .is_none()
+        );
+        let f16_weight = CopyTensor {
+            dtype: HtpDataType::F16 as u32,
+            nb: [2, 128, 128, 128],
+            ..w
+        };
+        assert!(derive(HtpOpCode::RmsNormMul, &[x, f16_weight], &x).is_none());
+        let strided_weight = CopyTensor {
+            nb: [8, 512, 512, 512],
+            ..w
+        };
+        assert!(derive(HtpOpCode::RmsNormMul, &[x, strided_weight], &x).is_none());
+        assert!(derive(HtpOpCode::RmsNormMulAdd, &[x, f16_weight, x], &x).is_none());
         // a GLU's two sources and result share a shape; a single source is twice as wide as its result
         assert!(derive(HtpOpCode::GluSwiglu, &[x, x], &x).is_some());
         assert!(derive(HtpOpCode::GluSwiglu, &[x, x], &f32_tensor([64, 3, 1, 1])).is_none());
@@ -1361,20 +1435,41 @@ mod tests {
         assert!(derive(HtpOpCode::UnarySilu, &[empty], &empty, 6).is_none());
         assert!(derive(HtpOpCode::GluSwiglu, &[empty, empty], &empty, 6).is_none());
 
+        // a row of 2^32 bytes does not fit a descriptor (`add_tensor` refuses it) and would be
+        // planned on a wrapped size: refused, whichever solver looks at it
         let huge = CopyTensor {
             dtype: x.dtype,
             ne: [1 << 30, 1, 1, 1],
             nb: [4, 0, 0, 0],
         };
-        let _ = derive(HtpOpCode::UnarySilu, &[huge], &huge, 6);
-        let _ = derive(HtpOpCode::GluSwiglu, &[huge, huge], &huge, 6);
-        let _ = derive(HtpOpCode::RmsNorm, &[huge], &huge, 6);
-        let _ = derive(HtpOpCode::RmsNormMul, &[huge, huge], &huge, 6);
+        let just_under = CopyTensor {
+            ne: [(1 << 30) - 1, 1, 1, 1],
+            ..huge
+        };
+        assert!(derive(HtpOpCode::UnarySilu, &[huge], &huge, 6).is_none());
+        assert!(derive(HtpOpCode::GluSwiglu, &[huge, huge], &huge, 6).is_none());
+        assert!(derive(HtpOpCode::RmsNorm, &[huge], &huge, 6).is_none());
+        assert!(derive(HtpOpCode::RmsNormMul, &[huge, huge], &huge, 6).is_none());
+        assert!(derive(HtpOpCode::Add, &[huge, huge], &huge, 6).is_none());
         let scale = CopyTensor {
             ne: [1 << 30, 1, 1, 1],
             ..huge
         };
-        let _ = derive(HtpOpCode::RmsNormMulAdd, &[huge, scale, scale], &huge, 6);
+        assert!(derive(HtpOpCode::RmsNormMulAdd, &[huge, scale, scale], &huge, 6).is_none());
+        // one element fewer is the largest row a descriptor can hold; it must not panic
+        let _ = derive(HtpOpCode::UnarySilu, &[just_under], &just_under, 6);
+        let _ = derive(HtpOpCode::Add, &[just_under, just_under], &just_under, 6);
+        // a destination of 2^31 or more columns for a single-source GLU
+        let wide = CopyTensor {
+            ne: [0x8000_0000, 1, 1, 1],
+            ..huge
+        };
+        assert!(derive(HtpOpCode::GluSwiglu, &[wide], &x, 6).is_none());
+
+        // empty operands of the binary and the matmul-free solvers
+        let none = f32_tensor([0, 128, 1, 1]);
+        assert!(derive(HtpOpCode::Add, &[none, none], &none, 6).is_none());
+        assert!(derive(HtpOpCode::Mul, &[none, f32_tensor([1, 1, 1, 1])], &none, 6).is_none());
     }
 
     #[test]

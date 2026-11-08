@@ -2330,10 +2330,10 @@ mod tests {
                     let rms = (nb / n as f64).sqrt();
                     let tail = (n - 4..n)
                         .map(|r| f64::from((g[r] - want[r]).abs()))
-                        .fold(0.0f64, f64::max)
+                        .fold(0.0f64, worst_max)
                         / rms;
-                    worst_cos = worst_cos.min(cos);
-                    worst_tail = worst_tail.max(tail);
+                    worst_cos = worst_min(worst_cos, cos);
+                    worst_tail = worst_max(worst_tail, tail);
                     if t == 0 {
                         gelu_trace(&format!(
                             "{} k={k} n={n} m={m}: cosine {cos:.6}, last-4 error {tail:.4} of rms, last out {:.4} want {:.4}",
@@ -2482,7 +2482,7 @@ mod tests {
                 let a = f64::from(amax(r, b));
                 let err = (0..32)
                     .map(|i| f64::from((got[b * 32 + i] - src[r * n + b * 32 + i]).abs()))
-                    .fold(0.0f64, f64::max);
+                    .fold(0.0f64, worst_max);
                 // one quantization step of the block is 1/127 of its maximum; an all-zero block
                 // must stay zero
                 let rel = if a == 0.0 { err } else { err / a };
@@ -2539,23 +2539,73 @@ mod tests {
         dst: (&RpcmemBuffer, [u32; 4]),
         params: [i32; 16],
     ) -> Result<(), CeraError> {
+        rig_run_f32_op_with(rig, opcode, srcs, dst, params, true)
+    }
+
+    /// [`rig_run_f32_op`] that skips the host's operand validation, so the DSP's own refusal of
+    /// an op the host would never send is what the test sees.
+    fn rig_run_f32_op_unvalidated(
+        rig: &mut GeluRig,
+        opcode: HtpOpCode,
+        srcs: &[(&RpcmemBuffer, [u32; 4])],
+        dst: (&RpcmemBuffer, [u32; 4]),
+        params: [i32; 16],
+    ) -> Result<(), CeraError> {
+        rig_run_f32_op_with(rig, opcode, srcs, dst, params, false)
+    }
+
+    fn rig_run_f32_op_with(
+        rig: &mut GeluRig,
+        opcode: HtpOpCode,
+        srcs: &[(&RpcmemBuffer, [u32; 4])],
+        dst: (&RpcmemBuffer, [u32; 4]),
+        params: [i32; 16],
+        validated: bool,
+    ) -> Result<(), CeraError> {
         let session = rig.device.queue_session_mut();
         let ids: Vec<u16> = srcs
             .iter()
             .map(|(b, ne)| rig_f32_tensor(session, b, *ne))
             .collect();
         let d = rig_f32_tensor(session, dst.0, dst.1);
-        session.enqueue_op(opcode as u32, &ids, &[d], params, [0i32; 32])?;
+        if validated {
+            session.enqueue_op(opcode as u32, &ids, &[d], params, [0i32; 32])?;
+        } else {
+            session.enqueue_op_unvalidated(opcode as u32, &ids, &[d], params, [0i32; 32])?;
+        }
         session.flush().map(|_| ())
     }
 
+    /// `f64::min` and `f64::max` drop a NaN, so a dead kernel (NaN or all-zero output, whose
+    /// cosine is 0/0) would never lower a running worst case; a NaN is the worst case instead.
+    fn worst_min(worst: f64, v: f64) -> f64 {
+        if v.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            worst.min(v)
+        }
+    }
+
+    fn worst_max(worst: f64, v: f64) -> f64 {
+        if v.is_nan() {
+            f64::INFINITY
+        } else {
+            worst.max(v)
+        }
+    }
+
     /// Worst absolute error of `got` against `want`, over the larger of 1 and the largest `want`.
+    /// A NaN in `got` is an infinite error.
     fn rig_rel_error(got: &[f32], want: &[f32]) -> f32 {
+        assert_eq!(got.len(), want.len(), "output length");
         let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
         got.iter()
             .zip(want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max)
+            .fold(
+                0.0f32,
+                |m, d| if d.is_nan() { f32::INFINITY } else { m.max(d) },
+            )
             / scale
     }
 
@@ -2860,50 +2910,149 @@ mod tests {
         assert!(worst < 1e-4, "worst relative error {worst}");
     }
 
-    /// Both conv ops answer shapes that disagree with a refusal instead of dividing by zero or
-    /// indexing past a tensor: groups that do not divide the channels, a weight with the wrong
-    /// channel count, and a transposed-conv weight that does not match its input.
+    /// The DSP's own refusals. Both conv ops answer shapes that disagree with `NoSupport` instead
+    /// of dividing by zero, indexing past a tensor or leaving part of the result unwritten. The ops
+    /// are sent without the host's validation (which refuses the same shapes first, see
+    /// `conv_ops_are_refused_when_their_shapes_disagree`), and every case breaks one rule alone.
+    /// A valid conv afterwards shows the session survived each refusal.
     #[test]
     #[ignore = "needs a Hexagon NPU"]
     fn device_conv_refuses_inconsistent_shapes() {
+        use super::super::{build_conv_transpose1d_params, build_conv1d_params};
         let mut rig = GeluRig::open();
-        let x_buf = rig_f32_buf(&rig, &rig_values(1, 16 * 8));
-        let w_buf = rig_f32_buf(&rig, &rig_values(2, 3 * 8 * 4));
-        let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; 16 * 4]);
-        // groups (8) above the output channels (4): the worker would divide by c_out / groups = 0
-        let bad_groups = rig_run_f32_op(
-            &mut rig,
-            HtpOpCode::Conv1D,
-            &[(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 1, 4, 1])],
-            (&dst_buf, [16, 4, 1, 1]),
-            super::super::build_conv1d_params(1, 1, 1, 8),
+        let (x_buf, w_buf) = (
+            rig_f32_buf(&rig, &rig_values(1, 16 * 8 * 2)),
+            rig_f32_buf(&rig, &rig_values(2, 3 * 8 * 8 * 2)),
         );
-        assert!(bad_groups.is_err(), "groups above c_out must be refused");
-        // a weight that holds 8 input channels per group where the input implies 1
-        let bad_weight = rig_run_f32_op(
-            &mut rig,
-            HtpOpCode::Conv1D,
-            &[(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 8, 4, 1])],
-            (&dst_buf, [16, 4, 1, 1]),
-            super::super::build_conv1d_params(1, 1, 1, 8),
+        let bias_buf = rig_f32_buf(&rig, &rig_values(3, 4));
+        let dst_buf = rig_f32_buf(&rig, &vec![123.0f32; 20 * 8 * 2 * 2]);
+        let conv = HtpOpCode::Conv1D;
+        let transposed = HtpOpCode::ConvTranspose1D;
+        // (name, op, sources, result, params): each breaks exactly one rule
+        type Case<'a> = (
+            &'static str,
+            HtpOpCode,
+            Vec<(&'a RpcmemBuffer, [u32; 4])>,
+            [u32; 4],
+            [i32; 16],
         );
+        let cases: Vec<Case> = vec![
+            // groups (8) above the output channels (4): the worker divided by c_out / groups = 0
+            (
+                "conv groups above c_out",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 1, 4, 1])],
+                [16, 4, 1, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // 4 groups divide 8 and 8, but the weight holds 8 channels per group, not 2
+            (
+                "conv weight channels per group",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 8, 8, 1])],
+                [16, 8, 1, 1],
+                build_conv1d_params(1, 1, 1, 4),
+            ),
+            // one input batch for two result batches
+            (
+                "conv fewer input batches than result batches",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 1, 8, 1])],
+                [16, 8, 2, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // a bias with 4 entries for 8 output channels
+            (
+                "conv short bias",
+                conv,
+                vec![
+                    (&x_buf, [16, 8, 1, 1]),
+                    (&w_buf, [3, 1, 8, 1]),
+                    (&bias_buf, [4, 1, 1, 1]),
+                ],
+                [16, 8, 1, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // a fourth extent the worker does not handle
+            (
+                "conv fourth extent",
+                conv,
+                vec![(&x_buf, [16, 8, 1, 2]), (&w_buf, [3, 1, 8, 1])],
+                [16, 8, 1, 1],
+                build_conv1d_params(1, 1, 1, 8),
+            ),
+            // a transposed-conv weight [K, C_out, C_in] whose C_in (4) is not the input's (8)
+            (
+                "transposed weight input channels",
+                transposed,
+                vec![(&w_buf, [3, 8, 4, 1]), (&x_buf, [16, 8, 1, 1])],
+                [18, 8, 1, 1],
+                build_conv_transpose1d_params(1, 0, 1),
+            ),
+            // a result with two batches for one input batch: a slab would come back unwritten
+            (
+                "transposed more result batches than input",
+                transposed,
+                vec![(&w_buf, [3, 8, 8, 1]), (&x_buf, [16, 8, 1, 1])],
+                [18, 8, 2, 1],
+                build_conv_transpose1d_params(1, 0, 1),
+            ),
+            // the same input and weight in the other order
+            (
+                "transposed operands swapped",
+                transposed,
+                vec![(&x_buf, [16, 8, 1, 1]), (&w_buf, [3, 8, 8, 1])],
+                [18, 8, 1, 1],
+                build_conv_transpose1d_params(1, 0, 1),
+            ),
+        ];
+        for (name, op, srcs, dst_ne, params) in cases {
+            let err = rig_run_f32_op_unvalidated(&mut rig, op, &srcs, (&dst_buf, dst_ne), params)
+                .expect_err(name)
+                .to_string();
+            assert!(
+                err.contains("NoSupport"),
+                "{name}: the DSP should answer NoSupport, got {err}"
+            );
+            gelu_trace(&format!("{name}: refused by the DSP"));
+        }
+        // the session is still good: a valid depthwise conv runs and is right
+        let x = rig_values(1, 16 * 8);
+        let w = rig_values(2, 3 * 8);
+        let want = conv1d_cpu(
+            &x,
+            &w,
+            &[],
+            &ConvCase {
+                label: "control",
+                w_in: 16,
+                c_in: 8,
+                k: 3,
+                c_out: 8,
+                stride: 1,
+                pad: 1,
+                dil: 1,
+                groups: 8,
+                bias: false,
+            },
+        );
+        let ok_x = rig_f32_buf(&rig, &x);
+        let ok_w = rig_f32_buf(&rig, &w);
+        let ok_dst = rig_f32_buf(&rig, &vec![123.0f32; 16 * 8]);
+        rig_run_f32_op_unvalidated(
+            &mut rig,
+            conv,
+            &[(&ok_x, [16, 8, 1, 1]), (&ok_w, [3, 1, 8, 1])],
+            (&ok_dst, [16, 8, 1, 1]),
+            build_conv1d_params(1, 1, 1, 8),
+        )
+        .unwrap();
+        let err = rig_rel_error(&gelu_download(&ok_dst, 16 * 8), &want);
         assert!(
-            bad_weight.is_err(),
-            "a weight/input channel mismatch must be refused"
+            err < 1e-4,
+            "a conv after the refusals: relative error {err}"
         );
-        // a transposed-conv weight [K, C_out, C_in] whose C_in (4) is not the input's (8)
-        let bad_transpose = rig_run_f32_op(
-            &mut rig,
-            HtpOpCode::ConvTranspose1D,
-            &[(&w_buf, [3, 8, 4, 1]), (&x_buf, [16, 8, 1, 1])],
-            (&dst_buf, [18, 8, 1, 1]),
-            super::super::build_conv_transpose1d_params(1, 0, 1),
-        );
-        assert!(
-            bad_transpose.is_err(),
-            "a transposed-conv channel mismatch must be refused"
-        );
-        rig.release(&[&x_buf, &w_buf, &dst_buf]);
+        rig.release(&[&x_buf, &w_buf, &bias_buf, &dst_buf, &ok_x, &ok_w, &ok_dst]);
     }
 
     /// The extension unary ops against the CPU, on rows that end in a partial vector (70 and 31
@@ -3232,7 +3381,7 @@ mod tests {
                 }
                 let cos = dot / (na.sqrt() * nb.sqrt());
                 gelu_trace(&format!("Q4_1 k={k} n={n} m={m} row {t}: cosine {cos:.6}"));
-                worst_cos = worst_cos.min(cos);
+                worst_cos = worst_min(worst_cos, cos);
             }
             rig.release(&[&x_buf, &dst_buf]);
         }
