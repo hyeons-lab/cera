@@ -510,7 +510,7 @@ impl GpuContext {
     /// blocking [`Self::new`] wrapper.
     pub async fn new_async() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
             flags: wgpu::InstanceFlags::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             backend_options: wgpu::BackendOptions::default(),
@@ -1564,8 +1564,9 @@ impl GpuContext {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let int_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
             let pipeline = self.create_pipeline(shader_source, entry_point, label);
-            let err = pollster::block_on(scope.pop());
+            let err = pollster::block_on(int_scope.pop()).or(pollster::block_on(scope.pop()));
             match err {
                 Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
                 None => Ok(pipeline),

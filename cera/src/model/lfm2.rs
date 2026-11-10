@@ -7452,7 +7452,9 @@ mod no_repack_tests {
     /// after upload). Needs the 230M model locally; skips without it (fails under `CERA_REQUIRE_MODEL`).
     #[test]
     fn no_repack_skips_cpu_repacks() {
-        let home = std::env::var("HOME").expect("HOME unset");
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .expect("HOME unset");
         let path = std::path::PathBuf::from(home)
             .join(".leap/models/LFM2.5-230M-Q4_0/LFM2.5-230M-Q4_0.gguf");
         if !crate::model::transformer::require_model_or_skip(&path) {

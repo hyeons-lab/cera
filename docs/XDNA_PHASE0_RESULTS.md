@@ -1,6 +1,6 @@
 # AMD XDNA NPU: Phase 0 and 0b results
 
-Results for the checklist in [XDNA_NPU_PHASE0.md](XDNA_NPU_PHASE0.md). Status: **Phase 0b decided.** The deciding question is answered (yes, 3c step 2), 3d evaluates the go/no-go bar against the section 2 baselines, and 3e records the follow-up Q4 kernel spike and the decision taken on it. Phase 0 items that are still open (the CPU tier, `target-cpu=native`, DX12) are marked open, not skipped.
+Results for the checklist in [XDNA_NPU_PHASE0.md](XDNA_NPU_PHASE0.md). Status: **Phase 0b decided and Phase 1 backend validated (section 8).** The deciding question is answered (yes, 3c step 2), 3d evaluates the go/no-go bar against the section 2 baselines, 3e records the follow-up Q4 kernel spike and the decision taken on it, and section 8 records the end-to-end `--device npu` backend results. The remaining Phase 0 items (the 2 Windows unit-test portability fixes, CPU SIMD tier, `target-cpu=native`, and `WGPU_BACKEND=dx12` vs `vulkan`) are also closed in sections 1 and 2.
 
 Sizes of buffers and transfers are binary (KiB, MiB); bandwidth is decimal GB/s (10^9 bytes per second); model file sizes (773 MB) are decimal. All measurements ran natively on Windows (the IRON kernels were built in WSL2; see 3c step 2). They were launched from a WSL2 shell through Windows interop, which starts the Windows executable as a normal Windows process. No measurement here ran inside the Linux VM.
 
@@ -47,17 +47,17 @@ There is no per-device rail for the NPU or the iGPU, so neither can be measured 
 |---|---|
 | Toolchain | `nightly-2026-07-10-x86_64-pc-windows-msvc`, picked up from `rust-toolchain.toml` |
 | `cargo build --release -p cera-cli` | Pass. The binary is `cera.exe` |
-| `cargo test --release -p cera --lib` | 1162 passed, **2 failed**, 16 ignored (see below) |
+| `cargo test --release -p cera --lib` | Originally 1162 passed, **2 failed**, 16 ignored (2026-10-03); after fixing both Windows test portability issues below (2026-11-10), `cargo test --release -p cera --lib --features xdna` runs **1478 passed, 0 failed, 16 ignored** |
 | `cera inspect --model Llama-3.2-1B-Instruct-Q4_0.gguf` | Pass: 147 tensors, 35 metadata keys, `llama`, 16 blocks. GGUF mmap and Windows path handling work |
 | GPU build | `cargo build --release -p cera-cli --features gpu` passes. The CLI's default feature set is empty, so a plain build has no GPU backend; all `--device gpu` numbers here use the `gpu` build |
-| wgpu backend chosen | **Vulkan**: `CERA_GPU_HOST_PROFILE=1` prints `adapter=AMD Radeon(TM) 8060S Graphics backend=Vulkan SUBGROUP=true SUBGROUP_BARRIER=true TIMESTAMP=true SHADER_F16=true` |
-| CPU tier selected | Open |
-| `RUSTFLAGS="-C target-cpu=native"` effect | Open |
+| wgpu backend chosen | **Vulkan** by default (`CERA_GPU_HOST_PROFILE=1` prints `adapter=AMD Radeon(TM) 8060S Graphics backend=Vulkan SUBGROUP=true SUBGROUP_BARRIER=true TIMESTAMP=true SHADER_F16=true`). `wgpu::Backends::from_env()` is wired in `cera/src/backend/wgpu.rs` so `WGPU_BACKEND=vulkan` or `WGPU_BACKEND=dx12` selects the backend at runtime (see section 2 for the Vulkan vs DX12 comparison) |
+| CPU tier selected | **`avx512+vnni`**: `cera.exe cpu` prints `cpu: tier=avx512+vnni [avx2 fma avx512f avx512bw avx512vl avx512vnni]` and `cores: pinnable=0 fast=0 perf_pool=32 placement=flat` |
+| `RUSTFLAGS="-C target-cpu=native"` effect | **No SIMD tier change and slight regression** (keep default `target-cpu`). Because all hot GEMM/GEMV/quantizer kernels in `cera` already carry explicit `#[target_feature(enable = "avx512f,avx512vl,avx512bw,avx512vnni,avx2,fma")]` attributes with runtime dispatch, the default build already dispatches to `avx512+vnni`. On `Llama-3.2-1B-Instruct-Q4_0.gguf` (`--device cpu --prompt-tokens 512 --max-tokens 128 --runs 5`, Turbo, two 5-run sets each), the default build achieves **498 / 505 tok/s prefill p50** and **56.5 / 56.9 tok/s decode p50**, whereas `RUSTFLAGS="-C target-cpu=native"` drops to **439 / 400 tok/s prefill p50** and **47.6 / 46.8 tok/s decode p50** (from compiler 512-bit auto-vectorization / register pressure in surrounding glue code) |
 
-The two test failures are Windows portability problems in the tests, not in the engine:
+The two original test failures were Windows portability problems in the tests, not in the engine, and are now fixed:
 
-- `model::lfm2::no_repack_tests::no_repack_skips_cpu_repacks` panics at its `std::env::var("HOME").expect("HOME unset")` (in `lfm2.rs`). Windows sets `USERPROFILE`, not `HOME`. On a machine without the model this test is meant to skip, but it panics before reaching the skip check.
-- `engine::tests::resolution::resolve_all_manifest_files_walks_every_field` fails `assert_eq!(manifest.files.model, "/models/bundles/model.gguf")` (in `engine.rs`). The cause is inferred, not confirmed from the panic output: the expected value is a string with `/` separators, while the resolved path is built with `Path::join`, which uses `\` on Windows.
+- `model::lfm2::no_repack_tests::no_repack_skips_cpu_repacks` panicked at `std::env::var("HOME").expect("HOME unset")` (in `lfm2.rs`) because Windows sets `USERPROFILE`, not `HOME`. Fixed by falling back to `std::env::var("USERPROFILE")`.
+- `engine::tests::resolution::resolve_all_manifest_files_walks_every_field` failed `assert_eq!(manifest.files.model, "/models/bundles/model.gguf")` (in `engine.rs`) because the expected strings hardcoded `/` while `Path::join` uses `\` on Windows. Fixed by constructing expected paths via `base.join(name)`.
 
 ### Models
 
@@ -70,7 +70,7 @@ The two test failures are Windows portability problems in the tests, not in the 
 
 ## 2. Phase 0 baselines
 
-Recorded 2026-10-03 (Performance) and 2026-10-12 (Turbo). `cera bench`, one fresh process per measurement, package power sampled over that process by `tools/xdna-spike/hwinfo_sm.py` (driver: `tools/xdna-spike/baselines.sh`). GPU rows use the Vulkan backend; the `WGPU_BACKEND` override for a DX12 comparison has not landed. Models are the Instruct Q4_0 and Q8_0 files from section 1.
+Recorded 2026-10-03 (Performance) and 2026-10-12 (Turbo). `cera bench`, one fresh process per measurement, package power sampled over that process by `tools/xdna-spike/hwinfo_sm.py` (driver: `tools/xdna-spike/baselines.sh`). GPU rows in the original 2026-10-03 / 2026-10-12 matrix use the default Vulkan backend; a direct `WGPU_BACKEND=vulkan` vs `WGPU_BACKEND=dx12` comparison on the current tree is recorded at the end of this section. Models are the Instruct Q4_0 and Q8_0 files from section 1.
 
 ### Matrix: 128 decode tokens after a 512- or 2048-token prompt, 20 runs per process, two interleaved rounds
 
@@ -137,6 +137,17 @@ Projected onto Llama-3.2-1B Q4_0 (773 MB per token), adding the measured floor o
 | int16 GEMV, 16.95 GB/s | about 20 tok/s | 21% | 0.96 (0.69x) | 2.66 (1.45x) |
 
 Gross is the honest number for battery life: the floor is paid for every second the work takes, and a slower device pays it for longer.
+
+### `WGPU_BACKEND=vulkan` vs `WGPU_BACKEND=dx12` (2026-11-10)
+
+With `wgpu::Backends::from_env()` wired in `cera/src/backend/wgpu.rs` (and `wgpu::ErrorFilter::Internal` added alongside `ErrorFilter::Validation` in `try_create_pipeline_checked` so DX12 FXC shader compile errors on `attention_flash_hd64` are caught by the error scope and fall back cleanly to the generic kernel), both backends were measured back to back on `Llama-3.2-1B-Instruct-Q4_0.gguf` (`--device gpu --prompt-tokens 512 --max-tokens 128 --runs 5`, 2 warmup runs, Turbo):
+
+| `WGPU_BACKEND` | wgpu features reported | 512-tok prefill passes | Prefill tok/s p50 (p10 / p90) | Decode tok/s p50 (p10 / p90) | TTFT ms p50 |
+|---|---|---|---|---|---|
+| **`vulkan`** (default) | `SUBGROUP=true SUBGROUP_BARRIER=true TIMESTAMP=true SHADER_F16=true` | 20 | **3,615** (3,541 / 3,654) | **108.7** (108.2 / 110.3) | **142** |
+| **`dx12`** | `SUBGROUP=false SUBGROUP_BARRIER=false TIMESTAMP=true SHADER_F16=false` | 130 | **1,634** (1,462 / 1,652) | **143.2** (136.0 / 146.0) | **313** |
+
+Greedy generation output on `"The capital of France is"` is token-for-token identical on both backends (`" Paris. The capital of Germany is Berlin. The capital of Italy is Rome."`). Vulkan remains the right default on Strix Halo because wgpu's DX12 backend does not expose `SUBGROUP`, `SHADER_F16`, or SPIR-V passthrough (forcing 130 compute passes instead of 20 and cutting 512-token prefill throughput by 2.2x), though DX12's single-token GEMV decode reaches 143.2 tok/s vs Vulkan's 108.7 tok/s on this current tree.
 
 ## 3a. License audit
 
@@ -539,4 +550,4 @@ The production backend (`cera/src/backend/xdna/`, `cera/src/model/xdna_llama.rs`
 | GPU (`--device gpu`, section 2, machine in use) | 73.7 | 66.50 | 1.11 | 44.80 (vs 21.70 W floor) | 1.65 |
 | CPU (`--device cpu`, section 2, machine in use) | 60.3 | 65.60 | 0.92 | 43.90 (vs 21.70 W floor) | 1.37 |
 
-**Gate verdict: PASS.** The XDNA backend clears both legs of the section 4 numeric bar (**41.6 tok/s >= 35 tok/s** and **2.08 gross tok/J >= 1.5 gross tok/J**), achieving 1.50x the GPU's gross energy efficiency and 2.26x the CPU's while drawing ~20 W whole-package power (~5 to 11 W above idle, vs ~67 W on the GPU and ~66 W on the CPU). `cargo test --release -p cera --lib --features xdna` passes 1,476 tests with only the 2 pre-existing Windows failures recorded in section 1.
+**Gate verdict: PASS.** The XDNA backend clears both legs of the section 4 numeric bar (**41.6 tok/s >= 35 tok/s** and **2.08 gross tok/J >= 1.5 gross tok/J**), achieving 1.50x the GPU's gross energy efficiency and 2.26x the CPU's while drawing ~20 W whole-package power (~5 to 11 W above idle, vs ~67 W on the GPU and ~66 W on the CPU). `cargo test --release -p cera --lib --features xdna` passes all **1,478** unit tests (**0 failed**, 16 ignored).

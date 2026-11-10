@@ -3071,22 +3071,23 @@ mod tests {
             let cfg = EngineConfig::default();
             resolve_all_manifest_files(&mut manifest, Some(&base), &cfg).unwrap();
 
-            assert_eq!(manifest.files.model, "/models/bundles/model.gguf");
+            let joined = |name: &str| base.join(name).to_string_lossy().into_owned();
+            assert_eq!(manifest.files.model, joined("model.gguf"));
             assert_eq!(
                 manifest.files.multimodal_projector.as_deref(),
-                Some("/models/bundles/mmproj.gguf")
+                Some(joined("mmproj.gguf").as_str())
             );
             assert_eq!(
                 manifest.files.audio_decoder.as_deref(),
-                Some("/models/bundles/decoder.gguf")
+                Some(joined("decoder.gguf").as_str())
             );
             assert_eq!(
                 manifest.files.audio_tokenizer.as_deref(),
-                Some("/models/bundles/tokenizer.safetensors")
+                Some(joined("tokenizer.safetensors").as_str())
             );
             assert_eq!(
                 manifest.files.extras.get("cover_art").map(String::as_str),
-                Some("/models/bundles/cover.png")
+                Some(joined("cover.png").as_str())
             );
             // Absolute extras stay absolute.
             assert_eq!(
