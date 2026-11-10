@@ -421,7 +421,7 @@ pub(crate) fn rope_partial(
 impl LlamaModel {
     /// Embedding row for `token`, scaled and recorded exactly as `forward`
     /// does. Panics on an out-of-range token, like `forward`.
-    fn embed_token(&self, token: u32, what: &str) -> Vec<f32> {
+    pub(crate) fn embed_token(&self, token: u32, what: &str) -> Vec<f32> {
         let token_id = token as usize;
         let cfg = &self.config;
         assert!(
@@ -1716,6 +1716,92 @@ impl LlamaModel {
 
     /// Physical layer loop interval for looped architectures (e.g. Nanbeige).
     pub fn loop_norm_interval(&self) -> Option<usize> {
+        self.loop_norm_interval
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn gguf_file(&self) -> &GgufFile {
+        &self.gguf
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn rope_freqs_slice(&self) -> Option<&[f32]> {
+        self.rope_freqs.as_deref()
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn output_norm_slice(&self) -> &[f32] {
+        &self.output_norm_weight
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn attn_norm_slice(&self, il: usize) -> &[f32] {
+        &self.attn_norm_weights[il]
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn ffn_norm_slice(&self, il: usize) -> &[f32] {
+        &self.ffn_norm_weights[il]
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn layer_stage_refs(&self, il: usize) -> [&WeightRef; 7] {
+        let r = &self.layer_refs[il];
+        [
+            &r.attn_q,
+            &r.attn_k,
+            &r.attn_v,
+            &r.attn_output,
+            &r.ffn_gate,
+            &r.ffn_up,
+            &r.ffn_down,
+        ]
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn lm_head_weight_ref(&self) -> &WeightRef {
+        self.output_ref.as_ref().unwrap_or(&self.embd_ref)
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn ensure_xdna_supported(&self) -> Result<()> {
+        ensure!(
+            !self.ext && self.norm_order == NormOrder::PreNorm && self.ffn_gated,
+            "XDNA backend requires PreNorm gated LLaMA architecture"
+        );
+        ensure!(
+            self.rope_type == RopeType::Norm && self.n_rot == self.head_dim,
+            "XDNA backend requires full-head NORM RoPE"
+        );
+        ensure!(
+            self.activation == FfnActivation::Swiglu,
+            "XDNA backend requires SwiGLU FFN activation"
+        );
+        ensure!(
+            self.attn_logit_softcapping.is_none()
+                && self.final_logit_softcapping.is_none()
+                && self.sliding_window.is_none()
+                && self.yarn.is_none()
+                && self.attn_temp_scale.is_none()
+                && self.loop_norm_interval.is_none(),
+            "XDNA backend does not support softcapping, SWA, YaRN, attn_temp_scale, or loop_norm"
+        );
+        ensure!(
+            self.attn_post_norm_weights.iter().all(Option::is_none)
+                && self.ffn_post_norm_weights.iter().all(Option::is_none)
+                && self.attn_q_norm_weights.iter().all(Option::is_none)
+                && self.attn_k_norm_weights.iter().all(Option::is_none)
+                && self.attn_q_bias.iter().all(Option::is_none)
+                && self.attn_k_bias.iter().all(Option::is_none)
+                && self.attn_v_bias.iter().all(Option::is_none)
+                && !self.has_projection_or_ffn_biases(),
+            "XDNA backend does not support QK-norm, post-norm, or projection/FFN biases"
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn _xdna_dummy(&self) -> Option<usize> {
         self.loop_norm_interval
     }
 

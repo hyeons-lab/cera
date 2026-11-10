@@ -500,3 +500,43 @@ Two kernel lessons from getting here, both measured: (1) A drain smaller than th
 ## 7. Resumption verification (2026-10-16)
 
 Sections 4 to 6 were written in a prior session and left uncommitted on this branch. On resumption, the three decisive measurements were re-run from the committed `spike.exe` and artifacts, with the power plan confirmed as Turbo (`6fecc5ae-f350-48a5-b669-b472cb895ccf`): Q4 GEMV at 16 runs in flight (65,536 x 2,048) reproduced at **54.82 GB/s** at p50 with the reference check passing (recorded: 54.76 to 54.79); `spike q4chain out` reproduced at **110.15 ms/token, 9.1 tok/s** (recorded: 109.9 ms, 9.1); and `spike q4layer` reproduced all seven stage checks passing at **1.047 ms/layer** at p50 (recorded: 1.064 ms), projecting 51.1 tok/s by the spike's own accounting. The prior session's numbers and the section 5 verdict stand: per-shape submission fails the bar through xclbin switching cost, and the fused single-xclbin layer is the architecture the backend is built on. Section 4 was also amended on resumption (prefill placement, teacher-forced parity, gross-energy bar, projection formula); sections 5 and 6 are unchanged.
+
+
+## 8. End-to-end backend validation (2026-11-10)
+
+The production backend (`cera/src/backend/xdna/`, `cera/src/model/xdna_llama.rs`, wired into `--device npu`) extends the section 6 fused layer into a complete on-device decode pipeline:
+
+- **Single hardware context across all 16 layers and the LM head.** `q4layer.cc` and `q4layer.py` fold all per-layer operations onto the 16 AIE2P cores: RMSNorm + Q8_0 activation quantization (`t == -100`), interleaved RoPE on Q and K (`t == -106`), online-softmax GQA attention over up to 648 cached `bfloat16` KV tokens (`ATTN_CHUNKS = 9` chunks of 72 tokens per KV head, using 3-slice `bfloat16` decomposition on Q and attention weights to preserve f32 dot-product precision on AIE2P's `bfloat16` MACs), `SiLU(gate) * up` + quantization (`t <= -102`), residual epilogues (`t == -101`), and the padded 131,072 x 2,048 Q4 LM head (`Q4LAYER_HEAD=1`). `q4layer.xclbin` and `q4head.xclbin` share the same xclbin image (paired with `insts_q4layer.bin` and `insts_q4head.bin`), and `cera_xdna_shim.cpp` reuses the active `xrt::hw_context` when the xclbin UUID matches, eliminating the ~3.8 ms/token hardware-context reconfiguration penalty between layers and head.
+- **17-run `xrt::runlist` chaining per token.** The kernel takes three buffer arguments `(w, y, y_next)` and drains stage 6 (`ffn_down`) directly into `y_next[0..2048]` (`layer_bo_y[l + 1]` for `l < 15`, `head_bo_y` for `l == 15`). `XdnaLlamaModel` chains all 16 layer runs and the head run into one `xrt::runlist` (`token_runlist`), executing each decode token in a single `execute()` + `wait()` round-trip while overlapping host-side f16 KV cache mirroring and next-position RoPE table computation with the NPU run.
+- **Layer probe at 541 KV tokens (`xdna_layer_probe 50`, `ATTN_CACHE_T = 540`).** All seven GEMV stages and 32-head GQA attention over 541 tokens pass against the host reference (`0` rows/values off; worst attention error `5.95e-8`, worst stage error `4.97e-7`), at **1,582.2 us p50** per standalone layer run at 1,810 MHz.
+
+**Teacher-forced 512-position parity** (`cargo run --release -p cera --example xdna_parity_oracle --features xdna` on `Llama-3.2-1B-Instruct-Q4_0.gguf`, 16-token prompt followed by 512 greedy CPU reference tokens forced into both CPU and NPU models):
+
+| Metric (512 forced decode positions) | Measured | Section 4 bar |
+|---|---|---|
+| Top-1 exact agreement | **493 / 512 (96.29%)** | Agree outside CPU top-2 tie window (all 19 diffs within narrow top-2 margins) |
+| Top-10 overlap | **mean 9.41 / 10** (min 7/10; >= 9/10 at 481/512 = 93.95%) | >= 9 / 10 |
+| Full-vocab logit cosine similarity | **mean 0.995753** (min 0.976758) | Diagnostic |
+
+**Decode throughput and package power** (`cera.exe bench --model Llama-3.2-1B-Instruct-Q4_0.gguf --device npu --prompt-tokens 16 --max-tokens 512 --runs 10`, 2 warmup runs, Turbo power plan `6fecc5ae-f350-48a5-b669-b472cb895ccf`, `xrt-smi` NPU power mode `Performance`, bracketed by 60 s idle floors under `tools/xdna-spike/hwinfo_sm.py` with `NPU Computing 0 Usage` at 0.00% on both floors):
+
+| Measurement | Value |
+|---|---|
+| Decode throughput (n = 10 runs x 512 tokens) | **41.6 tok/s p50** (p10 41.5, p90 41.7, mean 41.5, stddev 0.1) |
+| CPU prefill (16-token prompt) / TTFT | 82 tok/s p50 (p10 80, p90 84) / 197 ms p50 (p10 191, p90 199) |
+| Steady package power (`NPU Computing 0 Usage >= 90%`, 1,147 samples, 16.6 to 163.8 s) | **19.97 W** (min 18.77, max 24.17 W; Total System Power 17.51 W; NPU Clock mean 1,801.66 MHz; NPU Usage mean 98.28%) |
+| Whole-process package power (1,478 samples over 163.77 s) | **19.62 W** (min 8.38, max 24.17 W; total energy 3,214.21 J) |
+| Adjacent 60 s idle floors (before, after; NPU usage 0.00%) | **8.68 W** (min 7.80, max 11.49 W), **21.54 W** (min 10.06, max 36.56 W; host CPU woke during post-run check; two-floor mean 15.11 W) |
+| **Gross tokens per joule (steady / whole-process)** | **2.08 tok/J gross** (steady) / **2.12 tok/J gross** (whole-process) |
+| Net tokens per joule (above 8.68 W pre-run floor / 15.11 W mean floor) | **3.68 tok/J net** (11.29 W net) / **8.56 tok/J net** (4.86 W net) |
+
+**Comparison against the section 2 baselines and section 4 bar** (Llama-3.2-1B-Instruct Q4_0, 16-token prompt, 512 decode tokens, 10 runs, Turbo):
+
+| Backend | Decode tok/s p50 | Package W | Gross tok/J | Net W above floor | Net tok/J |
+|---|---|---|---|---|---|
+| **NPU (`--device npu`, steady)** | **41.6** | **19.97** | **2.08** | **11.29** (vs 8.68 W pre-floor) / **4.86** (vs 15.11 W mean floor) | **3.68 / 8.56** |
+| GPU (`--device gpu`, section 2, machine left alone) | 93.4 | 67.25 | 1.39 | 50.89 (vs 16.36 W floor) | 1.84 |
+| GPU (`--device gpu`, section 2, machine in use) | 73.7 | 66.50 | 1.11 | 44.80 (vs 21.70 W floor) | 1.65 |
+| CPU (`--device cpu`, section 2, machine in use) | 60.3 | 65.60 | 0.92 | 43.90 (vs 21.70 W floor) | 1.37 |
+
+**Gate verdict: PASS.** The XDNA backend clears both legs of the section 4 numeric bar (**41.6 tok/s >= 35 tok/s** and **2.08 gross tok/J >= 1.5 gross tok/J**), achieving 1.50x the GPU's gross energy efficiency and 2.26x the CPU's while drawing ~20 W whole-package power (~5 to 11 W above idle, vs ~67 W on the GPU and ~66 W on the CPU). `cargo test --release -p cera --lib --features xdna` passes 1,476 tests with only the 2 pre-existing Windows failures recorded in section 1.

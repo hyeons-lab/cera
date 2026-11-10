@@ -182,6 +182,16 @@ required-features = ["mmap", "vl-preprocess"]
 name = "hexagon_vit_probe"
 required-features = ["hexagon", "mmap"]
 
+# Opens the AMD XDNA NPU through the XRT shim and loads an xclbin (device only).
+[[example]]
+name = "xdna_probe"
+required-features = ["xdna"]
+
+# Fused XDNA layer on Rust-packed weights vs a host simulation (device only).
+[[example]]
+name = "xdna_layer_probe"
+required-features = ["xdna"]
+
 # Is NPU decode bit-reproducible (device only).
 [[example]]
 name = "hexagon_decode_probe"
@@ -350,4 +360,8 @@ vl-preprocess = ["dep:image"]
 avx512 = []
 # Qualcomm Hexagon NPU backend (Snapdragon 8 Gen 2 / SM8550+). FastRPC offload to HTP.
 hexagon = ["std-fs"]
+# AMD XDNA NPU backend (Ryzen AI, Strix Halo). Windows/MSVC only: build.rs
+# compiles a C ABI shim over the driver's XRT runtime; the Rust side loads it
+# at runtime, so builds still start on machines without the driver.
+xdna = ["std-fs"]
 default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess", "avx512"]

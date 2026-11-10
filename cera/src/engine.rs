@@ -2589,7 +2589,7 @@ fn load_text_model_npu(
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
     // `gguf`, `path` and `context_size` are only read by the vendor arms below.
-    #[cfg(not(feature = "hexagon"))]
+    #[cfg(not(any(feature = "hexagon", feature = "xdna")))]
     let _ = (&gguf, path, context_size);
 
     #[allow(unused_mut)]
@@ -2599,12 +2599,28 @@ fn load_text_model_npu(
     // vendor that a later one could follow pays for it: the last vendor takes
     // `gguf` by value, and a vendor added after Hexagon makes Hexagon clone.
     #[cfg(feature = "hexagon")]
-    match model::load_model_hexagon(gguf, path, context_size) {
+    match model::load_model_hexagon(
+        #[cfg(feature = "xdna")]
+        gguf.clone(),
+        #[cfg(not(feature = "xdna"))]
+        gguf,
+        path,
+        context_size,
+    ) {
         Ok(m) => {
             tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (npu)");
             return Ok(m);
         }
         Err(e) => tried.push(format!("Hexagon: {e:#}")),
+    }
+
+    #[cfg(feature = "xdna")]
+    match model::load_model_xdna(gguf, path, context_size) {
+        Ok(m) => {
+            tracing::debug!("cera::engine: using AMD XDNA NPU backend (npu)");
+            return Ok(m);
+        }
+        Err(e) => tried.push(format!("XDNA: {e}")),
     }
 
     if tried.is_empty() {
@@ -2914,7 +2930,12 @@ mod tests {
             msg.contains("no NPU backend could load this model") && msg.contains("Hexagon:"),
             "{msg}"
         );
-        #[cfg(not(feature = "hexagon"))]
+        #[cfg(feature = "xdna")]
+        assert!(
+            msg.contains("no NPU backend could load this model") && msg.contains("XDNA:"),
+            "{msg}"
+        );
+        #[cfg(not(any(feature = "hexagon", feature = "xdna")))]
         assert!(
             msg.contains("no NPU backend is compiled into this build"),
             "{msg}"

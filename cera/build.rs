@@ -60,6 +60,13 @@ fn main() {
         compile_slang_multitarget(want_wgsl, want_msl);
     }
 
+    // AMD XDNA shim (Windows/MSVC only): compile the C ABI shim over XRT into
+    // a DLL the Rust side embeds and loads at runtime, so binaries still start
+    // on machines without the AMD driver.
+    if std::env::var_os("CARGO_FEATURE_XDNA").is_some() {
+        compile_xdna_shim();
+    }
+
     // Emit `has_blas` only when the `blas` feature is active on Apple platforms (macOS/iOS).
     // Non-Apple targets (Linux, Android, Windows, wasm) exclusively run native SIMD kernels.
     println!("cargo:rustc-check-cfg=cfg(has_blas)");
@@ -320,6 +327,54 @@ fn apply_msl_postpass(path: &str, name: &str) {
 // can `include!` the same source and exercise it directly (same pattern as
 // `build_support/msl_postpass.rs`).
 include!("build_support/slang_headers.rs");
+
+/// Compile `src/backend/xdna/shim/cera_xdna_shim.cpp` into
+/// `OUT_DIR/cera_xdna_shim.dll`, linked against an import library generated
+/// from the committed `xrt_coreutil.def` (so no driver DLL is needed at build
+/// time). Requires Visual Studio with the C++ workload; the XRT headers are
+/// vendored under the shim's `include/` (XRT 2.19.0, commit 77c7088).
+fn compile_xdna_shim() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "windows" {
+        return;
+    }
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let shim_dir = format!("{manifest}/src/backend/xdna/shim");
+    let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    println!("cargo:rerun-if-changed={shim_dir}/cera_xdna_shim.cpp");
+    println!("cargo:rerun-if-changed={shim_dir}/xrt_coreutil.def");
+    println!("cargo:rerun-if-changed={shim_dir}/include");
+    let vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+    let vs = Command::new(vswhere)
+        .args(["-latest", "-products", "*", "-property", "installationPath"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .expect("xdna feature needs Visual Studio with the C++ workload (vswhere found none)");
+    let cmdline = format!(
+        "\"{vs}\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul && \
+         lib /nologo /def:\"{shim_dir}\\xrt_coreutil.def\" /machine:x64 /out:\"{out}\\xrt_coreutil.lib\" && \
+         cl /nologo /std:c++17 /Zc:__cplusplus /EHsc /O2 /MD /LD /Fo:\"{out}\\cera_xdna_shim.obj\" /I \"{shim_dir}\\include\" /I \"{shim_dir}\\include\\xrt\" \
+         \"{shim_dir}\\cera_xdna_shim.cpp\" /Fe:\"{out}\\cera_xdna_shim.dll\" /link /LIBPATH:\"{out}\" xrt_coreutil.lib"
+    );
+    // raw_arg: cmd /C needs the batch-file quoting passed through verbatim;
+    // the normal argv escaping turns the inner quotes into literal backslashes.
+    use std::os::windows::process::CommandExt;
+    let output = Command::new("cmd")
+        .raw_arg(format!("/C \"{cmdline}\""))
+        .output()
+        .expect("failed to run cmd for the xdna shim build");
+    if !output.status.success() {
+        panic!(
+            "xdna shim build failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
 
 /// Locate slangc: `SLANGC` env, then PATH, then the default local install.
 /// Every candidate (including `SLANGC`) is probed with `-v`, so a bad `SLANGC`
