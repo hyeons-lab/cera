@@ -38,7 +38,16 @@
 @group(0) @binding(1) var<storage, read_write> k_batch: array<f32>;
 @group(0) @binding(2) var<storage, read> q_norm_w: array<f32>;
 @group(0) @binding(3) var<storage, read> k_norm_w: array<f32>;
+#ifdef IMMEDIATES
+struct ImmParams {
+    v0: vec4<u32>,
+    v1: vec4<u32>,
+    v2: vec4<u32>,
+}
+var<immediate> imm: ImmParams;
+#else
 @group(0) @binding(4) var<storage, read> params: array<u32, 12>;
+#endif
 @group(0) @binding(5) var<storage, read> freq_factors: array<f32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
@@ -49,6 +58,20 @@ fn qk_norm_rope_batch(
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
     let tid = lid.x;
+#ifdef IMMEDIATES
+    let start_pos = imm.v0.x;
+    let n_tokens = imm.v0.y;
+    let n_heads = imm.v0.z;
+    let n_kv_heads = imm.v0.w;
+    let head_dim = imm.v1.x;
+    let eps = bitcast<f32>(imm.v1.y);
+    let freq_base = bitcast<f32>(imm.v1.z);
+    let rope_type = imm.v1.w;
+    let q_stride = imm.v2.x;
+    let k_stride = imm.v2.y;
+    let has_freq_factors = imm.v2.z;
+    let has_qk_norm = imm.v2.w;
+#else
     let start_pos = params[0];
     let n_tokens = params[1];
     let n_heads = params[2];
@@ -61,6 +84,7 @@ fn qk_norm_rope_batch(
     let k_stride = params[9];
     let has_freq_factors = params[10];
     let has_qk_norm = params[11];
+#endif
 
     let heads_per_token = n_heads + n_kv_heads;
     let tg = get_wid(wid);

@@ -62,6 +62,7 @@ use crate::model::gpu_weight_source::{
 use crate::model::transformer::WeightRef;
 use crate::model::weights::MmapWeight;
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
+use crate::par::*;
 use crate::tensor::DType;
 
 /// Key splits per head in the split-K decode attention. Must match `SPLITS` in
@@ -230,6 +231,69 @@ fn build_mul_mat_pipeline(
             ("TILE_K", &tile_k),
         ],
     )
+}
+
+/// Build a WGSL GEMV pipeline, preferring the `SUBGROUP` variant when
+/// `ctx.use_wgsl_subgroup()` is enabled and degrading cleanly to the tree
+/// fallback if the driver rejects the subgroup shader at validation time.
+/// Returns `(pipeline, used_subgroup)`.
+fn build_wgsl_gemv_pipeline(
+    ctx: &GpuContext,
+    subgroup_shader: &str,
+    fallback_shader: &str,
+    entry_point: &str,
+    label: &str,
+    base_defines: &[(&str, &str)],
+) -> (wgpu::ComputePipeline, bool) {
+    if ctx.use_wgsl_subgroup() {
+        let mut defines = base_defines.to_vec();
+        defines.push(("SUBGROUP", "1"));
+        match ctx.try_create_pipeline_with_defines_checked(
+            subgroup_shader,
+            entry_point,
+            label,
+            &defines,
+        ) {
+            Ok(pipe) => return (pipe, true),
+            Err(err) => {
+                tracing::warn!(
+                    "WGSL subgroup pipeline {label} rejected ({err:#}); falling back to tree reduction"
+                );
+            }
+        }
+    }
+    (
+        ctx.create_pipeline_with_defines(fallback_shader, entry_point, label, base_defines),
+        false,
+    )
+}
+
+/// Build an optional `IMMEDIATES` compute pipeline when the device supports at
+/// least `bytes` of immediate data, degrading cleanly to `None` if validation
+/// rejects the variant.
+fn build_optional_imm_pipeline(
+    ctx: &GpuContext,
+    bytes: u32,
+    shader_source: &str,
+    entry_point: &str,
+    label: &str,
+    extra_defines: &[(&str, &str)],
+) -> Option<wgpu::ComputePipeline> {
+    if !ctx.supports_immediates(bytes) {
+        return None;
+    }
+    let mut defines = extra_defines.to_vec();
+    defines.push(("IMMEDIATES", "1"));
+    match ctx.try_create_pipeline_with_defines_checked(shader_source, entry_point, label, &defines)
+    {
+        Ok(pipe) => Some(pipe),
+        Err(err) => {
+            tracing::warn!(
+                "immediate-constant pipeline {label} rejected ({err:#}); falling back to storage buffer params"
+            );
+            None
+        }
+    }
 }
 
 /// Whether to build reg-tile GEMM pipelines from slangc SPIR-V fed straight to
@@ -472,43 +536,61 @@ fn can_fuse_gate_up_shape(
 fn repack_q4_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
     assert_eq!(k % 32, 0, "streaming repack needs k % 32 == 0, got k={k}");
     let blocks_per_row = k / 32;
-    debug_assert_eq!(data.len(), m * blocks_per_row * 18);
-    let nibble = |qs: &[u8], w: usize| -> u16 {
-        if w < 16 {
-            (qs[w] & 0xF) as u16
-        } else {
-            (qs[w - 16] >> 4) as u16
-        }
-    };
-    let mut q = vec![0u32; m * k / 8];
-    let mut d = vec![0u32; m * blocks_per_row.div_ceil(2)];
-    for row in 0..m {
-        for b in 0..blocks_per_row {
-            let base = (row * blocks_per_row + b) * 18;
-            let scale_bits = u16::from_le_bytes([data[base], data[base + 1]]) as u32;
-            let qs = &data[base + 2..base + 18];
-            // Scale pair: block 2p in the low half, 2p+1 in the high half.
-            let pair = b / 2;
-            if b % 2 == 0 {
-                d[pair * m + row] = scale_bits;
-            } else {
-                d[pair * m + row] |= scale_bits << 16;
-            }
-            // Nibble ushorts: 8 per block, packed 2 per u32.
-            for u in 0..8 {
-                let mut v = 0u16;
-                for t in 0..4 {
-                    v |= nibble(qs, u * 4 + t) << (t * 4);
-                }
-                let qi = (b * 8 + u) / 2;
-                if u % 2 == 0 {
-                    q[qi * m + row] = v as u32;
-                } else {
-                    q[qi * m + row] |= (v as u32) << 16;
-                }
-            }
-        }
+    assert_eq!(
+        data.len(),
+        m * blocks_per_row * 18,
+        "streaming Q4_0 repack length mismatch"
+    );
+    if m == 0 || k == 0 {
+        return (Vec::new(), Vec::new());
     }
+    const ROW_TILE: usize = 64;
+    let mut q = vec![0u32; m * (k / 8)];
+    let mut d = vec![0u32; m * blocks_per_row.div_ceil(2)];
+
+    q.par_chunks_mut(4 * m).enumerate().for_each(|(b, q_blk)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_per_row + b) * 18;
+                let qs = &data[base + 2..base + 18];
+                let mut lo0 = 0u32;
+                let mut hi0 = 0u32;
+                let mut lo1 = 0u32;
+                let mut hi1 = 0u32;
+                for t in 0..8 {
+                    let b0 = qs[t];
+                    let b1 = qs[8 + t];
+                    let shift = t * 4;
+                    lo0 |= ((b0 & 0x0F) as u32) << shift;
+                    hi0 |= ((b0 >> 4) as u32) << shift;
+                    lo1 |= ((b1 & 0x0F) as u32) << shift;
+                    hi1 |= ((b1 >> 4) as u32) << shift;
+                }
+                q_blk[row] = lo0;
+                q_blk[m + row] = lo1;
+                q_blk[2 * m + row] = hi0;
+                q_blk[3 * m + row] = hi1;
+            }
+        }
+    });
+
+    d.par_chunks_mut(m).enumerate().for_each(|(pair, d_pair)| {
+        let b0 = pair * 2;
+        let b1 = b0 + 1;
+        for (row, out) in d_pair.iter_mut().enumerate() {
+            let base0 = (row * blocks_per_row + b0) * 18;
+            let s0 = u16::from_le_bytes([data[base0], data[base0 + 1]]) as u32;
+            let s1 = if b1 < blocks_per_row {
+                let base1 = base0 + 18;
+                u16::from_le_bytes([data[base1], data[base1 + 1]]) as u32
+            } else {
+                0
+            };
+            *out = s0 | (s1 << 16);
+        }
+    });
+
     (q, d)
 }
 
@@ -523,63 +605,65 @@ fn repack_q4_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
     assert_eq!(k % 256, 0, "streaming repack needs k % 256 == 0, got k={k}");
     let blocks_256 = k / 256;
     let block_size = 144usize; // BlockQ4KM
-    debug_assert_eq!(data.len(), m * blocks_256 * block_size);
+    assert_eq!(
+        data.len(),
+        m * blocks_256 * block_size,
+        "streaming Q4_K repack length mismatch"
+    );
+    if m == 0 || k == 0 {
+        return (Vec::new(), Vec::new());
+    }
 
+    const ROW_TILE: usize = 64;
     let n_kb = k / 32; // 8 sub-blocks per 256-block
     let mut q = vec![0u32; m * (k / 8)];
     let mut d = vec![0u32; m * n_kb];
 
-    for row in 0..m {
-        for b in 0..blocks_256 {
-            let base = (row * blocks_256 + b) * block_size;
-            let block_bytes = &data[base..base + block_size];
-            let d_val =
-                half::f16::from_bits(u16::from_le_bytes([block_bytes[0], block_bytes[1]])).to_f32();
-            let dmin_val =
-                half::f16::from_bits(u16::from_le_bytes([block_bytes[2], block_bytes[3]])).to_f32();
-
-            let mut scales = [0u8; 12];
-            scales.copy_from_slice(&block_bytes[4..16]);
-            let (sc, mn) = crate::quant::decode_q4km_scales(&scales);
-            let qs = &block_bytes[16..144]; // 128 bytes
-
-            // 4 pairs of sub-blocks (j = 0..4)
-            for j in 0..4 {
-                // Sub-block 0: 2 * j
-                let kb0 = b * 8 + 2 * j;
-                let sc0 = d_val * sc[2 * j] as f32;
-                let mn0 = dmin_val * mn[2 * j] as f32;
-                let sc0_f16 = half::f16::from_f32(sc0).to_bits() as u32;
-                let mn0_f16 = half::f16::from_f32(mn0).to_bits() as u32;
-                d[kb0 * m + row] = sc0_f16 | (mn0_f16 << 16);
-
-                // Sub-block 1: 2 * j + 1
-                let kb1 = b * 8 + 2 * j + 1;
-                let sc1 = d_val * sc[2 * j + 1] as f32;
-                let mn1 = dmin_val * mn[2 * j + 1] as f32;
-                let sc1_f16 = half::f16::from_f32(sc1).to_bits() as u32;
-                let mn1_f16 = half::f16::from_f32(mn1).to_bits() as u32;
-                d[kb1 * m + row] = sc1_f16 | (mn1_f16 << 16);
-
-                // 32 nibbles for sub-block 0 are the low nibbles of qs[j*32 .. j*32 + 32]
-                // 32 nibbles for sub-block 1 are the high nibbles of qs[j*32 .. j*32 + 32]
-                // 4 u32 words per sub-block (p = 0..4, 8 nibbles each)
-                for p in 0..4 {
-                    let mut v0 = 0u32;
-                    let mut v1 = 0u32;
-                    for t in 0..8 {
-                        let byte = qs[j * 32 + p * 8 + t];
-                        let nib0 = (byte & 0x0F) as u32;
-                        let nib1 = (byte >> 4) as u32;
-                        v0 |= nib0 << (t * 4);
-                        v1 |= nib1 << (t * 4);
+    q.par_chunks_mut(32 * m).enumerate().for_each(|(b, q_sb)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_256 + b) * block_size;
+                let qs = &data[base + 16..base + block_size]; // 128 bytes
+                for j in 0..4 {
+                    let sub0 = 2 * j;
+                    let sub1 = 2 * j + 1;
+                    for p in 0..4 {
+                        let mut v0 = 0u32;
+                        let mut v1 = 0u32;
+                        for t in 0..8 {
+                            let byte = qs[j * 32 + p * 8 + t];
+                            v0 |= ((byte & 0x0F) as u32) << (t * 4);
+                            v1 |= ((byte >> 4) as u32) << (t * 4);
+                        }
+                        q_sb[(sub0 * 4 + p) * m + row] = v0;
+                        q_sb[(sub1 * 4 + p) * m + row] = v1;
                     }
-                    q[(kb0 * 4 + p) * m + row] = v0;
-                    q[(kb1 * 4 + p) * m + row] = v1;
                 }
             }
         }
-    }
+    });
+
+    d.par_chunks_mut(8 * m).enumerate().for_each(|(b, d_sb)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_256 + b) * block_size;
+                let hdr = &data[base..base + 16];
+                let d_val = half::f16::from_bits(u16::from_le_bytes([hdr[0], hdr[1]])).to_f32();
+                let dmin_val = half::f16::from_bits(u16::from_le_bytes([hdr[2], hdr[3]])).to_f32();
+                let mut scales = [0u8; 12];
+                scales.copy_from_slice(&hdr[4..16]);
+                let (sc, mn) = crate::quant::decode_q4km_scales(&scales);
+                for sub in 0..8 {
+                    let sc_f16 = half::f16::from_f32(d_val * sc[sub] as f32).to_bits() as u32;
+                    let mn_f16 = half::f16::from_f32(dmin_val * mn[sub] as f32).to_bits() as u32;
+                    d_sb[sub * m + row] = sc_f16 | (mn_f16 << 16);
+                }
+            }
+        }
+    });
+
     (q, d)
 }
 
@@ -592,63 +676,82 @@ fn repack_q6_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
     assert_eq!(k % 256, 0, "streaming repack needs k % 256 == 0, got k={k}");
     let blocks_256 = k / 256;
     let block_size = 210usize; // BlockQ6K
-    debug_assert_eq!(data.len(), m * blocks_256 * block_size);
+    assert_eq!(
+        data.len(),
+        m * blocks_256 * block_size,
+        "streaming Q6_K repack length mismatch"
+    );
+    if m == 0 || k == 0 {
+        return (Vec::new(), Vec::new());
+    }
 
+    const ROW_TILE: usize = 64;
     let mut q = vec![0u32; m * (k / 4)];
     let mut d = vec![0u32; m * (k / 32)];
 
-    for row in 0..m {
-        for b in 0..blocks_256 {
-            let base = (row * blocks_256 + b) * block_size;
-            let block_bytes = &data[base..base + block_size];
-            let ql = &block_bytes[0..128];
-            let qh = &block_bytes[128..192];
-            let sc = &block_bytes[192..208];
-            let d_val =
-                half::f16::from_bits(u16::from_le_bytes([block_bytes[208], block_bytes[209]]))
-                    .to_f32();
-
-            let mut quants = [0i8; 256];
-            for n in 0..2 {
-                let y_off = n * 128;
-                let ql_off = n * 64;
-                let qh_off = n * 32;
-                for l in 0..32 {
-                    let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
-                    let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
-                        as i8
-                        - 32;
-                    let q3 =
-                        ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
-                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
-                        as i8
-                        - 32;
-                    quants[y_off + l] = q1;
-                    quants[y_off + l + 32] = q2;
-                    quants[y_off + l + 64] = q3;
-                    quants[y_off + l + 96] = q4;
+    q.par_chunks_mut(64 * m).enumerate().for_each(|(b, q_sb)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_256 + b) * block_size;
+                let ql = &data[base..base + 128];
+                let qh = &data[base + 128..base + 192];
+                let mut quants = [0i8; 256];
+                for n in 0..2 {
+                    let y_off = n * 128;
+                    let ql_off = n * 64;
+                    let qh_off = n * 32;
+                    for l in 0..32 {
+                        let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                        let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                            as i8
+                            - 32;
+                        let q3 =
+                            ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                        let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                            as i8
+                            - 32;
+                        quants[y_off + l] = q1;
+                        quants[y_off + l + 32] = q2;
+                        quants[y_off + l + 64] = q3;
+                        quants[y_off + l + 96] = q4;
+                    }
                 }
-            }
-
-            for sub32 in 0..8 {
-                let kb = b * 8 + sub32;
-                let sc_lo = d_val * (sc[2 * sub32] as i8 as f32);
-                let sc_hi = d_val * (sc[2 * sub32 + 1] as i8 as f32);
-                let lo_bits = half::f16::from_f32(sc_lo).to_bits() as u32;
-                let hi_bits = half::f16::from_f32(sc_hi).to_bits() as u32;
-                d[kb * m + row] = lo_bits | (hi_bits << 16);
-                for w in 0..8 {
-                    let base_q = sub32 * 32 + w * 4;
-                    q[(kb * 8 + w) * m + row] = u32::from_le_bytes([
-                        quants[base_q] as u8,
-                        quants[base_q + 1] as u8,
-                        quants[base_q + 2] as u8,
-                        quants[base_q + 3] as u8,
-                    ]);
+                for sub32 in 0..8 {
+                    for w in 0..8 {
+                        let base_q = sub32 * 32 + w * 4;
+                        q_sb[(sub32 * 8 + w) * m + row] = u32::from_le_bytes([
+                            quants[base_q] as u8,
+                            quants[base_q + 1] as u8,
+                            quants[base_q + 2] as u8,
+                            quants[base_q + 3] as u8,
+                        ]);
+                    }
                 }
             }
         }
-    }
+    });
+
+    d.par_chunks_mut(8 * m).enumerate().for_each(|(b, d_sb)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_256 + b) * block_size;
+                let sc = &data[base + 192..base + 208];
+                let d_val =
+                    half::f16::from_bits(u16::from_le_bytes([data[base + 208], data[base + 209]]))
+                        .to_f32();
+                for sub32 in 0..8 {
+                    let sc_lo = d_val * (sc[2 * sub32] as i8 as f32);
+                    let sc_hi = d_val * (sc[2 * sub32 + 1] as i8 as f32);
+                    let lo_bits = half::f16::from_f32(sc_lo).to_bits() as u32;
+                    let hi_bits = half::f16::from_f32(sc_hi).to_bits() as u32;
+                    d_sb[sub32 * m + row] = lo_bits | (hi_bits << 16);
+                }
+            }
+        }
+    });
+
     (q, d)
 }
 
@@ -661,61 +764,70 @@ fn repack_q5_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
     assert_eq!(k % 256, 0, "streaming repack needs k % 256 == 0, got k={k}");
     let blocks_256 = k / 256;
     let block_size = 176usize; // BlockQ5K
-    debug_assert_eq!(data.len(), m * blocks_256 * block_size);
+    assert_eq!(
+        data.len(),
+        m * blocks_256 * block_size,
+        "streaming Q5_K repack length mismatch"
+    );
+    if m == 0 || k == 0 {
+        return (Vec::new(), Vec::new());
+    }
 
+    const ROW_TILE: usize = 64;
     let mut q = vec![0u32; m * (k / 4)];
     let mut d = vec![0u32; m * (k / 32)];
 
-    for row in 0..m {
-        for b in 0..blocks_256 {
-            let base = (row * blocks_256 + b) * block_size;
-            let block_bytes = &data[base..base + block_size];
-            let d_val =
-                half::f16::from_bits(u16::from_le_bytes([block_bytes[0], block_bytes[1]])).to_f32();
-            let dmin_val =
-                half::f16::from_bits(u16::from_le_bytes([block_bytes[2], block_bytes[3]])).to_f32();
-
-            let mut scales = [0u8; 12];
-            scales.copy_from_slice(&block_bytes[4..16]);
-            let (sc, mn) = crate::quant::decode_q4km_scales(&scales);
-            let qh = &block_bytes[16..48]; // 32 bytes
-            let ql = &block_bytes[48..176]; // 128 bytes
-
-            for j in 0..4 {
-                let u1 = 1u8 << (2 * j);
-                let u2 = 2u8 << (2 * j);
-
-                let kb0 = b * 8 + 2 * j;
-                let sc0 = d_val * sc[2 * j] as f32;
-                let mn0 = dmin_val * mn[2 * j] as f32;
-                let sc0_f16 = half::f16::from_f32(sc0).to_bits() as u32;
-                let mn0_f16 = half::f16::from_f32(mn0).to_bits() as u32;
-                d[kb0 * m + row] = sc0_f16 | (mn0_f16 << 16);
-
-                let kb1 = b * 8 + 2 * j + 1;
-                let sc1 = d_val * sc[2 * j + 1] as f32;
-                let mn1 = dmin_val * mn[2 * j + 1] as f32;
-                let sc1_f16 = half::f16::from_f32(sc1).to_bits() as u32;
-                let mn1_f16 = half::f16::from_f32(mn1).to_bits() as u32;
-                d[kb1 * m + row] = sc1_f16 | (mn1_f16 << 16);
-
-                for w in 0..8 {
-                    let mut bytes0 = [0u8; 4];
-                    let mut bytes1 = [0u8; 4];
-                    for t in 0..4 {
-                        let l = w * 4 + t;
-                        let q_byte = ql[j * 32 + l];
-                        let hi0 = if (qh[l] & u1) != 0 { 16u8 } else { 0u8 };
-                        let hi1 = if (qh[l] & u2) != 0 { 16u8 } else { 0u8 };
-                        bytes0[t] = (q_byte & 0x0F) | hi0;
-                        bytes1[t] = (q_byte >> 4) | hi1;
+    q.par_chunks_mut(64 * m).enumerate().for_each(|(b, q_sb)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_256 + b) * block_size;
+                let qh = &data[base + 16..base + 48]; // 32 bytes
+                let ql = &data[base + 48..base + block_size]; // 128 bytes
+                for j in 0..4 {
+                    let u1 = 1u8 << (2 * j);
+                    let u2 = 2u8 << (2 * j);
+                    let sub0 = 2 * j;
+                    let sub1 = 2 * j + 1;
+                    for w in 0..8 {
+                        let mut bytes0 = [0u8; 4];
+                        let mut bytes1 = [0u8; 4];
+                        for t in 0..4 {
+                            let l = w * 4 + t;
+                            let q_byte = ql[j * 32 + l];
+                            let hi0 = if (qh[l] & u1) != 0 { 16u8 } else { 0u8 };
+                            let hi1 = if (qh[l] & u2) != 0 { 16u8 } else { 0u8 };
+                            bytes0[t] = (q_byte & 0x0F) | hi0;
+                            bytes1[t] = (q_byte >> 4) | hi1;
+                        }
+                        q_sb[(sub0 * 8 + w) * m + row] = u32::from_le_bytes(bytes0);
+                        q_sb[(sub1 * 8 + w) * m + row] = u32::from_le_bytes(bytes1);
                     }
-                    q[(kb0 * 8 + w) * m + row] = u32::from_le_bytes(bytes0);
-                    q[(kb1 * 8 + w) * m + row] = u32::from_le_bytes(bytes1);
                 }
             }
         }
-    }
+    });
+
+    d.par_chunks_mut(8 * m).enumerate().for_each(|(b, d_sb)| {
+        for row_base in (0..m).step_by(ROW_TILE) {
+            let row_end = (row_base + ROW_TILE).min(m);
+            for row in row_base..row_end {
+                let base = (row * blocks_256 + b) * block_size;
+                let hdr = &data[base..base + 16];
+                let d_val = half::f16::from_bits(u16::from_le_bytes([hdr[0], hdr[1]])).to_f32();
+                let dmin_val = half::f16::from_bits(u16::from_le_bytes([hdr[2], hdr[3]])).to_f32();
+                let mut scales = [0u8; 12];
+                scales.copy_from_slice(&hdr[4..16]);
+                let (sc, mn) = crate::quant::decode_q4km_scales(&scales);
+                for sub in 0..8 {
+                    let sc_f16 = half::f16::from_f32(d_val * sc[sub] as f32).to_bits() as u32;
+                    let mn_f16 = half::f16::from_f32(dmin_val * mn[sub] as f32).to_bits() as u32;
+                    d_sb[sub * m + row] = sc_f16 | (mn_f16 << 16);
+                }
+            }
+        }
+    });
+
     (q, d)
 }
 
@@ -928,7 +1040,7 @@ fn load_spv_variant(
                 zero_initialize_workgroup_memory: false,
                 ..Default::default()
             },
-            cache: None,
+            cache: ctx.pipeline_cache(),
         });
     let stem = std::path::Path::new(path)
         .file_stem()
@@ -989,25 +1101,77 @@ fn repack_q6_k_flat(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     assert_eq!(k % 256, 0, "flat Q6_K repack needs k % 256 == 0, got k={k}");
     let nb = k / 256;
     assert_eq!(data.len(), m * nb * 210, "flat Q6_K repack length mismatch");
+    if m == 0 || k == 0 {
+        return Vec::new();
+    }
+    const ROW_TILE: usize = 64;
     let (ql_plane, qh_plane, s_plane) = (m * nb * 128, m * nb * 64, m * nb * 16);
     let mut out = vec![0u8; m * nb * 210];
     let (ql_out, rest) = out.split_at_mut(ql_plane);
     let (qh_out, rest) = rest.split_at_mut(qh_plane);
     let (s_out, d_out) = rest.split_at_mut(s_plane);
-    for row in 0..m {
-        for b in 0..nb {
-            let base = (row * nb + b) * 210;
-            let (ql, rest) = data[base..base + 210].split_at(128);
-            let (qh, rest) = rest.split_at(64);
-            let (s, d) = rest.split_at(16);
-            debug_assert_eq!(d.len(), 2);
-            let o = row * nb + b;
-            ql_out[o * 128..(o + 1) * 128].copy_from_slice(ql);
-            qh_out[o * 64..(o + 1) * 64].copy_from_slice(qh);
-            s_out[o * 16..(o + 1) * 16].copy_from_slice(s);
-            d_out[o * 2..(o + 1) * 2].copy_from_slice(d);
-        }
-    }
+
+    ql_out
+        .par_chunks_mut(ROW_TILE * nb * 128)
+        .enumerate()
+        .for_each(|(tile_idx, ql_tile)| {
+            let row_base = tile_idx * ROW_TILE;
+            let rows = ql_tile.len() / (nb * 128);
+            for r in 0..rows {
+                let row = row_base + r;
+                for b in 0..nb {
+                    let base = (row * nb + b) * 210;
+                    let o = r * nb + b;
+                    ql_tile[o * 128..(o + 1) * 128].copy_from_slice(&data[base..base + 128]);
+                }
+            }
+        });
+    qh_out
+        .par_chunks_mut(ROW_TILE * nb * 64)
+        .enumerate()
+        .for_each(|(tile_idx, qh_tile)| {
+            let row_base = tile_idx * ROW_TILE;
+            let rows = qh_tile.len() / (nb * 64);
+            for r in 0..rows {
+                let row = row_base + r;
+                for b in 0..nb {
+                    let base = (row * nb + b) * 210;
+                    let o = r * nb + b;
+                    qh_tile[o * 64..(o + 1) * 64].copy_from_slice(&data[base + 128..base + 192]);
+                }
+            }
+        });
+    s_out
+        .par_chunks_mut(ROW_TILE * nb * 16)
+        .enumerate()
+        .for_each(|(tile_idx, s_tile)| {
+            let row_base = tile_idx * ROW_TILE;
+            let rows = s_tile.len() / (nb * 16);
+            for r in 0..rows {
+                let row = row_base + r;
+                for b in 0..nb {
+                    let base = (row * nb + b) * 210;
+                    let o = r * nb + b;
+                    s_tile[o * 16..(o + 1) * 16].copy_from_slice(&data[base + 192..base + 208]);
+                }
+            }
+        });
+    d_out
+        .par_chunks_mut(ROW_TILE * nb * 2)
+        .enumerate()
+        .for_each(|(tile_idx, d_tile)| {
+            let row_base = tile_idx * ROW_TILE;
+            let rows = d_tile.len() / (nb * 2);
+            for r in 0..rows {
+                let row = row_base + r;
+                for b in 0..nb {
+                    let base = (row * nb + b) * 210;
+                    let o = r * nb + b;
+                    d_tile[o * 2..(o + 1) * 2].copy_from_slice(&data[base + 208..base + 210]);
+                }
+            }
+        });
+
     out
 }
 
@@ -1782,6 +1946,7 @@ enum PrefillCmd<'a> {
         pipeline: &'a wgpu::ComputePipeline,
         bg: wgpu::BindGroup,
         grid: (u32, u32, u32),
+        immediates: Option<([u32; 12], usize)>,
         label: &'static str,
     },
     Copy {
@@ -1955,6 +2120,19 @@ struct GpuPipelines {
     moe_gemv_q4_0: wgpu::ComputePipeline,
     /// `lfm2moe` weighted sum of a token's expert outputs.
     moe_combine: wgpu::ComputePipeline,
+    /// Rows per workgroup emitted by `gemv_q4_k` (4 on subgroup/passthrough, 2 on tree fallback).
+    gemv_q4_k_rows: u32,
+    /// Rows per workgroup emitted by `gemv_q6_k` (1 on SPIR-V passthrough, 2 on WGSL subgroup/fallback).
+    gemv_q6_k_rows: u32,
+    /// Immediate-constant variants (`Features::IMMEDIATES`) avoiding per-dispatch params uploads.
+    gemv_f16_imm: Option<wgpu::ComputePipeline>,
+    gemm_f32_nt_imm: Option<wgpu::ComputePipeline>,
+    gemm_f32_nt_accum_imm: Option<wgpu::ComputePipeline>,
+    scaled_add_inplace_imm: Option<wgpu::ComputePipeline>,
+    scale_f32_imm: Option<wgpu::ComputePipeline>,
+    silu_mul_inplace_imm: Option<wgpu::ComputePipeline>,
+    sigmoid_head_gate_inplace_imm: Option<wgpu::ComputePipeline>,
+    qk_norm_rope_batch_imm: Option<wgpu::ComputePipeline>,
 }
 
 /// One LoRA target's low-rank factors uploaded to GPU. The apply is two GEMV
@@ -2346,6 +2524,9 @@ pub struct GpuLfmModel {
     /// Building one costs about 1.6 ms of host time, during which the GPU would otherwise sit idle;
     /// it is built while the previous token executes instead.
     prebuilt_decode: Mutex<Option<(PrebuiltKey, wgpu::CommandBuffer)>>,
+    /// Armed `map_buffer_on_submit` channel from the most recent decode tail submission.
+    pending_decode_readback:
+        Mutex<Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>>,
     /// Rank-width f32 scratch for the LoRA `tmp = A·x` intermediate. Sized to
     /// `MAX_LORA_RANK` so any accepted adapter fits without reallocation.
     lora_tmp: wgpu::Buffer,
@@ -3461,27 +3642,91 @@ impl GpuLfmModel {
 
         // Compile compute pipelines after all fallible weight reads and
         // scratch-sizing validations have succeeded.
+        let spv_gemv = use_spirv_passthrough(&ctx) && ctx.has_subgroup;
+        let (gemv_f16, gemv_f16_wgsl_sg) = if spv_gemv {
+            (ctx.gemv_f16_passthrough(), false)
+        } else {
+            build_wgsl_gemv_pipeline(
+                &ctx,
+                shaders::GEMV_F32,
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "gemv_f16",
+                &[("F16_A", "1")],
+            )
+        };
+        let (gemv_q4_k, gemv_q4_k_rows) = if spv_gemv {
+            (ctx.gemv_q4_k_passthrough(), 4)
+        } else {
+            let (pipe, sg) = build_wgsl_gemv_pipeline(
+                &ctx,
+                shaders::GEMV_Q4_K,
+                shaders::GEMV_Q4_K,
+                "gemv_q4_k",
+                "gemv_q4_k",
+                &[],
+            );
+            (pipe, if sg { 4 } else { 2 })
+        };
+        let (gemv_q6_k, gemv_q6_k_rows) = if spv_gemv {
+            (ctx.gemv_q6_k_passthrough(), 1)
+        } else {
+            let (pipe, _sg) = build_wgsl_gemv_pipeline(
+                &ctx,
+                shaders::GEMV_Q6_K,
+                shaders::GEMV_Q6_K,
+                "gemv_q6_k",
+                "gemv_q6_k",
+                &[],
+            );
+            (pipe, 2)
+        };
+        let gemv_f16_imm = if spv_gemv {
+            None
+        } else if gemv_f16_wgsl_sg {
+            build_optional_imm_pipeline(
+                &ctx,
+                16,
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "gemv_f16_imm",
+                &[("F16_A", "1"), ("SUBGROUP", "1")],
+            )
+        } else {
+            build_optional_imm_pipeline(
+                &ctx,
+                16,
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "gemv_f16_imm",
+                &[("F16_A", "1")],
+            )
+        };
+
         let pipelines = GpuPipelines {
-            gemv_f32: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+            gemv_f32: if spv_gemv {
                 ctx.gemv_f32_passthrough()
             } else {
-                ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32")
-            },
-            gemv_f16: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                ctx.gemv_f16_passthrough()
-            } else {
-                ctx.create_pipeline_with_defines(
+                build_wgsl_gemv_pipeline(
+                    &ctx,
+                    shaders::GEMV_F32,
                     shaders::GEMV_F32,
                     "gemv_f32",
-                    "gemv_f16",
-                    &[("F16_A", "1")],
+                    "gemv_f32",
+                    &[],
                 )
+                .0
             },
-            gemv_f32_accum: ctx.create_pipeline(
+            gemv_f16,
+            gemv_f32_accum: build_wgsl_gemv_pipeline(
+                &ctx,
+                shaders::GEMV_F32,
                 shaders::GEMV_F32,
                 "gemv_f32_accum",
                 "gemv_f32_accum",
-            ),
+                &[],
+            )
+            .0,
             gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt", "gemm_f32_nt"),
             gemm_f32_nt_accum: ctx.create_pipeline(
                 shaders::GEMM_F32,
@@ -3489,13 +3734,18 @@ impl GpuLfmModel {
                 "gemm_f32_nt_accum",
             ),
             gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
-            gemv_q4_0_fast: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                // Vulkan: subgroup-reduction twin via passthrough (naga
-                // cannot parse `enable subgroups`, so the WGSL twin below
-                // carries the tree instead). Same bindings, same NR=8.
+            gemv_q4_0_fast: if spv_gemv {
                 ctx.gemv_q4_0_fast_passthrough()
             } else {
-                ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast", "gemv_q4_0_fast")
+                build_wgsl_gemv_pipeline(
+                    &ctx,
+                    shaders::GEMV_Q4_0_FAST_SUBGROUP,
+                    shaders::GEMV_Q4_0_FAST,
+                    "gemv_q4_0_fast",
+                    "gemv_q4_0_fast",
+                    &[],
+                )
+                .0
             },
             gemv_q4_0_stream: if stream_layout {
                 tracing::debug!("gemv_q4_0_stream: SPIR-V passthrough (slang)");
@@ -3509,32 +3759,29 @@ impl GpuLfmModel {
             } else {
                 None
             },
-            gemv_q4_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                ctx.gemv_q4_k_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k")
-            },
+            gemv_q4_k,
             gemv_q4_k_stream: if stream_layout {
                 tracing::debug!("gemv_q4_k_stream: SPIR-V passthrough (slang)");
                 Some(ctx.gemv_q4_k_stream_passthrough())
             } else {
                 None
             },
-            gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
+            gemv_q5_k: build_wgsl_gemv_pipeline(
+                &ctx,
+                shaders::GEMV_Q5_K,
+                shaders::GEMV_Q5_K,
+                "gemv_q5_k",
+                "gemv_q5_k",
+                &[],
+            )
+            .0,
             gemv_q5_k_stream: if stream_layout {
                 tracing::debug!("gemv_q5_k_stream: SPIR-V passthrough (slang)");
                 Some(ctx.gemv_q5_k_stream_passthrough())
             } else {
                 None
             },
-            gemv_q6_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                // Vulkan: 64-thread subgroup twin via passthrough. Same
-                // bindings, NR=1 (WGSL fallback is NR=2: the rows gate in
-                // `gemv_pipeline_rows_label` mirrors this condition).
-                ctx.gemv_q6_k_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k")
-            },
+            gemv_q6_k,
             gemv_q6_k_flat: if use_flat_q6k(&ctx) {
                 tracing::debug!("gemv_q6_k_flat: SPIR-V passthrough (slang)");
                 Some(ctx.gemv_q6_k_flat_passthrough())
@@ -3547,7 +3794,15 @@ impl GpuLfmModel {
             } else {
                 None
             },
-            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
+            gemv_q8_0: build_wgsl_gemv_pipeline(
+                &ctx,
+                shaders::GEMV_Q8_0,
+                shaders::GEMV_Q8_0,
+                "gemv_q8_0",
+                "gemv_q8_0",
+                &[],
+            )
+            .0,
             gemv_q8_0_stream: if stream_layout {
                 tracing::debug!("gemv_q8_0_stream: SPIR-V passthrough (slang)");
                 Some(ctx.gemv_q8_0_stream_passthrough())
@@ -3821,6 +4076,65 @@ impl GpuLfmModel {
                 "moe_gemv_q4_0",
             ),
             moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine", "moe_combine"),
+            gemv_q4_k_rows,
+            gemv_q6_k_rows,
+            gemv_f16_imm,
+            gemm_f32_nt_imm: build_optional_imm_pipeline(
+                &ctx,
+                16,
+                shaders::GEMM_F32,
+                "gemm_f32_nt",
+                "gemm_f32_nt_imm",
+                &[],
+            ),
+            gemm_f32_nt_accum_imm: build_optional_imm_pipeline(
+                &ctx,
+                16,
+                shaders::GEMM_F32,
+                "gemm_f32_nt_accum",
+                "gemm_f32_nt_accum_imm",
+                &[],
+            ),
+            scaled_add_inplace_imm: build_optional_imm_pipeline(
+                &ctx,
+                8,
+                shaders::ELEMENTWISE,
+                "scaled_add_inplace",
+                "scaled_add_imm",
+                &[],
+            ),
+            scale_f32_imm: build_optional_imm_pipeline(
+                &ctx,
+                8,
+                shaders::SCALE_F32,
+                "scale_f32",
+                "scale_f32_imm",
+                &[],
+            ),
+            silu_mul_inplace_imm: build_optional_imm_pipeline(
+                &ctx,
+                8,
+                shaders::ELEMENTWISE,
+                "silu_mul_inplace",
+                "silu_mul_imm",
+                &[],
+            ),
+            sigmoid_head_gate_inplace_imm: build_optional_imm_pipeline(
+                &ctx,
+                8,
+                shaders::ELEMENTWISE,
+                "sigmoid_head_gate_inplace",
+                "sigmoid_head_gate_imm",
+                &[],
+            ),
+            qk_norm_rope_batch_imm: build_optional_imm_pipeline(
+                &ctx,
+                48,
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "qk_norm_rope_batch_imm",
+                &[],
+            ),
         };
 
         let argmax_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3961,6 +4275,7 @@ impl GpuLfmModel {
             lora_lru: Mutex::new(Vec::new()),
             active_lora: Mutex::new(None),
             prebuilt_decode: Mutex::new(None),
+            pending_decode_readback: Mutex::new(None),
             lora_tmp,
             lora_tmp_batched,
             lora_params_pool: Mutex::new((Vec::new(), 0)),
@@ -3969,6 +4284,7 @@ impl GpuLfmModel {
             fuse_gate_up_active: AtomicBool::new(false),
         };
         model.cache_bind_groups();
+        model.ctx.save_pipeline_cache();
         Ok(model)
     }
 
@@ -4211,80 +4527,144 @@ impl GpuLfmModel {
         output: &wgpu::Buffer,
         n: u32,
     ) {
-        // GEMM 1: Tmp[n × rank] = X[n × k] · Aᵀ  (A is [rank × k] row-major).
-        // One workgroup per output element; total = n·rank workgroups.
+        // GEMM 1: Tmp[n x rank] = X[n x k] * A^T  (A is [rank x k] row-major).
+        // One workgroup per output element; total = n * rank workgroups.
         let total1 = n * t.rank;
         let p1: [u32; 4] = [n, t.rank, t.k, 0];
-        let p1_buf = self.next_lora_params(&p1);
-        let bg1 = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("lora_batched_a"),
-                layout: &self.pipelines.gemm_f32_nt.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: input.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: t.a.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.lora_tmp_batched.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: p1_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        Self::push_prefill_dispatch(
-            cmds,
-            &self.pipelines.gemm_f32_nt,
-            bg1,
-            crate::backend::wgpu::gemv_row_workgroups(total1),
-            "lora_batched_a",
-        );
+        if let Some(ref pipe_imm) = self.pipelines.gemm_f32_nt_imm {
+            let bg1 = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("lora_batched_a"),
+                    layout: &pipe_imm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: input.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: t.a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.lora_tmp_batched.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch_imm(
+                cmds,
+                pipe_imm,
+                bg1,
+                crate::backend::wgpu::gemv_row_workgroups(total1),
+                &p1,
+                "lora_batched_a",
+            );
+        } else {
+            let p1_buf = self.next_lora_params(&p1);
+            let bg1 = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("lora_batched_a"),
+                    layout: &self.pipelines.gemm_f32_nt.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: input.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: t.a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.lora_tmp_batched.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: p1_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch(
+                cmds,
+                &self.pipelines.gemm_f32_nt,
+                bg1,
+                crate::backend::wgpu::gemv_row_workgroups(total1),
+                "lora_batched_a",
+            );
+        }
 
-        // GEMM 2: Y[n × d] += Tmp[n × rank] · Bᵀ  (B_batched is [d × rank] row-major).
+        // GEMM 2: Y[n x d] += Tmp[n x rank] * B^T  (B_batched is [d x rank] row-major).
         let total2 = n * t.d;
         let p2: [u32; 4] = [n, t.d, t.rank, 0];
-        let p2_buf = self.next_lora_params(&p2);
-        let bg2 = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("lora_batched_b"),
-                layout: &self.pipelines.gemm_f32_nt_accum.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.lora_tmp_batched.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: t.b_batched.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: output.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: p2_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        Self::push_prefill_dispatch(
-            cmds,
-            &self.pipelines.gemm_f32_nt_accum,
-            bg2,
-            crate::backend::wgpu::gemv_row_workgroups(total2),
-            "lora_batched_b",
-        );
+        if let Some(ref pipe_imm) = self.pipelines.gemm_f32_nt_accum_imm {
+            let bg2 = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("lora_batched_b"),
+                    layout: &pipe_imm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.lora_tmp_batched.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: t.b_batched.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: output.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch_imm(
+                cmds,
+                pipe_imm,
+                bg2,
+                crate::backend::wgpu::gemv_row_workgroups(total2),
+                &p2,
+                "lora_batched_b",
+            );
+        } else {
+            let p2_buf = self.next_lora_params(&p2);
+            let bg2 = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("lora_batched_b"),
+                    layout: &self.pipelines.gemm_f32_nt_accum.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.lora_tmp_batched.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: t.b_batched.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: output.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: p2_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch(
+                cmds,
+                &self.pipelines.gemm_f32_nt_accum,
+                bg2,
+                crate::backend::wgpu::gemv_row_workgroups(total2),
+                "lora_batched_b",
+            );
+        }
     }
 
     /// Batched-prefill counterpart of the decode `dispatch_lora_into`: apply the
@@ -4544,18 +4924,14 @@ impl GpuLfmModel {
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 8, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
-            DType::Q4KM => {
-                let rows = if self.ctx.supports_spirv_passthrough() && self.ctx.has_subgroup {
-                    4
-                } else {
-                    2
-                };
-                (&self.pipelines.gemv_q4_k, rows, "gemv_q4k")
-            }
-            // The Q6_K SPIR-V twin runs NR=1 while the WGSL fallback runs
-            // NR=2; the pipeline was picked under this same condition at
-            // construction, so mirror it here. Flat-planes twins (LM head
-            // on passthrough) run NR=8 on the flat kernel.
+            DType::Q4KM => (
+                &self.pipelines.gemv_q4_k,
+                self.pipelines.gemv_q4_k_rows,
+                "gemv_q4k",
+            ),
+            // Q6_K subgroup/passthrough variants run NR=1 while the tree fallback
+            // runs NR=2; `gemv_q6_k_rows` records whichever was built. Flat-planes
+            // twins (LM head on passthrough) run NR=8 on the flat kernel.
             DType::Q6K => {
                 if w.flat_q6k {
                     let pipe = self
@@ -4565,12 +4941,11 @@ impl GpuLfmModel {
                         .expect("flat Q6_K weight without a gemv_q6_k_flat pipeline");
                     return (pipe, 8, "gemv_q6f");
                 }
-                let rows = if self.ctx.supports_spirv_passthrough() && self.ctx.has_subgroup {
-                    1
-                } else {
-                    2
-                };
-                (&self.pipelines.gemv_q6_k, rows, "gemv_q6")
+                (
+                    &self.pipelines.gemv_q6_k,
+                    self.pipelines.gemv_q6_k_rows,
+                    "gemv_q6",
+                )
             }
             DType::Q5KM => (&self.pipelines.gemv_q5_k, 2, "gemv_q5k"),
             _ => (&self.pipelines.gemv_f32, 8, "gemv_f32"),
@@ -5213,6 +5588,23 @@ impl GpuLfmModel {
         }
     }
 
+    /// Encode a compute pass with immediate constants (`set_immediates` after `set_pipeline`).
+    fn encode_with_immediates(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups: (u32, u32, u32),
+        immediates: &[u32],
+        label: &str,
+    ) {
+        let mut pass = self.ctx.begin_pass(enc, label);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_immediates(0, bytemuck::cast_slice(immediates));
+        pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+    }
+
     /// Dispatch into an existing compute pass (no pass creation overhead).
     fn dispatch_into(
         &self,
@@ -5238,6 +5630,32 @@ impl GpuLfmModel {
             pipeline,
             bg,
             grid,
+            immediates: None,
+            label,
+        });
+    }
+
+    /// Record a prefill dispatch carrying immediate constants (`words.len() <= 12`).
+    fn push_prefill_dispatch_imm<'a>(
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        pipeline: &'a wgpu::ComputePipeline,
+        bg: wgpu::BindGroup,
+        grid: (u32, u32, u32),
+        words: &[u32],
+        label: &'static str,
+    ) {
+        assert!(
+            words.len() <= 12,
+            "prefill immediate payload exceeds 12 u32 words ({})",
+            words.len()
+        );
+        let mut buf = [0u32; 12];
+        buf[..words.len()].copy_from_slice(words);
+        cmds.push(PrefillCmd::Dispatch {
+            pipeline,
+            bg,
+            grid,
+            immediates: Some((buf, words.len())),
             label,
         });
     }
@@ -5291,9 +5709,21 @@ impl GpuLfmModel {
                         pipeline,
                         bg,
                         grid,
+                        immediates,
                         label,
                     } => {
-                        self.encode(enc, pipeline, &bg, grid, label);
+                        if let Some((words, len)) = immediates {
+                            self.encode_with_immediates(
+                                enc,
+                                pipeline,
+                                &bg,
+                                grid,
+                                &words[..len],
+                                label,
+                            );
+                        } else {
+                            self.encode(enc, pipeline, &bg, grid, label);
+                        }
                     }
                     PrefillCmd::Copy {
                         src,
@@ -5348,11 +5778,18 @@ impl GpuLfmModel {
                 seg += 1;
                 for d in &owned[i..j] {
                     if let PrefillCmd::Dispatch {
-                        pipeline, bg, grid, ..
+                        pipeline,
+                        bg,
+                        grid,
+                        immediates,
+                        ..
                     } = d
                     {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, bg, &[]);
+                        if let Some((words, len)) = immediates {
+                            pass.set_immediates(0, bytemuck::cast_slice(&words[..*len]));
+                        }
                         pass.dispatch_workgroups(grid.0, grid.1, grid.2);
                     }
                 }
@@ -5403,10 +5840,6 @@ impl GpuLfmModel {
             .prebuilt_decode
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some((key, cmd));
-    }
-
-    fn submit_command_buffer(&self, cmd: wgpu::CommandBuffer) {
-        self.ctx.submit_command_buffer(cmd);
     }
 
     /// Submit encoder and wait for GPU to finish.
@@ -5827,6 +6260,50 @@ impl GpuLfmModel {
             self.ctx.min_storage_buffer_offset_alignment,
             2, // f16 weight element size
         );
+
+        if let Some(ref pipe_imm) = self.pipelines.gemv_f16_imm {
+            let layout = pipe_imm.get_bind_group_layout(0);
+            let mut row_start = 0u32;
+            while row_start < m {
+                let rows = (m - row_start).min(tile_rows);
+                let weight_offset = u64::from(row_start) * row_bytes;
+                let bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: weight,
+                                    offset: weight_offset,
+                                    size: wgpu::BufferSize::new(
+                                        (u64::from(rows) * row_bytes).div_ceil(4) * 4,
+                                    ),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: input.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: output.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let groups = rows.div_ceil(8);
+                let grid = crate::backend::wgpu::gemv_row_workgroups(groups);
+                pass.set_pipeline(pipe_imm);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.set_immediates(0, bytemuck::cast_slice(&[rows, k, row_start, 0u32]));
+                pass.dispatch_workgroups(grid.0, grid.1, grid.2);
+                row_start += rows;
+            }
+            return;
+        }
 
         let layout = self.pipelines.gemv_f16.get_bind_group_layout(0);
         let mut row_start = 0u32;
@@ -6435,8 +6912,13 @@ impl GpuLfmModel {
             state,
             DecodeTail::Logits(TailArgmax::StageLogits),
         );
+        let rx = self
+            .pending_decode_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.ctx
-            .read_mapped_f32(&self.logits_readback_buf, self.config.vocab_size)
+            .finish_mapped_f32(&self.logits_readback_buf, self.config.vocab_size, rx)
     }
 
     /// Lazily build (once) the hidden-states scratch caches — same shapes as the
@@ -6957,7 +7439,38 @@ impl GpuLfmModel {
             let cmd = self
                 .take_prebuilt(key)
                 .unwrap_or_else(|| self.encode_decode_step(&lora, tail).finish());
-            self.submit_command_buffer(cmd);
+            let readback_rx = match argmax {
+                TailArgmax::DispatchAndStage => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    cmd.map_buffer_on_submit(
+                        &self.argmax_readback_buf,
+                        wgpu::MapMode::Read,
+                        0..4,
+                        move |res| {
+                            tx.send(res).ok();
+                        },
+                    );
+                    Some(rx)
+                }
+                TailArgmax::StageLogits if cfg.vocab_size > 0 => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    cmd.map_buffer_on_submit(
+                        &self.logits_readback_buf,
+                        wgpu::MapMode::Read,
+                        0..(cfg.vocab_size * 4) as u64,
+                        move |res| {
+                            tx.send(res).ok();
+                        },
+                    );
+                    Some(rx)
+                }
+                _ => None,
+            };
+            let submitted = self.ctx.try_submit_command_buffer(cmd);
+            *self
+                .pending_decode_readback
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = if submitted { readback_rx } else { None };
             self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
             state.seq_len += 1;
             let next = self.encode_decode_step(&lora, tail).finish();
@@ -6983,16 +7496,67 @@ impl GpuLfmModel {
                 self.ctx.finish_profiler();
                 Some(enc)
             }
-            DecodeTail::Logits(_) | DecodeTail::LogitsUnsubmitted(_) => {
+            DecodeTail::LogitsUnsubmitted(_) => {
                 self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
                 state.seq_len += 1;
                 self.ctx.finish_profiler();
-                if matches!(tail, DecodeTail::LogitsUnsubmitted(_)) {
-                    Some(enc)
-                } else {
-                    self.submit_and_wait(enc);
-                    None
+                Some(enc)
+            }
+            DecodeTail::Logits(argmax) => {
+                let readback_rx = match argmax {
+                    TailArgmax::DispatchAndStage => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        enc.map_buffer_on_submit(
+                            &self.argmax_readback_buf,
+                            wgpu::MapMode::Read,
+                            0..4,
+                            move |res| {
+                                tx.send(res).ok();
+                            },
+                        );
+                        Some(rx)
+                    }
+                    TailArgmax::StageLogits if cfg.vocab_size > 0 => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        enc.map_buffer_on_submit(
+                            &self.logits_readback_buf,
+                            wgpu::MapMode::Read,
+                            0..(cfg.vocab_size * 4) as u64,
+                            move |res| {
+                                tx.send(res).ok();
+                            },
+                        );
+                        Some(rx)
+                    }
+                    _ => None,
+                };
+                let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
+                let t_submit = host_prof.then(crate::time::Instant::now);
+                let submitted = self.ctx.try_submit_encoder(enc);
+                *self
+                    .pending_decode_readback
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) =
+                    if submitted { readback_rx } else { None };
+                if !matches!(
+                    argmax,
+                    TailArgmax::DispatchAndStage | TailArgmax::StageLogits
+                ) || host_prof
+                {
+                    let t_stall = host_prof.then(crate::time::Instant::now);
+                    self.ctx.device.poll_wait();
+                    if let (Some(t_submit), Some(t_stall)) = (t_submit, t_stall) {
+                        eprintln!(
+                            "[GPU-HOST] submit={:.0}us stall={:.0}us",
+                            t_stall.duration_since(t_submit).as_secs_f64() * 1e6,
+                            t_stall.elapsed().as_secs_f64() * 1e6,
+                        );
+                    }
                 }
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                None
             }
         }
     }
@@ -7631,7 +8195,12 @@ impl GpuLfmModel {
             DecodeTail::Logits(TailArgmax::DispatchAndStage),
         );
         let t_map = crate::time::Instant::now();
-        let argmax = self.ctx.read_mapped_u32(&self.argmax_readback_buf, 1);
+        let rx = self
+            .pending_decode_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let argmax = self.ctx.finish_mapped_u32(&self.argmax_readback_buf, 1, rx);
         let Some(&tok) = argmax.first() else {
             // The map failure is recorded first-wins in the readback slot
             // (and loud on stderr); return a dummy the session never
@@ -8206,6 +8775,34 @@ impl GpuLfmModel {
         label: &'static str,
     ) {
         let params: [u32; 2] = [total, scale.to_bits()];
+        if let Some(ref pipe_imm) = self.pipelines.scaled_add_inplace_imm {
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe_imm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: b.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch_imm(
+                cmds,
+                pipe_imm,
+                bg,
+                crate::backend::wgpu::kv_shift_workgroups(total),
+                &params,
+                label,
+            );
+            return;
+        }
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
         let bg = self
             .ctx
@@ -8249,6 +8846,34 @@ impl GpuLfmModel {
         head_dim: u32,
     ) {
         let params: [u32; 2] = [total, head_dim];
+        if let Some(ref pipe_imm) = self.pipelines.sigmoid_head_gate_inplace_imm {
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe_imm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: attn_out.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: gate.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch_imm(
+                cmds,
+                pipe_imm,
+                bg,
+                crate::backend::wgpu::kv_shift_workgroups(total),
+                &params,
+                "sigmoid_head_gate_batch",
+            );
+            return;
+        }
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
         let bg = self
             .ctx
@@ -9283,6 +9908,47 @@ impl GpuLfmModel {
             u32::from(layer_has_freq_factors && self.has_freq_factors),
             has_qk_norm as u32,
         ];
+        let tg_count = n * (n_heads + n_kv_heads);
+        if let Some(ref pipe_imm) = self.pipelines.qk_norm_rope_batch_imm {
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe_imm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: q_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: k_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: q_norm.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: k_norm.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: self.rope_freqs_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch_imm(
+                cmds,
+                pipe_imm,
+                bg,
+                crate::backend::wgpu::gemv_row_workgroups(tg_count),
+                &params,
+                "qk_norm_rope_batch",
+            );
+            return;
+        }
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
         let bg = self
             .ctx
@@ -9317,7 +9983,6 @@ impl GpuLfmModel {
                     },
                 ],
             });
-        let tg_count = n * (n_heads + n_kv_heads);
         Self::push_prefill_dispatch(
             cmds,
             &self.pipelines.qk_norm_rope_batch,
@@ -10449,37 +11114,59 @@ impl GpuLfmModel {
                 self.emit_prefill_cmds(&mut enc, &mut cmds, "prefill_head", n_u);
                 let total = n_u * (vocab as u32);
                 let params_data: [u32; 2] = [total, (1.0 / self.scalars.logit).to_bits()];
-                let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params_data));
-                let scale_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("logit_scale_bg"),
-                        layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
+                if let Some(ref pipe_imm) = self.pipelines.scale_f32_imm {
+                    let scale_bg = self
+                        .ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("logit_scale_bg"),
+                            layout: &pipe_imm.get_bind_group_layout(0),
+                            entries: &[wgpu::BindGroupEntry {
                                 binding: 0,
                                 resource: self.prefill_all_logits_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: p_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-                self.encode(
-                    &mut enc,
-                    &self.pipelines.scale_f32,
-                    &scale_bg,
-                    (total.div_ceil(256), 1, 1),
-                    "logit_scale",
-                );
+                            }],
+                        });
+                    self.encode_with_immediates(
+                        &mut enc,
+                        pipe_imm,
+                        &scale_bg,
+                        (total.div_ceil(256), 1, 1),
+                        &params_data,
+                        "logit_scale",
+                    );
+                } else {
+                    let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params_data));
+                    let scale_bg = self
+                        .ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("logit_scale_bg"),
+                            layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.prefill_all_logits_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: p_buf.as_entire_binding(),
+                                },
+                            ],
+                        });
+                    self.encode(
+                        &mut enc,
+                        &self.pipelines.scale_f32,
+                        &scale_bg,
+                        (total.div_ceil(256), 1, 1),
+                        "logit_scale",
+                    );
+                }
             }
         }
 
         // Flush anything still recorded (all_logits Quantized path with
         // logit == 1.0 leaves the tail GEMM here; every other path flushed
-        // above — emitting an empty vec is a no-op).
+        // above: emitting an empty vec is a no-op).
         self.emit_prefill_cmds(&mut enc, &mut cmds, "prefill_head", n_u);
 
         enc
@@ -11465,6 +12152,34 @@ impl GpuLfmModel {
     /// `silu(gate) * up` over the first `total` elements of the prefill gate/up buffers.
     fn encode_silu_mul_prefill<'a>(&'a self, cmds: &mut Vec<PrefillCmd<'a>>, total: u32) {
         let params: [u32; 2] = [total, 0];
+        if let Some(ref pipe_imm) = self.pipelines.silu_mul_inplace_imm {
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe_imm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.prefill_gate_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.prefill_up_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch_imm(
+                cmds,
+                pipe_imm,
+                bg,
+                crate::backend::wgpu::kv_shift_workgroups(total),
+                &params,
+                "silu_mul_batch",
+            );
+            return;
+        }
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
         let bg = self
             .ctx
@@ -12233,8 +12948,13 @@ impl Model for GpuLfmModel {
             state,
             DecodeTail::Logits(TailArgmax::StageLogits),
         );
+        let rx = self
+            .pending_decode_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.ctx
-            .read_mapped_f32(&self.logits_readback_buf, self.config.vocab_size)
+            .finish_mapped_f32(&self.logits_readback_buf, self.config.vocab_size, rx)
     }
 
     /// The audio path's counterpart to [`Model::forward`]: same layer stack and
@@ -16263,5 +16983,948 @@ mod tests {
         let logits_header = gpu_from_header.forward(&[1], 0, &mut state_header);
         let logits_full = gpu_from_full.forward(&[1], 0, &mut state_full);
         assert_eq!(logits_header, logits_full);
+    }
+
+    /// Parallelized row-tiled repacks must agree bit-for-bit with single-row repacks across
+    /// multiple `ROW_TILE = 64` boundaries (`m = 133` -> tiles `0..64`, `64..128`, `128..133`)
+    /// and handle empty `m == 0` / `k == 0` dimensions without panicking.
+    #[test]
+    fn parallel_repack_kernels_match_single_row_across_tile_boundaries() {
+        use super::{
+            repack_q4_0_stream, repack_q4_k_stream, repack_q5_k_stream, repack_q6_k_flat,
+            repack_q6_k_stream,
+        };
+        use crate::model::vision_encoder_gpu::{repack_f16_as_q8_0_stream, repack_q8_0_stream};
+
+        assert_eq!(repack_q4_0_stream(&[], 0, 64), (Vec::new(), Vec::new()));
+        assert_eq!(repack_q4_k_stream(&[], 0, 256), (Vec::new(), Vec::new()));
+        assert_eq!(repack_q5_k_stream(&[], 0, 256), (Vec::new(), Vec::new()));
+        assert_eq!(repack_q6_k_stream(&[], 0, 256), (Vec::new(), Vec::new()));
+        assert!(repack_q6_k_flat(&[], 0, 256).is_empty());
+
+        fn assert_plane_major_matches_rows<F>(
+            name: &str,
+            raw: &[u8],
+            m: usize,
+            k: usize,
+            row_bytes: usize,
+            repack: F,
+        ) where
+            F: Fn(&[u8], usize, usize) -> (Vec<u32>, Vec<u32>),
+        {
+            let (q_all, d_all) = repack(raw, m, k);
+            assert_eq!(q_all.len() % m, 0, "{name}: q length not divisible by m");
+            assert_eq!(d_all.len() % m, 0, "{name}: d length not divisible by m");
+            let q_planes = q_all.len() / m;
+            let d_planes = d_all.len() / m;
+            for r in 0..m {
+                let (q_one, d_one) = repack(&raw[r * row_bytes..(r + 1) * row_bytes], 1, k);
+                assert_eq!(q_one.len(), q_planes, "{name} row {r}: q_planes mismatch");
+                assert_eq!(d_one.len(), d_planes, "{name} row {r}: d_planes mismatch");
+                for p in 0..q_planes {
+                    assert_eq!(
+                        q_all[p * m + r],
+                        q_one[p],
+                        "{name} q mismatch at row={r} plane={p}"
+                    );
+                }
+                for p in 0..d_planes {
+                    assert_eq!(
+                        d_all[p * m + r],
+                        d_one[p],
+                        "{name} d mismatch at row={r} plane={p}"
+                    );
+                }
+            }
+        }
+
+        let m = 133usize;
+
+        // 1. Q4_0 stream with odd block count (k = 96 -> 3 blocks, exercises s1 zero-pad)
+        let k_q4_0 = 96usize;
+        let rb_q4_0 = (k_q4_0 / 32) * 18;
+        let raw_q4_0: Vec<u8> = (0..m * rb_q4_0)
+            .map(|i| ((i.wrapping_mul(131).wrapping_add(17)) & 0xFF) as u8)
+            .collect();
+        assert_plane_major_matches_rows(
+            "q4_0_stream",
+            &raw_q4_0,
+            m,
+            k_q4_0,
+            rb_q4_0,
+            repack_q4_0_stream,
+        );
+
+        // 2. Q8_0 stream with odd block count (k = 96 -> pads to k_pad = 128)
+        let rb_q8_0 = (k_q4_0 / 32) * 34;
+        let raw_q8_0: Vec<u8> = (0..m * rb_q8_0)
+            .map(|i| ((i.wrapping_mul(73).wrapping_add(29)) & 0xFF) as u8)
+            .collect();
+        assert_plane_major_matches_rows(
+            "q8_0_stream",
+            &raw_q8_0,
+            m,
+            k_q4_0,
+            rb_q8_0,
+            repack_q8_0_stream,
+        );
+
+        // 3. F16 -> Q8_0 stream with non-multiple-of-32 k = 100
+        let k_f16 = 100usize;
+        let rb_f16 = k_f16 * 2;
+        let mut raw_f16 = vec![0u8; m * rb_f16];
+        for r in 0..m {
+            for c in 0..k_f16 {
+                let val = (((r * 19 + c * 7) % 97) as f32 - 48.0) * 0.03125;
+                let bits = half::f16::from_f32(val).to_bits().to_le_bytes();
+                let off = (r * k_f16 + c) * 2;
+                raw_f16[off..off + 2].copy_from_slice(&bits);
+            }
+        }
+        assert_plane_major_matches_rows(
+            "f16_as_q8_0_stream",
+            &raw_f16,
+            m,
+            k_f16,
+            rb_f16,
+            repack_f16_as_q8_0_stream,
+        );
+
+        // 4. Q4_K, Q5_K, Q6_K stream and Q6_K flat across 2 super-blocks (k = 512)
+        let k_kquant = 512usize;
+        let nb = k_kquant / 256;
+
+        let rb_q4_k = nb * 144;
+        let mut raw_q4_k = vec![0u8; m * rb_q4_k];
+        for r in 0..m {
+            for b in 0..nb {
+                let base = (r * nb + b) * 144;
+                let d0 = half::f16::from_f32(0.01 + (r % 13) as f32 * 0.001).to_bits();
+                let dm = half::f16::from_f32(0.005 + (b % 7) as f32 * 0.001).to_bits();
+                raw_q4_k[base..base + 2].copy_from_slice(&d0.to_le_bytes());
+                raw_q4_k[base + 2..base + 4].copy_from_slice(&dm.to_le_bytes());
+                for i in 4..144 {
+                    raw_q4_k[base + i] = ((r * 37 + b * 53 + i * 11) & 0xFF) as u8;
+                }
+            }
+        }
+        assert_plane_major_matches_rows(
+            "q4_k_stream",
+            &raw_q4_k,
+            m,
+            k_kquant,
+            rb_q4_k,
+            repack_q4_k_stream,
+        );
+
+        let rb_q5_k = nb * 176;
+        let mut raw_q5_k = vec![0u8; m * rb_q5_k];
+        for r in 0..m {
+            for b in 0..nb {
+                let base = (r * nb + b) * 176;
+                let d0 = half::f16::from_f32(0.008 + (r % 17) as f32 * 0.001).to_bits();
+                let dm = half::f16::from_f32(0.004 + (b % 5) as f32 * 0.001).to_bits();
+                raw_q5_k[base..base + 2].copy_from_slice(&d0.to_le_bytes());
+                raw_q5_k[base + 2..base + 4].copy_from_slice(&dm.to_le_bytes());
+                for i in 4..176 {
+                    raw_q5_k[base + i] = ((r * 41 + b * 23 + i * 7) & 0xFF) as u8;
+                }
+            }
+        }
+        assert_plane_major_matches_rows(
+            "q5_k_stream",
+            &raw_q5_k,
+            m,
+            k_kquant,
+            rb_q5_k,
+            repack_q5_k_stream,
+        );
+
+        let rb_q6_k = nb * 210;
+        let mut raw_q6_k = vec![0u8; m * rb_q6_k];
+        for r in 0..m {
+            for b in 0..nb {
+                let base = (r * nb + b) * 210;
+                for i in 0..208 {
+                    raw_q6_k[base + i] = ((r * 29 + b * 61 + i * 13) & 0xFF) as u8;
+                }
+                let d0 = half::f16::from_f32(0.006 + (r % 11) as f32 * 0.0005).to_bits();
+                raw_q6_k[base + 208..base + 210].copy_from_slice(&d0.to_le_bytes());
+            }
+        }
+        assert_plane_major_matches_rows(
+            "q6_k_stream",
+            &raw_q6_k,
+            m,
+            k_kquant,
+            rb_q6_k,
+            repack_q6_k_stream,
+        );
+
+        let flat_all = repack_q6_k_flat(&raw_q6_k, m, k_kquant);
+        let (ql_plane, qh_plane, s_plane) = (m * nb * 128, m * nb * 64, m * nb * 16);
+        for r in 0..m {
+            let flat_one = repack_q6_k_flat(&raw_q6_k[r * rb_q6_k..(r + 1) * rb_q6_k], 1, k_kquant);
+            let (o_ql, o_qh, o_s, o_d) = (nb * 128, nb * 64, nb * 16, nb * 2);
+            assert_eq!(
+                &flat_all[r * o_ql..(r + 1) * o_ql],
+                &flat_one[..o_ql],
+                "q6_k_flat ql mismatch at row {r}"
+            );
+            assert_eq!(
+                &flat_all[ql_plane + r * o_qh..ql_plane + (r + 1) * o_qh],
+                &flat_one[o_ql..o_ql + o_qh],
+                "q6_k_flat qh mismatch at row {r}"
+            );
+            assert_eq!(
+                &flat_all[ql_plane + qh_plane + r * o_s..ql_plane + qh_plane + (r + 1) * o_s],
+                &flat_one[o_ql + o_qh..o_ql + o_qh + o_s],
+                "q6_k_flat sc mismatch at row {r}"
+            );
+            let d_base = ql_plane + qh_plane + s_plane;
+            assert_eq!(
+                &flat_all[d_base + r * o_d..d_base + (r + 1) * o_d],
+                &flat_one[o_ql + o_qh + o_s..],
+                "q6_k_flat d mismatch at row {r}"
+            );
+        }
+    }
+
+    /// WGSL `SUBGROUP` GEMV shaders must match their tree-reduction WGSL counterparts across
+    /// ragged row counts (`m = 37`) and both narrow `k` (`nb < NQ`, leaving idle subgroup lanes)
+    /// and multi-iteration `k`.
+    #[test]
+    fn wgsl_subgroup_gemv_shaders_match_tree_fallback() {
+        use super::shaders;
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        if !ctx.use_wgsl_subgroup() {
+            return;
+        }
+
+        let run_gemv = |pipe: &wgpu::ComputePipeline,
+                        w_buf: &wgpu::Buffer,
+                        x_buf: &wgpu::Buffer,
+                        y_seed: Option<&[f32]>,
+                        params: &[u32; 4],
+                        m: u32,
+                        rows_per_wg: u32|
+         -> Vec<f32> {
+            let y_buf = match y_seed {
+                Some(seed) => ctx.upload_f32(seed, "test.gemv_y_seed"),
+                None => ctx.create_storage_rw(m as u64 * 4, "test.gemv_y"),
+            };
+            let p_buf = ctx.upload_storage(bytemuck::cast_slice(params), "test.gemv_p");
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(m.div_ceil(rows_per_wg), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            ctx.download_f32(&y_buf, m as usize)
+        };
+
+        let m = 37usize;
+
+        // 1. Q4_0 (`GEMV_Q4_0_FAST_SUBGROUP` vs `GEMV_Q4_0_FAST`)
+        let p_q4_base = ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast", "q4_base");
+        let p_q4_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_Q4_0_FAST_SUBGROUP,
+                "gemv_q4_0_fast",
+                "q4_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("GEMV_Q4_0_FAST_SUBGROUP must validate on subgroup-capable adapter");
+        for k in [64usize, 1056] {
+            let nb = k / 32;
+            let mut raw = vec![0u8; m * nb * 18];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 18;
+                    let d = half::f16::from_f32(0.02 + ((r + b) % 11) as f32 * 0.003).to_bits();
+                    raw[base..base + 2].copy_from_slice(&d.to_le_bytes());
+                    for i in 2..18 {
+                        raw[base + i] = ((r * 13 + b * 29 + i * 7) & 0xFF) as u8;
+                    }
+                }
+            }
+            let x: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.13).sin()) * 0.8).collect();
+            let w_buf = ctx.upload_storage(&raw, "q4_w");
+            let x_buf = ctx.upload_f32(&x, "q4_x");
+            let params = [m as u32, k as u32, 0, 0];
+            let got_base = run_gemv(&p_q4_base, &w_buf, &x_buf, None, &params, m as u32, 8);
+            let got_sg = run_gemv(&p_q4_sg, &w_buf, &x_buf, None, &params, m as u32, 8);
+            let diff = max_abs_diff(&got_base, &got_sg);
+            assert!(diff < 2e-4, "Q4_0 subgroup GEMV k={k}: max_diff={diff:.3e}");
+        }
+
+        // 2. Q8_0 (`GEMV_Q8_0` with/without `SUBGROUP`)
+        let p_q8_base = ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "q8_base");
+        let p_q8_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_Q8_0,
+                "gemv_q8_0",
+                "q8_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("GEMV_Q8_0 SUBGROUP must validate");
+        for k in [64usize, 1056] {
+            let nb = k / 32;
+            let mut raw = vec![0u8; m * nb * 34];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 34;
+                    let d = half::f16::from_f32(0.01 + ((r * 3 + b) % 9) as f32 * 0.002).to_bits();
+                    raw[base..base + 2].copy_from_slice(&d.to_le_bytes());
+                    for i in 2..34 {
+                        raw[base + i] = ((r * 17 + b * 19 + i * 5) & 0xFF) as u8;
+                    }
+                }
+            }
+            let x: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.07).cos()) * 0.9).collect();
+            let w_buf = ctx.upload_storage(&raw, "q8_w");
+            let x_buf = ctx.upload_f32(&x, "q8_x");
+            let params = [m as u32, k as u32, 0, 0];
+            let got_base = run_gemv(&p_q8_base, &w_buf, &x_buf, None, &params, m as u32, 8);
+            let got_sg = run_gemv(&p_q8_sg, &w_buf, &x_buf, None, &params, m as u32, 8);
+            let diff = max_abs_diff(&got_base, &got_sg);
+            assert!(diff < 2e-4, "Q8_0 subgroup GEMV k={k}: max_diff={diff:.3e}");
+        }
+
+        // 3. Q4_K (`NR=2` base vs `NR=4` subgroup), Q5_K (`NR=2`), Q6_K (`NR=2` base vs `NR=1` subgroup)
+        let p_q4k_base = ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "q4k_base");
+        let p_q4k_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_Q4_K,
+                "gemv_q4_k",
+                "q4k_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("GEMV_Q4_K SUBGROUP must validate");
+        let p_q5k_base = ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "q5k_base");
+        let p_q5k_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_Q5_K,
+                "gemv_q5_k",
+                "q5k_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("GEMV_Q5_K SUBGROUP must validate");
+        let p_q6k_base = ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "q6k_base");
+        let p_q6k_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_Q6_K,
+                "gemv_q6_k",
+                "q6k_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("GEMV_Q6_K SUBGROUP must validate");
+
+        for k in [256usize, 1024] {
+            let nb = k / 256;
+            let x: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.09).sin()) * 0.7).collect();
+            let x_buf = ctx.upload_f32(&x, "kquant_x");
+            let params = [m as u32, k as u32, 0, 0];
+
+            let mut raw_4k = vec![0u8; m * nb * 144];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 144;
+                    let d0 = half::f16::from_f32(0.005 + (r % 9) as f32 * 0.001).to_bits();
+                    let dm = half::f16::from_f32(0.003 + (b % 5) as f32 * 0.001).to_bits();
+                    raw_4k[base..base + 2].copy_from_slice(&d0.to_le_bytes());
+                    raw_4k[base + 2..base + 4].copy_from_slice(&dm.to_le_bytes());
+                    for i in 4..144 {
+                        raw_4k[base + i] = ((r * 23 + b * 41 + i * 9) & 0xFF) as u8;
+                    }
+                }
+            }
+            let w_4k = ctx.upload_storage(&raw_4k, "q4k_w");
+            let b_4k = run_gemv(&p_q4k_base, &w_4k, &x_buf, None, &params, m as u32, 2);
+            let s_4k = run_gemv(&p_q4k_sg, &w_4k, &x_buf, None, &params, m as u32, 4);
+            let diff_4k = max_abs_diff(&b_4k, &s_4k);
+            assert!(
+                diff_4k < 5e-4,
+                "Q4_K subgroup GEMV k={k}: max_diff={diff_4k:.3e}"
+            );
+
+            let mut raw_5k = vec![0u8; m * nb * 176];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 176;
+                    let d0 = half::f16::from_f32(0.004 + (r % 11) as f32 * 0.0008).to_bits();
+                    let dm = half::f16::from_f32(0.002 + (b % 7) as f32 * 0.0008).to_bits();
+                    raw_5k[base..base + 2].copy_from_slice(&d0.to_le_bytes());
+                    raw_5k[base + 2..base + 4].copy_from_slice(&dm.to_le_bytes());
+                    for i in 4..176 {
+                        raw_5k[base + i] = ((r * 19 + b * 31 + i * 11) & 0xFF) as u8;
+                    }
+                }
+            }
+            let w_5k = ctx.upload_storage(&raw_5k, "q5k_w");
+            let b_5k = run_gemv(&p_q5k_base, &w_5k, &x_buf, None, &params, m as u32, 2);
+            let s_5k = run_gemv(&p_q5k_sg, &w_5k, &x_buf, None, &params, m as u32, 2);
+            let diff_5k = max_abs_diff(&b_5k, &s_5k);
+            assert!(
+                diff_5k < 5e-4,
+                "Q5_K subgroup GEMV k={k}: max_diff={diff_5k:.3e}"
+            );
+
+            let mut raw_6k = vec![0u8; m * nb * 210];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 210;
+                    for i in 0..192 {
+                        raw_6k[base + i] = ((r * 31 + b * 17 + i * 7) & 0xFF) as u8;
+                    }
+                    for i in 192..208 {
+                        raw_6k[base + i] = (((r + b + i) % 15) as i8 - 7) as u8;
+                    }
+                    let d0 = half::f16::from_f32(0.003 + (r % 7) as f32 * 0.0005).to_bits();
+                    raw_6k[base + 208..base + 210].copy_from_slice(&d0.to_le_bytes());
+                }
+            }
+            let w_6k = ctx.upload_storage(&raw_6k, "q6k_w");
+            let b_6k = run_gemv(&p_q6k_base, &w_6k, &x_buf, None, &params, m as u32, 2);
+            let s_6k = run_gemv(&p_q6k_sg, &w_6k, &x_buf, None, &params, m as u32, 2);
+            let diff_6k = max_abs_diff(&b_6k, &s_6k);
+            assert!(
+                diff_6k < 5e-4,
+                "Q6_K subgroup GEMV k={k}: max_diff={diff_6k:.3e}"
+            );
+        }
+
+        // 4. F32, F16_A (with non-zero row_base), and `gemv_f32_accum`
+        let p_f32_base = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "f32_base");
+        let p_f32_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "f32_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("GEMV_F32 SUBGROUP must validate");
+        let p_acc_base = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32_accum", "acc_base");
+        let p_acc_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_F32,
+                "gemv_f32_accum",
+                "acc_sg",
+                &[("SUBGROUP", "1")],
+            )
+            .expect("gemv_f32_accum SUBGROUP must validate");
+        let p_f16_base = ctx.create_pipeline_with_defines(
+            shaders::GEMV_F32,
+            "gemv_f32",
+            "f16_base",
+            &[("F16_A", "1")],
+        );
+        let p_f16_sg = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "f16_sg",
+                &[("F16_A", "1"), ("SUBGROUP", "1")],
+            )
+            .expect("GEMV_F16 SUBGROUP must validate");
+
+        for k in [52usize, 1028] {
+            let w_f32: Vec<f32> = (0..m * k)
+                .map(|i| ((i as f32 * 0.031).sin()) * 0.5)
+                .collect();
+            let x: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.077).cos()) * 0.8).collect();
+            let seed: Vec<f32> = (0..m).map(|i| i as f32 * 0.125 - 2.0).collect();
+            let w_buf = ctx.upload_f32(&w_f32, "f32_w");
+            let x_buf = ctx.upload_f32(&x, "f32_x");
+            let params = [m as u32, k as u32, 0, 0];
+
+            let b_f32 = run_gemv(&p_f32_base, &w_buf, &x_buf, None, &params, m as u32, 8);
+            let s_f32 = run_gemv(&p_f32_sg, &w_buf, &x_buf, None, &params, m as u32, 8);
+            assert!(
+                max_abs_diff(&b_f32, &s_f32) < 2e-4,
+                "F32 subgroup GEMV k={k} mismatch"
+            );
+
+            let b_acc = run_gemv(
+                &p_acc_base,
+                &w_buf,
+                &x_buf,
+                Some(&seed),
+                &params,
+                m as u32,
+                8,
+            );
+            let s_acc = run_gemv(&p_acc_sg, &w_buf, &x_buf, Some(&seed), &params, m as u32, 8);
+            assert!(
+                max_abs_diff(&b_acc, &s_acc) < 2e-4,
+                "F32 accum subgroup GEMV k={k} mismatch"
+            );
+
+            if k % 2 == 0 {
+                let mut w_f16_bytes = Vec::with_capacity(m * k * 2);
+                for &v in &w_f32 {
+                    w_f16_bytes.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+                }
+                let w16_buf = ctx.upload_storage(&w_f16_bytes, "f16_w");
+                let b_f16 = run_gemv(&p_f16_base, &w16_buf, &x_buf, None, &params, m as u32, 8);
+                let s_f16 = run_gemv(&p_f16_sg, &w16_buf, &x_buf, None, &params, m as u32, 8);
+                assert!(
+                    max_abs_diff(&b_f16, &s_f16) < 2e-4,
+                    "F16 subgroup GEMV k={k} mismatch"
+                );
+            }
+        }
+    }
+
+    /// Immediate-constant shader variants (`IMMEDIATES`) must produce identical outputs to their
+    /// storage-buffer `params` counterparts, including back-to-back dispatches with distinct
+    /// immediate payloads in a single `ComputePass` (verifying `set_immediates` after `set_pipeline`).
+    #[test]
+    fn immediate_constant_pipelines_match_storage_params() {
+        use super::shaders;
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        if !ctx.supports_immediates(48) {
+            return;
+        }
+
+        // 1. Elementwise (`scaled_add_inplace`, `silu_mul_inplace`, `sigmoid_head_gate_inplace`) + `scale_f32`
+        let n = 300usize;
+        let a_init: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 1.5).collect();
+        let b_init: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).cos() * 1.2).collect();
+
+        for (entry, p_words) in [
+            ("scaled_add_inplace", [n as u32, 0.375f32.to_bits()]),
+            ("silu_mul_inplace", [n as u32, 0u32]),
+            ("sigmoid_head_gate_inplace", [256u32, 64u32]),
+        ] {
+            let p_base = ctx.create_pipeline(shaders::ELEMENTWISE, entry, entry);
+            let p_imm = ctx
+                .try_create_pipeline_with_defines_checked(
+                    shaders::ELEMENTWISE,
+                    entry,
+                    entry,
+                    &[("IMMEDIATES", "1")],
+                )
+                .expect("elementwise IMMEDIATES must validate");
+            let b_in = if entry == "sigmoid_head_gate_inplace" {
+                (0..4).map(|i| (i as f32 - 1.5) * 0.7).collect::<Vec<f32>>()
+            } else {
+                b_init.clone()
+            };
+            let a_ref = ctx.upload_f32(&a_init, "ew_a_ref");
+            let a_imm = ctx.upload_f32(&a_init, "ew_a_imm");
+            let b_buf = ctx.upload_f32(&b_in, "ew_b");
+            let p_buf = ctx.upload_storage(bytemuck::cast_slice(&p_words), "ew_p");
+
+            let bg_ref = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p_base.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a_ref.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let bg_imm = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p_imm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a_imm.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&p_base);
+                pass.set_bind_group(0, &bg_ref, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+
+                pass.set_pipeline(&p_imm);
+                pass.set_immediates(0, bytemuck::cast_slice(&p_words));
+                pass.set_bind_group(0, &bg_imm, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            assert_eq!(
+                ctx.download_f32(&a_ref, n),
+                ctx.download_f32(&a_imm, n),
+                "{entry} IMMEDIATES mismatch"
+            );
+        }
+
+        // `scale_f32`: two dispatches in the same pass with distinct scales to pin state updates.
+        let p_scale_base = ctx.create_pipeline(shaders::SCALE_F32, "scale_f32", "scale_base");
+        let p_scale_imm = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::SCALE_F32,
+                "scale_f32",
+                "scale_imm",
+                &[("IMMEDIATES", "1")],
+            )
+            .expect("scale_f32 IMMEDIATES must validate");
+        let s_ref = ctx.upload_f32(&a_init, "scale_ref");
+        let s_imm = ctx.upload_f32(&a_init, "scale_imm");
+        let sp1 = [n as u32, 0.5f32.to_bits()];
+        let sp2 = [n as u32, (-1.25f32).to_bits()];
+        let sp1_buf = ctx.upload_storage(bytemuck::cast_slice(&sp1), "sp1");
+        let sp2_buf = ctx.upload_storage(bytemuck::cast_slice(&sp2), "sp2");
+        let bg_s_ref1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &p_scale_base.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: s_ref.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sp1_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let bg_s_ref2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &p_scale_base.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: s_ref.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sp2_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let bg_s_imm = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &p_scale_imm.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: s_imm.as_entire_binding(),
+            }],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&p_scale_base);
+            pass.set_bind_group(0, &bg_s_ref1, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+            pass.set_bind_group(0, &bg_s_ref2, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+
+            pass.set_pipeline(&p_scale_imm);
+            pass.set_immediates(0, bytemuck::cast_slice(&sp1));
+            pass.set_bind_group(0, &bg_s_imm, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+            pass.set_immediates(0, bytemuck::cast_slice(&sp2));
+            pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        assert_eq!(ctx.download_f32(&s_ref, n), ctx.download_f32(&s_imm, n));
+
+        // 2. `gemm_f32_nt` + `gemm_f32_nt_accum` (16-byte immediates)
+        let (gm, gn, gk) = (5u32, 7u32, 40u32);
+        let lhs: Vec<f32> = (0..(gm * gk) as usize)
+            .map(|i| (i as f32 * 0.13).sin())
+            .collect();
+        let rhs: Vec<f32> = (0..(gn * gk) as usize)
+            .map(|i| (i as f32 * 0.09).cos())
+            .collect();
+        let lhs_b = ctx.upload_f32(&lhs, "gemm_lhs");
+        let rhs_b = ctx.upload_f32(&rhs, "gemm_rhs");
+        let out_ref = ctx.create_storage_rw((gm * gn * 4) as u64, "gemm_out_ref");
+        let out_imm = ctx.create_storage_rw((gm * gn * 4) as u64, "gemm_out_imm");
+        let gp = [gm, gn, gk, 0u32];
+        let gp_buf = ctx.upload_storage(bytemuck::cast_slice(&gp), "gemm_p");
+
+        for entry in ["gemm_f32_nt", "gemm_f32_nt_accum"] {
+            let p_base = ctx.create_pipeline(shaders::GEMM_F32, entry, entry);
+            let p_imm = ctx
+                .try_create_pipeline_with_defines_checked(
+                    shaders::GEMM_F32,
+                    entry,
+                    entry,
+                    &[("IMMEDIATES", "1")],
+                )
+                .expect("gemm_f32 IMMEDIATES must validate");
+            let bg_r = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p_base.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: lhs_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: out_ref.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: gp_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let bg_i = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p_imm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: lhs_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: out_imm.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&p_base);
+                pass.set_bind_group(0, &bg_r, &[]);
+                pass.dispatch_workgroups(gm * gn, 1, 1);
+
+                pass.set_pipeline(&p_imm);
+                pass.set_immediates(0, bytemuck::cast_slice(&gp));
+                pass.set_bind_group(0, &bg_i, &[]);
+                pass.dispatch_workgroups(gm * gn, 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            assert_eq!(
+                ctx.download_f32(&out_ref, (gm * gn) as usize),
+                ctx.download_f32(&out_imm, (gm * gn) as usize),
+                "{entry} IMMEDIATES mismatch"
+            );
+        }
+
+        // 3. `qk_norm_rope_batch` (48-byte immediates, keeping @binding(5) freq_factors)
+        let (n_tok, n_h, n_kv, hd) = (3u32, 4u32, 2u32, 64u32);
+        let q_len = (n_tok * n_h * hd) as usize;
+        let k_len = (n_tok * n_kv * hd) as usize;
+        let q_in: Vec<f32> = (0..q_len).map(|i| (i as f32 * 0.05).sin()).collect();
+        let k_in: Vec<f32> = (0..k_len).map(|i| (i as f32 * 0.07).cos()).collect();
+        let qn_w: Vec<f32> = (0..hd as usize).map(|i| 0.8 + i as f32 * 0.005).collect();
+        let kn_w: Vec<f32> = (0..hd as usize).map(|i| 1.1 - i as f32 * 0.004).collect();
+        let freqs: Vec<f32> = (0..(hd / 2) as usize)
+            .map(|i| 1.0 + i as f32 * 0.02)
+            .collect();
+        let q_ref = ctx.upload_f32(&q_in, "q_ref");
+        let k_ref = ctx.upload_f32(&k_in, "k_ref");
+        let q_imm = ctx.upload_f32(&q_in, "q_imm");
+        let k_imm = ctx.upload_f32(&k_in, "k_imm");
+        let qnw_b = ctx.upload_f32(&qn_w, "qnw");
+        let knw_b = ctx.upload_f32(&kn_w, "knw");
+        let ff_b = ctx.upload_f32(&freqs, "ff");
+        let rope_p: [u32; 12] = [
+            5,
+            n_tok,
+            n_h,
+            n_kv,
+            hd,
+            1e-5f32.to_bits(),
+            10000.0f32.to_bits(),
+            0,
+            n_h * hd,
+            n_kv * hd,
+            1,
+            1,
+        ];
+        let rope_p_buf = ctx.upload_storage(bytemuck::cast_slice(&rope_p), "rope_p");
+        let p_rope_base = ctx.create_pipeline(
+            shaders::QK_NORM_ROPE_BATCH,
+            "qk_norm_rope_batch",
+            "rope_base",
+        );
+        let p_rope_imm = ctx
+            .try_create_pipeline_with_defines_checked(
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "rope_imm",
+                &[("IMMEDIATES", "1")],
+            )
+            .expect("qk_norm_rope_batch IMMEDIATES must validate");
+        let bg_rope_ref = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &p_rope_base.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_ref.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_ref.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: qnw_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: knw_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: rope_p_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: ff_b.as_entire_binding(),
+                },
+            ],
+        });
+        let bg_rope_imm = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &p_rope_imm.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_imm.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_imm.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: qnw_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: knw_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: ff_b.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&p_rope_base);
+            pass.set_bind_group(0, &bg_rope_ref, &[]);
+            pass.dispatch_workgroups(n_tok * (n_h + n_kv), 1, 1);
+
+            pass.set_pipeline(&p_rope_imm);
+            pass.set_immediates(0, bytemuck::cast_slice(&rope_p));
+            pass.set_bind_group(0, &bg_rope_imm, &[]);
+            pass.dispatch_workgroups(n_tok * (n_h + n_kv), 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        assert_eq!(
+            ctx.download_f32(&q_ref, q_len),
+            ctx.download_f32(&q_imm, q_len)
+        );
+        assert_eq!(
+            ctx.download_f32(&k_ref, k_len),
+            ctx.download_f32(&k_imm, k_len)
+        );
+    }
+
+    /// Multi-step prebuilt decode + `map_buffer_on_submit` must return identical greedy token IDs
+    /// to `argmax(forward)` across cache hits and `PrebuiltKey` switches (`DispatchAndStage` <->
+    /// `StageLogits`).
+    #[test]
+    fn prebuilt_decode_map_on_submit_greedy_and_logits_parity() {
+        use crate::model::{InferenceState, Model};
+        let Some(ctx1) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let Some(ctx2) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let gguf1 = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
+        let gguf2 = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
+        let m_greedy =
+            super::GpuLfmModel::from_gguf_with_ctx(gguf1, 64, "decode-greedy".into(), ctx1)
+                .unwrap();
+        let m_logits =
+            super::GpuLfmModel::from_gguf_with_ctx(gguf2, 64, "decode-logits".into(), ctx2)
+                .unwrap();
+        let mut st_greedy = InferenceState::from_config(m_greedy.config()).unwrap();
+        let mut st_logits = InferenceState::from_config(m_logits.config()).unwrap();
+
+        let prompt = [1u32, 2, 3, 4];
+        let l0_g = m_greedy.forward_prefill(&prompt, 0, &mut st_greedy);
+        let l0 = m_logits.forward_prefill(&prompt, 0, &mut st_logits);
+        let argmax = |v: &[f32]| -> u32 {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        let g0 = argmax(&l0_g);
+        assert_eq!(g0, argmax(&l0));
+
+        let mut tok = g0;
+        for pos in prompt.len()..(prompt.len() + 4) {
+            let g = m_greedy.forward_greedy(&[tok], pos, &mut st_greedy);
+            let l = m_logits.forward(&[tok], pos, &mut st_logits);
+            assert_eq!(g, argmax(&l), "decode parity mismatch at pos={pos}");
+            tok = g;
+        }
+        // Switch `m_greedy` from `forward_greedy` (`DispatchAndStage` prebuilt) to `forward`
+        // (`StageLogits`) to exercise `PrebuiltKey` invalidation without stale readback state.
+        let pos_switch = prompt.len() + 4;
+        let switched = m_greedy.forward(&[tok], pos_switch, &mut st_greedy);
+        let expected = m_logits.forward(&[tok], pos_switch, &mut st_logits);
+        assert_eq!(switched, expected);
     }
 }

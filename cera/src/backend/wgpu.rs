@@ -213,11 +213,25 @@ pub struct GpuContext {
     /// slang source, since `enable subgroups` fails module creation on
     /// devices lacking the feature.
     pub has_subgroup: bool,
+    /// Whether `IMMEDIATES` (push constants / `setBytes` / root constants) was
+    /// available and requested on this device.
+    pub has_immediates: bool,
+    /// Maximum immediate payload size in bytes (`0` when `has_immediates` is false).
+    pub max_immediate_size: u32,
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
     pub max_compute_workgroup_storage_size: u32,
     pub preprocessor: Preprocessor,
+    /// Driver pipeline cache (`VkPipelineCache` on Vulkan) persisted across runs.
+    pipeline_cache: Option<wgpu::PipelineCache>,
+    /// On-disk path backing [`Self::pipeline_cache`], when persistent caching is active.
+    #[cfg(not(target_arch = "wasm32"))]
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    /// `(len, fnv1a64)` of the last pipeline-cache blob loaded from or written to disk,
+    /// so warm-hit loads skip redundant atomic disk writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pipeline_cache_saved_sig: Arc<std::sync::Mutex<Option<(usize, u64)>>>,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
     pub profiler: Option<Arc<GpuProfiler>>,
     /// Pre-allocated staging buffer for download_f32. Resized on demand.
@@ -259,11 +273,18 @@ impl Clone for GpuContext {
             backend: self.backend.clone(),
             shader_f16: self.shader_f16,
             has_subgroup: self.has_subgroup,
+            has_immediates: self.has_immediates,
+            max_immediate_size: self.max_immediate_size,
             max_storage_buffer_binding_size: self.max_storage_buffer_binding_size,
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
             max_compute_workgroup_storage_size: self.max_compute_workgroup_storage_size,
             preprocessor: self.preprocessor.clone(),
+            pipeline_cache: self.pipeline_cache.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline_cache_path: self.pipeline_cache_path.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline_cache_saved_sig: Arc::clone(&self.pipeline_cache_saved_sig),
             profiler: self.profiler.clone(),
             staging: Arc::clone(&self.staging),
             staging_size: Arc::clone(&self.staging_size),
@@ -419,6 +440,302 @@ fn flash_attention_supported_for(
         && flash_attention_supported(workgroup_storage, adapter_name, is_android)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PIPELINE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sanitize_pipeline_cache_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_pipeline_cache_filename(wgpu_key: &str, git_sha: &str) -> Option<(String, String)> {
+    let prefix = sanitize_pipeline_cache_key(wgpu_key);
+    let sha = sanitize_pipeline_cache_key(git_sha);
+    if prefix.is_empty() || sha.is_empty() {
+        return None;
+    }
+    let filename = format!("{prefix}-{sha}.bin");
+    Some((prefix, filename))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_private_pipeline_cache_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(dir)?;
+
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::other(
+                "pipeline cache path is not a regular directory",
+            ));
+        }
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "pipeline cache directory is owned by another user",
+            ));
+        }
+        if (meta.mode() & 0o077) != 0 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            let tightened = std::fs::symlink_metadata(dir)?;
+            if (tightened.mode() & 0o022) != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "pipeline cache directory is group- or world-writable",
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::other(
+                "pipeline cache path is not a regular directory",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn candidate_pipeline_cache_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(explicit) = std::env::var("CERA_PIPELINE_CACHE_DIR") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            // If explicitly configured, honor only this directory (or disable on failure).
+            dirs.push(std::path::PathBuf::from(trimmed));
+            return dirs;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        dirs.push(
+            std::path::PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("cera")
+                .join("pipeline-cache"),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
+        && !local_app_data.is_empty()
+    {
+        dirs.push(
+            std::path::PathBuf::from(local_app_data)
+                .join("cera")
+                .join("pipeline-cache"),
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            let p = std::path::Path::new(&xdg);
+            if !xdg.is_empty() && p.is_absolute() {
+                dirs.push(p.join("cera").join("pipeline-cache"));
+            }
+        }
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+            && home != "/"
+        {
+            dirs.push(
+                std::path::PathBuf::from(home)
+                    .join(".cache")
+                    .join("cera")
+                    .join("pipeline-cache"),
+            );
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    if let Ok(cmdline) = std::fs::read("/proc/self/cmdline") {
+        let nul_end = cmdline
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(cmdline.len());
+        if let Ok(pkg) = std::str::from_utf8(&cmdline[..nul_end]) {
+            let pkg = pkg.trim();
+            if pkg.contains('.')
+                && !pkg.contains('/')
+                && !pkg.contains("..")
+                && pkg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':')
+            {
+                let base_pkg = pkg.split(':').next().unwrap_or(pkg);
+                dirs.push(
+                    std::path::PathBuf::from("/data/user/0")
+                        .join(base_pkg)
+                        .join("code_cache")
+                        .join("cera-pipeline-cache"),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let euid = unsafe { libc::geteuid() };
+        dirs.push(std::env::temp_dir().join(format!("cera-pipeline-cache-{euid}")));
+    }
+    #[cfg(not(unix))]
+    {
+        dirs.push(std::env::temp_dir().join("cera-pipeline-cache"));
+    }
+
+    dirs
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_pipeline_cache_dir() -> Option<std::path::PathBuf> {
+    candidate_pipeline_cache_dirs()
+        .into_iter()
+        .find(|dir| ensure_private_pipeline_cache_dir(dir).is_ok())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_pipeline_cache_blob(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let lmeta = std::fs::symlink_metadata(path).ok()?;
+    if !lmeta.file_type().is_file() {
+        return None;
+    }
+    if lmeta.len() == 0 || lmeta.len() > MAX_PIPELINE_CACHE_BYTES {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+
+    let fmeta = file.metadata().ok()?;
+    if !fmeta.is_file() || fmeta.len() == 0 || fmeta.len() > MAX_PIPELINE_CACHE_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = unsafe { libc::geteuid() };
+        if fmeta.uid() != euid || (fmeta.mode() & 0o022) != 0 {
+            return None;
+        }
+    }
+
+    let mut buf = Vec::with_capacity(fmeta.len() as usize);
+    file.take(MAX_PIPELINE_CACHE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() || (buf.len() as u64) > MAX_PIPELINE_CACHE_BYTES {
+        return None;
+    }
+    Some(buf)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_pipeline_cache_blob_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if data.is_empty() || (data.len() as u64) > MAX_PIPELINE_CACHE_BYTES {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("pipeline cache path has no parent"))?;
+    ensure_private_pipeline_cache_dir(parent)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid pipeline cache filename"))?;
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = opts.open(&tmp_path)?;
+    let write_res = (|| -> std::io::Result<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_res
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prune_stale_pipeline_caches(dir: &std::path::Path, key_prefix: &str, keep_filename: &str) {
+    let prefix_with_dash = format!("{key_prefix}-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str != keep_filename
+            && name_str.starts_with(&prefix_with_dash)
+            && name_str.ends_with(".bin")
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 impl GpuContext {
     /// Report (and record) device loss. A lost device drops all work
     /// silently, so submitting/reading back anyway would produce
@@ -429,7 +746,7 @@ impl GpuContext {
     /// `take_decode_error`) and every choke point that sees `true` skips
     /// its work and returns an empty/zero value. Loss stays unrecoverable
     /// without recreating the whole context.
-    fn device_is_lost(&self) -> bool {
+    pub(crate) fn device_is_lost(&self) -> bool {
         let guard = self.device_lost.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(detail) => {
@@ -447,8 +764,14 @@ impl GpuContext {
     /// Every GPU submit in this backend goes through here, so the submit count
     /// is exact and there is a single choke point to batch submissions at.
     pub(crate) fn submit_encoder(&self, enc: wgpu::CommandEncoder) {
+        let _ = self.try_submit_encoder(enc);
+    }
+
+    /// Finish `enc` and submit it, returning `false` when device loss caused the
+    /// submission to be dropped.
+    pub(crate) fn try_submit_encoder(&self, enc: wgpu::CommandEncoder) -> bool {
         if self.device_is_lost() {
-            return;
+            return false;
         }
         io_stats::record_submit();
         #[cfg(test)]
@@ -468,19 +791,21 @@ impl GpuContext {
                 t1.elapsed().as_secs_f64() * 1e6,
             );
         }
+        true
     }
 
-    /// Submit a command buffer that was finished earlier, counting the submit like
-    /// [`Self::submit_encoder`] (which does the `finish` and this in one step).
-    pub(crate) fn submit_command_buffer(&self, cmd: wgpu::CommandBuffer) {
+    /// Submit a command buffer, returning `false` when device loss caused the
+    /// submission to be dropped.
+    pub(crate) fn try_submit_command_buffer(&self, cmd: wgpu::CommandBuffer) -> bool {
         if self.device_is_lost() {
-            return;
+            return false;
         }
         io_stats::record_submit();
         #[cfg(test)]
         self.submit_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.queue.submit(Some(cmd));
+        true
     }
 
     /// Initialize the GPU: request a high-performance adapter + device
@@ -525,15 +850,18 @@ impl GpuContext {
             .await
             .context("no GPU adapter found")?;
 
-        let adapter_name = adapter.get_info().name.clone();
-        let backend_kind = adapter.get_info().backend;
+        let adapter_info = adapter.get_info();
+        let adapter_name = adapter_info.name.clone();
+        let backend_kind = adapter_info.backend;
         let backend = format!("{backend_kind:?}");
         if std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1") {
             let f = adapter.features();
             eprintln!(
-                "[GPU-HOST] adapter={adapter_name} backend={backend} SUBGROUP={} SUBGROUP_BARRIER={} TIMESTAMP={} SHADER_F16={}",
+                "[GPU-HOST] adapter={adapter_name} backend={backend} SUBGROUP={} SUBGROUP_BARRIER={} IMMEDIATES={} PIPELINE_CACHE={} TIMESTAMP={} SHADER_F16={}",
                 f.contains(wgpu::Features::SUBGROUP),
                 f.contains(wgpu::Features::SUBGROUP_BARRIER),
+                f.contains(wgpu::Features::IMMEDIATES),
+                f.contains(wgpu::Features::PIPELINE_CACHE),
                 f.contains(wgpu::Features::TIMESTAMP_QUERY),
                 f.contains(wgpu::Features::SHADER_F16),
             );
@@ -558,6 +886,17 @@ impl GpuContext {
         {
             features |= wgpu::Features::SUBGROUP_BARRIER;
         }
+        if !crate::backend::cpu_features::env_disabled("CERA_WGPU_IMMEDIATES")
+            && adapter.features().contains(wgpu::Features::IMMEDIATES)
+        {
+            features |= wgpu::Features::IMMEDIATES;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !crate::backend::cpu_features::env_disabled("CERA_PIPELINE_CACHE")
+            && adapter.features().contains(wgpu::Features::PIPELINE_CACHE)
+        {
+            features |= wgpu::Features::PIPELINE_CACHE;
+        }
         // SPIR-V passthrough lets us feed slangc-compiled SPIR-V straight to the
         // Vulkan driver, bypassing naga-30's codegen (which regresses ~28% on
         // PowerVR prefill). wgpu-core only accepts a SPIR-V passthrough module on
@@ -575,7 +914,10 @@ impl GpuContext {
 
         // Use the adapter's actual limits instead of hardcoding. This avoids
         // failures on GPUs with smaller max_buffer_size (integrated, mobile).
-        let adapter_limits = adapter.limits();
+        let mut adapter_limits = adapter.limits();
+        if !features.contains(wgpu::Features::IMMEDIATES) {
+            adapter_limits.max_immediate_size = 0;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -653,11 +995,61 @@ impl GpuContext {
         preprocessor.add_include("common_decls.tmpl", shaders::COMMON_DECLS);
         preprocessor.add_include("mul_mat_decls.tmpl", shaders::MUL_MAT_DECLS);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let (pipeline_cache, pipeline_cache_path, pipeline_cache_saved_sig) =
+            if features.contains(wgpu::Features::PIPELINE_CACHE) {
+                if let (Some(wgpu_key), Some(dir)) = (
+                    wgpu::util::pipeline_cache_key(&adapter_info),
+                    resolve_pipeline_cache_dir(),
+                ) {
+                    if let Some((_prefix, filename)) =
+                        format_pipeline_cache_filename(&wgpu_key, env!("CERA_GIT_SHA"))
+                    {
+                        let path = dir.join(filename);
+                        let initial_bytes = read_pipeline_cache_blob(&path);
+                        let sig = initial_bytes.as_deref().map(|b| (b.len(), fnv1a64(b)));
+                        // SAFETY: `initial_bytes` comes from a user-owned, non-world-writable
+                        // cache file keyed by `pipeline_cache_key(&adapter_info)` and
+                        // `CERA_GIT_SHA`. `fallback: true` creates an empty cache if the
+                        // Vulkan driver rejects a stale or corrupt header.
+                        let cache = unsafe {
+                            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                                label: Some("cera-pipeline-cache"),
+                                data: initial_bytes.as_deref(),
+                                fallback: true,
+                            })
+                        };
+                        (
+                            Some(cache),
+                            Some(path),
+                            Arc::new(std::sync::Mutex::new(sig)),
+                        )
+                    } else {
+                        (None, None, Arc::new(std::sync::Mutex::new(None)))
+                    }
+                } else {
+                    (None, None, Arc::new(std::sync::Mutex::new(None)))
+                }
+            } else {
+                (None, None, Arc::new(std::sync::Mutex::new(None)))
+            };
+        #[cfg(target_arch = "wasm32")]
+        let pipeline_cache: Option<wgpu::PipelineCache> = None;
+
+        let has_immediates = features.contains(wgpu::Features::IMMEDIATES);
+        let max_immediate_size = if has_immediates {
+            adapter_limits.max_immediate_size
+        } else {
+            0
+        };
+
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
             max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size,
             max_buffer_size = adapter_limits.max_buffer_size,
+            has_immediates,
+            max_immediate_size,
             "GPU initialized"
         );
 
@@ -668,12 +1060,19 @@ impl GpuContext {
             backend,
             shader_f16: features.contains(wgpu::Features::SHADER_F16),
             has_subgroup: features.contains(wgpu::Features::SUBGROUP),
+            has_immediates,
+            max_immediate_size,
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size as u64,
             max_buffer_size: adapter_limits.max_buffer_size,
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
                 as u64,
             max_compute_workgroup_storage_size: adapter_limits.max_compute_workgroup_storage_size,
             preprocessor,
+            pipeline_cache,
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline_cache_path,
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline_cache_saved_sig,
             profiler,
             staging: Arc::new(std::sync::Mutex::new(None)),
             staging_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -682,6 +1081,64 @@ impl GpuContext {
             #[cfg(test)]
             submit_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Whether `IMMEDIATES` is enabled on this device with at least `bytes` of payload capacity.
+    pub fn supports_immediates(&self, bytes: u32) -> bool {
+        self.has_immediates && self.max_immediate_size >= bytes
+    }
+
+    /// Whether WGSL `subgroupAdd` compute variants are enabled on this device.
+    /// Controlled by `CERA_WGPU_SUBGROUP=0` for fallback/ablation testing.
+    pub fn use_wgsl_subgroup(&self) -> bool {
+        self.has_subgroup && !crate::backend::cpu_features::env_disabled("CERA_WGPU_SUBGROUP")
+    }
+
+    /// Persist the driver's compiled pipeline cache to disk if active and changed.
+    /// Safe to call multiple times (e.g. after trunk + ViT + audio pipeline init);
+    /// skips disk I/O when the serialized blob is unchanged since load or last save.
+    pub fn save_pipeline_cache(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path)
+            else {
+                return;
+            };
+            let Some(data) = cache.get_data() else {
+                return;
+            };
+            if data.is_empty() || (data.len() as u64) > MAX_PIPELINE_CACHE_BYTES {
+                return;
+            }
+            let sig = (data.len(), fnv1a64(&data));
+            let mut guard = self
+                .pipeline_cache_saved_sig
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *guard == Some(sig) {
+                return;
+            }
+            match write_pipeline_cache_blob_atomic(path, &data) {
+                Ok(()) => {
+                    *guard = Some(sig);
+                    if let (Some(parent), Some(file_name)) =
+                        (path.parent(), path.file_name().and_then(|s| s.to_str()))
+                        && let Some(stem) = file_name.strip_suffix(".bin")
+                        && let Some((key_prefix, _sha)) = stem.rsplit_once('-')
+                    {
+                        prune_stale_pipeline_caches(parent, key_prefix, file_name);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "cera::wgpu",
+                        path = %path.display(),
+                        error = %e,
+                        "failed to persist pipeline cache"
+                    );
+                }
+            }
+        }
     }
 
     /// Flush pending `queue.write_buffer` staging copies and reclaim their
@@ -1012,6 +1469,102 @@ impl GpuContext {
         result
     }
 
+    /// Complete a `u32` readback whose `map_buffer_on_submit` callback was armed
+    /// onto the command buffer or encoder before submission. Falls back to
+    /// [`Self::read_mapped_u32`] when `rx` is `None`.
+    pub(crate) fn finish_mapped_u32(
+        &self,
+        staging: &wgpu::Buffer,
+        count: usize,
+        rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    ) -> Vec<u32> {
+        let Some(rx) = rx else {
+            return self.read_mapped_u32(staging, count);
+        };
+        let size = (count * std::mem::size_of::<u32>()) as u64;
+        assert!(
+            staging.size() >= size,
+            "readback buffer is {} bytes but {size} were requested",
+            staging.size(),
+        );
+        self.device.poll_wait();
+        let map_ok = rx.recv().ok().and_then(|r| r.ok()).is_some();
+        if self.device_is_lost() {
+            if map_ok {
+                staging.unmap();
+            }
+            return Vec::new();
+        }
+        io_stats::record_readback(size);
+        if !map_ok {
+            eprintln!("[cera::wgpu] read_mapped_u32: readback map failed; returning empty");
+            self.record_readback_fault(
+                "read_mapped_u32: GPU readback map failed; returned empty".to_string(),
+            );
+            return Vec::new();
+        }
+        let slice = staging.slice(0..size);
+        let result = if let Ok(data) = slice.get_mapped_range() {
+            let res: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            res
+        } else {
+            eprintln!(
+                "[cera::wgpu] read_mapped_u32: get_mapped_range failed after successful map; returning empty"
+            );
+            self.record_readback_fault(
+                "read_mapped_u32: get_mapped_range failed after successful map; returned empty"
+                    .to_string(),
+            );
+            Vec::new()
+        };
+        staging.unmap();
+        result
+    }
+
+    /// Complete an `f32` readback whose `map_buffer_on_submit` callback was armed
+    /// onto the command buffer or encoder before submission. Falls back to
+    /// [`Self::read_mapped_f32`] when `rx` is `None`.
+    pub(crate) fn finish_mapped_f32(
+        &self,
+        staging: &wgpu::Buffer,
+        count: usize,
+        rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    ) -> Vec<f32> {
+        let Some(rx) = rx else {
+            return self.read_mapped_f32(staging, count);
+        };
+        let size = (count * std::mem::size_of::<f32>()) as u64;
+        assert!(
+            staging.size() >= size,
+            "readback buffer is {} bytes but {size} were requested",
+            staging.size(),
+        );
+        self.device.poll_wait();
+        let map_ok = rx.recv().ok().and_then(|r| r.ok()).is_some();
+        if self.device_is_lost() {
+            if map_ok {
+                staging.unmap();
+            }
+            return vec![0.0f32; count];
+        }
+        io_stats::record_readback(size);
+        if !map_ok {
+            self.warn_readback_zeros("read_mapped_f32", count);
+            return vec![0.0f32; count];
+        }
+        let slice = staging.slice(0..size);
+        let mut result = vec![0.0f32; count];
+        if let Ok(data) = slice.get_mapped_range() {
+            bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
+            drop(data);
+        } else {
+            self.warn_mapped_range_zeros("read_mapped_f32", count);
+        }
+        staging.unmap();
+        result
+    }
+
     /// Loud-zeros note shared by every blocking readback that zero-fills on
     /// map failure: a failed map is otherwise indistinguishable from a
     /// compute skip, so say so at the swallow site. `op` is the caller name
@@ -1121,7 +1674,6 @@ impl GpuContext {
                 label: Some("download"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
-        self.submit_encoder(encoder);
 
         // Map only the requested `0..size` byte range, not the full
         // staging buffer. The cached staging is sized to the largest
@@ -1129,12 +1681,15 @@ impl GpuContext {
         // entire size every call (e.g. a small `count` after a prior
         // `vocab_size` download would still pay the vocab-sized cost
         // and stale tail bytes would leak into the returned `Vec`).
-        io_stats::record_readback(size);
-        let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
+        encoder.map_buffer_on_submit(staging, wgpu::MapMode::Read, 0..size, move |result| {
             tx.send(result).ok();
         });
+        if !self.try_submit_encoder(encoder) {
+            return vec![0.0f32; count];
+        }
+        io_stats::record_readback(size);
+        let slice = staging.slice(0..size);
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
@@ -1196,16 +1751,16 @@ impl GpuContext {
             None
         } else {
             encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-            self.submit_encoder(encoder);
-
-            io_stats::record_readback(size);
             let (tx, rx) = futures_channel::oneshot::channel();
-            staging
-                .slice(0..size)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx.send(result);
-                });
-            Some(rx)
+            encoder.map_buffer_on_submit(&staging, wgpu::MapMode::Read, 0..size, move |result| {
+                let _ = tx.send(result);
+            });
+            if self.try_submit_encoder(encoder) {
+                io_stats::record_readback(size);
+                Some(rx)
+            } else {
+                None
+            }
         };
 
         PendingReadback {
@@ -1288,19 +1843,21 @@ impl GpuContext {
                 label: Some("download_u32"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
-        self.submit_encoder(encoder);
 
-        // Map only the requested `0..size` range — see download_f32
+        // Map only the requested `0..size` range; see download_f32
         // above for the same reasoning. With a vocab-sized cached
         // staging buffer, mapping the full range turns the 4-byte
         // argmax readback into a vocab-sized copy on every greedy
         // step, defeating the optimization.
-        io_stats::record_readback(size);
-        let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
+        encoder.map_buffer_on_submit(staging, wgpu::MapMode::Read, 0..size, move |r| {
             tx.send(r).ok();
         });
+        if !self.try_submit_encoder(encoder) {
+            return vec![0u32; count];
+        }
+        io_stats::record_readback(size);
+        let slice = staging.slice(0..size);
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
@@ -1385,13 +1942,19 @@ impl GpuContext {
                     dst_off += aligned;
                 }
             }
-            self.submit_encoder(encoder);
-            io_stats::record_readback(batch_bytes);
-            let slice = staging.slice(0..batch_bytes);
             let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| {
+            encoder.map_buffer_on_submit(staging, wgpu::MapMode::Read, 0..batch_bytes, move |r| {
                 tx.send(r).ok();
             });
+            if !self.try_submit_encoder(encoder) {
+                for &(_, len) in &slices[idx..batch_end] {
+                    out.push(vec![0u8; len]);
+                }
+                idx = batch_end;
+                continue;
+            }
+            io_stats::record_readback(batch_bytes);
+            let slice = staging.slice(0..batch_bytes);
             self.device.poll_wait();
             let map_res = rx.recv().ok();
             if map_res.and_then(|r| r.ok()).is_none() {
@@ -1457,14 +2020,16 @@ impl GpuContext {
                 label: Some("download_f16"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, aligned_size);
-        self.submit_encoder(encoder);
+        let (tx, rx) = std::sync::mpsc::channel();
+        encoder.map_buffer_on_submit(staging, wgpu::MapMode::Read, 0..aligned_size, move |r| {
+            tx.send(r).ok();
+        });
+        if !self.try_submit_encoder(encoder) {
+            return vec![0.0f32; count];
+        }
 
         io_stats::record_readback(aligned_size);
         let slice = staging.slice(0..aligned_size);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            tx.send(r).ok();
-        });
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
@@ -1494,6 +2059,11 @@ impl GpuContext {
         self.create_pipeline_with_defines(shader_source, entry_point, label, &[])
     }
 
+    /// Driver pipeline cache handle, if supported and enabled on this device.
+    pub(crate) fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
+        self.pipeline_cache.as_ref()
+    }
+
     /// Create a compute pipeline from WGSL source with preprocessor defines.
     pub fn create_pipeline_with_defines(
         &self,
@@ -1502,9 +2072,22 @@ impl GpuContext {
         label: &str,
         defines: &[(&str, &str)],
     ) -> wgpu::ComputePipeline {
+        let needs_webgpu_subgroups = (cfg!(target_arch = "wasm32")
+            || self.backend == "BrowserWebGpu")
+            && defines.iter().any(|&(k, _)| k == "SUBGROUP")
+            && !defines.iter().any(|&(k, _)| k == "WEBGPU_SUBGROUPS");
+        let owned_defines;
+        let effective_defines: &[(&str, &str)] = if needs_webgpu_subgroups {
+            let mut v = defines.to_vec();
+            v.push(("WEBGPU_SUBGROUPS", "1"));
+            owned_defines = v;
+            &owned_defines
+        } else {
+            defines
+        };
         let preprocessed = self
             .preprocessor
-            .preprocess(shader_source, defines)
+            .preprocess(shader_source, effective_defines)
             .with_context(|| format!("failed to preprocess shader: {label}"))
             .expect("shader preprocessing failed");
 
@@ -1538,7 +2121,7 @@ impl GpuContext {
                     zero_initialize_workgroup_memory: false,
                     ..Default::default()
                 },
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             })
     }
 
@@ -1557,14 +2140,28 @@ impl GpuContext {
         entry_point: &str,
         label: &str,
     ) -> anyhow::Result<wgpu::ComputePipeline> {
+        self.try_create_pipeline_with_defines_checked(shader_source, entry_point, label, &[])
+    }
+
+    /// Checked variant of [`Self::create_pipeline_with_defines`] using a validation error scope
+    /// on native targets so callers can fall back cleanly if a driver rejects an optional feature
+    /// variant (such as WGSL subgroups or immediates).
+    pub fn try_create_pipeline_with_defines_checked(
+        &self,
+        shader_source: &str,
+        entry_point: &str,
+        label: &str,
+        defines: &[(&str, &str)],
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
         #[cfg(target_arch = "wasm32")]
         {
-            Ok(self.create_pipeline(shader_source, entry_point, label))
+            Ok(self.create_pipeline_with_defines(shader_source, entry_point, label, defines))
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let pipeline = self.create_pipeline(shader_source, entry_point, label);
+            let pipeline =
+                self.create_pipeline_with_defines(shader_source, entry_point, label, defines);
             let err = pollster::block_on(scope.pop());
             match err {
                 Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
@@ -1690,7 +2287,7 @@ impl GpuContext {
                     zero_initialize_workgroup_memory: false,
                     ..Default::default()
                 },
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             })
     }
 
@@ -1761,63 +2358,11 @@ impl GpuContext {
     /// (our slangc-compiled `gemv_q4_0_fast.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemv_q4_0_fast_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemv_q4_0_fast_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, false),
-                    storage(3, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_q4_0_fast_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemv_q4_0_fast.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemv_q4_0_fast.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemv_q4_0_fast_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    // The kernel writes `sg_scratch` (one float per subgroup
-                    // per row) before the combine reads it — same contract as
-                    // the naga path (see `create_pipeline_with_defines`).
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemv_q4_0_fast_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_0_fast.spv")),
+            &[true, true, false, true],
+        )
     }
 
     /// Flat-planes Q6_K decode GEMV via SPIR-V passthrough
@@ -1832,133 +2377,29 @@ impl GpuContext {
     /// (our slangc-compiled `gemv_q6_k_flat.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemv_q6_k_flat_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemv_q6_k_flat_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, false),
-                    storage(3, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_q6_k_flat_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemv_q6_k_flat.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemv_q6_k_flat.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemv_q6_k_flat_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    // The kernel writes `sg_scratch` before the combine
-                    // reads it — same contract as the naga path.
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemv_q6_k_flat_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q6_k_flat.spv")),
+            &[true, true, false, true],
+        )
     }
 
     /// Fast Q6_K decode GEMV via SPIR-V passthrough: 64-thread,
     /// subgroup-reduction twin of the handwritten `gemv_q6_k.wgsl`
     /// (`spirv/gemv_q6_k.slang`, entry `main`). Same 4-binding interface;
     /// NR=1 here vs NR=2 on the WGSL twin (host gates rows on the
-    /// pipeline). Passthrough is the only way to ship subgroups: naga
-    /// cannot parse WGSL `enable subgroups`, so the WGSL twin keeps the
-    /// 5-barrier tree.
+    /// pipeline).
     ///
     /// # Safety
     /// The module must be spirv-val-clean with the binding interface above
     /// (our slangc-compiled `gemv_q6_k.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemv_q6_k_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemv_q6_k_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, false),
-                    storage(3, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_q6_k_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemv_q6_k.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemv_q6_k.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemv_q6_k_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    // The kernel writes `sg_scratch` before the combine
-                    // reads it — same contract as the naga path.
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemv_q6_k_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q6_k.spv")),
+            &[true, true, false, true],
+        )
     }
 
     /// Streaming Q4_0 prefill GEMM via SPIR-V passthrough. Five bindings
@@ -1972,61 +2413,11 @@ impl GpuContext {
     /// `gemm_stream_q4_0.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemm_stream_q4_0_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemm_stream_q4_0_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemm_stream_q4_0_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemm_stream_q4_0.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemm_stream_q4_0.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemm_stream_q4_0_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemm_stream_q4_0_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q4_0.spv")),
+            &[true, true, true, false, true],
+        )
     }
 
     /// K-slice-64 twin of `gemm_stream_q4_0_passthrough`: identical binding
@@ -2106,7 +2497,7 @@ impl GpuContext {
                     zero_initialize_workgroup_memory: false,
                     ..Default::default()
                 },
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             })
     }
 
@@ -2254,55 +2645,11 @@ impl GpuContext {
     /// `transpose_cast_f16.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn transpose_cast_f16_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("transpose_cast_f16_passthrough_bgl"),
-                entries: &[storage(0, true), storage(1, false), storage(2, true)],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("transpose_cast_f16_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from transpose_cast_f16.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/transpose_cast_f16.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("transpose_cast_f16_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "transpose_cast_f16_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/transpose_cast_f16.spv")),
+            &[true, false, true],
+        )
     }
 
     /// A compute pipeline over one raw SPIR-V module (entry `main`) whose storage-buffer bindings
@@ -2362,7 +2709,7 @@ impl GpuContext {
                     zero_initialize_workgroup_memory: false,
                     ..Default::default()
                 },
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             })
     }
 
@@ -2419,63 +2766,11 @@ impl GpuContext {
     /// (our slangc-compiled `gemv_q4_0_stream.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemv_q4_0_stream_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemv_q4_0_stream_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_q4_0_stream_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemv_q4_0_stream.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemv_q4_0_stream.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemv_q4_0_stream_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    // The kernel writes `sg_scratch` before the combine reads
-                    // it — same contract as `gemv_q4_0_fast_passthrough`.
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemv_q4_0_stream_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_0_stream.spv")),
+            &[true, true, true, false, true],
+        )
     }
 
     /// Register-tiled Q4_0 GEMM over the resident stream layout
@@ -2491,61 +2786,14 @@ impl GpuContext {
     /// (our slangc-compiled `mul_mat_reg_tile_q4_0_stream.slang`). Only call
     /// when `supports_spirv_passthrough()` is true.
     pub fn mul_mat_reg_tile_q4_0_stream_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("mul_mat_reg_tile_q4_0_stream_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("mul_mat_reg_tile_q4_0_stream_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from mul_mat_reg_tile_q4_0_stream.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/mul_mat_reg_tile_q4_0_stream.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("mul_mat_reg_tile_q4_0_stream_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "mul_mat_reg_tile_q4_0_stream_passthrough",
+            wgpu::include_spirv_raw!(concat!(
+                env!("OUT_DIR"),
+                "/mul_mat_reg_tile_q4_0_stream.spv"
+            )),
+            &[true, true, true, false, true],
+        )
     }
 
     /// Streaming fp16 Q4_K prefill GEMM (`gemm_stream_q4_k.slang`).
@@ -2556,61 +2804,11 @@ impl GpuContext {
     /// (our slangc-compiled `gemm_stream_q4_k.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemm_stream_q4_k_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemm_stream_q4_k_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemm_stream_q4_k_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemm_stream_q4_k.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemm_stream_q4_k.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemm_stream_q4_k_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemm_stream_q4_k_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q4_k.spv")),
+            &[true, true, true, false, true],
+        )
     }
 
     /// Q4_K decode GEMV over the resident stream layout (`spirv/gemv_q4_k_stream.slang`, entry `main`).
@@ -2621,61 +2819,11 @@ impl GpuContext {
     /// (our slangc-compiled `gemv_q4_k_stream.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemv_q4_k_stream_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemv_q4_k_stream_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_q4_k_stream_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemv_q4_k_stream.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemv_q4_k_stream.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemv_q4_k_stream_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemv_q4_k_stream_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_k_stream.spv")),
+            &[true, true, true, false, true],
+        )
     }
 
     /// Q8_0 decode GEMV over the resident stream layout (`spirv/gemv_q8_0_stream.slang`, entry `main`).
@@ -2781,60 +2929,11 @@ impl GpuContext {
     /// (our slangc-compiled `gemv_q4_k.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemv_q4_k_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemv_q4_k_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, false),
-                    storage(3, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_q4_k_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemv_q4_k.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemv_q4_k.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemv_q4_k_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        self.passthrough_pipeline(
+            "gemv_q4_k_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_k.spv")),
+            &[true, true, false, true],
+        )
     }
 
     // NOTE: no `repack_q4_0_stream` GPU kernel. The (q, d) repack is
@@ -2925,24 +3024,26 @@ impl GpuContext {
         }
 
         // Resolve queries → resolve_buf, then copy → read_buf
+        let byte_len = (n_queries as u64) * 8;
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.resolve_query_set(&profiler.query_set, 0..n_queries, &profiler.resolve_buf, 0);
-        enc.copy_buffer_to_buffer(
-            &profiler.resolve_buf,
-            0,
-            &profiler.read_buf,
-            0,
-            (n_queries as u64) * 8,
-        );
-        self.submit_encoder(enc);
-
-        let slice = profiler.read_buf.slice(..((n_queries as u64) * 8));
+        enc.copy_buffer_to_buffer(&profiler.resolve_buf, 0, &profiler.read_buf, 0, byte_len);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            tx.send(r).ok();
-        });
+        enc.map_buffer_on_submit(
+            &profiler.read_buf,
+            wgpu::MapMode::Read,
+            0..byte_len,
+            move |r| {
+                tx.send(r).ok();
+            },
+        );
+        if !self.try_submit_encoder(enc) {
+            return;
+        }
+
+        let slice = profiler.read_buf.slice(..byte_len);
         self.device.poll_wait();
         if let Ok(Ok(())) = rx.recv() {
             let data = match slice.get_mapped_range() {
@@ -3011,6 +3112,8 @@ pub mod shaders {
     /// Fast Q4_0 GEMV, generated from `shaders/slang/gemv_q4_0_fast.slang` by
     /// build.rs and shared with the Metal backend.
     pub const GEMV_Q4_0_FAST: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv_q4_0_fast.wgsl"));
+    /// WGSL subgroup-reduction variant of `gemv_q4_0_fast` (NR=8, WG=64, 1 barrier).
+    pub const GEMV_Q4_0_FAST_SUBGROUP: &str = include_str!("shaders/gemv_q4_0_fast_subgroup.wgsl");
     pub const GEMV_Q4_K: &str = include_str!("shaders/gemv_q4_k.wgsl");
     pub const GEMV_Q5_K: &str = include_str!("shaders/gemv_q5_k.wgsl");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
@@ -8976,5 +9079,208 @@ mod tests {
                 "{kernel:?}: an empty window must write zeros; idx {i} = {g}"
             );
         }
+    }
+
+    struct TempTestDir(std::path::PathBuf);
+
+    impl TempTestDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir()
+                .join(format!("cera-wgpu-test-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            Self(p)
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn pipeline_cache_helpers_sanitize_permissions_and_prune() {
+        assert_eq!(
+            super::sanitize_pipeline_cache_key("vulkan-10de_2684/../bad key\0!"),
+            "vulkan-10de_2684badkey"
+        );
+        assert_eq!(super::format_pipeline_cache_filename("///", "abc123"), None);
+        assert_eq!(super::format_pipeline_cache_filename("vk_key", ".."), None);
+        let (prefix, fname) =
+            super::format_pipeline_cache_filename("wgpu_vk-830", "fb296da9").unwrap();
+        assert_eq!(prefix, "wgpu_vk-830");
+        assert_eq!(fname, "wgpu_vk-830-fb296da9.bin");
+
+        let tmp = TempTestDir::new("pcache");
+        let dir = tmp.0.join("nested").join("cache");
+        super::ensure_private_pipeline_cache_dir(&dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = std::fs::symlink_metadata(&dir).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+            // Loose directory permissions get tightened back to 0700.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            super::ensure_private_pipeline_cache_dir(&dir).unwrap();
+            let tightened = std::fs::symlink_metadata(&dir).unwrap().mode() & 0o777;
+            assert_eq!(tightened, 0o700);
+        }
+
+        // File in place of directory must be rejected.
+        let file_as_dir = tmp.0.join("not_a_dir");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        assert!(super::ensure_private_pipeline_cache_dir(&file_as_dir).is_err());
+
+        // Atomic write + verified read round-trip.
+        let cur_path = dir.join(&fname);
+        let payload = b"synthetic-driver-pipeline-cache-payload";
+        super::write_pipeline_cache_blob_atomic(&cur_path, payload).unwrap();
+        assert_eq!(
+            super::read_pipeline_cache_blob(&cur_path).as_deref(),
+            Some(&payload[..])
+        );
+
+        // Empty files are ignored.
+        let empty_path = dir.join("empty.bin");
+        std::fs::write(&empty_path, b"").unwrap();
+        assert!(super::read_pipeline_cache_blob(&empty_path).is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Group/world-writable cache blobs must be rejected.
+            let loose_blob = dir.join("loose.bin");
+            std::fs::write(&loose_blob, b"abc").unwrap();
+            std::fs::set_permissions(&loose_blob, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(super::read_pipeline_cache_blob(&loose_blob).is_none());
+
+            // Symlinks must be rejected by both directory check and blob reader.
+            let link_blob = dir.join("symlink.bin");
+            std::os::unix::fs::symlink(&cur_path, &link_blob).unwrap();
+            assert!(super::read_pipeline_cache_blob(&link_blob).is_none());
+
+            let link_dir = tmp.0.join("symlink_dir");
+            std::os::unix::fs::symlink(&dir, &link_dir).unwrap();
+            assert!(super::ensure_private_pipeline_cache_dir(&link_dir).is_err());
+        }
+
+        // Stale git-SHA caches for the same adapter key are pruned, while current
+        // and unrelated adapter keys remain untouched.
+        let stale_a = dir.join("wgpu_vk-830-0000aaaa.bin");
+        let stale_b = dir.join("wgpu_vk-830-1111bbbb.bin");
+        let other_gpu = dir.join("wgpu_vk-other-0000aaaa.bin");
+        std::fs::write(&stale_a, b"old_a").unwrap();
+        std::fs::write(&stale_b, b"old_b").unwrap();
+        std::fs::write(&other_gpu, b"other").unwrap();
+
+        super::prune_stale_pipeline_caches(&dir, &prefix, &fname);
+        assert!(cur_path.exists());
+        assert!(!stale_a.exists());
+        assert!(!stale_b.exists());
+        assert!(other_gpu.exists());
+    }
+
+    #[test]
+    fn gpu_pipeline_cache_corrupt_blob_falls_back_cleanly() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        if !ctx
+            .device
+            .features()
+            .contains(wgpu::Features::PIPELINE_CACHE)
+        {
+            return;
+        }
+        let corrupt = b"corrupt-non-driver-pipeline-cache-header-0123456789";
+        let cache = unsafe {
+            ctx.device
+                .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("test_corrupt_pipeline_cache"),
+                    data: Some(corrupt),
+                    fallback: true,
+                })
+        };
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pcache_smoke_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    "@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+                     @compute @workgroup_size(1) fn main() { out[0] = 42u; }"
+                        .into(),
+                ),
+            });
+        let pipe = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pcache_smoke_pipe"),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: Some(&cache),
+            });
+        let out = ctx.create_storage_rw(4, "pcache_smoke_out");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: out.as_entire_binding(),
+            }],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        assert_eq!(ctx.download_u32(&out, 1), vec![42]);
+        // Second save with unchanged pipelines is a no-op.
+        ctx.save_pipeline_cache();
+        ctx.save_pipeline_cache();
+    }
+
+    #[test]
+    fn gpu_finish_mapped_u32_and_f32_on_submit() {
+        let Some(ctx) = gpu_or_skip() else { return };
+
+        let src_u32 = ctx.upload_storage(bytemuck::cast_slice(&[7u32, 13, 29, 99]), "src_u32");
+        let stage_u32 = ctx.create_readback_buffer(16, "stage_u32");
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&src_u32, 0, &stage_u32, 0, 16);
+        let (tx_u32, rx_u32) = std::sync::mpsc::channel();
+        enc.map_buffer_on_submit(&stage_u32, wgpu::MapMode::Read, 0..16, move |r| {
+            let _ = tx_u32.send(r);
+        });
+        assert!(ctx.try_submit_encoder(enc));
+        assert_eq!(
+            ctx.finish_mapped_u32(&stage_u32, 4, Some(rx_u32)),
+            vec![7, 13, 29, 99]
+        );
+
+        let want_f32 = vec![-1.5f32, 0.25, 3.75, 42.0, -8.125];
+        let src_f32 = ctx.upload_f32(&want_f32, "src_f32");
+        let stage_f32 = ctx.create_readback_buffer(32, "stage_f32");
+        let mut enc2 = ctx.device.create_command_encoder(&Default::default());
+        enc2.copy_buffer_to_buffer(&src_f32, 0, &stage_f32, 0, 20);
+        let cmd2 = enc2.finish();
+        let (tx_f32, rx_f32) = std::sync::mpsc::channel();
+        cmd2.map_buffer_on_submit(&stage_f32, wgpu::MapMode::Read, 0..20, move |r| {
+            let _ = tx_f32.send(r);
+        });
+        assert!(ctx.try_submit_command_buffer(cmd2));
+        assert_eq!(ctx.finish_mapped_f32(&stage_f32, 5, Some(rx_f32)), want_f32);
+
+        // `rx: None` fallback exercises `read_mapped_f32` / `read_mapped_u32` cleanly.
+        let mut enc3 = ctx.device.create_command_encoder(&Default::default());
+        enc3.copy_buffer_to_buffer(&src_f32, 0, &stage_f32, 0, 20);
+        assert!(ctx.try_submit_encoder(enc3));
+        assert_eq!(ctx.finish_mapped_f32(&stage_f32, 5, None), want_f32);
     }
 }

@@ -909,6 +909,7 @@ pub enum WgpuVitWeight {
 /// Requires `k % 32 == 0`; when `k % 64 == 32`, the trailing 32-element half-slice is zero-padded.
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    use crate::par::*;
     assert!(
         m > 0 && k > 0 && k.is_multiple_of(32),
         "q8_0 streaming repack needs m > 0, k > 0, and k % 32 == 0, got m={m}, k={k}"
@@ -920,24 +921,42 @@ pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, 
         m * blocks_per_row * 34,
         "q8_0 repack: wrong byte count"
     );
+    const ROW_TILE: usize = 64;
     let mut q = vec![0u32; m * k_pad / 4];
     let mut d = vec![0u32; m * (k_pad / 64)];
-    for row in 0..m {
-        for b in 0..blocks_per_row {
-            let base = (row * blocks_per_row + b) * 34;
-            let scale_bits = u16::from_le_bytes([data[base], data[base + 1]]) as u32;
-            let pair = b / 2;
-            if b % 2 == 0 {
-                d[pair * m + row] = scale_bits;
+
+    q[..blocks_per_row * 8 * m]
+        .par_chunks_mut(8 * m)
+        .enumerate()
+        .for_each(|(b, q_blk)| {
+            for row_base in (0..m).step_by(ROW_TILE) {
+                let row_end = (row_base + ROW_TILE).min(m);
+                for row in row_base..row_end {
+                    let base = (row * blocks_per_row + b) * 34;
+                    for w in 0..8 {
+                        let src = &data[base + 2 + w * 4..base + 2 + w * 4 + 4];
+                        q_blk[w * m + row] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                    }
+                }
+            }
+        });
+
+    d.par_chunks_mut(m).enumerate().for_each(|(pair, d_pair)| {
+        let b0 = pair * 2;
+        let b1 = b0 + 1;
+        for (row, out) in d_pair.iter_mut().enumerate() {
+            let base0 = (row * blocks_per_row + b0) * 34;
+            let s0 = u16::from_le_bytes([data[base0], data[base0 + 1]]) as u32;
+            let s1 = if b1 < blocks_per_row {
+                let base1 = base0 + 34;
+                u16::from_le_bytes([data[base1], data[base1 + 1]]) as u32
             } else {
-                d[pair * m + row] |= scale_bits << 16;
-            }
-            for w in 0..8 {
-                let src = &data[base + 2 + w * 4..base + 2 + w * 4 + 4];
-                q[(b * 8 + w) * m + row] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-            }
+                0
+            };
+            *out = s0 | (s1 << 16);
         }
-    }
+    });
+
     (q, d)
 }
 
@@ -947,6 +966,7 @@ pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, 
 /// LFM2.5-VL-1.6B's `ffn_down` with `k = 4304`).
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_f16_as_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    use crate::par::*;
     assert!(
         m > 0 && k > 0,
         "f16 streaming repack needs m > 0 and k > 0, got m={m}, k={k}"
@@ -956,47 +976,78 @@ pub(crate) fn repack_f16_as_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec
         m * k * 2,
         "f16 streaming repack: wrong byte count"
     );
+    const ROW_TILE: usize = 64;
     let k_pad = k.next_multiple_of(64);
     let blocks_per_row = k.div_ceil(32);
     let mut q = vec![0u32; m * k_pad / 4];
     let mut d = vec![0u32; m * (k_pad / 64)];
-    for row in 0..m {
-        let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
-        for b in 0..blocks_per_row {
-            let col_start = b * 32;
-            let valid = (k - col_start).min(32);
-            let mut block = [0.0f32; 32];
-            let mut amax = 0.0f32;
-            for (i, dst) in block[..valid].iter_mut().enumerate() {
-                let off = (col_start + i) * 2;
-                let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
-                let val = half::f16::from_bits(bits).to_f32();
-                *dst = val;
-                let a = val.abs();
-                if a > amax {
-                    amax = a;
-                }
-            }
-            let scale_f32 = amax / 127.0;
-            let scale_f16 = half::f16::from_f32(scale_f32);
-            let scale_bits = scale_f16.to_bits() as u32;
-            let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-            let pair = b / 2;
-            if b % 2 == 0 {
-                d[pair * m + row] = scale_bits;
-            } else {
-                d[pair * m + row] |= scale_bits << 16;
-            }
-            for w in 0..8 {
-                let mut bytes = [0u8; 4];
-                for j in 0..4 {
-                    let qi = (block[w * 4 + j] * inv_scale).round().clamp(-127.0, 127.0) as i8;
-                    bytes[j] = qi as u8;
-                }
-                q[(b * 8 + w) * m + row] = u32::from_le_bytes(bytes);
+
+    let block_amax = |row_bytes: &[u8], b: usize| -> f32 {
+        let col_start = b * 32;
+        let valid = (k - col_start).min(32);
+        let mut amax = 0.0f32;
+        for i in 0..valid {
+            let off = (col_start + i) * 2;
+            let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
+            let a = half::f16::from_bits(bits).to_f32().abs();
+            if a > amax {
+                amax = a;
             }
         }
-    }
+        amax
+    };
+
+    q[..blocks_per_row * 8 * m]
+        .par_chunks_mut(8 * m)
+        .enumerate()
+        .for_each(|(b, q_blk)| {
+            let col_start = b * 32;
+            let valid = (k - col_start).min(32);
+            for row_base in (0..m).step_by(ROW_TILE) {
+                let row_end = (row_base + ROW_TILE).min(m);
+                for row in row_base..row_end {
+                    let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
+                    let mut block = [0.0f32; 32];
+                    let mut amax = 0.0f32;
+                    for (i, dst) in block[..valid].iter_mut().enumerate() {
+                        let off = (col_start + i) * 2;
+                        let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
+                        let val = half::f16::from_bits(bits).to_f32();
+                        *dst = val;
+                        let a = val.abs();
+                        if a > amax {
+                            amax = a;
+                        }
+                    }
+                    let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    for w in 0..8 {
+                        let mut bytes = [0u8; 4];
+                        for j in 0..4 {
+                            let qi =
+                                (block[w * 4 + j] * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                            bytes[j] = qi as u8;
+                        }
+                        q_blk[w * m + row] = u32::from_le_bytes(bytes);
+                    }
+                }
+            }
+        });
+
+    d.par_chunks_mut(m).enumerate().for_each(|(pair, d_pair)| {
+        let b0 = pair * 2;
+        let b1 = b0 + 1;
+        for (row, out) in d_pair.iter_mut().enumerate() {
+            let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
+            let s0 = half::f16::from_f32(block_amax(row_bytes, b0) / 127.0).to_bits() as u32;
+            let s1 = if b1 < blocks_per_row {
+                half::f16::from_f32(block_amax(row_bytes, b1) / 127.0).to_bits() as u32
+            } else {
+                0
+            };
+            *out = s0 | (s1 << 16);
+        }
+    });
+
     (q, d)
 }
 
@@ -1266,7 +1317,10 @@ impl WgpuVitOps {
                 p_mul_mat_q8_0,
                 p_mul_mat_q4_0,
                 p_linear,
-                ctx,
+                ctx: {
+                    ctx.save_pipeline_cache();
+                    ctx
+                },
                 #[cfg(test)]
                 flash_dispatches: std::sync::atomic::AtomicU32::new(0),
             }

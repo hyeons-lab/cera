@@ -551,6 +551,7 @@ impl WgpuAudioDecoder {
             }
         };
 
+        ctx.save_pipeline_cache();
         Ok(Self {
             ctx,
             cfg,

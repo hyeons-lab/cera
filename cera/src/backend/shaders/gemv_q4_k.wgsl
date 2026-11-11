@@ -30,6 +30,12 @@
 // does NOT hold for the 2-byte-aligned blocks (Q6_K 210 B, Q4_0 18 B, Q8_0
 // 34 B) — those need a funnel-shift and keep the per-byte path for now.
 
+#ifdef SUBGROUP
+#ifdef WEBGPU_SUBGROUPS
+enable subgroups;
+#endif
+#endif
+
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
@@ -41,10 +47,19 @@
 
 const QK_K: u32 = 256u;
 const Q4K_BYTES: u32 = 144u;
+#ifdef SUBGROUP
+const NR: u32 = 4u;
+const WG_SIZE: u32 = 64u;
+const NQ: u32 = 2u;
+const MAX_SUBGROUPS: u32 = 64u;
+
+var<workgroup> sg_sums: array<f32, NR * MAX_SUBGROUPS>;
+#else
 const NR: u32 = 2u;
 const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, 64>;
+#endif
 
 // Extract byte `b` (0..=11) of the 12-byte scales array from its three
 // preloaded words `s0`/`s1`/`s2` — equals the old `rb(scales_off + b)`.
@@ -84,6 +99,148 @@ fn dq(w: u32, byte: u32, hi: u32, scale: f32, minv: f32) -> f32 {
     return scale * f32(nib) - minv;
 }
 
+fn q4k_block_dot(
+    blk: u32,
+    sub: u32,
+    qbase: u32,
+    hi: u32,
+    xl0: f32,
+    xl1: f32,
+    xl2: f32,
+    xl3: f32,
+    xl4: f32,
+    xl5: f32,
+    xl6: f32,
+    xl7: f32,
+) -> f32 {
+    let ddm = unpack2x16float(a[blk / 4u]);
+    let d = ddm.x;
+    let dmin = ddm.y;
+    let sw = blk / 4u + 1u;
+    let s0 = a[sw];
+    let s1 = a[sw + 1u];
+    let s2 = a[sw + 2u];
+    let scale = d * f32(q4k_sc(s0, s1, s2, sub));
+    let minv = dmin * f32(q4k_mn(s0, s1, s2, sub));
+    let qw = (blk + 16u + qbase) / 4u;
+    let qw0 = a[qw];
+    let qw1 = a[qw + 1u];
+
+    var s = 0.0;
+    s += dq(qw0, 0u, hi, scale, minv) * xl0;
+    s += dq(qw0, 1u, hi, scale, minv) * xl1;
+    s += dq(qw0, 2u, hi, scale, minv) * xl2;
+    s += dq(qw0, 3u, hi, scale, minv) * xl3;
+    s += dq(qw1, 0u, hi, scale, minv) * xl4;
+    s += dq(qw1, 1u, hi, scale, minv) * xl5;
+    s += dq(qw1, 2u, hi, scale, minv) * xl6;
+    s += dq(qw1, 3u, hi, scale, minv) * xl7;
+    return s;
+}
+
+#ifdef SUBGROUP
+@compute @workgroup_size(64, 1, 1)
+fn gemv_q4_k(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
+) {
+    let m = params.x;
+    let k = params.y;
+    let first_row = get_wid(wid) * NR;
+    if first_row >= m {
+        return;
+    }
+
+    let nb = k / QK_K;
+    let row_bytes = nb * Q4K_BYTES;
+    let tid = lid.x;
+    let slot = tid / 32u;
+    let tiisg = tid % 32u;
+
+    let e0 = tiisg * 8u;
+    let j = e0 / 64u;
+    let o = e0 % 64u;
+    let hi = o / 32u;
+    let sub = 2u * j + hi;
+    let qbase = 32u * j + (o % 32u);
+
+    var sumf0: f32 = 0.0;
+    var sumf1: f32 = 0.0;
+    var sumf2: f32 = 0.0;
+    var sumf3: f32 = 0.0;
+
+    for (var ib_base = 0u; ib_base < nb; ib_base += NQ) {
+        let ib = ib_base + slot;
+        if ib < nb {
+            let x_off = ib * QK_K + e0;
+            let xl0 = x[x_off + 0u];
+            let xl1 = x[x_off + 1u];
+            let xl2 = x[x_off + 2u];
+            let xl3 = x[x_off + 3u];
+            let xl4 = x[x_off + 4u];
+            let xl5 = x[x_off + 5u];
+            let xl6 = x[x_off + 6u];
+            let xl7 = x[x_off + 7u];
+
+            let b_off = ib * Q4K_BYTES;
+            sumf0 += q4k_block_dot(first_row * row_bytes + b_off, sub, qbase, hi, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7);
+            if first_row + 1u < m {
+                sumf1 += q4k_block_dot((first_row + 1u) * row_bytes + b_off, sub, qbase, hi, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7);
+            }
+            if first_row + 2u < m {
+                sumf2 += q4k_block_dot((first_row + 2u) * row_bytes + b_off, sub, qbase, hi, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7);
+            }
+            if first_row + 3u < m {
+                sumf3 += q4k_block_dot((first_row + 3u) * row_bytes + b_off, sub, qbase, hi, xl0, xl1, xl2, xl3, xl4, xl5, xl6, xl7);
+            }
+        }
+    }
+
+    let s0 = subgroupAdd(sumf0);
+    let s1 = subgroupAdd(sumf1);
+    let s2 = subgroupAdd(sumf2);
+    let s3 = subgroupAdd(sumf3);
+
+    let nsg = (WG_SIZE + sg_size - 1u) / sg_size;
+    if nsg == 1u {
+        if tid == 0u {
+            y[first_row] = s0;
+            if first_row + 1u < m { y[first_row + 1u] = s1; }
+            if first_row + 2u < m { y[first_row + 2u] = s2; }
+            if first_row + 3u < m { y[first_row + 3u] = s3; }
+        }
+        return;
+    }
+
+    let sgid = tid / sg_size;
+    if sg_lane == 0u {
+        sg_sums[0u * MAX_SUBGROUPS + sgid] = s0;
+        sg_sums[1u * MAX_SUBGROUPS + sgid] = s1;
+        sg_sums[2u * MAX_SUBGROUPS + sgid] = s2;
+        sg_sums[3u * MAX_SUBGROUPS + sgid] = s3;
+    }
+    workgroupBarrier();
+
+    if tid == 0u {
+        var t0: f32 = 0.0;
+        var t1: f32 = 0.0;
+        var t2: f32 = 0.0;
+        var t3: f32 = 0.0;
+        for (var sg = 0u; sg < nsg; sg += 1u) {
+            t0 += sg_sums[0u * MAX_SUBGROUPS + sg];
+            t1 += sg_sums[1u * MAX_SUBGROUPS + sg];
+            t2 += sg_sums[2u * MAX_SUBGROUPS + sg];
+            t3 += sg_sums[3u * MAX_SUBGROUPS + sg];
+        }
+        y[first_row] = t0;
+        if first_row + 1u < m { y[first_row + 1u] = t1; }
+        if first_row + 2u < m { y[first_row + 2u] = t2; }
+        if first_row + 3u < m { y[first_row + 3u] = t3; }
+    }
+}
+#else
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q4_k(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -180,3 +337,4 @@ fn gemv_q4_k(
         if first_row + 1u < m { y[first_row + 1u] = partials[1u * WG_SIZE]; }
     }
 }
+#endif
