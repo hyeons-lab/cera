@@ -14,10 +14,25 @@
 // cap. Correct-first-cut kernel — the LoRA GEMMs are tiny (rank ≤ 64), so this
 // isn't a hot path. Mirrors `gemm_f32.metal`.
 
-@group(0) @binding(0) var<storage, read> lhs: array<f32>;        // [M×K] row-major
-@group(0) @binding(1) var<storage, read> rhs: array<f32>;        // [N×K] row-major (accessed transposed)
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;  // [M×N] row-major
-@group(0) @binding(3) var<storage, read> params: vec4<u32>;      // (m, n, k, 0)
+@group(0) @binding(0) var<storage, read> lhs: array<f32>;
+@group(0) @binding(1) var<storage, read> rhs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+#ifdef IMMEDIATES
+struct ImmParams {
+    v: vec4<u32>,
+}
+var<immediate> imm: ImmParams;
+#else
+@group(0) @binding(3) var<storage, read> params: vec4<u32>;
+#endif
+
+fn get_params() -> vec4<u32> {
+#ifdef IMMEDIATES
+    return imm.v;
+#else
+    return params;
+#endif
+}
 
 #include "common_decls.tmpl"
 
@@ -57,9 +72,10 @@ fn gemm_f32_nt(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
-    let m = params.x;
-    let n = params.y;
-    let k = params.z;
+    let p = get_params();
+    let m = p.x;
+    let n = p.y;
+    let k = p.z;
     let idx = get_wid(wid);
     if idx >= m * n { return; }
     let i = idx / n; // lhs row (token)
@@ -68,18 +84,18 @@ fn gemm_f32_nt(
     if lid.x == 0u { out[idx] = v; }
 }
 
-// Accumulate variant: `C += Lhs · Rhsᵀ`. Same layout/dispatch as `gemm_f32_nt`;
-// used for the LoRA up-projection epilogue (`Y[n×d] += Tmp[n×rank]·Bᵀ`), where
-// the `alpha/rank` scale is pre-folded into the uploaded `B` so there is no
-// separate scale pass.
+// Accumulate variant: `C += Lhs * Rhs^T`. Same layout/dispatch as `gemm_f32_nt`;
+// used for the LoRA up-projection epilogue, where the `alpha/rank` scale is
+// pre-folded into the uploaded `B` so there is no separate scale pass.
 @compute @workgroup_size(32, 1, 1)
 fn gemm_f32_nt_accum(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
-    let m = params.x;
-    let n = params.y;
-    let k = params.z;
+    let p = get_params();
+    let m = p.x;
+    let n = p.y;
+    let k = p.z;
     let idx = get_wid(wid);
     if idx >= m * n { return; }
     let i = idx / n;

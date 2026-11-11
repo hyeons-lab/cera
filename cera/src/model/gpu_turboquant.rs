@@ -281,6 +281,7 @@ impl TqGpuCache {
             ),
         };
 
+        ctx.save_pipeline_cache();
         Ok(Self {
             mode,
             layout,
