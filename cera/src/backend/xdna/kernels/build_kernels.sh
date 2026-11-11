@@ -7,15 +7,18 @@
 #
 #   bash build_kernels.sh            # rebuild all artifacts in place
 #
-# Artifacts: q4layer (fused Llama-3.2-1B layer) and q4head (131072x2048
-# GEMV for the padded LM head). After rebuilding, update the SHA-256 table
-# in README.md; CI compares the table against the committed files.
+# Artifacts: q4layer (fused Llama-3.2-1B layer, default 9 KV chunks plus
+# bucketed c1/c2/c4/c6 instruction streams sharing q4layer.xclbin) and q4head
+# (131072x2048 GEMV for the padded LM head). After rebuilding, update the
+# SHA-256 table in README.md; CI compares the table against the committed files.
 set -eo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DST="$HOME/xdna-iron/kernels-build"
-mkdir -p "$DST"
+OUT="$DST/out"
+rm -rf "$DST/iron" "$OUT"
+mkdir -p "$OUT"
 cp -r "$HERE/iron" "$DST/"
-python3 - "$DST" <<'PY'
+python3 - "$DST/iron" <<'PY'
 import pathlib, sys
 for p in pathlib.Path(sys.argv[1]).rglob("*"):
     if p.is_file():
@@ -32,14 +35,36 @@ set -- "${ARGS[@]}"
 set -u
 export PATH="$IRON_HOME/xrt-local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$IRON_HOME/xrt-local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
-# The IRON JIT cache (.prj next to an artifact) does not notice kernel-source
-# changes; never let a stale one survive a rebuild.
-rm -rf "$HERE/q4layer.prj" "$HERE/q4head.prj"
+
+# Build full 9-chunk q4layer xclbin + instruction stream on native ext4.
 python3 "$DST/iron/q4layer/q4layer.py" --dev npu2 \
-  --xclbin-path="$HERE/q4layer.xclbin" --insts-path="$HERE/insts_q4layer.bin"
-rm -rf "$HERE/q4layer.prj" "$HERE/q4head.prj"
+  --xclbin-path="$OUT/q4layer.xclbin" --insts-path="$OUT/insts_q4layer.bin"
+
+ELF="$(find "$OUT/q4layer.prj" -name 'core_*.elf' | head -n 1)"
+if [[ -n "$ELF" ]]; then
+  echo "=== Core ELF size ($ELF) ==="
+  "$PEANO_INSTALL_DIR/bin/llvm-size" "$ELF"
+fi
+rm -rf "$OUT/q4layer.prj"
+
+# Emit bucketed KV-chunk instruction streams (all share q4layer.xclbin).
+for c in 1 2 3 4 5 6 7 8; do
+  Q4LAYER_KV_CHUNKS="$c" python3 "$DST/iron/q4layer/q4layer.py" --dev npu2 \
+    --xclbin-path="$OUT/tmp_c${c}.xclbin" --insts-path="$OUT/insts_q4layer_c${c}.bin"
+  rm -rf "$OUT/tmp_c${c}.prj" "$OUT/tmp_c${c}.xclbin"
+done
+
+# Emit q4head instruction stream (shares q4layer.xclbin).
 Q4LAYER_HEAD=1 python3 "$DST/iron/q4layer/q4layer.py" --dev npu2 \
-  --xclbin-path="$HERE/q4head.xclbin" --insts-path="$HERE/insts_q4head.bin"
-cp "$HERE/q4layer.xclbin" "$HERE/q4head.xclbin"
-rm -rf "$HERE/q4layer.prj" "$HERE/q4head.prj"
-echo "rebuilt q4layer and q4head artifacts in $HERE"
+  --xclbin-path="$OUT/tmp_head.xclbin" --insts-path="$OUT/insts_q4head.bin"
+rm -rf "$OUT/tmp_head.prj" "$OUT/tmp_head.xclbin"
+
+cp "$OUT/q4layer.xclbin" "$HERE/q4layer.xclbin"
+cp "$OUT/q4layer.xclbin" "$HERE/q4head.xclbin"
+cp "$OUT/insts_q4layer.bin" "$HERE/insts_q4layer.bin"
+for c in 1 2 3 4 5 6 7 8; do
+  cp "$OUT/insts_q4layer_c${c}.bin" "$HERE/insts_q4layer_c${c}.bin"
+done
+cp "$OUT/insts_q4head.bin" "$HERE/insts_q4head.bin"
+ls -lh "$HERE"/*.bin "$HERE"/*.xclbin
+echo "rebuilt q4layer (c1..c9) and q4head artifacts in $HERE"

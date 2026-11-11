@@ -29,8 +29,16 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <map>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #define CERA_XDNA_API extern "C" __declspec(dllexport)
 
@@ -87,6 +95,9 @@ CERA_XDNA_API uint32_t cera_xdna_shim_abi(void) { return CERA_XDNA_SHIM_ABI; }
 
 CERA_XDNA_API int cera_xdna_device_open(uint32_t index, cera_xdna_device** out, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+#ifdef _WIN32
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+#endif
     *out = new cera_xdna_device{xrt::device(index)};
     return 0;
   });
@@ -97,6 +108,9 @@ CERA_XDNA_API void cera_xdna_device_free(cera_xdna_device* d) {
     delete d;
   } catch (...) {
   }
+#ifdef _WIN32
+  SetThreadExecutionState(ES_CONTINUOUS);
+#endif
 }
 
 // Writes the device's BDF-style identifier (for logs) into buf.
@@ -129,7 +143,27 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
         k->kernel = d->kernel;
       } else {
         k->dev.register_xclbin(x);
-        k->ctx = xrt::hw_context(k->dev, x.get_uuid());
+        // Vote for high-throughput, low-latency NPU DPM clocks via XRT QoS
+        // (analogous to Hexagon's FASTRPC_CONTROL_LATENCY), falling back to a
+        // lighter QoS hint or default shared context if resource limits reject it.
+        bool created = false;
+        for (uint32_t gops : {40000u, 8000u, 1000u}) {
+          try {
+            xrt::hw_context::cfg_param_type qos{
+                {"gops", gops},
+                {"fps", 100},
+                {"dma_bandwidth", 55},
+                {"latency", 10},
+            };
+            k->ctx = xrt::hw_context(k->dev, x.get_uuid(), qos);
+            created = true;
+            break;
+          } catch (...) {
+          }
+        }
+        if (!created) {
+          k->ctx = xrt::hw_context(k->dev, x.get_uuid());
+        }
         k->kernel = xrt::kernel(k->ctx, name);
         d->ctx_uuid = x.get_uuid();
         d->ctx = k->ctx;
@@ -218,6 +252,9 @@ CERA_XDNA_API int cera_xdna_run_create(cera_xdna_kernel* k, cera_xdna_bo* const*
 
 CERA_XDNA_API int cera_xdna_run_start(cera_xdna_run* r, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+#ifdef _WIN32
+    SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+#endif
     r->run.start();
     return 0;
   });
@@ -263,6 +300,11 @@ CERA_XDNA_API int cera_xdna_runlist_add(cera_xdna_runlist* l, cera_xdna_run* r, 
 
 CERA_XDNA_API int cera_xdna_runlist_execute(cera_xdna_runlist* l, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+#ifdef _WIN32
+    // Prevent Windows Modern Standby / display-off SoC fabric downclocking
+    // during active NPU decode turns (see docs/XDNA_PHASE0_RESULTS.md sec. 0).
+    SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+#endif
     l->list.execute();
     return 0;
   });

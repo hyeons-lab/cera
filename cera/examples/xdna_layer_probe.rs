@@ -8,7 +8,9 @@
 
 use cera::backend::xdna::XdnaDevice;
 use cera::backend::xdna::kernels::{Q4LAYER_INSTS, Q4LAYER_XCLBIN, inst_words};
-use cera::backend::xdna::repack::{f32_to_bf16, pack_f32_stage, stage_bytes};
+use cera::backend::xdna::repack::{
+    f32_to_bf16, interleave_worker_stages, pack_f32_stage, stage_bytes,
+};
 use std::process::ExitCode;
 
 const ACT_SLOT: usize = 8192;
@@ -111,22 +113,31 @@ fn main() -> ExitCode {
         }
     };
     let mut stage_weights: Vec<Vec<f32>> = Vec::new();
+    let mut stage_packed: Vec<Vec<u8>> = Vec::new();
     {
-        let w = bo_w.as_mut_slice();
-        let mut base = 0usize;
         let mut rng = Rng(2024);
         for &(_, m, k, _) in &STAGES {
             let weights: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
-            let written = match pack_f32_stage(&mut w[base..], &weights, m, k) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            base += written;
+            let mut buf = vec![0u8; stage_bytes(m, k).unwrap()];
+            if let Err(e) = pack_f32_stage(&mut buf, &weights, m, k) {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+            stage_packed.push(buf);
             stage_weights.push(weights);
         }
+        let w = bo_w.as_mut_slice();
+        let mut off = 0usize;
+        off += interleave_worker_stages(
+            &mut w[off..],
+            &[&stage_packed[0], &stage_packed[1], &stage_packed[2]],
+        )
+        .unwrap();
+        w[off..off + stage_packed[3].len()].copy_from_slice(&stage_packed[3]);
+        off += stage_packed[3].len();
+        off +=
+            interleave_worker_stages(&mut w[off..], &[&stage_packed[4], &stage_packed[5]]).unwrap();
+        w[off..off + stage_packed[6].len()].copy_from_slice(&stage_packed[6]);
     }
     if let Err(e) = bo_w.sync(true) {
         eprintln!("{e}");
@@ -285,12 +296,6 @@ fn main() -> ExitCode {
             for (v, w) in input.iter_mut().zip(nw) {
                 *v = *v * inv * w;
             }
-        } else if in_slot == 5 {
-            // SiLU(gate) * up folded into the kernel's quantize pass.
-            let up = &slots[6 * ACT_SLOT..6 * ACT_SLOT + k];
-            for (g, &u) in input.iter_mut().zip(up) {
-                *g = (*g / (1.0 + (-*g).exp())) * u;
-            }
         }
         // Q8_0-style activation quantization, round half away from zero.
         let nb = k / 32;
@@ -355,13 +360,31 @@ fn main() -> ExitCode {
                 }
             }
         }
+        if out_slot == 5 {
+            // Stage 4 (gate) stays on-core in gate_local; save host reference in slot 6
+            // so Stage 5 (up) can fold SiLU(gate) * up and verify against slot 5.
+            for r in 0..m {
+                slots[6 * ACT_SLOT + r] = raw_ref[r] as f32;
+            }
+            println!("  stage {si} ({m}x{k} -> L1 gate_local): on-core (verified via stage 5)");
+            continue;
+        }
+        let verify_slot = if out_slot == 6 { 5 } else { out_slot };
+        if out_slot == 6 {
+            for r in 0..m {
+                let g = slots[6 * ACT_SLOT + r] as f64;
+                let silu_g = g / (1.0 + (-g).exp());
+                raw_ref[r] *= silu_g;
+                raw_mag[r] *= silu_g.abs().max(1.0);
+            }
+        }
         let mut bad = 0usize;
         let mut worst = 0.0f64;
         for r in 0..m {
             let reference = raw_ref[r];
             let mag = raw_mag[r];
-            slots[out_slot * ACT_SLOT + r] = reference as f32;
-            let got = npu_slots[out_slot * ACT_SLOT + r] as f64;
+            slots[verify_slot * ACT_SLOT + r] = reference as f32;
+            let got = npu_slots[verify_slot * ACT_SLOT + r] as f64;
             let err = (got - reference).abs() / if mag > 0.0 { mag } else { 1.0 };
             if err <= 1e-4 {
                 worst = worst.max(err);
@@ -370,7 +393,7 @@ fn main() -> ExitCode {
             }
         }
         println!(
-            "  stage {si} ({m}x{k} -> slot {out_slot}): {bad} of {m} rows off (worst ok {worst:.2e}) {}",
+            "  stage {si} ({m}x{k} -> slot {verify_slot}): {bad} of {m} rows off (worst ok {worst:.2e}) {}",
             if bad == 0 { "PASS" } else { "FAIL" }
         );
         bad_total += bad;
@@ -382,8 +405,7 @@ fn main() -> ExitCode {
             let scale = 1.0f64 / (HEAD_DIM as f64).sqrt();
             for qh in 0..N_HEADS {
                 let kvh = qh / (N_HEADS / N_KV_HEADS);
-                let q_slice =
-                    &slots[1 * ACT_SLOT + qh * HEAD_DIM..1 * ACT_SLOT + (qh + 1) * HEAD_DIM];
+                let q_slice = &slots[ACT_SLOT + qh * HEAD_DIM..ACT_SLOT + (qh + 1) * HEAD_DIM];
                 let mut scores = vec![0.0f64; n_tok];
                 let mut s_mags = vec![0.0f64; n_tok];
                 let mut max_s = f64::NEG_INFINITY;
@@ -425,7 +447,7 @@ fn main() -> ExitCode {
                         acc += w * v_val;
                         mag += w * v_val.abs() * (1.0 + s_mags[t]);
                     }
-                    let idx = 1 * ACT_SLOT + ATTN_OUT + qh * HEAD_DIM + d;
+                    let idx = ACT_SLOT + ATTN_OUT + qh * HEAD_DIM + d;
                     slots[idx] = acc as f32;
                     let got = npu_slots[idx] as f64;
                     let err = (got - acc).abs() / if mag > 0.0 { mag } else { 1.0 };

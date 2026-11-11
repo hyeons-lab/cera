@@ -9,18 +9,20 @@
 // accumulation); t encodes the tile and chunk as tile * TSTRIDE + chunk.
 //
 // q4_step modes (t):
-//   <= -200: online-softmax GQA attention step over k tokens (mode = -t - 200:
-//            bit 0 = init running max/sum/acc, bit 1 = normalize by 1/sum)
+//   <= -200: 16-token block online-softmax GQA attention step over k tokens
+//            (mode = -t - 200: bit 0 = init running max/sum/acc + split q,
+//            bit 1 = current f32 token + normalize by 1/sum)
 //   <= -110: drain 32 f32 attention outputs at offset (-t - 110) * 32
-//   -106: load 128 f32 RoPE cos/sin values for this worker's output rows
-//   <= -102: SiLU(gate) * up + quantize a 2048-wide chunk at x offset (-t - 102) * NORM_N
-//   -101: load 128 f32 residual (or query) values into res_x
-//   -100: RMSNorm + quantize a 2048-wide activation + weight pair (and if k > 0,
-//         load 128 f32 RoPE cos/sin values from slot + k)
-//   -2: quantize an f32 activation chunk at x offset 0
-//   <= -3: quantize an f32 activation chunk at x offset (-t - 3) * ACT_CHUNK
-//   >= 0: weight tile chunk; 16 outputs go to out[16 * (t / TSTRIDE) ..],
-//         accumulated when (t % TSTRIDE) != 0
+//   -100: RMSNorm + quantize a 2048-wide activation + weight pair; if
+//         k >= ROPE_CS (wid = k - ROPE_CS), saves worker's 128 residual floats
+//         and 64 RoPE cos/sin floats; else (wid = k), saves worker's 128 FFN
+//         residual floats and arms on-core gate->SiLU(gate)*up fusion
+//   -3: quantize k f32 activations (at offset 0 if k == NORM_N else ACT_CHUNK)
+//       and arm residual epilogue from res_x
+//   -2: quantize k f32 activations at offset 0
+//   >= 0: weight tile chunk; 16 outputs go to gate_local (gate_mode == 1) or
+//         out[16 * (t / TSTRIDE) ..] (with SiLU(gate_local) * up when
+//         gate_mode == 2, accumulated when (t % TSTRIDE) != 0)
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
@@ -38,28 +40,36 @@
 #define BLOCK_S_BYTES (ROWS * 2)
 #define NORM_N 2048
 #define NORM_EPS 1e-5f
+#define ROPE_CS 4096
 #define SILU_U_OFF 2304
 #define RES_N 128
 
 alignas(64) static int8_t x_q[KMAX];
 static float x_d[KMAX / QBLK];
 alignas(64) static float res_x[RES_N];
+alignas(64) static float saved_rope[64];
+alignas(64) static float gate_local[512];
 alignas(64) static float q_local[RES_N];
+alignas(64) static bfloat16 q_bf16[384];
 alignas(64) static float attn_acc[RES_N];
 alignas(64) static float attn_ml[64];
+alignas(64) static float scratch_f32[16];
+alignas(64) static bfloat16 p_bf16[16 * 48];
+alignas(64) static const int32_t lane_idx[16] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 static int32_t res_pos = -1;
 static int32_t rope_pos = -1;
+static int32_t k_rope_off = 0;
 static int32_t attn_rem = 0;
+static int32_t gate_mode = 0;
+static int32_t gate_idx = 0;
 
 // AIE2P emulates 16-lane f32 multiply in software using nine bf16xbf16 vector
 // multiplies (~208 bytes inline per call) and has no callee-saved vector
 // registers; keeping fmul_16 and inv_16 out-of-line avoids code duplication
 // across the 16 KB program memory budget.
-static __attribute__((noinline)) aie::vector<float, 16> fmul_16(aie::vector<float, 16> a, aie::vector<float, 16> b) {
-  return aie::mul(a, b).template to_vector<float>();
-}
-
-static inline aie::vector<float, 16> fmul_inline(aie::vector<float, 16> a, aie::vector<float, 16> b) {
+static __attribute__((noinline)) aie::vector<float, 16> fmul_16(
+    aie::vector<float, 16> a, aie::vector<float, 16> b) {
   return aie::mul(a, b).template to_vector<float>();
 }
 
@@ -71,10 +81,6 @@ static __attribute__((noinline)) aie::vector<float, 16> inv_16(aie::vector<float
 // Apache-2.0 WITH LLVM-exception): 2^x = p(f) * 2^k, k = round(x), f = x - k
 // in [-0.5, 0.5], holding ~2.4e-6 relative error where hardware
 // aie::exp2<bfloat16> is 6-49%.
-// Uses IEEE-754 float magic numbers (1.5 * 2^23 for round-to-nearest-even and
-// 1.5 * 2^16 + 127 = 98431.0f to place ((k + 127) << 7) in the low 16 bits of
-// each f32 lane, reinterpreted as bf16 2^k) so no int32 vector conversions are
-// pulled in.
 static __attribute__((noinline)) aie::vector<float, 16> exp2f_16(aie::vector<float, 16> x) {
   x = aie::max(x, aie::broadcast<float, 16>(-126.0f));
   x = aie::min(x, aie::broadcast<float, 16>(126.0f));
@@ -92,15 +98,14 @@ static __attribute__((noinline)) aie::vector<float, 16> exp2f_16(aie::vector<flo
   return aie::mul(p, ea.template to_vector<float>()).template to_vector<float>();
 }
 
-static __attribute__((noinline)) void load_res(const float *rf, int32_t mode) {
+static __attribute__((noinline)) void copy_f32_16x(float *dst, const float *src, int32_t n) {
 #pragma clang loop unroll(disable)
-  for (int i = 0; i < RES_N; i += 16)
-    aie::store_v(res_x + i, aie::load_v<16>(rf + i));
-  res_pos = mode ? -1 : 0;
-  rope_pos = mode == 1 ? 0 : mode == 2 ? RES_N : -1;
+  for (int i = 0; i < n; i += 16)
+    aie::store_v(dst + i, aie::load_v<16>(src + i));
 }
 
-static inline void split3_bf16(aie::vector<float, 16> x, bfloat16 *dst) {
+static __attribute__((noinline)) void split3_bf16(aie::vector<float, 16> x, bfloat16 *dst) {
+#pragma clang loop unroll(disable)
   for (int s = 0; s < 48; s += 16) {
     aie::accum<accfloat, 16> a;
     a.from_vector(x);
@@ -119,11 +124,13 @@ static inline aie::accum<accfloat, 16> mac3_bf16(
       v);
 }
 
-// Plain (mode == 0), RMSNorm (mode == 1), or SiLU(gate) * up (mode == 2) folded
-// into the quantize pass for one NORM_N-wide f32 activation chunk.
-static __attribute__((noinline)) void prep_quantize_x_f32(const float *slot, int32_t base, int32_t mode) {
+// Plain (mode == 0) or RMSNorm (mode == 1) folded into the quantize pass for a
+// k-wide f32 activation chunk (k and base are multiples of QBLK = 32).
+static __attribute__((noinline)) void prep_quantize_x_f32(
+    const float *slot, int32_t k, int32_t base, int32_t mode) {
   res_pos = -1;
   rope_pos = -1;
+  gate_mode = 0;
   float norm_s = 1.0f;
   if (mode == 1) {
     aie::accum<accfloat, 16> ssa = aie::zeros<accfloat, 16>();
@@ -132,28 +139,27 @@ static __attribute__((noinline)) void prep_quantize_x_f32(const float *slot, int
         ssa = aie::mac(ssa, v, v);
       }
     float ss = aie::reduce_add(ssa.template to_vector<float>());
-    aie::vector<float, 16> mean = fmul_16(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(1.0f / NORM_N));
+    aie::vector<float, 16> mean =
+        fmul_16(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(1.0f / NORM_N));
     norm_s = aie::invsqrt(aie::add(mean, aie::broadcast<float, 16>(NORM_EPS))).get(0);
   }
-  const float *wf = slot + (mode == 2 ? SILU_U_OFF : NORM_N);
+  const float *wf = slot + NORM_N;
 #pragma clang loop unroll(disable)
-  for (int b = 0; b < NORM_N / QBLK; ++b) {
+  for (int b = 0; b < (k >> 5); ++b) {
     const float *xf = slot + b * QBLK;
     if (mode > 0) {
+      aie::vector<float, 16> scale = aie::broadcast<float, 16>(norm_s);
 #pragma clang loop unroll(disable)
       for (int j = 0; j < QBLK; j += 16) {
-        aie::vector<float, 16> scale = aie::broadcast<float, 16>(norm_s);
-        if (mode == 2) {
-          aie::vector<float, 16> e = exp2f_16(fmul_16(aie::load_v<16>(xf + j), aie::broadcast<float, 16>(-1.4426950408889634f)));
-          scale = inv_16(aie::add(e, aie::broadcast<float, 16>(1.0f)));
-        }
-        aie::store_v(res_x + j, fmul_16(fmul_16(aie::load_v<16>(xf + j), scale), aie::load_v<16>(wf + b * QBLK + j)));
+        aie::store_v(
+            res_x + j,
+            fmul_16(fmul_16(aie::load_v<16>(xf + j), scale), aie::load_v<16>(wf + b * QBLK + j)));
       }
       xf = res_x;
     }
     float amax = aie::reduce_max(aie::max(aie::abs(aie::load_v<16>(xf)), aie::abs(aie::load_v<16>(xf + 16))));
     aie::vector<float, 16> dv = fmul_16(aie::broadcast<float, 16>(amax), aie::broadcast<float, 16>(1.0f / 127.0f));
-    x_d[base / QBLK + b] = dv.get(0);
+    x_d[(base >> 5) + b] = dv.get(0);
     aie::vector<float, 16> zero = aie::zeros<float, 16>();
     aie::vector<float, 16> idv = aie::select(zero, inv_16(dv), aie::lt(zero, dv));
     aie::vector<float, 16> s0 = fmul_16(aie::load_v<16>(xf), idv);
@@ -179,68 +185,91 @@ static __attribute__((noinline)) void attn_step(const float *slot, float *out, i
     float *qp = q_local + h * 64;
     float *acc = attn_acc + h * 64;
     float *ml = attn_ml + h * 32;
+    bfloat16 *qb = q_bf16 + h * 192;
     if (mode & 1) {
       aie::store_v(ml, aie::broadcast<float, 16>(-1e30f));
       aie::store_v(ml + 16, aie::zeros<float, 16>());
 #pragma clang loop unroll(disable)
       for (int d = 0; d < 64; d += 32)
         aie::store_v(acc + d, aie::zeros<float, 32>());
-    }
-    bfloat16 *qb = (bfloat16 *)res_x;
-#pragma clang loop unroll(disable)
-    for (int d = 0; d < 4; ++d) {
-      aie::vector<float, 16> qv = aie::load_v<16>(qp + d * 16);
-      if (mode & 1) {
-        qv = fmul_16(qv, aie::broadcast<float, 16>(0.18033688011112042f));
-        aie::store_v(qp + d * 16, qv);
-      }
-      split3_bf16(qv, qb + d * 48);
-    }
-#pragma clang loop unroll(disable)
-    for (int t = 0; t < n_tok; ++t) {
-      aie::accum<accfloat, 16> sa = aie::zeros<accfloat, 16>();
-      const bfloat16 *kb = (const bfloat16 *)slot + t * 64;
 #pragma clang loop unroll(disable)
       for (int d = 0; d < 4; ++d) {
-        if (mode & 2)
-          sa = aie::mac(sa, aie::load_v<16>(qp + d * 16), aie::load_v<16>(slot + d * 16));
-        else
-          sa = mac3_bf16(sa, qb + d * 48, aie::load_v<16>(kb + d * 16));
+        aie::vector<float, 16> qv =
+            fmul_16(aie::load_v<16>(qp + d * 16), aie::broadcast<float, 16>(0.18033688011112042f));
+        aie::store_v(qp + d * 16, qv);
+        split3_bf16(qv, qb + d * 48);
       }
+    }
+    if (mode & 2) {
+      aie::accum<accfloat, 16> sa = aie::zeros<accfloat, 16>();
+#pragma clang loop unroll(disable)
+      for (int d = 0; d < 64; d += 16)
+        sa = aie::mac(sa, aie::load_v<16>(qp + d), aie::load_v<16>(slot + d));
       aie::vector<float, 16> sv = aie::broadcast<float, 16>(aie::reduce_add(sa.template to_vector<float>()));
       aie::vector<float, 16> mv = aie::load_v<16>(ml);
-      bool rescale = (mode & 2) || aie::lt(mv, sv).test(0);
       aie::vector<float, 16> mnv = aie::max(sv, mv);
-      aie::store_v(ml, mnv);
-      aie::vector<float, 16> diff = aie::sub(aie::interleave_zip(mv, sv, 1).first, mnv);
-      aie::vector<float, 16> ev = exp2f_16(diff);
+      aie::vector<float, 16> ev = exp2f_16(aie::sub(aie::interleave_zip(mv, sv, 1).first, mnv));
       aie::vector<float, 16> cv = aie::broadcast<float, 16>(ev.get(0));
       aie::vector<float, 16> pv = aie::broadcast<float, 16>(ev.get(1));
-      aie::vector<float, 16> lv = aie::load_v<16>(ml + 16);
-      if (rescale)
-        lv = fmul_16(lv, cv);
-      lv = aie::add(pv, lv);
-      aie::store_v(ml + 16, lv);
-      if (mode & 2) {
-        aie::vector<float, 16> ilv = inv_16(lv);
-        cv = fmul_16(cv, ilv);
-        pv = fmul_16(pv, ilv);
-      }
-      split3_bf16(pv, qb + 192);
+      aie::vector<float, 16> lv = aie::add(pv, fmul_16(aie::load_v<16>(ml + 16), cv));
+      aie::vector<float, 16> ilv = inv_16(lv);
+      cv = fmul_16(cv, ilv);
+      pv = fmul_16(pv, ilv);
 #pragma clang loop unroll(disable)
       for (int d = 0; d < 64; d += 16) {
-        aie::vector<float, 16> av = aie::load_v<16>(acc + d);
-        if (rescale)
-          av = fmul_16(av, cv);
-        if (mode & 2) {
-          av = aie::add(av, fmul_16(pv, aie::load_v<16>(slot + SILU_U_OFF + d)));
-        } else {
+        aie::vector<float, 16> av = fmul_16(aie::load_v<16>(acc + d), cv);
+        av = aie::add(av, fmul_16(pv, aie::load_v<16>(slot + SILU_U_OFF + d)));
+        aie::store_v(acc + d, av);
+      }
+    } else {
+#pragma clang loop unroll(disable)
+      for (int t0 = 0; t0 < n_tok; t0 += 16) {
+        int32_t blk = n_tok - t0 < 16 ? n_tok - t0 : 16;
+        aie::store_v(scratch_f32, aie::broadcast<float, 16>(-1e30f));
+#pragma clang loop unroll(disable)
+        for (int j = 0; j < blk; ++j) {
+          aie::accum<accfloat, 16> sa = aie::zeros<accfloat, 16>();
+          const bfloat16 *kb = (const bfloat16 *)slot + (t0 + j) * 64;
+#pragma clang loop unroll(disable)
+          for (int d = 0; d < 4; ++d)
+            sa = mac3_bf16(sa, qb + d * 48, aie::load_v<16>(kb + d * 16));
+          scratch_f32[j] = aie::reduce_add(sa.template to_vector<float>());
+        }
+        aie::vector<float, 16> sv = aie::load_v<16>(scratch_f32);
+        aie::vector<float, 16> bmax = aie::broadcast<float, 16>(aie::reduce_max(sv));
+        aie::vector<float, 16> mv = aie::load_v<16>(ml);
+        bool rescale = aie::lt(mv, bmax).test(0);
+        aie::vector<float, 16> mnv = aie::max(bmax, mv);
+        aie::store_v(ml, mnv);
+        aie::vector<float, 16> ev = exp2f_16(aie::sub(sv, mnv));
+        auto valid = aie::lt(aie::load_v<16>(lane_idx), aie::broadcast<int32, 16>(blk));
+        ev = aie::select(aie::zeros<float, 16>(), ev, valid);
+        aie::store_v(scratch_f32, ev);
+        aie::vector<float, 16> lv = aie::load_v<16>(ml + 16);
+        aie::vector<float, 16> cv;
+        if (rescale) {
+          cv = exp2f_16(aie::sub(mv, mnv));
+          lv = fmul_16(lv, cv);
+        }
+        lv = aie::add(lv, aie::broadcast<float, 16>(aie::reduce_add(ev)));
+        aie::store_v(ml + 16, lv);
+
+#pragma clang loop unroll(disable)
+        for (int j = 0; j < blk; ++j)
+          split3_bf16(aie::broadcast<float, 16>(scratch_f32[j]), p_bf16 + j * 48);
+        const bfloat16 *vb0 = (const bfloat16 *)slot + SILU_U_OFF * 2 + t0 * 64;
+#pragma clang loop unroll(disable)
+        for (int d = 0; d < 64; d += 16) {
+          aie::vector<float, 16> av = aie::load_v<16>(acc + d);
+          if (rescale)
+            av = fmul_16(av, cv);
           aie::accum<accfloat, 16> va;
           va.from_vector(av);
-          va = mac3_bf16(va, qb + 192, aie::load_v<16>((const bfloat16 *)slot + SILU_U_OFF * 2 + t * 64 + d));
-          av = va.template to_vector<float>();
+#pragma clang loop unroll(disable)
+          for (int j = 0; j < blk; ++j)
+            va = mac3_bf16(va, p_bf16 + j * 48, aie::load_v<16>(vb0 + j * 64 + d));
+          aie::store_v(acc + d, va.template to_vector<float>());
         }
-        aie::store_v(acc + d, av);
       }
     }
   }
@@ -249,12 +278,12 @@ static __attribute__((noinline)) void attn_step(const float *slot, float *out, i
 static __attribute__((noinline)) void gemv_tile(const uint8_t *tile, float *out, int32_t k, int32_t t) {
   const int32_t tile_t = t / TSTRIDE;
   const bool accumulate = (t % TSTRIDE) != 0;
-  const int32_t blk0 = (t % TSTRIDE) * (k / QBLK);
+  const int32_t blk0 = (t % TSTRIDE) * (k >> 5);
   using MMUL = aie::mmul<4, 16, 16, int8, int4>;
   aie::accum<accfloat, ROWS> facc = aie::zeros<accfloat, ROWS>();
   const uint8_t *p = tile;
-  const uint8_t *ps = tile + (k / QBLK) * BLOCK_W_BYTES;
-  for (int b = 0; b < k / QBLK; ++b) chess_prepare_for_pipelining {
+  const uint8_t *ps = tile + (k >> 5) * BLOCK_W_BYTES;
+  for (int b = 0; b < (k >> 5); ++b) chess_prepare_for_pipelining {
       aie::vector<int8, 64> a0 = aie::zeros<int8, 64>();
       aie::vector<int8, 64> a1 = aie::zeros<int8, 64>();
       a0.insert(0, aie::load_v<16>(x_q + (blk0 + b) * QBLK));
@@ -275,18 +304,35 @@ static __attribute__((noinline)) void gemv_tile(const uint8_t *tile, float *out,
       ps += BLOCK_S_BYTES;
     }
   aie::vector<float, ROWS> fv = facc.template to_vector<float>();
-  if (accumulate) {
+  if (gate_mode == 1) {
+    aie::store_v(gate_local + gate_idx, fv);
+    gate_idx += ROWS;
+    if (gate_idx == 512) {
+      gate_mode = 2;
+      gate_idx = 0;
+    }
+    return;
+  }
+  if (gate_mode == 2) {
+    aie::vector<float, ROWS> g = aie::load_v<ROWS>(gate_local + gate_idx);
+    aie::vector<float, ROWS> e = exp2f_16(fmul_16(g, aie::broadcast<float, ROWS>(-1.4426950408889634f)));
+    aie::vector<float, ROWS> sig = inv_16(aie::add(e, aie::broadcast<float, ROWS>(1.0f)));
+    fv = fmul_16(fmul_16(g, sig), fv);
+    gate_idx += ROWS;
+    if (gate_idx == 512)
+      gate_mode = 0;
+  } else if (accumulate) {
     fv = aie::add(aie::load_v<ROWS>(out + ROWS * tile_t), fv);
   } else if (res_pos >= 0) {
     fv = aie::add(fv, aie::load_v<ROWS>(res_x + res_pos));
     res_pos += ROWS;
   }
   aie::store_v(out + ROWS * tile_t, fv);
-  if (!accumulate && rope_pos >= 0 && rope_pos < RES_N + 32 && tile_t == 1) {
+  if (!accumulate && rope_pos >= 0 && rope_pos <= RES_N && tile_t == 1) {
     aie::vector<float, 32> v = aie::load_v<32>(out);
     aie::vector<float, 16> x0 = aie::filter_even(v, 1);
     aie::vector<float, 16> x1 = aie::filter_odd(v, 1);
-    const float *cs = res_x + (rope_pos & (RES_N - 1));
+    const float *cs = saved_rope + (rope_pos < RES_N ? (rope_pos & 32) : k_rope_off);
     aie::vector<float, 16> c = aie::load_v<16>(cs);
     aie::vector<float, 16> s = aie::load_v<16>(cs + 16);
     aie::vector<float, 16> y0 = aie::sub(fmul_16(x0, c), fmul_16(x1, s));
@@ -303,23 +349,31 @@ static __attribute__((noinline)) void gemv_tile(const uint8_t *tile, float *out,
 extern "C" {
 
 void q4_step(const uint8_t *slot, float *out, int32_t k, int32_t t) {
-  if (t <= -110)
+  if (t <= -110) {
     attn_step((const float *)slot, out, k, t <= -200 ? -t - 200 : t + 109);
-  else if (t == -106 || t == -101)
-    load_res((const float *)slot, t == -106 ? 2 : 0);
-  else if (t <= -102)
-    prep_quantize_x_f32((const float *)slot, (-t - 102) * NORM_N, 2);
-  else if (t == -100) {
-    prep_quantize_x_f32((const float *)slot, 0, 1);
-    if (k > 0) {
-      attn_rem = ((const int32_t *)slot)[k + RES_N];
-      if (attn_rem >= 0)
-        load_res((const float *)slot + k, 1);
+  } else if (t == -100) {
+    prep_quantize_x_f32((const float *)slot, NORM_N, 0, 1);
+    if (k >= ROPE_CS) {
+      int32_t wid = k - ROPE_CS;
+      attn_rem = ((const int32_t *)slot)[ROPE_CS + RES_N];
+      if (attn_rem >= 0) {
+        copy_f32_16x(res_x, (const float *)slot + wid * RES_N, RES_N);
+        copy_f32_16x(saved_rope, (const float *)slot + ROPE_CS, 64);
+        k_rope_off = (wid & 1) * 32;
+        rope_pos = 0;
+      }
+    } else {
+      copy_f32_16x(res_x, (const float *)slot + k * RES_N, RES_N);
+      gate_mode = 1;
+      gate_idx = 0;
     }
-  } else if (t <= -2)
-    prep_quantize_x_f32((const float *)slot, t == -2 ? 0 : (-t - 3) * ACT_CHUNK, 0);
-  else
+  } else if (t <= -2) {
+    prep_quantize_x_f32((const float *)slot, k, t == -3 && k != NORM_N ? ACT_CHUNK : 0, 0);
+    if (t == -3)
+      res_pos = 0;
+  } else {
     gemv_tile(slot, out, k, t);
+  }
 }
 
 } // extern "C"

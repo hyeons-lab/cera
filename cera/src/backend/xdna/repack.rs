@@ -227,6 +227,40 @@ pub fn pack_f32_stage(
     pack_stage(dst, &F32Source { src, cols }, rows, cols)
 }
 
+/// Number of AIE2P workers across which every stage's row tiles are partitioned.
+const WORKERS: usize = 16;
+
+/// Interleave already-packed stage buffers per worker so a fused TaskGroup
+/// (`q+k+v` or `gate+up`) streams all of worker `i`'s stage slices in a single
+/// contiguous Shim DMA buffer descriptor.
+pub fn interleave_worker_stages(dst: &mut [u8], stages: &[&[u8]]) -> Result<usize, String> {
+    let mut total = 0usize;
+    for (idx, s) in stages.iter().enumerate() {
+        if s.is_empty() || !s.len().is_multiple_of(WORKERS) {
+            return Err(format!(
+                "packed stage {idx} byte length {} is not a nonzero multiple of {WORKERS}",
+                s.len()
+            ));
+        }
+        total += s.len();
+    }
+    if dst.len() < total {
+        return Err(format!(
+            "xdna interleave buffer too small: need {total}, have {}",
+            dst.len()
+        ));
+    }
+    let mut wp = 0usize;
+    for w in 0..WORKERS {
+        for s in stages {
+            let pw = s.len() / WORKERS;
+            dst[wp..wp + pw].copy_from_slice(&s[w * pw..(w + 1) * pw]);
+            wp += pw;
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +353,21 @@ mod tests {
         let sp = 512; // nb_chunk=2: scales after 2 * 256 int4 bytes
         let scale_bits = u16::from_le_bytes([packed[sp], packed[sp + 1]]);
         assert_eq!(scale_bits, f32_to_bf16(-12.5));
+    }
+
+    #[test]
+    fn interleave_worker_stages_groups_worker_slices_contiguously() {
+        let s0: Vec<u8> = (0u8..32).collect(); // 2 bytes/worker
+        let s1: Vec<u8> = (100u8..116).collect(); // 1 byte/worker
+        let mut dst = vec![0u8; 48];
+        let written = interleave_worker_stages(&mut dst, &[&s0, &s1]).unwrap();
+        assert_eq!(written, 48);
+        for w in 0..WORKERS {
+            let base = w * 3;
+            assert_eq!(dst[base], (w * 2) as u8);
+            assert_eq!(dst[base + 1], (w * 2 + 1) as u8);
+            assert_eq!(dst[base + 2], (100 + w) as u8);
+        }
+        assert!(interleave_worker_stages(&mut dst, &[&[0u8; 15]]).is_err());
     }
 }

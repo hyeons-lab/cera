@@ -8,23 +8,34 @@
 # q4_step), and each worker drains its output rows into the next slot, with
 # the task group finished before the next stage starts.
 #
-# Stage chaining executes the full transformer layer on-NPU:
-# q/k/v read the hidden slot (RMSNorm + quantize), q and k apply interleaved-pair
-# RoPE (RopeType::Norm) on their output tiles before draining, GQA online-softmax
-# attention runs across cached KV tokens + the current (k, v) token and writes
-# its 2048-float output to slot 1 offset ATTN_OUT, o reads slot 1 offset ATTN_OUT
-# and adds the hidden residual into slot 4, gate/up read slot 4 (FFN RMSNorm +
-# quantize), and down reads gate and up's slots (SiLU(gate) * up + quantize,
-# 8192 wide, split-K) and adds slot 4's residual into slot 7 (layer out).
+# Stage chaining executes the full transformer layer on-NPU in 5 TaskGroups
+# with at most 2 MM2S BDs per channel per group:
+# 1. q+k+v read slot 0 (RMSNorm + quantize, saving worker's 128 residual floats
+#    and 64 RoPE cos/sin floats in L1) and stream per-worker contiguous (q, k, v)
+#    weights, applying interleaved RoPE to q (-> slot 1) and k (-> slot 2) and
+#    draining v (-> slot 3).
+# 2. 16-token block online-softmax GQA attention streams Q4LAYER_KV_CHUNKS
+#    (1..9) cached KV chunks plus the current (k, v) token and writes its
+#    2048-float output to slot 1 + ATTN_OUT.
+# 3. o reads slot 1 + ATTN_OUT, adds the L1-saved slot 0 residual, and drains
+#    post-attn hidden h1 into slot 4.
+# 4. gate+up read slot 4 (FFN RMSNorm + quantize, saving worker's 128 h1
+#    residual floats in L1), stream per-worker contiguous (gate, up) weights,
+#    keep worker's 512 gate rows in L1, fuse SiLU(gate) * up on-core during up,
+#    and drain 8192 floats of SiLU(gate) * up into slot 5.
+# 5. down reads slot 5 in one contiguous 2*TILE_F32 DMA, runs split-K 8192->2048
+#    GEMV adding the L1-saved h1 residual, and drains directly into y_next[0..2048].
 import argparse
 import os as _os
 from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
+from aie.dialects import arith
+from aie.extras import types as T
 from aie.helpers.dialects.scf import else_, if_
 from aie.helpers.taplib.tap import TensorAccessPattern
-from aie.iron import CompileTime, ExternalFunction, In, Out
+from aie.iron import ExternalFunction, In, Out
 from aie.iron.controlflow import range_
 from aie.iron.dataflow import ObjectFifo
 from aie.iron.program import Program
@@ -41,53 +52,22 @@ NUM_CHANNELS = 2
 CHUNK_K = 2048  # columns per streamed weight-tile chunk (split-K)
 TILE_F32 = 4608  # one stream element: 18432 bytes viewed as f32
 ACT_CHUNK = TILE_F32  # f32 activations quantized per stream element
-SILU_HALF = TILE_F32 // 2  # f32 words per half-element (gate/up or K/V)
+SILU_HALF = TILE_F32 // 2  # f32 words per half-element (K/V)
 ACT_SLOT = 8192  # f32 stride of one activation slot in DDR (max K)
 TSTRIDE = 8  # tile/chunk encoding stride in q4_step's t (see q4layer.cc)
-MAX_OT = 16
 
-# (input slot, rows M, cols K, output slot); slots: 0 hidden, 1 q (+ attn_out at ATTN_OUT),
-# 2 k (+ k_cache at KV_CACHE_OFF), 3 v (+ v_cache at KV_CACHE_OFF),
-# 4 post-attn residual (h1), 5 gate, 6 up, 7 layer out (h2).
-STAGES = [
-    (0, 2048, 2048, 1),  # q (RMSNorm + GEMV + RoPE -> slot 1 [0..2048))
-    (0, 512, 2048, 2),  # k (RMSNorm + GEMV + RoPE -> slot 2 [0..512))
-    (0, 512, 2048, 3),  # v (RMSNorm + GEMV -> slot 3 [0..512), followed by GQA attention -> slot 1 [2048..4096))
-    (1, 2048, 2048, 4),  # o (reads attn_out at slot 1 + ATTN_OUT; + slot 0 residual -> slot 4)
-    (4, 8192, 2048, 5),  # gate (FFN RMSNorm on slot 4)
-    (4, 8192, 2048, 6),  # up (FFN RMSNorm on slot 4)
-    (5, 2048, 8192, 7),  # down (SiLU(slot 5) * slot 6; + slot 4 residual -> slot 7)
-]
-N_SLOTS = 8
-# Slots 0 and 4 are [activation f32 x 2048 | RMSNorm weights f32 x 2048]:
-# stages reading slot 0 (q, k, v) or slot 4 (gate, up) stream both in their
-# one activation element and the core norms + quantizes in one pass
-# (q4layer.cc, t == -100). Slot 0 also carries the 128-float RoPE cos/sin table
-# at offset ROPE_CS (4096), which fits inside the same 4608-float element.
 NORM_W = 2048
 ROPE_CS = 4096
 ATTN_OUT = 2048
 ATTN_CHUNK_T = (SILU_HALF * 2) // 64
 ATTN_CHUNKS = 9
+N_SLOTS = 8
 KV_CACHE_BASE = N_SLOTS * ACT_SLOT
 KV_HEAD_STRIDE = ATTN_CHUNKS * TILE_F32
 KV_SLOT = 8 * KV_HEAD_STRIDE
 
-# Diagnostic: Q4LAYER_STAGES=N builds only the first N stages (the host still
-# packs and checks all seven; only the built stages can pass).
-STAGES = STAGES[: int(_os.environ.get("Q4LAYER_STAGES", "7"))]
-if _os.environ.get("Q4LAYER_SPEC"):
-    STAGES = [tuple(int(x) for x in s.split(":")) for s in _os.environ["Q4LAYER_SPEC"].split(";")]
-elif _os.environ.get("Q4LAYER_PICK"):
-    STAGES = [STAGES[int(i)] for i in _os.environ["Q4LAYER_PICK"].split(",")]
-
 
 def stage_params(M, K, workers_n):
-    # Fixed output grouping OT=2 for every stage (as in q4gemv): each out
-    # fifo element holds exactly ROWS*OT outputs and every drain consumes
-    # whole elements. A drain smaller than the element leaves the fifo
-    # inconsistent and the next stage reads zeros (measured: a stage after
-    # a partially drained stage produces nothing).
     rows_pw = M // workers_n
     tiles_pw = rows_pw // ROWS
     return {
@@ -96,29 +76,47 @@ def stage_params(M, K, workers_n):
         "ot": 2,
         "outs_pw": tiles_pw // 2,
         "kchunks": K // CHUNK_K,
-        "achunks": (K + ACT_CHUNK - 1) // ACT_CHUNK,
     }
 
 
 @iron.jit
 def q4layer(w: In, y: Out, y_next: Out):
     workers_n = get_current_device().cols * NUM_CHANNELS
-    stages = [stage_params(M, K, workers_n) | {"in_slot": i, "M": M, "K": K, "out_slot": o} for (i, M, K, o) in STAGES]
 
-    # Weight stream layout (f32 words): stages in order, per stage each
-    # worker's tiles contiguous, tile = TILE_F32 words.
-    w_total = 0
-    for s in stages:
-        s["w_base"] = w_total
-        s["per_worker_w"] = s["tiles_pw"] * s["kchunks"] * TILE_F32
-        w_total += workers_n * s["per_worker_w"]
+    q_s = stage_params(2048, 2048, workers_n)
+    k_s = stage_params(512, 2048, workers_n)
+    v_s = stage_params(512, 2048, workers_n)
+    o_s = stage_params(2048, 2048, workers_n)
+    gate_s = stage_params(8192, 2048, workers_n)
+    up_s = stage_params(8192, 2048, workers_n)
+    down_s = stage_params(2048, 8192, workers_n)
+
+    # Weight stream layout (f32 words):
+    # - Group 0 (q+k+v): per worker [q (8 tiles) | k (2 tiles) | v (2 tiles)] = 12 * TILE_F32
+    # - Group 1 (o):     per worker [o (8 tiles)]                             =  8 * TILE_F32
+    # - Group 2 (g+u):   per worker [gate (32 tiles) | up (32 tiles)]         = 64 * TILE_F32
+    # - Group 3 (down):  per worker [down (8 tiles * 4 kchunks)]              = 32 * TILE_F32
+    qkv_pw_w = (q_s["tiles_pw"] + k_s["tiles_pw"] + v_s["tiles_pw"]) * TILE_F32
+    o_pw_w = o_s["tiles_pw"] * TILE_F32
+    gu_pw_w = (gate_s["tiles_pw"] + up_s["tiles_pw"]) * TILE_F32
+    down_pw_w = down_s["tiles_pw"] * down_s["kchunks"] * TILE_F32
+
+    w_qkv_base = 0
+    w_o_base = w_qkv_base + workers_n * qkv_pw_w
+    w_gu_base = w_o_base + workers_n * o_pw_w
+    w_down_base = w_gu_base + workers_n * gu_pw_w
+    w_total = w_down_base + workers_n * down_pw_w
 
     act_total = KV_CACHE_BASE + KV_SLOT
     head_mode = _os.environ.get("Q4LAYER_HEAD") == "1"
+    kv_chunks = int(_os.environ.get("Q4LAYER_KV_CHUNKS", str(ATTN_CHUNKS)))
+    assert 1 <= kv_chunks <= ATTN_CHUNKS
+
     head_s = stage_params(131072, 2048, workers_n)
     head_per_worker_w = head_s["tiles_pw"] * TILE_F32
     head_w_total = workers_n * head_per_worker_w
     head_y_total = TILE_F32 + 131072
+
     slot_ty = np.ndarray[(TILE_F32,), np.dtype[np.float32]]
     yel_ty = np.ndarray[(ROWS * 2,), np.dtype[np.float32]]
     w_ty = np.ndarray[(head_w_total if head_mode else w_total,), np.dtype[np.float32]]
@@ -129,108 +127,121 @@ def q4layer(w: In, y: Out, y_next: Out):
         source_file=str(Path(__file__).parent / "q4layer.cc"),
         arg_types=[slot_ty, yel_ty, np.int32, np.int32],
         include_dirs=[cxx_header_path()],
-        compile_flags=[f"-DKMAX={max(s['K'] for s in stages)}", f"-DACT_CHUNK={ACT_CHUNK}"],
+        compile_flags=[f"-DKMAX=8192", f"-DACT_CHUNK={ACT_CHUNK}"],
     )
-    for s in stages:
-        s["norm"] = s["out_slot"] in (1, 5)
-        s["silu"] = s["in_slot"] == 5
-        s["rope"] = s["out_slot"] == 2
-        s["res_slot"] = 0 if s["out_slot"] == 4 else 4 if s["out_slot"] == 7 else None
-        if s["out_slot"] in (2, 3, 6):
-            s["achunks"] = 0
-        elif s["silu"]:
-            assert s["K"] == 8192, "silu*up stage is the 8192-wide FFN down"
-            s["achunks"] = s["K"] // CHUNK_K
-        assert not s["norm"] or (s["K"] == 2048 and s["achunks"] == 1), "norm stages are 2048-wide"
-        assert s["res_slot"] is None or s["rows_pw"] == 128, "residual stages have 128 rows per worker"
+
     of_ins = [ObjectFifo(slot_ty, name=f"w_{i}") for i in range(workers_n)]
     of_outs = [ObjectFifo(yel_ty, name=f"y_{i}") for i in range(workers_n)]
 
-    def core_body(of_in, of_out, step):
-        s0 = stages[0]
-        for o in range(2):
-            y = of_out.acquire(1)
-            if o == 0:
-                x = of_in.acquire(1)
-                is_head = x[ROPE_CS + 129] > x[ROPE_CS + 130]
-                step(x, y, ROPE_CS, -100)
-                of_in.release(1)
-            for tt in range(s0["ot"]):
-                for ch in range(s0["kchunks"]):
-                    tile = of_in.acquire(1)
-                    step(tile, y, CHUNK_K, tt * TSTRIDE + ch)
-                    of_in.release(1)
-            of_out.release(1)
-        with if_(is_head) as if_op:
-            for _ in range_(head_s["outs_pw"] - 2):
+    def make_core_body(wid):
+        def core_body(of_in, of_out, step):
+            # Stage 0 prefix (2 output pairs = 4 tiles), shared by q4layer and q4head.
+            for o in range(2):
                 y = of_out.acquire(1)
-                for tt in range(head_s["ot"]):
+                if o == 0:
+                    y0 = y
+                    x = of_in.acquire(1)
+                    head_flag = arith.bitcast(T.i32(), x[ROPE_CS + 129])
+                    is_head = arith.cmpi(
+                        arith.CmpIPredicate.ne, head_flag, arith.constant(T.i32(), 0)
+                    )
+                    skip_kv = arith.bitcast(T.i32(), x[ROPE_CS + 131])
+                    extra_kv = arith.subi(
+                        arith.constant(T.i32(), ATTN_CHUNKS - 1), skip_kv
+                    )
+                    step(x, y, ROPE_CS + wid, -100)
+                    of_in.release(1)
+                for tt in range(2):
                     tile = of_in.acquire(1)
                     step(tile, y, CHUNK_K, tt * TSTRIDE)
                     of_in.release(1)
                 of_out.release(1)
-        with else_(if_op):
-            for _ in range_(s0["outs_pw"] - 2):
-                y = of_out.acquire(1)
-                for tt in range(s0["ot"]):
-                    for ch in range(s0["kchunks"]):
-                        tile = of_in.acquire(1)
-                        step(tile, y, CHUNK_K, tt * TSTRIDE + ch)
-                        of_in.release(1)
-                of_out.release(1)
-            for s in stages[1:]:
-                y = of_out.acquire(1)
-                for c in range(s["achunks"]):
-                    x = of_in.acquire(1)
-                    if s["silu"]:
-                        step(x, y, CHUNK_K, -102 - c)
-                    elif s["norm"]:
-                        step(x, y, ROPE_CS if s["out_slot"] == 1 else 0, -100)
-                    else:
-                        n = min(ACT_CHUNK, s["K"] - c * ACT_CHUNK)
-                        step(x, y, n, -1 if _os.environ.get("Q4LAYER_XMODE") == "-1" else -3 - c)
-                    of_in.release(1)
-                if s["res_slot"] is not None:
-                    r = of_in.acquire(1)
-                    step(r, y, 0, -101)
-                    of_in.release(1)
-                if s["rope"]:
-                    rp = of_in.acquire(1)
-                    step(rp, y, 0, -106)
-                    of_in.release(1)
-                for tt in range(s["ot"]):
-                    for ch in range(s["kchunks"]):
-                        tile = of_in.acquire(1)
-                        step(tile, y, CHUNK_K, tt * TSTRIDE + ch)
-                        of_in.release(1)
-                of_out.release(1)
-                if s["outs_pw"] > 1:
-                    for _ in range_(s["outs_pw"] - 1):
-                        y = of_out.acquire(1)
-                        for tt in range(s["ot"]):
-                            for ch in range(s["kchunks"]):
-                                tile = of_in.acquire(1)
-                                step(tile, y, CHUNK_K, tt * TSTRIDE + ch)
-                                of_in.release(1)
-                        of_out.release(1)
-                if s["out_slot"] == 3:
-                    for o in range(4):
-                        y = of_out.acquire(1)
-                        if o == 0:
-                            kv0 = of_in.acquire(1)
-                            step(kv0, y, ATTN_CHUNK_T, -201)
-                            of_in.release(1)
-                            for _ in range_(ATTN_CHUNKS - 1):
-                                kv0 = of_in.acquire(1)
-                                step(kv0, y, ATTN_CHUNK_T, -200)
-                                of_in.release(1)
-                            kv1 = of_in.acquire(1)
-                            step(kv1, y, 1, -202)
-                            of_in.release(1)
-                        step(kv1, y, 0, -110 - o)
-                        of_out.release(1)
 
-    workers = [Worker(core_body, [of_ins[i].cons(), of_outs[i].prod(), step], stack_size=2560) for i in range(workers_n)]
+            with if_(is_head) as if_op:
+                for _ in range_(head_s["outs_pw"] - 2):
+                    y = of_out.acquire(1)
+                    for tt in range(2):
+                        tile = of_in.acquire(1)
+                        step(tile, y, CHUNK_K, tt * TSTRIDE)
+                        of_in.release(1)
+                    of_out.release(1)
+            with else_(if_op):
+                # Remaining 2 output pairs of q + 1 pair of k + 1 pair of v = 4 pairs.
+                for _ in range_(4):
+                    y = of_out.acquire(1)
+                    for tt in range(2):
+                        tile = of_in.acquire(1)
+                        step(tile, y, CHUNK_K, tt * TSTRIDE)
+                        of_in.release(1)
+                    of_out.release(1)
+
+                # GQA attention over (1 + extra_kv) cached KV chunks + current token.
+                for o in range(4):
+                    y = of_out.acquire(1)
+                    if o == 0:
+                        kv0 = of_in.acquire(1)
+                        step(kv0, y, ATTN_CHUNK_T, -201)
+                        of_in.release(1)
+                        for _ in range_(extra_kv):
+                            kv0 = of_in.acquire(1)
+                            step(kv0, y, ATTN_CHUNK_T, -200)
+                            of_in.release(1)
+                        kv1 = of_in.acquire(1)
+                        step(kv1, y, 1, -202)
+                        of_in.release(1)
+                    step(kv1, y, 0, -110 - o)
+                    of_out.release(1)
+
+                # Stage 3 (o): quantize attn_out + add saved slot 0 residual -> slot 4.
+                x = of_in.acquire(1)
+                step(x, y0, NORM_W, -3)
+                of_in.release(1)
+                for _ in range_(o_s["outs_pw"]):
+                    y = of_out.acquire(1)
+                    for tt in range(2):
+                        tile = of_in.acquire(1)
+                        step(tile, y, CHUNK_K, tt * TSTRIDE)
+                        of_in.release(1)
+                    of_out.release(1)
+
+                # Stage 4+5 (gate + up -> on-core SiLU(gate)*up -> slot 5).
+                x = of_in.acquire(1)
+                step(x, y0, wid, -100)
+                of_in.release(1)
+                for _ in range_(gate_s["tiles_pw"]):
+                    tile = of_in.acquire(1)
+                    step(tile, y0, CHUNK_K, 0)
+                    of_in.release(1)
+                for _ in range_(up_s["outs_pw"]):
+                    y = of_out.acquire(1)
+                    for tt in range(2):
+                        tile = of_in.acquire(1)
+                        step(tile, y, CHUNK_K, tt * TSTRIDE)
+                        of_in.release(1)
+                    of_out.release(1)
+
+                # Stage 6 (down): 2 contiguous activation elements + split-K + saved h1 residual -> y_next.
+                x0 = of_in.acquire(1)
+                step(x0, y0, ACT_CHUNK, -2)
+                of_in.release(1)
+                x1 = of_in.acquire(1)
+                step(x1, y0, 8192 - ACT_CHUNK, -3)
+                of_in.release(1)
+                for _ in range_(down_s["outs_pw"]):
+                    y = of_out.acquire(1)
+                    for tt in range(2):
+                        for ch in range(down_s["kchunks"]):
+                            tile = of_in.acquire(1)
+                            step(tile, y, CHUNK_K, tt * TSTRIDE + ch)
+                            of_in.release(1)
+                    of_out.release(1)
+
+        return core_body
+
+    workers = [
+        Worker(make_core_body(i), [of_ins[i].cons(), of_outs[i].prod(), step], stack_size=2560)
+        for i in range(workers_n)
+    ]
 
     def tap(total, offset, size):
         return TensorAccessPattern((1, total), offset, [1, 1, 1, size], [0, 0, 0, 1])
@@ -253,46 +264,58 @@ def q4layer(w: In, y: Out, y_next: Out):
                 )
             tg.finish()
             return
-        one_group = _os.environ.get("Q4LAYER_ONEGROUP") == "1"
-        tg = TaskGroup() if one_group else None
-        for s in stages:
-            if not one_group and s["out_slot"] in (1, 4, 5, 7):
-                tg = TaskGroup()
-            in_base = s["in_slot"] * ACT_SLOT + (ATTN_OUT if s["in_slot"] == 1 else 0)
-            for i in range(workers_n):
-                if s["silu"]:
-                    for c in range(s["achunks"]):
-                        in_prods[i].fill(y_buf, tap_silu(act_total, in_base + c * CHUNK_K), group=tg)
-                else:
-                    for c in range(s["achunks"]):
-                        in_prods[i].fill(y_buf, tap(act_total, in_base + c * ACT_CHUNK, TILE_F32), group=tg)
-                if s["res_slot"] is not None:
-                    in_prods[i].fill(y_buf, tap(act_total, s["res_slot"] * ACT_SLOT + i * s["rows_pw"], TILE_F32), group=tg)
-                if s["rope"]:
-                    in_prods[i].fill(y_buf, tap(act_total, ROPE_CS + (i % 2) * 32, TILE_F32), group=tg)
-                in_prods[i].fill(w_in, tap(w_total, s["w_base"] + i * s["per_worker_w"], s["per_worker_w"]), group=tg)
-            for i in range(workers_n):
-                out_conses[i].drain(
-                    y_next if s["out_slot"] == 7 else y_buf,
-                    tap(act_total, (0 if s["out_slot"] == 7 else s["out_slot"] * ACT_SLOT) + i * s["rows_pw"], s["rows_pw"]),
-                    wait=s["out_slot"] in (3, 4, 6, 7),
-                    group=tg,
-                )
-            if not one_group and s["out_slot"] in (3, 4, 6, 7):
-                tg.finish()
-            if s["out_slot"] == 3:
-                if not one_group:
-                    tg = TaskGroup()
-                for i in range(workers_n):
-                    kv_h = i // 2
-                    in_prods[i].fill(y_buf, tap(act_total, KV_CACHE_BASE + kv_h * KV_HEAD_STRIDE, KV_HEAD_STRIDE), group=tg)
-                    in_prods[i].fill(y_buf, tap_silu(act_total, 2 * ACT_SLOT + kv_h * 64), group=tg)
-                for i in range(workers_n):
-                    out_conses[i].drain(y_buf, tap(act_total, 1 * ACT_SLOT + ATTN_OUT + i * 128, 128), wait=True, group=tg)
-                if not one_group:
-                    tg.finish()
-        if one_group:
-            tg.finish()
+
+        # Group 1: q + k + v
+        tg = TaskGroup()
+        for i in range(workers_n):
+            in_prods[i].fill(y_buf, tap(act_total, 0, TILE_F32), group=tg)
+            in_prods[i].fill(w_in, tap(w_total, w_qkv_base + i * qkv_pw_w, qkv_pw_w), group=tg)
+        for i in range(workers_n):
+            out_conses[i].drain(y_buf, tap(act_total, 1 * ACT_SLOT + i * q_s["rows_pw"], q_s["rows_pw"]), wait=False, group=tg)
+            out_conses[i].drain(y_buf, tap(act_total, 2 * ACT_SLOT + i * k_s["rows_pw"], k_s["rows_pw"]), wait=False, group=tg)
+            out_conses[i].drain(y_buf, tap(act_total, 3 * ACT_SLOT + i * v_s["rows_pw"], v_s["rows_pw"]), wait=True, group=tg)
+        tg.finish()
+
+        # Group 2: GQA attention (kv_chunks cached chunks + current token)
+        tg = TaskGroup()
+        for i in range(workers_n):
+            kv_h = i // 2
+            in_prods[i].fill(
+                y_buf,
+                tap(act_total, KV_CACHE_BASE + kv_h * KV_HEAD_STRIDE, kv_chunks * TILE_F32),
+                group=tg,
+            )
+            in_prods[i].fill(y_buf, tap_silu(act_total, 2 * ACT_SLOT + kv_h * 64), group=tg)
+        for i in range(workers_n):
+            out_conses[i].drain(y_buf, tap(act_total, 1 * ACT_SLOT + ATTN_OUT + i * 128, 128), wait=True, group=tg)
+        tg.finish()
+
+        # Group 3: o (+ saved slot 0 residual -> slot 4)
+        tg = TaskGroup()
+        for i in range(workers_n):
+            in_prods[i].fill(y_buf, tap(act_total, 1 * ACT_SLOT + ATTN_OUT, TILE_F32), group=tg)
+            in_prods[i].fill(w_in, tap(w_total, w_o_base + i * o_pw_w, o_pw_w), group=tg)
+        for i in range(workers_n):
+            out_conses[i].drain(y_buf, tap(act_total, 4 * ACT_SLOT + i * o_s["rows_pw"], o_s["rows_pw"]), wait=True, group=tg)
+        tg.finish()
+
+        # Group 4: gate + up (-> on-core SiLU(gate)*up -> slot 5)
+        tg = TaskGroup()
+        for i in range(workers_n):
+            in_prods[i].fill(y_buf, tap(act_total, 4 * ACT_SLOT, TILE_F32), group=tg)
+            in_prods[i].fill(w_in, tap(w_total, w_gu_base + i * gu_pw_w, gu_pw_w), group=tg)
+        for i in range(workers_n):
+            out_conses[i].drain(y_buf, tap(act_total, 5 * ACT_SLOT + i * up_s["rows_pw"], up_s["rows_pw"]), wait=True, group=tg)
+        tg.finish()
+
+        # Group 5: down (+ saved slot 4 residual -> y_next[0..2048])
+        tg = TaskGroup()
+        for i in range(workers_n):
+            in_prods[i].fill(y_buf, tap(act_total, 5 * ACT_SLOT, 2 * TILE_F32), group=tg)
+            in_prods[i].fill(w_in, tap(w_total, w_down_base + i * down_pw_w, down_pw_w), group=tg)
+        for i in range(workers_n):
+            out_conses[i].drain(y_next, tap(act_total, i * down_s["rows_pw"], down_s["rows_pw"]), wait=True, group=tg)
+        tg.finish()
 
     rt = Runtime(sequence, [w_ty, y_ty, y_ty, [of.prod() for of in of_ins], [of.cons() for of in of_outs]])
     return Program(get_current_device(), rt, workers=workers).resolve_program()
