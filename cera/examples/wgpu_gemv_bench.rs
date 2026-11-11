@@ -112,10 +112,12 @@ fn env_f64(key: &str, default: f64) -> anyhow::Result<f64> {
 struct Kernel {
     name: &'static str,
     dtype: DType,
-    shader: &'static str,
+    subgroup_shader: &'static str,
+    fallback_shader: &'static str,
     entry: &'static str,
     /// Must match the shader's `NR` / `ROWS_PER_WG`.
-    rows_per_wg: u32,
+    subgroup_rows_per_wg: u32,
+    fallback_rows_per_wg: u32,
 }
 
 /// Block geometry: `(elements_per_block, bytes_per_block)`.
@@ -203,44 +205,56 @@ fn main() -> anyhow::Result<()> {
         Kernel {
             name: "q4_k",
             dtype: DType::Q4KM,
-            shader: shaders::GEMV_Q4_K,
+            subgroup_shader: shaders::GEMV_Q4_K,
+            fallback_shader: shaders::GEMV_Q4_K,
             entry: "gemv_q4_k",
-            rows_per_wg: 2,
+            subgroup_rows_per_wg: 4,
+            fallback_rows_per_wg: 2,
         },
         Kernel {
             name: "q5_k",
             dtype: DType::Q5KM,
-            shader: shaders::GEMV_Q5_K,
+            subgroup_shader: shaders::GEMV_Q5_K,
+            fallback_shader: shaders::GEMV_Q5_K,
             entry: "gemv_q5_k",
-            rows_per_wg: 2,
+            subgroup_rows_per_wg: 2,
+            fallback_rows_per_wg: 2,
         },
         Kernel {
             name: "q4_0",
             dtype: DType::Q4_0,
-            shader: shaders::GEMV_Q4_0_FAST,
+            subgroup_shader: shaders::GEMV_Q4_0_FAST_SUBGROUP,
+            fallback_shader: shaders::GEMV_Q4_0_FAST,
             entry: "gemv_q4_0_fast",
-            rows_per_wg: 4,
+            subgroup_rows_per_wg: 8,
+            fallback_rows_per_wg: 8,
         },
         Kernel {
             name: "q8_0",
             dtype: DType::Q8_0,
-            shader: shaders::GEMV_Q8_0,
+            subgroup_shader: shaders::GEMV_Q8_0,
+            fallback_shader: shaders::GEMV_Q8_0,
             entry: "gemv_q8_0",
-            rows_per_wg: 8,
+            subgroup_rows_per_wg: 8,
+            fallback_rows_per_wg: 8,
         },
         Kernel {
             name: "f32",
             dtype: DType::F32,
-            shader: shaders::GEMV_F32,
+            subgroup_shader: shaders::GEMV_F32,
+            fallback_shader: shaders::GEMV_F32,
             entry: "gemv_f32",
-            rows_per_wg: 8,
+            subgroup_rows_per_wg: 8,
+            fallback_rows_per_wg: 8,
         },
         Kernel {
             name: "q6_k",
             dtype: DType::Q6K,
-            shader: shaders::GEMV_Q6_K,
+            subgroup_shader: shaders::GEMV_Q6_K,
+            fallback_shader: shaders::GEMV_Q6_K,
             entry: "gemv_q6_k",
-            rows_per_wg: 2,
+            subgroup_rows_per_wg: 2,
+            fallback_rows_per_wg: 2,
         },
     ];
 
@@ -282,13 +296,29 @@ fn main() -> anyhow::Result<()> {
     // every measurement leaned on `run(2)` to absorb a fresh compile — one more
     // uncontrolled per-cell variable in a harness whose residual positional
     // effect is still unexplained.
-    let pipelines: Vec<wgpu::ComputePipeline> = kernels
+    let pipelines: Vec<(wgpu::ComputePipeline, u32)> = kernels
         .iter()
-        .map(|kern| ctx.create_pipeline(kern.shader, kern.entry, kern.entry))
+        .map(|kern| {
+            if ctx.use_wgsl_subgroup()
+                && let Ok(pipe) = ctx.try_create_pipeline_with_defines_checked(
+                    kern.subgroup_shader,
+                    kern.entry,
+                    kern.entry,
+                    &[("SUBGROUP", "1")],
+                )
+            {
+                return (pipe, kern.subgroup_rows_per_wg);
+            }
+            (
+                ctx.create_pipeline(kern.fallback_shader, kern.entry, kern.entry),
+                kern.fallback_rows_per_wg,
+            )
+        })
         .collect();
+    ctx.save_pipeline_cache();
 
     for round in 0..2 {
-        for (kern, pipeline) in kernels.iter().zip(&pipelines) {
+        for (kern, (pipeline, rows_per_wg)) in kernels.iter().zip(&pipelines) {
             for &(m, k, label) in shapes {
                 let weight_bytes = synth_weights(kern.dtype, m as usize, k as usize);
                 let x: Vec<f32> = (0..k)
@@ -324,7 +354,8 @@ fn main() -> anyhow::Result<()> {
                     ],
                 });
 
-                let groups = m.div_ceil(kern.rows_per_wg);
+                let (gx, gy, gz) =
+                    cera::backend::wgpu::gemv_row_workgroups(m.div_ceil(*rows_per_wg));
                 // All iterations share ONE compute pass. A pass per iteration charged
                 // a boundary to every measurement, which is why this bench used to
                 // report q4_0 at 53 GB/s for the LM-head shape where #321 then
@@ -360,7 +391,7 @@ fn main() -> anyhow::Result<()> {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, &bg, &[]);
                         for _ in 0..count {
-                            pass.dispatch_workgroups(groups, 1, 1);
+                            pass.dispatch_workgroups(gx, gy, gz);
                         }
                     }
                     ctx.queue.submit(Some(enc.finish()));
