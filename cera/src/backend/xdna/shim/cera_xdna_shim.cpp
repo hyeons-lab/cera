@@ -30,6 +30,7 @@
 #include <cstring>
 #include <exception>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,7 @@
 
 // Bumped whenever a signature below changes; the Rust side refuses a shim
 // whose version it does not know.
-#define CERA_XDNA_SHIM_ABI 1
+#define CERA_XDNA_SHIM_ABI 2
 
 struct cera_xdna_device {
   xrt::device dev;
@@ -93,11 +94,41 @@ int guarded(char* err, size_t len, F&& f) {
 
 CERA_XDNA_API uint32_t cera_xdna_shim_abi(void) { return CERA_XDNA_SHIM_ABI; }
 
+// Process-wide power request toggled on 0->1 / 1->0 transitions by Rust's
+// VoteCounter. Uses PowerCreateRequest rather than ES_CONTINUOUS so the vote
+// is process-scoped (safe across threads when XdnaDevice moves).
+CERA_XDNA_API void cera_xdna_set_wakelock(int enable) {
+#ifdef _WIN32
+  static std::mutex g_power_mu;
+  static HANDLE g_power_req = INVALID_HANDLE_VALUE;
+  static bool g_power_active = false;
+  std::lock_guard<std::mutex> lock(g_power_mu);
+  if (enable) {
+    if (g_power_req == INVALID_HANDLE_VALUE) {
+      REASON_CONTEXT rc{};
+      rc.Version = POWER_REQUEST_CONTEXT_VERSION;
+      rc.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+      wchar_t reason[] = L"Cera XDNA NPU inference";
+      rc.Reason.SimpleReasonString = reason;
+      g_power_req = PowerCreateRequest(&rc);
+    }
+    if (g_power_req != INVALID_HANDLE_VALUE && !g_power_active) {
+      PowerSetRequest(g_power_req, PowerRequestSystemRequired);
+      PowerSetRequest(g_power_req, PowerRequestDisplayRequired);
+      g_power_active = true;
+    }
+  } else if (g_power_req != INVALID_HANDLE_VALUE && g_power_active) {
+    PowerClearRequest(g_power_req, PowerRequestDisplayRequired);
+    PowerClearRequest(g_power_req, PowerRequestSystemRequired);
+    g_power_active = false;
+  }
+#else
+  (void)enable;
+#endif
+}
+
 CERA_XDNA_API int cera_xdna_device_open(uint32_t index, cera_xdna_device** out, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
-#ifdef _WIN32
-    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-#endif
     *out = new cera_xdna_device{xrt::device(index)};
     return 0;
   });
@@ -108,9 +139,6 @@ CERA_XDNA_API void cera_xdna_device_free(cera_xdna_device* d) {
     delete d;
   } catch (...) {
   }
-#ifdef _WIN32
-  SetThreadExecutionState(ES_CONTINUOUS);
-#endif
 }
 
 // Writes the device's BDF-style identifier (for logs) into buf.

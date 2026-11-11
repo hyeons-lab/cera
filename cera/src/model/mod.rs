@@ -928,7 +928,7 @@ pub trait Model: Send + Sync {
         self.forward_prefill_from_embeddings(embeddings, n_tokens, start_pos, state)
     }
 
-    /// Which backend runs this model: `"cpu"`, `"metal"`, `"wgpu"` or `"hexagon"`.
+    /// Which backend runs this model: `"cpu"`, `"metal"`, `"wgpu"`, `"hexagon"` or `"xdna"`.
     fn backend_label(&self) -> &'static str {
         "cpu"
     }

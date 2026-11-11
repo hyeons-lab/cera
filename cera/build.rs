@@ -60,10 +60,13 @@ fn main() {
         compile_slang_multitarget(want_wgsl, want_msl);
     }
 
-    // AMD XDNA shim (Windows/MSVC only): compile the C ABI shim over XRT into
-    // a DLL the Rust side embeds and loads at runtime, so binaries still start
-    // on machines without the AMD driver.
-    if std::env::var_os("CARGO_FEATURE_XDNA").is_some() {
+    // AMD XDNA shim (Windows/MSVC target only): compile the C ABI shim over XRT
+    // into a DLL the Rust side embeds and loads at runtime, so binaries still
+    // start on machines without the AMD driver. Non-Windows targets build the
+    // pure-Rust XDNA modules (repack, kernel tables, upfront metadata checks)
+    // and report XDNA unavailable at runtime, mirroring the Hexagon backend.
+    println!("cargo:rustc-check-cfg=cfg(has_xdna_shim)");
+    if std::env::var_os("CARGO_FEATURE_XDNA").is_some() && target_os == "windows" {
         compile_xdna_shim();
     }
 
@@ -333,9 +336,12 @@ include!("build_support/slang_headers.rs");
 /// from the committed `xrt_coreutil.def` (so no driver DLL is needed at build
 /// time). Requires Visual Studio with the C++ workload; the XRT headers are
 /// vendored under the shim's `include/` (XRT 2.19.0, commit 77c7088).
+#[cfg(windows)]
 fn compile_xdna_shim() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "windows" {
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os != "windows" || target_arch != "x86_64" || target_env != "msvc" {
         return;
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -374,7 +380,11 @@ fn compile_xdna_shim() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    println!("cargo:rustc-cfg=has_xdna_shim");
 }
+
+#[cfg(not(windows))]
+fn compile_xdna_shim() {}
 
 /// Locate slangc: `SLANGC` env, then PATH, then the default local install.
 /// Every candidate (including `SLANGC`) is probed with `-v`, so a bad `SLANGC`

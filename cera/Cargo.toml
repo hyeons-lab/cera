@@ -192,6 +192,11 @@ required-features = ["xdna"]
 name = "xdna_layer_probe"
 required-features = ["xdna"]
 
+# Teacher-forced 512-position CPU vs XDNA NPU parity oracle (device only).
+[[example]]
+name = "xdna_parity_oracle"
+required-features = ["xdna", "mmap"]
+
 # Is NPU decode bit-reproducible (device only).
 [[example]]
 name = "hexagon_decode_probe"
@@ -360,8 +365,8 @@ vl-preprocess = ["dep:image"]
 avx512 = []
 # Qualcomm Hexagon NPU backend (Snapdragon 8 Gen 2 / SM8550+). FastRPC offload to HTP.
 hexagon = ["std-fs"]
-# AMD XDNA NPU backend (Ryzen AI, Strix Halo). Windows/MSVC only: build.rs
-# compiles a C ABI shim over the driver's XRT runtime; the Rust side loads it
-# at runtime, so builds still start on machines without the driver.
+# AMD XDNA NPU backend (Ryzen AI, Strix Halo). On Windows x86_64 MSVC, build.rs
+# compiles a C ABI shim over the driver's XRT runtime and loads it at runtime;
+# other targets compile host-side repack/validation and report XDNA unavailable.
 xdna = ["std-fs"]
 default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess", "avx512"]

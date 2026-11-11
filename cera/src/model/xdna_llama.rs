@@ -3,10 +3,11 @@
 //! Prefill runs on the CPU via [`LlamaModel`] (per Section 4 of
 //! `docs/XDNA_PHASE0_RESULTS.md`), and single-token decode runs all 16
 //! transformer layers on the NPU through [`Q4LAYER_XCLBIN`] followed by the
-//! final RMSNorm on the host and the 128,256-row LM head on the NPU through
-//! [`Q4HEAD_XCLBIN`].
+//! final RMSNorm and 128,256-row LM head on the NPU through [`Q4HEAD_XCLBIN`]
+//! in a single 17-run `xrt::runlist`.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -104,6 +105,121 @@ pub struct XdnaLlamaModel {
     npu: Mutex<XdnaDecodeState>,
     session_gate: ModelSessionGate,
     decode_error: Mutex<Option<CeraError>>,
+    state_torn: AtomicBool,
+}
+
+fn validate_xdna_llama_cpu(cpu: &LlamaModel) -> Result<()> {
+    cpu.ensure_xdna_supported()?;
+
+    let cfg = cpu.config();
+    ensure!(
+        cfg.is_causal,
+        "XDNA q4layer kernel requires causal attention"
+    );
+    ensure!(
+        cfg.n_layers == N_LAYERS
+            && cfg.hidden_size == HIDDEN_SIZE
+            && cfg.intermediate_size == INTERMEDIATE_SIZE
+            && cfg.n_heads == N_HEADS
+            && cfg.n_kv_heads == N_KV_HEADS
+            && cfg.head_dim == HEAD_DIM,
+        "XDNA q4layer kernel is compiled for Llama-3.2-1B shape \
+         (layers={N_LAYERS}, hidden={HIDDEN_SIZE}, inter={INTERMEDIATE_SIZE}, \
+         heads={N_HEADS}/{N_KV_HEADS}, head_dim={HEAD_DIM}); got \
+         layers={}, hidden={}, inter={}, heads={}/{}, head_dim={}",
+        cfg.n_layers,
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+    );
+    ensure!(
+        cfg.vocab_size > 0 && cfg.vocab_size <= HEAD_PADDED_VOCAB,
+        "XDNA q4head kernel supports vocab_size <= {HEAD_PADDED_VOCAB}, got {}",
+        cfg.vocab_size
+    );
+    ensure!(
+        cfg.scalars.residual == 1.0 && cfg.scalars.attn.is_none_or(|s| (s - 0.125).abs() <= 1e-6),
+        "XDNA q4layer kernel requires unit residual scale and standard 1/sqrt(64) attention scale"
+    );
+    ensure!(
+        (cfg.rms_norm_eps - 1e-5).abs() <= 1e-6,
+        "XDNA q4layer kernel is compiled with rms_norm_eps=1e-5, got {}",
+        cfg.rms_norm_eps
+    );
+
+    for il in 0..N_LAYERS {
+        let stage_refs = cpu.layer_stage_refs(il);
+        for (si, (wref, &(rows, cols))) in
+            stage_refs.iter().zip(LAYER_STAGE_SHAPES.iter()).enumerate()
+        {
+            ensure!(
+                wref.m == rows && wref.k == cols,
+                "XDNA layer {il} stage {si} shape mismatch: expected {rows}x{cols}, got {}x{}",
+                wref.m,
+                wref.k
+            );
+        }
+    }
+
+    let head_ref = cpu.lm_head_weight_ref();
+    ensure!(
+        head_ref.k == HIDDEN_SIZE && head_ref.m >= cfg.vocab_size,
+        "XDNA LM head shape mismatch: got {}x{}",
+        head_ref.m,
+        head_ref.k
+    );
+    Ok(())
+}
+
+fn select_kv_bucket(bucket_chunks: &[usize], pos: usize) -> (usize, i32) {
+    let needed_chunks = pos.max(1).div_ceil(ATTN_CHUNK_T);
+    let bucket_idx = bucket_chunks
+        .iter()
+        .position(|&c| c >= needed_chunks)
+        .unwrap_or(bucket_chunks.len() - 1);
+    let skip_kv = (ATTN_CHUNKS - bucket_chunks[bucket_idx]) as i32;
+    (bucket_idx, skip_kv)
+}
+
+fn parse_profile_decode(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+fn profile_decode_enabled() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            parse_profile_decode(std::env::var("CERA_PROFILE_DECODE").ok().as_deref())
+        })
+    }
+}
+
+fn lock_npu_state<'a>(
+    npu: &'a Mutex<XdnaDecodeState>,
+    state_torn: &AtomicBool,
+) -> MutexGuard<'a, XdnaDecodeState> {
+    match npu.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            if let Some((_, kv)) = guard.pending_cpu_kv.take() {
+                guard.spare_kv = Some(kv);
+            }
+            state_torn.store(true, Ordering::SeqCst);
+            npu.clear_poison();
+            tracing::warn!("cera::xdna: NPU mutex poisoned by a prior panic; marking state torn");
+            eprintln!("cera::xdna: NPU mutex poisoned by a prior panic; marking state torn");
+            guard
+        }
+    }
 }
 
 impl XdnaLlamaModel {
@@ -114,57 +230,9 @@ impl XdnaLlamaModel {
         model_id: String,
     ) -> Result<Self> {
         let cpu = LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?;
-        cpu.ensure_xdna_supported()?;
-
+        validate_xdna_llama_cpu(&cpu)?;
         let cfg = cpu.config();
-        ensure!(
-            cfg.n_layers == N_LAYERS
-                && cfg.hidden_size == HIDDEN_SIZE
-                && cfg.intermediate_size == INTERMEDIATE_SIZE
-                && cfg.n_heads == N_HEADS
-                && cfg.n_kv_heads == N_KV_HEADS
-                && cfg.head_dim == HEAD_DIM,
-            "XDNA q4layer kernel is compiled for Llama-3.2-1B shape \
-             (layers={N_LAYERS}, hidden={HIDDEN_SIZE}, inter={INTERMEDIATE_SIZE}, \
-             heads={N_HEADS}/{N_KV_HEADS}, head_dim={HEAD_DIM}); got \
-             layers={}, hidden={}, inter={}, heads={}/{}, head_dim={}",
-            cfg.n_layers,
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            cfg.n_heads,
-            cfg.n_kv_heads,
-            cfg.head_dim,
-        );
-        ensure!(
-            cfg.vocab_size > 0 && cfg.vocab_size <= HEAD_PADDED_VOCAB,
-            "XDNA q4head kernel supports vocab_size <= {HEAD_PADDED_VOCAB}, got {}",
-            cfg.vocab_size
-        );
-        ensure!(
-            cfg.scalars.residual == 1.0
-                && cfg.scalars.attn.is_none_or(|s| (s - 0.125).abs() <= 1e-6),
-            "XDNA q4layer kernel requires unit residual scale and standard 1/sqrt(64) attention scale"
-        );
-        ensure!(
-            (cfg.rms_norm_eps - 1e-5).abs() <= 1e-6,
-            "XDNA q4layer kernel is compiled with rms_norm_eps=1e-5, got {}",
-            cfg.rms_norm_eps
-        );
-
         let gguf_ref = cpu.gguf_file();
-        for il in 0..N_LAYERS {
-            let stage_refs = cpu.layer_stage_refs(il);
-            for (si, (wref, &(rows, cols))) in
-                stage_refs.iter().zip(LAYER_STAGE_SHAPES.iter()).enumerate()
-            {
-                ensure!(
-                    wref.m == rows && wref.k == cols,
-                    "XDNA layer {il} stage {si} shape mismatch: expected {rows}x{cols}, got {}x{}",
-                    wref.m,
-                    wref.k
-                );
-            }
-        }
 
         let device = XdnaDevice::open(0).map_err(|e| anyhow::anyhow!("XDNA open failed: {e}"))?;
         let mut bucket_chunks = Vec::with_capacity(Q4LAYER_KV_BUCKETS.len());
@@ -355,12 +423,6 @@ impl XdnaLlamaModel {
             .map_err(|e| anyhow::anyhow!("XDNA head bo_y sync: {e}"))?;
 
         let head_ref = cpu.lm_head_weight_ref();
-        ensure!(
-            head_ref.k == HIDDEN_SIZE && head_ref.m >= cfg.vocab_size,
-            "XDNA LM head shape mismatch: got {}x{}",
-            head_ref.m,
-            head_ref.k
-        );
 
         let chunk_packed_bytes =
             stage_bytes(HEAD_REPACK_CHUNK_ROWS, HIDDEN_SIZE).map_err(|e| anyhow::anyhow!(e))?;
@@ -491,7 +553,12 @@ impl XdnaLlamaModel {
             }),
             session_gate: ModelSessionGate::default(),
             decode_error: Mutex::new(None),
+            state_torn: AtomicBool::new(false),
         })
+    }
+
+    fn lock_npu(&self) -> MutexGuard<'_, XdnaDecodeState> {
+        lock_npu_state(&self.npu, &self.state_torn)
     }
 
     fn flush_pending_cpu_kv(npu: &mut XdnaDecodeState, state: &mut InferenceState) {
@@ -567,13 +634,13 @@ impl XdnaLlamaModel {
         npu: &mut XdnaDecodeState,
         state: &mut InferenceState,
         target_pos: usize,
-    ) {
+    ) -> Result<(), String> {
         Self::flush_pending_cpu_kv(npu, state);
         if target_pos < npu.synced_kv_len {
             npu.synced_kv_len = target_pos;
         }
         if npu.synced_kv_len >= target_pos {
-            return;
+            return Ok(());
         }
         let start = npu.synced_kv_len;
         let use_f16 = state.kv_f16;
@@ -612,13 +679,18 @@ impl XdnaLlamaModel {
                 }
                 _ => unreachable!("LlamaModel layer {l} must have LayerState::Attention"),
             }
-            let _ = npu.layer_bo_y[l].sync_range(true, KV_SLOT * 4, KV_CACHE_BASE * 4);
+            npu.layer_bo_y[l]
+                .sync_range(true, KV_SLOT * 4, KV_CACHE_BASE * 4)
+                .map_err(|e| format!("layer {l} KV cache sync to device: {e}"))?;
         }
         npu.synced_kv_len = target_pos;
+        Ok(())
     }
 
     fn record_fault(&self, msg: String) -> Vec<f32> {
+        self.state_torn.store(true, Ordering::SeqCst);
         tracing::error!("cera::xdna: {msg}");
+        eprintln!("cera::xdna: {msg}");
         record_first_fault(&self.decode_error, CeraError::Backend(msg));
         vec![0.0f32; self.cpu.config().vocab_size]
     }
@@ -672,23 +744,39 @@ impl Model for XdnaLlamaModel {
         take_fault(&self.decode_error)
     }
 
+    fn backend_label(&self) -> &'static str {
+        "xdna"
+    }
+
+    fn supports_lora(&self) -> bool {
+        // The fused `q4layer` / `q4head` NPU kernels have no LoRA delta hooks.
+        false
+    }
+
     fn config(&self) -> &ModelConfig {
         self.cpu.config()
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
-        let mut npu = self.npu.lock().unwrap_or_else(|p| p.into_inner());
+        let mut npu = self.lock_npu();
         Self::flush_pending_cpu_kv(&mut npu, state);
         state.truncate_to(len);
         npu.synced_kv_len = npu.synced_kv_len.min(len);
     }
 
     fn check_kv_rewind(&self, state: &InferenceState, len: usize) -> Result<(), KvRewindError> {
+        let _npu = self.lock_npu();
+        if self.state_torn.load(Ordering::SeqCst) {
+            return Err(KvRewindError::BackendUnsupported);
+        }
         self.cpu.check_kv_rewind(state, len)
     }
 
     fn try_truncate_kv(&self, state: &mut InferenceState, len: usize) -> Result<(), KvRewindError> {
-        let mut npu = self.npu.lock().unwrap_or_else(|p| p.into_inner());
+        let mut npu = self.lock_npu();
+        if self.state_torn.load(Ordering::SeqCst) {
+            return Err(KvRewindError::BackendUnsupported);
+        }
         Self::flush_pending_cpu_kv(&mut npu, state);
         self.cpu.try_truncate_kv(state, len)?;
         npu.synced_kv_len = npu.synced_kv_len.min(len);
@@ -701,12 +789,13 @@ impl Model for XdnaLlamaModel {
         compression: &KvCompression,
         max_seq_len: usize,
     ) -> Result<(), CeraError> {
-        let mut npu = self.npu.lock().unwrap_or_else(|p| p.into_inner());
+        let mut npu = self.lock_npu();
         if let Some((_, kv)) = npu.pending_cpu_kv.take() {
             npu.spare_kv = Some(kv);
         }
         self.cpu.try_reset_kv(state, compression, max_seq_len)?;
         npu.synced_kv_len = 0;
+        self.state_torn.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -717,7 +806,12 @@ impl Model for XdnaLlamaModel {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         {
-            let mut npu = self.npu.lock().unwrap_or_else(|p| p.into_inner());
+            let mut npu = self.lock_npu();
+            if self.state_torn.load(Ordering::SeqCst) {
+                return self.record_fault(
+                    "XDNA NPU state torn after a fault; reset the session".to_string(),
+                );
+            }
             if start_pos == 0 {
                 if let Some((_, kv)) = npu.pending_cpu_kv.take() {
                     npu.spare_kv = Some(kv);
@@ -733,26 +827,37 @@ impl Model for XdnaLlamaModel {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "XdnaLlamaModel::forward expects 1 token");
 
-        // Positions beyond the 648-token NPU KV stream layout or with an active
-        // LoRA adapter fall back to CPU decode seamlessly (`state.layers` has
-        // the full KV history because every NPU decode step mirrors K/V there).
+        // Positions beyond the 648-token NPU KV stream layout (or a raw caller
+        // passing `state.lora`) fall back to CPU decode seamlessly (`state.layers`
+        // holds the full KV history because every NPU decode step mirrors K/V).
         if pos >= MAX_KV_CACHE_TOKENS || state.lora.is_some() {
             {
-                let mut npu = self.npu.lock().unwrap_or_else(|p| p.into_inner());
+                let mut npu = self.lock_npu();
+                if self.state_torn.load(Ordering::SeqCst) {
+                    return self.record_fault(
+                        "XDNA NPU state torn after a fault; reset the session".to_string(),
+                    );
+                }
                 Self::flush_pending_cpu_kv(&mut npu, state);
             }
             return self.cpu.forward(tokens, pos, state);
         }
 
-        let mut npu = self.npu.lock().unwrap_or_else(|p| p.into_inner());
+        let mut npu = self.lock_npu();
+        if self.state_torn.load(Ordering::SeqCst) {
+            return self
+                .record_fault("XDNA NPU state torn after a fault; reset the session".to_string());
+        }
         if pos == 0 {
             if let Some((_, kv)) = npu.pending_cpu_kv.take() {
                 npu.spare_kv = Some(kv);
             }
             npu.synced_kv_len = 0;
         }
-        if npu.synced_kv_len != pos {
-            self.sync_cpu_kv_to_npu(&mut npu, state, pos);
+        if npu.synced_kv_len != pos
+            && let Err(e) = self.sync_cpu_kv_to_npu(&mut npu, state, pos)
+        {
+            return self.record_fault(e);
         }
 
         let cfg = self.cpu.config();
@@ -763,16 +868,10 @@ impl Model for XdnaLlamaModel {
             _ => self.compute_rope_cs(pos),
         };
 
-        let needed_chunks = pos.max(1).div_ceil(ATTN_CHUNK_T);
-        let bucket_idx = npu
-            .bucket_chunks
-            .iter()
-            .position(|&c| c >= needed_chunks)
-            .unwrap_or(npu.bucket_chunks.len() - 1);
-        let skip_kv = (ATTN_CHUNKS - npu.bucket_chunks[bucket_idx]) as i32;
+        let (bucket_idx, skip_kv) = select_kv_bucket(&npu.bucket_chunks, pos);
 
-        let prof = std::env::var("CERA_XDNA_PROFILE").as_deref() == Ok("1");
-        let tc0 = std::time::Instant::now();
+        let prof = profile_decode_enabled();
+        let tc0 = prof.then(std::time::Instant::now);
         for l in 0..N_LAYERS {
             let yl = npu.layer_bo_y[l].as_mut_slice();
             if l == 0 {
@@ -790,9 +889,9 @@ impl Model for XdnaLlamaModel {
                 return self.record_fault(format!("layer {l} bo_y sync to device: {e}"));
             }
         }
-        let t_crit_sync = tc0.elapsed().as_secs_f64() * 1e6;
+        let t_crit_sync = tc0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
-        let t0 = std::time::Instant::now();
+        let t0 = prof.then(std::time::Instant::now);
         if let Err(e) = npu.bucket_runlists[bucket_idx].execute() {
             return self.record_fault(format!("token runlist execute: {e}"));
         }
@@ -810,9 +909,9 @@ impl Model for XdnaLlamaModel {
         if let Err(e) = npu.bucket_runlists[bucket_idx].wait(0) {
             return self.record_fault(format!("token runlist wait: {e}"));
         }
-        let t_npu_wait = t0.elapsed().as_secs_f64() * 1e6;
+        let t_npu_wait = t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
-        let tkv0 = std::time::Instant::now();
+        let tkv0 = prof.then(std::time::Instant::now);
         for l in 0..N_LAYERS {
             if transformer::oracle_dump::is_active() {
                 let next_bo = if l + 1 < N_LAYERS {
@@ -886,16 +985,16 @@ impl Model for XdnaLlamaModel {
         if pos + 1 >= MAX_KV_CACHE_TOKENS {
             Self::flush_pending_cpu_kv(&mut npu, state);
         }
-        let t_kv_sync = tkv0.elapsed().as_secs_f64() * 1e6;
+        let t_kv_sync = tkv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
-        let th0 = std::time::Instant::now();
+        let th0 = prof.then(std::time::Instant::now);
         if let Err(e) = npu
             .head_bo_y
             .sync_range(false, cfg.vocab_size * 4, TILE_F32 * 4)
         {
             return self.record_fault(format!("head bo_y sync from device: {e}"));
         }
-        let t_head_sync = th0.elapsed().as_secs_f64() * 1e6;
+        let t_head_sync = th0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
         if prof && !(20..520).contains(&pos) {
             eprintln!(
                 "xdna prof pos={pos}: npu_wait={t_npu_wait:.0}us crit_sync={t_crit_sync:.0}us kv_sync={t_kv_sync:.0}us head_sync={t_head_sync:.0}us"
@@ -946,4 +1045,95 @@ pub fn load_model_xdna(
         context_size,
         model_id,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::xdna::sys::fake::{Config as FakeConfig, with_shim};
+
+    #[test]
+    fn parse_profile_decode_accepts_truthy_and_ignores_disabled() {
+        assert!(!parse_profile_decode(None));
+        assert!(!parse_profile_decode(Some("")));
+        assert!(!parse_profile_decode(Some("   ")));
+        assert!(!parse_profile_decode(Some("0")));
+        assert!(!parse_profile_decode(Some(" 0 ")));
+        assert!(parse_profile_decode(Some("1")));
+        assert!(parse_profile_decode(Some("true")));
+    }
+
+    #[test]
+    fn kv_bucket_selection_covers_all_positions() {
+        let buckets: Vec<usize> = Q4LAYER_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+        assert_eq!(select_kv_bucket(&buckets, 0), (0, 8));
+        assert_eq!(select_kv_bucket(&buckets, 1), (0, 8));
+        assert_eq!(select_kv_bucket(&buckets, 72), (0, 8));
+        assert_eq!(select_kv_bucket(&buckets, 73), (1, 7));
+        assert_eq!(select_kv_bucket(&buckets, 144), (1, 7));
+        assert_eq!(select_kv_bucket(&buckets, 145), (2, 6));
+        assert_eq!(select_kv_bucket(&buckets, 576), (7, 1));
+        assert_eq!(select_kv_bucket(&buckets, 577), (8, 0));
+        assert_eq!(select_kv_bucket(&buckets, 647), (8, 0));
+    }
+
+    #[test]
+    fn poisoned_npu_lock_clears_poison_recycles_pending_kv_and_marks_torn() {
+        let (_, events) = with_shim(FakeConfig::default(), || {
+            let device = XdnaDevice::open(0).expect("fake open");
+            let kernel = device
+                .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
+                .expect("fake load");
+            let head_bo_w = kernel.alloc_bo(64, 3).expect("bo");
+            let head_bo_y = kernel.alloc_bo(64, 4).expect("bo");
+            let state = XdnaDecodeState {
+                bucket_chunks: vec![9],
+                bucket_runlists: Vec::new(),
+                _head_runs: Vec::new(),
+                _layer_runs: Vec::new(),
+                head_bo_y,
+                _head_bo_w: head_bo_w,
+                layer_bo_y: Vec::new(),
+                _layer_bo_w: Vec::new(),
+                _head_kernel: kernel,
+                _layer_kernels: Vec::new(),
+                _device: device,
+                synced_kv_len: 16,
+                cached_rope: None,
+                pending_cpu_kv: Some((
+                    15,
+                    (
+                        vec![[1.0f32; KV_DIM]; N_LAYERS],
+                        vec![[2.0f32; KV_DIM]; N_LAYERS],
+                    ),
+                )),
+                spare_kv: None,
+                q8_scales: Vec::new(),
+                q8_quants: Vec::new(),
+            };
+            let mu = Mutex::new(state);
+            let torn = AtomicBool::new(false);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = mu.lock().unwrap();
+                panic!("synthetic panic inside forward");
+            }));
+            assert!(mu.is_poisoned());
+
+            {
+                let g = lock_npu_state(&mu, &torn);
+                assert!(torn.load(Ordering::SeqCst));
+                assert!(g.pending_cpu_kv.is_none());
+                assert!(g.spare_kv.is_some());
+            }
+            // `clear_poison` ran, so a subsequent lock does not re-trigger poison recovery.
+            assert!(!mu.is_poisoned());
+            torn.store(false, Ordering::SeqCst);
+            let _g2 = lock_npu_state(&mu, &torn);
+            assert!(
+                !torn.load(Ordering::SeqCst),
+                "second lock must not re-mark torn after clear_poison"
+            );
+        });
+        assert!(!events.is_empty());
+    }
 }

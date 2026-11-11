@@ -8,9 +8,9 @@
 //! (element `e = k*16 + n`, low nibble first) followed by the 16 bf16 row
 //! scales of every block: 288 bytes per block, 4.5 bits per weight.
 //!
-//! Weights arrive as GGUF Q4_0 (or, for the LM head, Q6_K dequantized to
-//! f32 and quantized with the spike's Q4_0 rule). Q4_1 pricing is still
-//! open in the decision record; this module rejects it loudly.
+//! Weights arrive as GGUF Q4_0 (`pack_q4_0_stage`) or as dequantized f32 rows
+//! (`pack_f32_stage`, used for Q6_K or other non-Q4_0 tensors quantized with
+//! the spike's Q4_0 rule).
 
 use crate::quant::f16_to_f32;
 
@@ -234,6 +234,9 @@ const WORKERS: usize = 16;
 /// (`q+k+v` or `gate+up`) streams all of worker `i`'s stage slices in a single
 /// contiguous Shim DMA buffer descriptor.
 pub fn interleave_worker_stages(dst: &mut [u8], stages: &[&[u8]]) -> Result<usize, String> {
+    if stages.is_empty() {
+        return Err("xdna interleave requires at least one stage".to_string());
+    }
     let mut total = 0usize;
     for (idx, s) in stages.iter().enumerate() {
         if s.is_empty() || !s.len().is_multiple_of(WORKERS) {
@@ -270,14 +273,17 @@ mod tests {
         assert_eq!(f32_to_bf16(1.0), 0x3F80);
         assert_eq!(f32_to_bf16(-2.5), 0xC020);
         assert_eq!(f32_to_bf16(0.0), 0x0000);
-        // 1.00390625 is exactly between two bf16 values ending in even/odd;
-        // nearest-even keeps the even one (0x3F80), +1 ulp of f32 rounds up.
-        assert_eq!(f32_to_bf16(1.00390625), 0x3F80);
-        assert_eq!(f32_to_bf16(1.00390637), 0x3F81);
+        // 0x3f80_8000 (1 + 2^-8) is midway between bf16 0x3F80 (even) and
+        // 0x3F81 (odd): nearest-even keeps 0x3F80, and +1 f32 ULP rounds up.
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f80_8000)), 0x3F80);
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f80_8001)), 0x3F81);
     }
 
     #[test]
     fn shape_validation_rejects_bad_shapes() {
+        assert!(stage_bytes(0, 2048).is_err());
+        assert!(stage_bytes(2048, 0).is_err());
+        assert!(stage_bytes(0, 0).is_err());
         assert!(stage_bytes(100, 2048).is_err());
         assert!(stage_bytes(2048, 100).is_err());
         assert!(stage_bytes(512, 2048).is_ok());
@@ -368,6 +374,8 @@ mod tests {
             assert_eq!(dst[base + 1], (w * 2 + 1) as u8);
             assert_eq!(dst[base + 2], (100 + w) as u8);
         }
+        assert!(interleave_worker_stages(&mut dst, &[]).is_err());
+        assert!(interleave_worker_stages(&mut dst, &[&[]]).is_err());
         assert!(interleave_worker_stages(&mut dst, &[&[0u8; 15]]).is_err());
     }
 }

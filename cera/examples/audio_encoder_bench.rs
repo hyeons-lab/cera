@@ -23,6 +23,7 @@ use cera::gguf::GgufFile;
 use cera::model::audio_encoder::{AudioEncoderWeights, SAMPLE_RATE, encode_audio_pcm};
 
 /// User plus system CPU time of this process, in seconds.
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `getrusage` fills the struct it is given; RUSAGE_SELF is valid.
@@ -32,6 +33,44 @@ fn cpu_seconds() -> f64 {
     };
     let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
     secs(ru.ru_utime) + secs(ru.ru_stime)
+}
+
+#[cfg(windows)]
+fn cpu_seconds() -> f64 {
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut c, mut e, mut k, mut u) = (
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    );
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        return 0.0;
+    }
+    let secs = |ft: FileTime| (((ft.high as u64) << 32) | (ft.low as u64)) as f64 * 1e-7;
+    secs(k) + secs(u)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cpu_seconds() -> f64 {
+    0.0
 }
 
 fn main() {

@@ -80,7 +80,7 @@ pub enum BackendPreference {
     /// Qualcomm Hexagon NPU. Requires the `hexagon` feature.
     Hexagon,
     /// Whichever NPU this machine has: tries each NPU backend compiled into
-    /// this build (today only Hexagon) and loads the first that works. Errors
+    /// this build (Hexagon, AMD XDNA) and loads the first that works. Errors
     /// with every vendor's reason when none does, or when no NPU backend is
     /// compiled in.
     Npu,
@@ -2625,7 +2625,7 @@ fn load_text_model_npu(
 
     if tried.is_empty() {
         Err(CeraError::Backend(
-            "no NPU backend is compiled into this build (enable a vendor feature such as `hexagon`)"
+            "no NPU backend is compiled into this build (enable a vendor feature such as `hexagon` or `xdna`)"
                 .into(),
         ))
     } else {

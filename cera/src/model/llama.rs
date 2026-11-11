@@ -1800,11 +1800,6 @@ impl LlamaModel {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn _xdna_dummy(&self) -> Option<usize> {
-        self.loop_norm_interval
-    }
-
     /// Attention dims for layer `il`.
     fn attn_dims(&self, il: usize) -> AttnDims<'_> {
         AttnDims {
