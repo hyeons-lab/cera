@@ -1,8 +1,8 @@
 //! Runtime loading of the embedded XDNA shim DLL and its C ABI.
 //!
 //! On Windows x86_64 MSVC, `build.rs` compiles `shim/cera_xdna_shim.cpp` into a
-//! DLL (`has_xdna_shim`) that links `xrt_coreutil.dll`. `LoadLibraryW` fails on
-//! machines without the AMD NPU driver; that failure (and non-Windows targets,
+//! DLL (`has_xdna_shim`) that links `xrt_coreutil.dll`. `LoadLibraryExW` fails
+//! on machines without the AMD NPU driver; that failure (and non-Windows targets,
 //! where `has_xdna_shim` is unset) is the backend's "unavailable" signal and is
 //! reported as an error string, never a panic.
 
@@ -92,7 +92,8 @@ pub struct Shim {
 static SHIM: OnceLock<Result<Shim, String>> = OnceLock::new();
 
 /// Load the shim once per process. On Windows x86_64 MSVC, the DLL bytes are
-/// written to a per-process temp file because `LoadLibraryW` needs a path.
+/// staged into a user-private directory with a CSPRNG nonce and exclusive write
+/// sharing because `LoadLibraryExW` needs a path on disk.
 pub fn shim() -> Result<&'static Shim, String> {
     #[cfg(test)]
     if let Some(fake) = fake::active_shim() {
@@ -102,23 +103,114 @@ pub fn shim() -> Result<&'static Shim, String> {
 }
 
 #[cfg(has_xdna_shim)]
-fn load() -> Result<Shim, String> {
-    let dir = std::env::temp_dir().join(format!("cera_xdna_shim_{}.dll", std::process::id()));
-    std::fs::write(&dir, SHIM_DLL)
-        .map_err(|e| format!("cannot write xdna shim to {}: {e}", dir.display()))?;
-    let wide: Vec<u16> = dir
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
-    if module == 0 {
-        let code = unsafe { GetLastError() };
-        return Err(format!(
-            "cannot load the xdna shim ({}); the AMD NPU driver (xrt_coreutil.dll) is probably not installed [Win32 error {code}]",
-            dir.display()
-        ));
+fn shim_stage_dir() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(|base| std::path::PathBuf::from(base).join("cera").join("xdna"))
+        .unwrap_or_else(|| std::env::temp_dir().join("cera-xdna"));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create xdna shim directory {}: {e}", dir.display()))?;
+    // Best-effort sweep of prior exited processes' staged DLLs; any DLL mapped
+    // by a live process has its image section locked by Windows and fails with
+    // a sharing violation, which is ignored.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with("cera_xdna_shim_")
+                && name.ends_with(".dll")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
+    Ok(dir)
+}
+
+#[cfg(any(has_xdna_shim, test))]
+fn stage_shim_dll_in(
+    dir: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Write};
+
+    let pid = std::process::id();
+    for _ in 0..16 {
+        let nonce: u128 = rand::random();
+        let path = dir.join(format!("cera_xdna_shim_{pid}_{nonce:032x}.dll"));
+        let mut create_opts = OpenOptions::new();
+        create_opts.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Exclusive access (`share_mode(0)`) while writing initial bytes.
+            create_opts.share_mode(0);
+        }
+        match create_opts.open(&path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("cannot write xdna shim to {}: {e}", path.display()));
+                }
+                drop(file);
+
+                // Re-open read-only with `FILE_SHARE_READ` (no write/delete
+                // sharing) and re-verify the payload bytes while holding that
+                // read lock. `LoadLibraryExW` fails with `ERROR_SHARING_VIOLATION`
+                // if an open handle still holds `GENERIC_WRITE`, whereas a
+                // read-only lock lets `LoadLibraryExW` map `SEC_IMAGE` while
+                // blocking any concurrent write, rename, or swap (CWE-377).
+                let mut lock_opts = OpenOptions::new();
+                lock_opts.read(true);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    lock_opts.share_mode(0x0000_0001); // FILE_SHARE_READ
+                }
+                let mut read_lock = match lock_opts.open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(format!(
+                            "cannot lock staged xdna shim {}: {e}",
+                            path.display()
+                        ));
+                    }
+                };
+                let mut verify = Vec::with_capacity(bytes.len());
+                if let Err(e) = read_lock.read_to_end(&mut verify) {
+                    drop(read_lock);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!(
+                        "cannot verify staged xdna shim {}: {e}",
+                        path.display()
+                    ));
+                }
+                if verify != bytes {
+                    drop(read_lock);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!(
+                        "staged xdna shim {} failed integrity verification",
+                        path.display()
+                    ));
+                }
+                return Ok((path, read_lock));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!("cannot create xdna shim in {}: {e}", dir.display()));
+            }
+        }
+    }
+    Err(format!(
+        "cannot create unique xdna shim file in {} after 16 attempts",
+        dir.display()
+    ))
+}
+
+#[cfg(has_xdna_shim)]
+unsafe fn load_symbols(module: isize) -> Result<Shim, String> {
     let shim = Shim {
         module,
         abi: unsafe { get(module, "cera_xdna_shim_abi")? },
@@ -152,6 +244,52 @@ fn load() -> Result<Shim, String> {
     Ok(shim)
 }
 
+#[cfg(has_xdna_shim)]
+fn load() -> Result<Shim, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const LOAD_LIBRARY_SEARCH_APPLICATION_DIR: u32 = 0x0000_0200;
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+    let stage_dir = shim_stage_dir()?;
+    let (dll_path, lock_file) = stage_shim_dll_in(&stage_dir, SHIM_DLL)?;
+    let wide: Vec<u16> = dll_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // Hold `lock_file` across `LoadLibraryExW` so the staged DLL cannot be
+    // modified or replaced before Windows maps its image section, and restrict
+    // dependent DLL lookup (`xrt_coreutil.dll`, MSVC runtime) to the app dir
+    // and `%SystemRoot%\System32`.
+    let module = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            0,
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    drop(lock_file);
+    if module == 0 {
+        let code = unsafe { GetLastError() };
+        let _ = std::fs::remove_file(&dll_path);
+        return Err(format!(
+            "cannot load the xdna shim ({}); the AMD NPU driver (xrt_coreutil.dll) is probably not installed [Win32 error {code}]",
+            dll_path.display()
+        ));
+    }
+    match unsafe { load_symbols(module) } {
+        Ok(shim) => Ok(shim),
+        Err(e) => {
+            unsafe {
+                let _ = FreeLibrary(module);
+            }
+            let _ = std::fs::remove_file(&dll_path);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(not(has_xdna_shim))]
 fn load() -> Result<Shim, String> {
     Err("AMD XDNA NPU backend requires Windows x86_64 (MSVC)".to_string())
@@ -173,7 +311,8 @@ pub fn new_err_buf() -> ErrBuf {
 #[cfg(has_xdna_shim)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn LoadLibraryW(path: *const u16) -> isize;
+    fn LoadLibraryExW(path: *const u16, file: isize, flags: u32) -> isize;
+    fn FreeLibrary(module: isize) -> i32;
     fn GetProcAddress(module: isize, name: *const c_char) -> *mut c_void;
     fn GetLastError() -> u32;
 }
@@ -506,8 +645,48 @@ mod tests {
 
     #[test]
     fn shim_loads_with_expected_abi() {
+        #[cfg(has_xdna_shim)]
+        if std::env::var_os("SystemRoot")
+            .map(|r| {
+                std::path::PathBuf::from(r)
+                    .join("System32")
+                    .join("xrt_coreutil.dll")
+            })
+            .is_some_and(|p| p.exists())
+        {
+            let shim = shim().expect("shim must load when xrt_coreutil.dll is installed");
+            assert_eq!(unsafe { (shim.abi)() }, EXPECTED_ABI);
+            return;
+        }
         // Driverless or non-Windows machines skip: loading the shim is the availability probe.
         let Ok(shim) = shim() else { return };
         assert_eq!(unsafe { (shim.abi)() }, EXPECTED_ABI);
+    }
+
+    #[test]
+    fn stage_shim_dll_creates_unique_locked_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let payload = b"cera-xdna-shim-test-payload";
+        let (p1, f1) = stage_shim_dll_in(tmp.path(), payload).expect("stage 1");
+        let (p2, f2) = stage_shim_dll_in(tmp.path(), payload).expect("stage 2");
+        assert_ne!(p1, p2, "staged filenames must carry fresh CSPRNG nonces");
+        assert_eq!(std::fs::read(&p1).expect("read p1"), payload);
+        #[cfg(windows)]
+        {
+            // While `f1` is open with `FILE_SHARE_READ` only, any concurrent
+            // write or delete attempt must fail with a sharing violation.
+            assert!(
+                std::fs::OpenOptions::new().write(true).open(&p1).is_err(),
+                "staged DLL must reject concurrent write handles while locked"
+            );
+            assert!(
+                std::fs::remove_file(&p1).is_err(),
+                "staged DLL must reject unlink/swap while locked"
+            );
+        }
+        drop(f1);
+        drop(f2);
+        std::fs::remove_file(&p1).expect("cleanup p1 after unlock");
+        std::fs::remove_file(&p2).expect("cleanup p2 after unlock");
     }
 }

@@ -139,7 +139,7 @@ fn main() -> ExitCode {
             interleave_worker_stages(&mut w[off..], &[&stage_packed[4], &stage_packed[5]]).unwrap();
         w[off..off + stage_packed[6].len()].copy_from_slice(&stage_packed[6]);
     }
-    if let Err(e) = bo_w.sync(true) {
+    if let Err(e) = bo_w.sync_to_device() {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
@@ -215,7 +215,7 @@ fn main() -> ExitCode {
             y[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
     }
-    if let Err(e) = bo_y.sync(true) {
+    if let Err(e) = bo_y.sync_to_device() {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
@@ -228,7 +228,7 @@ fn main() -> ExitCode {
         }
     };
     bo_y_next.as_mut_slice().fill(0);
-    if let Err(e) = bo_y_next.sync(true) {
+    if let Err(e) = bo_y_next.sync_to_device() {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
@@ -255,11 +255,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    if let Err(e) = bo_y.sync(false) {
+    if let Err(e) = bo_y.sync_from_device() {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
-    if let Err(e) = bo_y_next.sync(false) {
+    if let Err(e) = bo_y_next.sync_from_device() {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }

@@ -238,30 +238,60 @@ impl XdnaBo {
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 
-    /// Sync the buffer to (`to_device = true`) or from the device.
-    pub fn sync(&self, to_device: bool) -> Result<(), String> {
+    /// Sync the entire buffer from host memory to the device.
+    pub fn sync_to_device(&self) -> Result<(), String> {
         let mut err = new_err_buf();
-        let rc = unsafe {
-            (self.shim.bo_sync)(self.handle, to_device as i32, err.as_mut_ptr(), err.len())
-        };
-        check(rc, &err, "sync buffer")?;
+        let rc = unsafe { (self.shim.bo_sync)(self.handle, 1, err.as_mut_ptr(), err.len()) };
+        check(rc, &err, "sync buffer to device")?;
         Ok(())
     }
 
-    /// Sync `size` bytes starting at `offset` to (`to_device = true`) or from the device.
-    pub fn sync_range(&self, to_device: bool, size: usize, offset: usize) -> Result<(), String> {
+    /// Sync the entire buffer from the device into host memory.
+    ///
+    /// Takes `&mut self` so no slice returned by [`Self::as_slice`] or
+    /// [`Self::as_mut_slice`] can alias the DMA write into mapped host memory.
+    pub fn sync_from_device(&mut self) -> Result<(), String> {
+        let mut err = new_err_buf();
+        let rc = unsafe { (self.shim.bo_sync)(self.handle, 0, err.as_mut_ptr(), err.len()) };
+        check(rc, &err, "sync buffer from device")?;
+        Ok(())
+    }
+
+    fn check_range(&self, size: usize, offset: usize) -> Result<(), String> {
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| format!("sync buffer range overflow: offset={offset} size={size}"))?;
+        if end > self.len {
+            return Err(format!(
+                "sync buffer range out of bounds: offset={offset} size={size} len={}",
+                self.len
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sync `size` bytes starting at `offset` from host memory to the device.
+    pub fn sync_range_to_device(&self, size: usize, offset: usize) -> Result<(), String> {
+        self.check_range(size, offset)?;
         let mut err = new_err_buf();
         let rc = unsafe {
-            (self.shim.bo_sync_range)(
-                self.handle,
-                to_device as i32,
-                size,
-                offset,
-                err.as_mut_ptr(),
-                err.len(),
-            )
+            (self.shim.bo_sync_range)(self.handle, 1, size, offset, err.as_mut_ptr(), err.len())
         };
-        check(rc, &err, "sync buffer range")?;
+        check(rc, &err, "sync buffer range to device")?;
+        Ok(())
+    }
+
+    /// Sync `size` bytes starting at `offset` from the device into host memory.
+    ///
+    /// Takes `&mut self` so no slice returned by [`Self::as_slice`] or
+    /// [`Self::as_mut_slice`] can alias the DMA write into mapped host memory.
+    pub fn sync_range_from_device(&mut self, size: usize, offset: usize) -> Result<(), String> {
+        self.check_range(size, offset)?;
+        let mut err = new_err_buf();
+        let rc = unsafe {
+            (self.shim.bo_sync_range)(self.handle, 0, size, offset, err.as_mut_ptr(), err.len())
+        };
+        check(rc, &err, "sync buffer range from device")?;
         Ok(())
     }
 }
@@ -429,5 +459,22 @@ mod tests {
                 && events.contains(&Event::BoFree(1)),
             "allocated BO must be freed when map returns null: {events:?}"
         );
+    }
+
+    #[test]
+    fn bo_sync_range_rejects_out_of_bounds_and_overflow() {
+        static COUNTER: VoteCounter = VoteCounter::new();
+        let _ = with_shim(Config::default(), || {
+            let dev = XdnaDevice::open_with_counter(0, &COUNTER).expect("open");
+            let k = dev
+                .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
+                .expect("load");
+            let mut bo = k.alloc_bo(64, 3).expect("alloc");
+            assert!(bo.sync_range_to_device(64, 0).is_ok());
+            assert!(bo.sync_range_from_device(32, 32).is_ok());
+            assert!(bo.sync_range_to_device(65, 0).is_err());
+            assert!(bo.sync_range_from_device(1, 64).is_err());
+            assert!(bo.sync_range_to_device(1, usize::MAX).is_err());
+        });
     }
 }

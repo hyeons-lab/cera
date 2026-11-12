@@ -386,14 +386,14 @@ impl XdnaLlamaModel {
                 6,
             )?;
 
-            bo_w.sync(true)
+            bo_w.sync_to_device()
                 .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_w sync: {e}"))?;
 
             let y_slice = bo_y.as_mut_slice();
             y_slice.fill(0);
             write_f32_slice(y_slice, ATTN_NORM_W, cpu.attn_norm_slice(il));
             write_f32_slice(y_slice, 4 * ACT_SLOT + FFN_NORM_W, cpu.ffn_norm_slice(il));
-            bo_y.sync(true)
+            bo_y.sync_to_device()
                 .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_y sync: {e}"))?;
 
             layer_bo_w.push(bo_w);
@@ -419,7 +419,7 @@ impl XdnaLlamaModel {
         write_i32(head_bo_y.as_mut_slice(), ATTN_N_OFF, -1);
         write_f32_slice(head_bo_y.as_mut_slice(), ATTN_N_OFF + 1, &[1.0, 0.0]);
         head_bo_y
-            .sync(true)
+            .sync_to_device()
             .map_err(|e| anyhow::anyhow!("XDNA head bo_y sync: {e}"))?;
 
         let head_ref = cpu.lm_head_weight_ref();
@@ -485,7 +485,7 @@ impl XdnaLlamaModel {
             }
         }
         head_bo_w
-            .sync(true)
+            .sync_to_device()
             .map_err(|e| anyhow::anyhow!("XDNA head bo_w sync: {e}"))?;
 
         let mut layer_runs = Vec::with_capacity(layer_kernels.len());
@@ -680,7 +680,7 @@ impl XdnaLlamaModel {
                 _ => unreachable!("LlamaModel layer {l} must have LayerState::Attention"),
             }
             npu.layer_bo_y[l]
-                .sync_range(true, KV_SLOT * 4, KV_CACHE_BASE * 4)
+                .sync_range_to_device(KV_SLOT * 4, KV_CACHE_BASE * 4)
                 .map_err(|e| format!("layer {l} KV cache sync to device: {e}"))?;
         }
         npu.synced_kv_len = target_pos;
@@ -881,11 +881,11 @@ impl Model for XdnaLlamaModel {
             write_i32(yl, ATTN_N_OFF, pos as i32);
             write_i32(yl, ATTN_SKIP_KV_OFF, skip_kv);
             if l == 0
-                && let Err(e) = npu.layer_bo_y[0].sync_range(true, HIDDEN_SIZE * 4, 0)
+                && let Err(e) = npu.layer_bo_y[0].sync_range_to_device(HIDDEN_SIZE * 4, 0)
             {
                 return self.record_fault(format!("layer 0 hidden sync to device: {e}"));
             }
-            if let Err(e) = npu.layer_bo_y[l].sync_range(true, 132 * 4, ROPE_CS * 4) {
+            if let Err(e) = npu.layer_bo_y[l].sync_range_to_device(132 * 4, ROPE_CS * 4) {
                 return self.record_fault(format!("layer {l} bo_y sync to device: {e}"));
             }
         }
@@ -914,15 +914,17 @@ impl Model for XdnaLlamaModel {
         let tkv0 = prof.then(std::time::Instant::now);
         for l in 0..N_LAYERS {
             if transformer::oracle_dump::is_active() {
-                let next_bo = if l + 1 < N_LAYERS {
-                    &npu.layer_bo_y[l + 1]
-                } else {
-                    &npu.head_bo_y
-                };
-                if let Err(e) = next_bo.sync_range(false, HIDDEN_SIZE * 4, 0) {
-                    return self.record_fault(format!("layer {l} out sync from device: {e}"));
+                {
+                    let next_bo = if l + 1 < N_LAYERS {
+                        &mut npu.layer_bo_y[l + 1]
+                    } else {
+                        &mut npu.head_bo_y
+                    };
+                    if let Err(e) = next_bo.sync_range_from_device(HIDDEN_SIZE * 4, 0) {
+                        return self.record_fault(format!("layer {l} out sync from device: {e}"));
+                    }
+                    read_f32_slice(next_bo.as_slice(), 0, &mut hidden);
                 }
-                read_f32_slice(next_bo.as_slice(), 0, &mut hidden);
                 transformer::oracle_dump::record(&format!("l_out-{l}"), &hidden);
                 if l + 1 == N_LAYERS {
                     let mut normed = vec![0.0f32; HIDDEN_SIZE];
@@ -943,10 +945,10 @@ impl Model for XdnaLlamaModel {
                 }
             }
 
-            if let Err(e) = npu.layer_bo_y[l].sync_range(false, KV_DIM * 4, 2 * ACT_SLOT * 4) {
+            if let Err(e) = npu.layer_bo_y[l].sync_range_from_device(KV_DIM * 4, 2 * ACT_SLOT * 4) {
                 return self.record_fault(format!("layer {l} slot 2 sync from device: {e}"));
             }
-            if let Err(e) = npu.layer_bo_y[l].sync_range(false, KV_DIM * 4, 3 * ACT_SLOT * 4) {
+            if let Err(e) = npu.layer_bo_y[l].sync_range_from_device(KV_DIM * 4, 3 * ACT_SLOT * 4) {
                 return self.record_fault(format!("layer {l} slot 3 sync from device: {e}"));
             }
             let k_cur = &mut pending_k[l];
@@ -971,11 +973,11 @@ impl Model for XdnaLlamaModel {
                 }
             }
             for &k_byte_off in &k_offs {
-                if let Err(e) = npu.layer_bo_y[l].sync_range(true, HEAD_DIM * 2, k_byte_off) {
+                if let Err(e) = npu.layer_bo_y[l].sync_range_to_device(HEAD_DIM * 2, k_byte_off) {
                     return self.record_fault(format!("layer {l} k sync to device: {e}"));
                 }
                 if let Err(e) =
-                    npu.layer_bo_y[l].sync_range(true, HEAD_DIM * 2, k_byte_off + SILU_HALF * 4)
+                    npu.layer_bo_y[l].sync_range_to_device(HEAD_DIM * 2, k_byte_off + SILU_HALF * 4)
                 {
                     return self.record_fault(format!("layer {l} v sync to device: {e}"));
                 }
@@ -990,7 +992,7 @@ impl Model for XdnaLlamaModel {
         let th0 = prof.then(std::time::Instant::now);
         if let Err(e) = npu
             .head_bo_y
-            .sync_range(false, cfg.vocab_size * 4, TILE_F32 * 4)
+            .sync_range_from_device(cfg.vocab_size * 4, TILE_F32 * 4)
         {
             return self.record_fault(format!("head bo_y sync from device: {e}"));
         }
