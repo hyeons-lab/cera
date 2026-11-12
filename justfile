@@ -247,7 +247,10 @@ dart-bindings-check: dart-bindings
     # The plugin does need Flutter: pub refuses to publish a package declaring
     # `flutter.plugin.platforms` without an SDK constraint, and that constraint
     # is exactly what `dart pub get` rejects. See cera_ffi_flutter/pubspec.yaml.
-    cd cera_ffi_flutter && flutter pub get && flutter analyze
+    # `--no-fatal-infos` matches `dart analyze` above so rolling `channel: stable`
+    # SDK deprecation infos (e.g. Flutter 3.47 `package:flutter/material.dart`)
+    # do not fail CI while warnings and errors remain fatal.
+    cd cera_ffi_flutter && flutter pub get && flutter analyze --no-fatal-infos
 
 # Format every hand-written Dart file, the way CI checks it.
 #
