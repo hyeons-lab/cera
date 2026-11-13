@@ -580,6 +580,67 @@ fn value_enables(v: &str) -> bool {
     !v.trim().is_empty() && !is_off_spelling(v)
 }
 
+/// Parse a raw `CERA_PROFILE_DECODE` string into `Ok(true)`, `Ok(false)`, or `Err(trimmed)` when
+/// non-empty and unrecognized.
+fn parse_profile_decode_value(raw: &str) -> Result<bool, &str> {
+    let v = raw.trim();
+    if v.is_empty()
+        || ["0", "false", "off", "no"]
+            .iter()
+            .any(|d| v.eq_ignore_ascii_case(d))
+    {
+        return Ok(false);
+    }
+    if ["1", "true", "on", "yes"]
+        .iter()
+        .any(|e| v.eq_ignore_ascii_case(e))
+    {
+        return Ok(true);
+    }
+    Err(v)
+}
+
+/// Pure lookup seam for `CERA_PROFILE_DECODE`, shared by the CPU LFM2 and AMD XDNA decode paths.
+///
+/// Accepts `1`, `true`, `on`, `yes` as enabled and `0`, `false`, `off`, `no` (plus empty or unset)
+/// as disabled, trimmed and case-insensitive. Unrecognized non-empty values log a warning and
+/// leave profiling off rather than silently turning it on.
+pub(crate) fn profile_decode_enabled_from_lookup(
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> bool {
+    let Some(raw) = lookup("CERA_PROFILE_DECODE") else {
+        return false;
+    };
+    match parse_profile_decode_value(&raw) {
+        Ok(enabled) => enabled,
+        Err(v) => {
+            tracing::warn!(
+                "ignoring unrecognized CERA_PROFILE_DECODE={v:?}; expected 1/true/on/yes or 0/false/off/no"
+            );
+            eprintln!(
+                "cera: ignoring unrecognized CERA_PROFILE_DECODE={v:?}; expected 1/true/on/yes or 0/false/off/no"
+            );
+            false
+        }
+    }
+}
+
+/// Whether `CERA_PROFILE_DECODE` enables per-step decode timing output, cached once per process.
+///
+/// Always `false` under `cfg(test)` so an ambient shell variable never perturbs test output or
+/// golden runs; unit tests exercise [`profile_decode_enabled_from_lookup`] directly.
+pub(crate) fn profile_decode_enabled() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| profile_decode_enabled_from_lookup(|k| std::env::var(k).ok()))
+    }
+}
+
 /// Whether `CERA_PIN` switches worker pinning off, resolved once.
 ///
 /// Lives here rather than next to `threadpool::pinning_enabled` (which is now
@@ -2761,5 +2822,47 @@ not a mountinfo line\n\
         let r = cpu_features().report();
         assert!(r.contains("tier="));
         assert!(r.contains(cpu_tier().label()));
+    }
+
+    #[test]
+    fn profile_decode_lookup_seam_parses_opt_in_and_rejects_off_or_garbage() {
+        assert!(!profile_decode_enabled_from_lookup(|_| None));
+        for quiet_off in [
+            "", "   ", "0", " 0 ", "false", "FALSE", "off", "Off", "no", "NO",
+        ] {
+            assert_eq!(
+                super::parse_profile_decode_value(quiet_off),
+                Ok(false),
+                "expected recognized Ok(false) for {quiet_off:?}"
+            );
+            assert!(
+                !profile_decode_enabled_from_lookup(|k| {
+                    assert_eq!(k, "CERA_PROFILE_DECODE");
+                    Some(quiet_off.to_string())
+                }),
+                "expected off for {quiet_off:?}"
+            );
+        }
+        for bad in ["garbage", "2", " -1 "] {
+            assert_eq!(
+                super::parse_profile_decode_value(bad),
+                Err(bad.trim()),
+                "expected unrecognized Err for {bad:?}"
+            );
+            assert!(!profile_decode_enabled_from_lookup(|_| Some(
+                bad.to_string()
+            )));
+        }
+        for on in ["1", " 1 ", "true", "TRUE", "on", "On", "yes", "YES"] {
+            assert_eq!(super::parse_profile_decode_value(on), Ok(true));
+            assert!(
+                profile_decode_enabled_from_lookup(|k| {
+                    assert_eq!(k, "CERA_PROFILE_DECODE");
+                    Some(on.to_string())
+                }),
+                "expected on for {on:?}"
+            );
+        }
+        assert!(!profile_decode_enabled());
     }
 }

@@ -34,6 +34,9 @@ pub mod metal;
 #[cfg(feature = "hexagon")]
 pub mod hexagon;
 
+#[cfg(feature = "xdna")]
+pub mod xdna;
+
 /// Compute operations supported by backends.
 #[derive(Debug)]
 pub enum Op {

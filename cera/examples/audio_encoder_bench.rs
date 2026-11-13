@@ -23,6 +23,7 @@ use cera::gguf::GgufFile;
 use cera::model::audio_encoder::{AudioEncoderWeights, SAMPLE_RATE, encode_audio_pcm};
 
 /// User plus system CPU time of this process, in seconds.
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `getrusage` fills the struct it is given; RUSAGE_SELF is valid.
@@ -34,18 +35,84 @@ fn cpu_seconds() -> f64 {
     secs(ru.ru_utime) + secs(ru.ru_stime)
 }
 
+#[cfg(windows)]
+fn cpu_seconds() -> f64 {
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut c, mut e, mut k, mut u) = (
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    );
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        return 0.0;
+    }
+    let secs = |ft: FileTime| (((ft.high as u64) << 32) | (ft.low as u64)) as f64 * 1e-7;
+    secs(k) + secs(u)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cpu_seconds() -> f64 {
+    0.0
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let path = args
-        .next()
-        .expect("usage: audio_encoder_bench <mmproj.gguf> [seconds] [reps]");
-    let seconds: f64 = args.next().map_or(10.0, |s| s.parse().expect("seconds"));
-    let reps: usize = args.next().map_or(5, |s| s.parse().expect("reps"));
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: audio_encoder_bench <mmproj.gguf> [seconds] [reps]");
+        return;
+    }
+    if raw_args.is_empty() || raw_args.len() > 3 {
+        eprintln!("error: usage: audio_encoder_bench <mmproj.gguf> [seconds] [reps]");
+        std::process::exit(2);
+    }
+    let path = &raw_args[0];
+    let seconds: f64 = match raw_args.get(1) {
+        Some(s) => s.parse().unwrap_or_else(|_| {
+            eprintln!("error: invalid seconds `{s}`: expected finite number in (0, 3600]");
+            std::process::exit(2);
+        }),
+        None => 10.0,
+    };
+    if !seconds.is_finite() || seconds * (SAMPLE_RATE as f64) < 1.0 || seconds > 3600.0 {
+        eprintln!(
+            "error: seconds must yield at least 1 sample at {SAMPLE_RATE} Hz and be <= 3600, got {seconds}"
+        );
+        std::process::exit(2);
+    }
+    let reps: usize = match raw_args.get(2) {
+        Some(s) => s.parse().unwrap_or_else(|_| {
+            eprintln!("error: invalid reps `{s}`: expected integer in 1..=100000");
+            std::process::exit(2);
+        }),
+        None => 5,
+    };
+    if !(1..=100_000).contains(&reps) {
+        eprintln!("error: reps must be in 1..=100000, got {reps}");
+        std::process::exit(2);
+    }
 
     // The CLI does this; an embedder that skips it gets a differently sized pool.
     cera::backend::cpu::configure_thread_pool();
 
-    let gguf = GgufFile::open_arc(Path::new(&path)).expect("open mmproj");
+    let gguf = GgufFile::open_arc(Path::new(path)).expect("open mmproj");
     let weights = AudioEncoderWeights::from_gguf(&gguf).expect("audio encoder weights");
     let cfg = &weights.config;
     println!(

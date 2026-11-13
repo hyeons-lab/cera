@@ -13,3 +13,11 @@ cera/src/generated/** linguist-generated=true
 
 # Vendored Hexagon DSP skels (prebuilt binaries + upstream license).
 cera/src/backend/hexagon/skels/** linguist-generated=true
+
+# Vendored XRT headers, WSL kernel scripts, and prebuilt XDNA NPU kernel binaries.
+cera/src/backend/xdna/shim/include/** linguist-generated=true
+cera/src/backend/xdna/kernels/*.sh text eol=lf
+tools/xdna-spike/*.sh text eol=lf
+tools/xdna-spike/iron/*.sh text eol=lf
+cera/src/backend/xdna/kernels/*.xclbin binary linguist-generated=true
+cera/src/backend/xdna/kernels/*.bin binary linguist-generated=true

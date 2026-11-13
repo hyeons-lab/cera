@@ -122,8 +122,17 @@ test-hexagon:
     cargo test -p cera-ffi --features hexagon --lib
     cargo test -p cera-cli --features hexagon
 
+# Clippy and tests for the non-default `xdna` feature, mirroring `.github/workflows/ci.yml`.
+clippy-xdna:
+    cargo clippy -p cera --features xdna --all-targets -- -D warnings
+    cargo clippy -p cera-cli --features xdna --all-targets -- -D warnings
+
+test-xdna:
+    cargo test -p cera --features xdna --lib -- xdna npu_preference_errors_name_every_vendor_that_failed
+    cargo test -p cera-cli --features xdna
+
 # Run all CI checks locally (mirrors GitHub Actions)
-ci: fmt clippy test python-test clippy-hexagon test-hexagon
+ci: fmt clippy test python-test clippy-hexagon test-hexagon clippy-xdna test-xdna
 
 # Print the host's resolved SIMD tier, then run the tier-specific kernel tests.
 # Each test self-skips unless the host has the feature it covers, so the useful
@@ -247,7 +256,10 @@ dart-bindings-check: dart-bindings
     # The plugin does need Flutter: pub refuses to publish a package declaring
     # `flutter.plugin.platforms` without an SDK constraint, and that constraint
     # is exactly what `dart pub get` rejects. See cera_ffi_flutter/pubspec.yaml.
-    cd cera_ffi_flutter && flutter pub get && flutter analyze
+    # `--no-fatal-infos` matches `dart analyze` above so rolling `channel: stable`
+    # SDK deprecation infos (e.g. Flutter 3.47 `package:flutter/material.dart`)
+    # do not fail CI while warnings and errors remain fatal.
+    cd cera_ffi_flutter && flutter pub get && flutter analyze --no-fatal-infos
 
 # Format every hand-written Dart file, the way CI checks it.
 #

@@ -68,6 +68,12 @@ jobs:
       - name: Clippy (cera-cli hexagon feature)
         # Verify CLI feature-gated Hexagon code and lints compile cleanly.
         run: cargo clippy -p cera-cli --features hexagon --all-targets -- -D warnings
+      - name: Clippy (xdna feature)
+        # Non-default feature; exercises host-side repack, kernel layout, and
+        # validation code on Linux (`has_xdna_shim` is tested on `windows-xdna`).
+        run: cargo clippy -p cera --features xdna --all-targets -- -D warnings
+      - name: Clippy (cera-cli xdna feature)
+        run: cargo clippy -p cera-cli --features xdna --all-targets -- -D warnings
       # Host-side compilation checks without default features. Because workspace
       # checks unify features across all crates, `cargo check --workspace` never
       # verifies `cera` with `default-features = false`. Checking `cera-wasm` on
@@ -83,15 +89,27 @@ jobs:
         run: cargo test -p cera-cli --features gpu
       - name: Test cera-cli (hexagon feature)
         run: cargo test -p cera-cli --features hexagon
+      - name: Test cera-cli (xdna feature)
+        run: cargo test -p cera-cli --features xdna
       - name: Python unit tests
         run: |
           python3 tests/test_format_review_comment.py
           python3 tests/api_contracts/check.py
           python3 -m unittest discover -s tests/api_contracts
-      - name: Shell syntax check (bench script)
-        # `bench_android.sh` only runs against hardware; a syntax slip would
-        # otherwise surface on-device instead of on the PR.
-        run: bash -n scripts/bench_android.sh
+      - name: Shell and IRON generator syntax check
+        # Hardware/WSL build scripts only run on-device or during kernel regen;
+        # a syntax slip would otherwise surface there instead of on the PR.
+        run: |
+          bash -n scripts/bench_android.sh
+          bash -n cera/src/backend/xdna/kernels/build_kernels.sh
+          bash -n tools/xdna-spike/fix_and_build.sh
+          bash -n tools/xdna-spike/build_spec.sh
+          bash -n tools/xdna-spike/iron/build.sh
+          python3 -m py_compile \
+            cera/src/backend/xdna/kernels/iron/q4gemv/q4gemv.py \
+            cera/src/backend/xdna/kernels/iron/q4layer/q4layer.py \
+            tools/xdna-spike/iron/q4gemv/q4gemv.py \
+            tools/xdna-spike/iron/q4layer/q4layer.py
       - name: Hexagon skel list pin
         # The DSP skel filename set lives in three hand-synced places (the
         # embedded skel dir, `HexagonArch::skel_filename`, Kotlin
@@ -174,6 +192,44 @@ jobs:
           for f in cera/src/backend/hexagon/skels/libcera-htp-v*.so; do
             python3 -I scripts/hexagon-skels/finalize.py --check "$f" || exit 1
           done
+      - name: XDNA kernel artifact SHA-256 pin
+        # Every committed `.xclbin` and `.bin` in `cera/src/backend/xdna/kernels/`
+        # must appear in `kernels/README.md` with its exact SHA-256, and no listed
+        # file may be missing on disk.
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, re, sys
+
+          kdir = pathlib.Path("cera/src/backend/xdna/kernels")
+          readme = (kdir / "README.md").read_text(encoding="utf-8")
+          table = dict(
+              re.findall(r"^\|\s*`([^`]+)`\s*\|\s*`([0-9a-f]{64})`\s*\|", readme, re.M)
+          )
+          actual = {
+              p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in sorted(kdir.iterdir())
+              if p.is_file() and p.suffix in {".xclbin", ".bin"}
+          }
+          if not actual:
+              print("::error::no XDNA kernel artifacts found", file=sys.stderr)
+              sys.exit(1)
+          if set(table) != set(actual):
+              print(
+                  f"::error::XDNA kernel artifact set mismatch: README={sorted(table)} vs disk={sorted(actual)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          bad = [
+              f"{name}: README={table[name]} vs disk={actual[name]}"
+              for name in sorted(actual)
+              if table[name] != actual[name]
+          ]
+          if bad:
+              for line in bad:
+                  print(f"::error::XDNA artifact SHA-256 drift: {line}", file=sys.stderr)
+              sys.exit(1)
+          print(f"XDNA kernel artifacts verified ({len(actual)} files)")
+          PY
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build
@@ -244,6 +300,58 @@ jobs:
       # runnable (no FastRPC hardware); safe on both OS legs.
       - name: Hexagon FFI unit tests
         run: cargo test -p cera-ffi --features hexagon --lib --no-fail-fast
+      - name: XDNA host-side unit tests
+        run: |
+          set -euo pipefail
+          FILTERS="xdna npu_preference_errors_name_every_vendor_that_failed"
+          # shellcheck disable=SC2086
+          COUNT=$(cargo test -p cera --features xdna --lib -- --list $FILTERS \
+                  | grep -c ': test$' || true)
+          if [ "$COUNT" -lt 15 ]; then
+            echo "::error::expected at least 15 xdna-gated lib tests, found $COUNT" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          cargo test -p cera --features xdna --lib --no-fail-fast -- $FILTERS
+
+  windows-xdna:
+    name: XDNA shim & tests (windows-latest)
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy XDNA (MSVC shim + Win32 loader)
+        run: cargo clippy -p cera -p cera-cli --features xdna --all-targets -- -D warnings
+      - name: Verify MSVC shim DLL and has_xdna_shim cfg were emitted
+        shell: pwsh
+        run: |
+          $dlls = @(Get-ChildItem -Path target/debug/build/cera-*/out/cera_xdna_shim.dll -ErrorAction SilentlyContinue)
+          $cfgs = @(Select-String -Path target/debug/build/cera-*/output -Pattern '^cargo:rustc-cfg=has_xdna_shim$' -ErrorAction SilentlyContinue)
+          if ($dlls.Count -eq 0 -or $cfgs.Count -eq 0) {
+            Write-Error "expected build.rs to compile cera_xdna_shim.dll and emit cargo:rustc-cfg=has_xdna_shim on windows-latest"
+            exit 1
+          }
+      - name: Run XDNA unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILTERS="xdna npu_preference_errors_name_every_vendor_that_failed"
+          # shellcheck disable=SC2086
+          COUNT=$(cargo test -p cera --features xdna --lib -- --list $FILTERS \
+                  | grep -c ': test$' || true)
+          if [ "$COUNT" -lt 25 ]; then
+            echo "::error::expected at least 25 xdna-gated lib tests on Windows, found $COUNT" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          cargo test -p cera --features xdna --lib --no-fail-fast -- $FILTERS
+          cargo test -p cera-cli --features xdna
 
   # x86_64 with the default-on `avx512` crate feature OFF.
   #

@@ -635,6 +635,7 @@ optimal on any one. The knobs below override them.
 | `CERA_CPU_ATTN_TILED=off` | Disables the register-tiled NEON prefill attention (`0` / `false` / `off`), restoring the whole-head blocked kernel. An A/B performance lever. |
 | `CERA_VIT_INT8=off` | Runs the CPU vision tower's linears on the f32 path instead of the int8 GEMM (roughly 2 to 3x slower, measured on an Apple-silicon Mac; `0` / `false` / `off`). |
 | `CERA_VIT_PROFILE=1` | Prints per-phase wall time of each vision-tower encode (CPU and GPU). Off by default and free when off. |
+| `CERA_PROFILE_DECODE=1` | Prints per-token decode phase timings: LFM2 CPU per-layer norm/conv/attn/FFN and LM-head timings, and AMD XDNA NPU wait plus BO sync timings at boundary positions (`1`, `true`, `on`, `yes` enables; `0`, `false`, `off`, `no` disables). Off by default. |
 | `CERA_GPU_PREBUILD=off` | wgpu decode: stops finishing the next token's command buffer while the current one executes (`0` / `false` / `off`). A/B lever; decode is about 20% slower with it off on Adreno 830. |
 | `CERA_GPU_ATTN_SPLIT=off` | wgpu decode: uses the single-kernel attention instead of the split-K attention (head_dim 64 only; `0` / `false` / `off`). |
 | `CERA_WGPU_STREAM_MIN_N=<n>` | wgpu prefill: smallest batch size routed to the streaming Q4_0 GEMM (default 1, i.e. every batch). |

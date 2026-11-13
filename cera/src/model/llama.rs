@@ -421,7 +421,7 @@ pub(crate) fn rope_partial(
 impl LlamaModel {
     /// Embedding row for `token`, scaled and recorded exactly as `forward`
     /// does. Panics on an out-of-range token, like `forward`.
-    fn embed_token(&self, token: u32, what: &str) -> Vec<f32> {
+    pub(crate) fn embed_token(&self, token: u32, what: &str) -> Vec<f32> {
         let token_id = token as usize;
         let cfg = &self.config;
         assert!(
@@ -1717,6 +1717,92 @@ impl LlamaModel {
     /// Physical layer loop interval for looped architectures (e.g. Nanbeige).
     pub fn loop_norm_interval(&self) -> Option<usize> {
         self.loop_norm_interval
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn gguf_file(&self) -> &GgufFile {
+        &self.gguf
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn rope_freqs_slice(&self) -> Option<&[f32]> {
+        self.rope_freqs.as_deref()
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn output_norm_slice(&self) -> &[f32] {
+        &self.output_norm_weight
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn attn_norm_slice(&self, il: usize) -> &[f32] {
+        &self.attn_norm_weights[il]
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn ffn_norm_slice(&self, il: usize) -> &[f32] {
+        &self.ffn_norm_weights[il]
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn layer_stage_refs(&self, il: usize) -> [&WeightRef; 7] {
+        let r = &self.layer_refs[il];
+        [
+            &r.attn_q,
+            &r.attn_k,
+            &r.attn_v,
+            &r.attn_output,
+            &r.ffn_gate,
+            &r.ffn_up,
+            &r.ffn_down,
+        ]
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn lm_head_weight_ref(&self) -> &WeightRef {
+        self.output_ref.as_ref().unwrap_or(&self.embd_ref)
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn embd_weight_ref(&self) -> &WeightRef {
+        &self.embd_ref
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn ensure_xdna_supported(&self) -> Result<()> {
+        ensure!(
+            !self.ext && self.norm_order == NormOrder::PreNorm && self.ffn_gated,
+            "XDNA backend requires PreNorm gated LLaMA architecture"
+        );
+        ensure!(
+            self.rope_type == RopeType::Norm && self.n_rot == self.head_dim,
+            "XDNA backend requires full-head NORM RoPE"
+        );
+        ensure!(
+            self.activation == FfnActivation::Swiglu,
+            "XDNA backend requires SwiGLU FFN activation"
+        );
+        ensure!(
+            self.attn_logit_softcapping.is_none()
+                && self.final_logit_softcapping.is_none()
+                && self.sliding_window.is_none()
+                && self.yarn.is_none()
+                && self.attn_temp_scale.is_none()
+                && self.loop_norm_interval.is_none(),
+            "XDNA backend does not support softcapping, SWA, YaRN, attn_temp_scale, or loop_norm"
+        );
+        ensure!(
+            self.attn_post_norm_weights.iter().all(Option::is_none)
+                && self.ffn_post_norm_weights.iter().all(Option::is_none)
+                && self.attn_q_norm_weights.iter().all(Option::is_none)
+                && self.attn_k_norm_weights.iter().all(Option::is_none)
+                && self.attn_q_bias.iter().all(Option::is_none)
+                && self.attn_k_bias.iter().all(Option::is_none)
+                && self.attn_v_bias.iter().all(Option::is_none)
+                && !self.has_projection_or_ffn_biases(),
+            "XDNA backend does not support QK-norm, post-norm, or projection/FFN biases"
+        );
+        Ok(())
     }
 
     /// Attention dims for layer `il`.
@@ -4687,6 +4773,74 @@ mod tests {
         assert!(
             err.to_string().contains("simulated OPFS read failure"),
             "{err}"
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn ensure_xdna_supported_enforces_architecture_gates() {
+        let load = |m: &Tiny, id: &str| {
+            let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(m).into_boxed_slice())).unwrap();
+            LlamaModel::from_gguf_no_repack_with_loader(gguf, 64, id.to_string(), |g, name| {
+                Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+            })
+            .unwrap()
+        };
+        let llama_base = || {
+            let mut m = build_tiny(Kind::Cohere);
+            m.arch = Some("llama");
+            for l in 0..NLAYER {
+                m.tensors
+                    .push((format!("blk.{l}.ffn_norm.weight"), vec![HS], vec![1.0; HS]));
+            }
+            m
+        };
+
+        load(&llama_base(), "test-xdna-ok")
+            .ensure_xdna_supported()
+            .unwrap();
+
+        let u32v = |v: u32| v.to_le_bytes().to_vec();
+        let f32v = |v: f32| v.to_le_bytes().to_vec();
+        let str_v = |s: &str| {
+            let mut b = Vec::new();
+            put_str(&mut b, s);
+            b
+        };
+        for (id, patch) in [
+            ("test-xdna-swa", ("attention.sliding_window", 4u32, u32v(8))),
+            (
+                "test-xdna-cap",
+                ("final_logit_softcapping", 6u32, f32v(30.0)),
+            ),
+            ("test-xdna-yarn", ("rope.scaling.type", 8u32, str_v("yarn"))),
+        ] {
+            let mut m = llama_base();
+            m.extra_kv.push(patch);
+            assert!(load(&m, id).ensure_xdna_supported().is_err(), "{id}");
+        }
+
+        // Non-zero / present attention QKV bias is also rejected.
+        let mut biased = llama_base();
+        biased.tensors.push((
+            "blk.0.attn_q.bias".into(),
+            vec![NH * HD],
+            vec![0.0; NH * HD],
+        ));
+        biased.tensors.push((
+            "blk.0.attn_k.bias".into(),
+            vec![NKV * HD],
+            vec![0.0; NKV * HD],
+        ));
+        biased.tensors.push((
+            "blk.0.attn_v.bias".into(),
+            vec![NKV * HD],
+            vec![0.0; NKV * HD],
+        ));
+        assert!(
+            load(&biased, "test-xdna-bias")
+                .ensure_xdna_supported()
+                .is_err()
         );
     }
 }

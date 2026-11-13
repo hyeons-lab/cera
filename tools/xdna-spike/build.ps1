@@ -2,9 +2,15 @@
 # Needs Visual Studio with the C++ workload, and the XRT headers in .\xrt (see README.md).
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-$vs = & 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' -latest -products * -property installationPath
-if (-not $vs) { throw "Visual Studio not found" }
-cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | % { if ($_ -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2] } }
+$pf86 = if (${env:ProgramFiles(x86)}) { ${env:ProgramFiles(x86)} } else { 'C:\Program Files (x86)' }
+$vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw "Visual Studio with VC.Tools.x86.x64 not found" }
+$vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+if (-not (Test-Path $vcvars)) { throw "$vcvars not found" }
+$envLines = cmd /c "`"$vcvars`" >nul && set"
+if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit code $LASTEXITCODE" }
+$envLines | % { if ($_ -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2] } }
 # The DLL spike.exe loads at run time, so the import library matches it.
 $dll = "$env:SystemRoot\System32\xrt_coreutil.dll"
 if (-not (Test-Path $dll)) { throw "$dll not found; is the AMD NPU driver installed?" }

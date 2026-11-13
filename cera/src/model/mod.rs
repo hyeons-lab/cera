@@ -83,6 +83,10 @@ pub mod vision_encoder_hexagon;
 pub mod whisper_hexagon;
 #[cfg(feature = "hexagon")]
 pub(crate) mod whisper_mel_hexagon;
+#[cfg(feature = "xdna")]
+pub mod xdna_llama;
+#[cfg(feature = "xdna")]
+pub use xdna_llama::load_model_xdna;
 
 #[allow(
     clippy::too_many_arguments,
@@ -413,7 +417,13 @@ pub(crate) fn run_chunked_prefill(
 /// last one. Shared by the NPU/wgpu/Metal backends (each `eprintln`s
 /// unconditionally so the full failure order stays in logs); pinned by
 /// `sticky_slot_keeps_first_fault` below.
-#[cfg(any(test, feature = "hexagon", feature = "gpu", feature = "metal"))]
+#[cfg(any(
+    test,
+    feature = "hexagon",
+    feature = "xdna",
+    feature = "gpu",
+    feature = "metal"
+))]
 pub(crate) fn record_first_fault(
     slot: &std::sync::Mutex<Option<crate::CeraError>>,
     err: crate::CeraError,
@@ -426,9 +436,15 @@ pub(crate) fn record_first_fault(
 
 /// Take half of [`record_first_fault`]: drain a sticky decode-fault slot,
 /// recovering through a poisoned lock (a panicked recorder must not wedge
-/// the drain). Symmetric twin so record/take stay one shape at all three
-/// backend drains.
-#[cfg(any(test, feature = "hexagon", feature = "gpu", feature = "metal"))]
+/// the drain). Symmetric twin so record/take stay one shape across every backend
+/// decode-fault slot.
+#[cfg(any(
+    test,
+    feature = "hexagon",
+    feature = "xdna",
+    feature = "gpu",
+    feature = "metal"
+))]
 pub(crate) fn take_fault(
     slot: &std::sync::Mutex<Option<crate::CeraError>>,
 ) -> Option<crate::CeraError> {
@@ -912,7 +928,7 @@ pub trait Model: Send + Sync {
         self.forward_prefill_from_embeddings(embeddings, n_tokens, start_pos, state)
     }
 
-    /// Which backend runs this model: `"cpu"`, `"metal"`, `"wgpu"` or `"hexagon"`.
+    /// Which backend runs this model: `"cpu"`, `"metal"`, `"wgpu"`, `"hexagon"` or `"xdna"`.
     fn backend_label(&self) -> &'static str {
         "cpu"
     }

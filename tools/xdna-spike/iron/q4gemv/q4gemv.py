@@ -7,6 +7,7 @@
 # the host in consumption order so every transfer is a plain linear read.
 # x rides the weight channel because the weights need all 16 shim channels.
 import argparse
+import os
 from pathlib import Path
 
 import aie.iron as iron
@@ -25,7 +26,8 @@ from aie.utils.hostruntime.cli import run_design_cli
 
 ROWS = 16  # output rows per tile
 QBLK = 32
-OUT_TILES = 16  # tiles per output element (256 floats)
+MAX_OUT_TILES = 16  # cap on tiles per output element (256 floats)
+CHUNK_K = 2048  # columns per streamed tile chunk; wider K is split-K accumulated
 NUM_CHANNELS = 2
 
 
@@ -33,32 +35,54 @@ def tile_bytes(K):
     return (K // QBLK) * (2 * 128 + ROWS * 2)
 
 
+def out_tiles_for(tiles_per_worker):
+    # Largest grouping (up to MAX_OUT_TILES) that divides the worker's tiles
+    # and still leaves at least two output elements per worker. This is what
+    # lets small row counts (512, 2048) use the same design as large ones.
+    cap = min(int(os.environ.get("SPIKE_Q4_MAX_OT", str(MAX_OUT_TILES))), MAX_OUT_TILES)
+    cand = MAX_OUT_TILES
+    while cand >= 1:
+        if cand <= cap and tiles_per_worker % cand == 0 and tiles_per_worker // cand >= 2:
+            return cand
+        cand //= 2
+    raise ValueError(f"no output tiling works for {tiles_per_worker} tiles per worker")
+
+
 @iron.jit
 def q4gemv(w: In, x: In, out: Out, *, M: CompileTime[int], K: CompileTime[int]):
+    if M <= 0 or K <= 0:
+        raise ValueError(f"M and K must be positive, got M={M}, K={K}")
     workers_n = get_current_device().cols * NUM_CHANNELS
-    tb = tile_bytes(K)
-    if M % (workers_n * ROWS * OUT_TILES):
-        raise ValueError(f"M must be a multiple of {workers_n * ROWS * OUT_TILES}")
-    rows_per_worker = M // workers_n
-    tiles_per_worker = rows_per_worker // ROWS
-    outs_per_worker = tiles_per_worker // OUT_TILES
+    if workers_n != 16:
+        raise ValueError(f"q4gemv requires 16 workers (8 cols x 2 channels), got {workers_n}")
+    chunk_k = min(K, CHUNK_K)
+    if K % chunk_k:
+        raise ValueError(f"K must be a multiple of {chunk_k} (split-K chunk)")
     if K % 64:
         raise ValueError("K must be a multiple of 64 (q4gemv.cc copies x 64 bytes at a time)")
-    if outs_per_worker < 2:
-        raise ValueError("need at least 2 output elements per worker (M >= 8192 on npu2)")
+    chunks = K // chunk_k
+    tb = tile_bytes(chunk_k)
+    if K + (K // QBLK) * 4 > tb:
+        raise ValueError(f"K={K} exceeds single-slot x capacity ({tb} bytes; max K=16384)")
+    if M % (workers_n * ROWS):
+        raise ValueError(f"M must be a multiple of {workers_n * ROWS}")
+    rows_per_worker = M // workers_n
+    tiles_per_worker = rows_per_worker // ROWS
+    out_tiles = out_tiles_for(tiles_per_worker)
+    outs_per_worker = tiles_per_worker // out_tiles
 
-    w_ty = np.ndarray[(workers_n * tiles_per_worker * tb,), np.dtype[np.uint8]]
+    w_ty = np.ndarray[(workers_n * tiles_per_worker * chunks * tb,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(tb,), np.dtype[np.uint8]]
     out_ty = np.ndarray[(M,), np.dtype[np.float32]]
     slot_ty = np.ndarray[(tb,), np.dtype[np.uint8]]
-    outel_ty = np.ndarray[(ROWS * OUT_TILES,), np.dtype[np.float32]]
+    outel_ty = np.ndarray[(ROWS * out_tiles,), np.dtype[np.float32]]
 
     step = ExternalFunction(
         "q4_step",
         source_file=str(Path(__file__).parent / "q4gemv.cc"),
         arg_types=[slot_ty, outel_ty, np.int32, np.int32],
         include_dirs=[cxx_header_path()],
-        compile_flags=[f"-DKMAX={K}"],
+        compile_flags=[f"-DKMAX={K}", f"-DKCHUNKS={chunks}"],
     )
 
     of_ins = [ObjectFifo(slot_ty, name=f"w_{i}") for i in range(workers_n)]
@@ -71,22 +95,22 @@ def q4gemv(w: In, x: In, out: Out, *, M: CompileTime[int], K: CompileTime[int]):
         slot = of_in.acquire(1)
         step(slot, y, K, -1)
         of_in.release(1)
-        for t in range_(OUT_TILES):
+        for t in range_(out_tiles * chunks):
             tile = of_in.acquire(1)
-            step(tile, y, K, t)
+            step(tile, y, chunk_k, t)
             of_in.release(1)
         of_out.release(1)
         for _ in range_(outs_per_worker - 1):
             y = of_out.acquire(1)
-            for t in range_(OUT_TILES):
+            for t in range_(out_tiles * chunks):
                 tile = of_in.acquire(1)
-                step(tile, y, K, t)
+                step(tile, y, chunk_k, t)
                 of_in.release(1)
             of_out.release(1)
 
     workers = [Worker(core_body, [of_ins[i].cons(), of_outs[i].prod(), step]) for i in range(workers_n)]
 
-    per_worker_w = tiles_per_worker * tb
+    per_worker_w = tiles_per_worker * chunks * tb
     x_tap = TensorAccessPattern((1, tb), 0, [1, 1, 1, tb], [0, 0, 0, 1])
     w_taps = [
         TensorAccessPattern((1, workers_n * per_worker_w), per_worker_w * i, [1, 1, 1, per_worker_w], [0, 0, 0, 1])

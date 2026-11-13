@@ -25,8 +25,10 @@
 *~
 .DS_Store
 
-# Claude Code local state (memory, skills, scheduled tasks, per-project settings)
+# Claude Code / agent local state (memory, skills, scheduled tasks, scratch/backups)
 .claude/
+.agent-tmp/
+.agents/backups/
 
 # Local-only development logs (per-branch session notes, plans)
 devlog/

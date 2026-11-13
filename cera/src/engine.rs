@@ -80,7 +80,7 @@ pub enum BackendPreference {
     /// Qualcomm Hexagon NPU. Requires the `hexagon` feature.
     Hexagon,
     /// Whichever NPU this machine has: tries each NPU backend compiled into
-    /// this build (today only Hexagon) and loads the first that works. Errors
+    /// this build (Hexagon, AMD XDNA) and loads the first that works. Errors
     /// with every vendor's reason when none does, or when no NPU backend is
     /// compiled in.
     Npu,
@@ -1444,7 +1444,7 @@ impl CeraEngine {
         self.model.clear_cache();
     }
 
-    /// The backend the loaded model runs on (`"cpu"`, `"metal"`, `"wgpu"` or `"hexagon"`),
+    /// The backend the loaded model runs on (`"cpu"`, `"metal"`, `"wgpu"`, `"hexagon"`, or `"xdna"`),
     /// which is what an `Auto` load resolved to.
     pub fn backend_name(&self) -> &'static str {
         self.model.backend_label()
@@ -2589,7 +2589,7 @@ fn load_text_model_npu(
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
     // `gguf`, `path` and `context_size` are only read by the vendor arms below.
-    #[cfg(not(feature = "hexagon"))]
+    #[cfg(not(any(feature = "hexagon", feature = "xdna")))]
     let _ = (&gguf, path, context_size);
 
     #[allow(unused_mut)]
@@ -2599,7 +2599,14 @@ fn load_text_model_npu(
     // vendor that a later one could follow pays for it: the last vendor takes
     // `gguf` by value, and a vendor added after Hexagon makes Hexagon clone.
     #[cfg(feature = "hexagon")]
-    match model::load_model_hexagon(gguf, path, context_size) {
+    match model::load_model_hexagon(
+        #[cfg(feature = "xdna")]
+        gguf.clone(),
+        #[cfg(not(feature = "xdna"))]
+        gguf,
+        path,
+        context_size,
+    ) {
         Ok(m) => {
             tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (npu)");
             return Ok(m);
@@ -2607,9 +2614,18 @@ fn load_text_model_npu(
         Err(e) => tried.push(format!("Hexagon: {e:#}")),
     }
 
+    #[cfg(feature = "xdna")]
+    match model::load_model_xdna(gguf, path, context_size) {
+        Ok(m) => {
+            tracing::debug!("cera::engine: using AMD XDNA NPU backend (npu)");
+            return Ok(m);
+        }
+        Err(e) => tried.push(format!("XDNA: {e:#}")),
+    }
+
     if tried.is_empty() {
         Err(CeraError::Backend(
-            "no NPU backend is compiled into this build (enable a vendor feature such as `hexagon`)"
+            "no NPU backend is compiled into this build (enable a vendor feature such as `hexagon` or `xdna`)"
                 .into(),
         ))
     } else {
@@ -2914,10 +2930,37 @@ mod tests {
             msg.contains("no NPU backend could load this model") && msg.contains("Hexagon:"),
             "{msg}"
         );
-        #[cfg(not(feature = "hexagon"))]
+        #[cfg(feature = "xdna")]
+        assert!(
+            msg.contains("no NPU backend could load this model") && msg.contains("XDNA:"),
+            "{msg}"
+        );
+        #[cfg(not(any(feature = "hexagon", feature = "xdna")))]
         assert!(
             msg.contains("no NPU backend is compiled into this build"),
             "{msg}"
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_npu_preference_error_preserves_anyhow_cause_chain() {
+        let mut w = crate::convert::writer::GgufWriter::new();
+        w.add_string("general.architecture", "llama");
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes)
+            .expect("write minimal llama gguf");
+        let gguf = GgufFile::from_bytes(bytes.into()).expect("parse minimal llama gguf");
+
+        let err = match load_text_model_npu(gguf, None, 128) {
+            Ok(_) => panic!("incomplete llama GGUF must fail XDNA load"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("XDNA: failed to load CPU Llama weights for XDNA")
+                && msg.contains("llama.block_count"),
+            "NPU load error must preserve inner anyhow context via {{e:#}}, got: {msg}"
         );
     }
 
@@ -3050,22 +3093,23 @@ mod tests {
             let cfg = EngineConfig::default();
             resolve_all_manifest_files(&mut manifest, Some(&base), &cfg).unwrap();
 
-            assert_eq!(manifest.files.model, "/models/bundles/model.gguf");
+            let joined = |name: &str| base.join(name).to_string_lossy().into_owned();
+            assert_eq!(manifest.files.model, joined("model.gguf"));
             assert_eq!(
                 manifest.files.multimodal_projector.as_deref(),
-                Some("/models/bundles/mmproj.gguf")
+                Some(joined("mmproj.gguf").as_str())
             );
             assert_eq!(
                 manifest.files.audio_decoder.as_deref(),
-                Some("/models/bundles/decoder.gguf")
+                Some(joined("decoder.gguf").as_str())
             );
             assert_eq!(
                 manifest.files.audio_tokenizer.as_deref(),
-                Some("/models/bundles/tokenizer.safetensors")
+                Some(joined("tokenizer.safetensors").as_str())
             );
             assert_eq!(
                 manifest.files.extras.get("cover_art").map(String::as_str),
-                Some("/models/bundles/cover.png")
+                Some(joined("cover.png").as_str())
             );
             // Absolute extras stay absolute.
             assert_eq!(

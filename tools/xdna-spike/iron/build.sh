@@ -3,13 +3,15 @@
 #   build.sh gemv   <M> <K> <n_cores> <n_cols>   -> gemv_<M>x<K>_c<n_cores>_cols<n_cols>.*
 #   build.sh memcpy <length_int32>               -> memcpy_<length>.*
 #   build.sh readbw <length_int32> [tile_int32]  -> readbw_<length>_t<tile>.*
-#   build.sh q4gemv <M> [K]                      -> q4gemv_<M>x<K>.*  (M a multiple of 4096,
-#                                                   at least 8192; K a multiple of 64, 2048 tested)
+#   build.sh q4gemv <M> [K]                      -> q4gemv_<M>x<K>.*  (M a multiple of 256 with a
+#                                                   workable tiling; K a multiple of 2048 up to
+#                                                   16384, or a multiple of 64 below 2048)
+#   build.sh q4layer                             -> q4layer.*
 # Each design writes <name>.xclbin and insts_<name>.bin. Needs an IRON venv
 # (see ../README.md); IRON_HOME points at it.
 set -eo pipefail
 usage() {
-  echo "usage: build.sh gemv <M> <K> <n_cores> <n_cols> | memcpy <length> | readbw <length> [tile] | q4gemv <M> [K]" >&2
+  echo "usage: build.sh gemv <M> <K> <n_cores> <n_cols> | memcpy <length> | readbw <length> [tile] | q4gemv <M> [K] | q4layer" >&2
   exit 2
 }
 # Check arguments before sourcing anything, so a mistake prints the usage line.
@@ -18,6 +20,7 @@ case "${1:-}" in
   memcpy) [ $# -eq 2 ] || usage ;;
   readbw) [ $# -ge 2 ] && [ $# -le 3 ] || usage ;;
   q4gemv) [ $# -ge 2 ] && [ $# -le 3 ] || usage ;;
+  q4layer) [ $# -eq 1 ] || usage ;;
   *) usage ;;
 esac
 IRON_HOME="${IRON_HOME:-$HOME/xdna-iron}"
@@ -35,19 +38,28 @@ mkdir -p "$OUT_DIR"
 case "$1" in
   gemv)
     name="gemv_${2}x${3}_c${4}_cols${5}"
+    rm -rf "$OUT_DIR/$name.prj"
     python3 "$HERE/gemv_multi.py" --dev npu2 -M "$2" -K "$3" --n_cores "$4" --n_cols "$5" \
       --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
   memcpy)
     name="memcpy_${2}"
+    rm -rf "$OUT_DIR/$name.prj"
     python3 "$HERE/memcpy_bw.py" --dev npu2 -l "$2" \
       --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
   readbw)
     name="readbw_${2}_t${3:-1024}"
+    rm -rf "$OUT_DIR/$name.prj"
     python3 "$HERE/readbw.py" --dev npu2 -l "$2" -t "${3:-1024}" \
       --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
   q4gemv)
     name="q4gemv_${2}x${3:-2048}"
+    rm -rf "$OUT_DIR/$name.prj"
     python3 "$HERE/q4gemv/q4gemv.py" --dev npu2 -M "$2" -K "${3:-2048}" \
+      --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
+  q4layer)
+    name="q4layer"
+    rm -rf "$OUT_DIR/$name.prj"
+    python3 "$HERE/q4layer/q4layer.py" --dev npu2 \
       --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
 esac
 echo "built $OUT_DIR/$name.xclbin and $OUT_DIR/insts_$name.bin"

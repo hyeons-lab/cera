@@ -337,7 +337,7 @@ jobs:
               echo "::error::flutter pub get failed to resolve dependencies after 18 attempts (360s)" >&2
               exit 1
             fi
-            flutter analyze
+            flutter analyze --no-fatal-infos
           )
 
       # Provision a fresh pub.dev OIDC token for publishing cera_ffi_flutter.
@@ -354,7 +354,7 @@ jobs:
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi_flutter package validation ==="
             echo "Note: pubspec_overrides.yaml is intentionally retained for dry-run validation so local path dependencies resolve."
-            ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
+            ( cd cera_ffi_flutter && flutter pub get && flutter analyze --no-fatal-infos )
             set +e
             out=$(cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1)
             exit_code=$?

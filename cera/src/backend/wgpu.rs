@@ -503,6 +503,43 @@ impl GpuContext {
         )
     }
 
+    fn resolve_wgpu_backends_from_lookup<F>(lookup: F) -> wgpu::Backends
+    where
+        F: FnOnce(&str) -> Option<String>,
+    {
+        let Some(raw) = lookup("WGPU_BACKEND") else {
+            return wgpu::Backends::all();
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return wgpu::Backends::all();
+        }
+        let mut backends = wgpu::Backends::empty();
+        for token in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let parsed = wgpu::Backends::from_comma_list(token);
+            if parsed.is_empty() {
+                tracing::warn!(
+                    "cera::wgpu: unrecognized token {token:?} in WGPU_BACKEND={trimmed:?}; ignoring"
+                );
+                eprintln!(
+                    "[cera::wgpu] unrecognized token {token:?} in WGPU_BACKEND={trimmed:?}; ignoring"
+                );
+            } else {
+                backends |= parsed;
+            }
+        }
+        if backends.is_empty() {
+            tracing::warn!(
+                "cera::wgpu: unrecognized WGPU_BACKEND={trimmed:?}; falling back to all backends"
+            );
+            eprintln!(
+                "[cera::wgpu] unrecognized WGPU_BACKEND={trimmed:?}; falling back to all backends"
+            );
+            return wgpu::Backends::all();
+        }
+        backends
+    }
+
     /// Initialize the GPU asynchronously: request a high-performance adapter
     /// and device. This is the wasm-compatible entry point — WebGPU's
     /// `requestAdapter` / `requestDevice` resolve on the JS event loop, so
@@ -510,7 +547,7 @@ impl GpuContext {
     /// blocking [`Self::new`] wrapper.
     pub async fn new_async() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: Self::resolve_wgpu_backends_from_lookup(|k| std::env::var(k).ok()),
             flags: wgpu::InstanceFlags::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             backend_options: wgpu::BackendOptions::default(),
@@ -1542,6 +1579,29 @@ impl GpuContext {
             })
     }
 
+    /// Run `build` inside `Validation` and `Internal` error scopes on native targets,
+    /// returning `Err` if either scope reports a driver error.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_pipeline_checked<F>(
+        &self,
+        label: &str,
+        build: F,
+    ) -> anyhow::Result<wgpu::ComputePipeline>
+    where
+        F: FnOnce() -> wgpu::ComputePipeline,
+    {
+        let val_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let int_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let pipeline = build();
+        // Pop error scopes in strict LIFO order before combining.
+        let int_err = pollster::block_on(int_scope.pop());
+        let val_err = pollster::block_on(val_scope.pop());
+        match int_err.or(val_err) {
+            Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
+            None => Ok(pipeline),
+        }
+    }
+
     /// Create a compute pipeline, returning `Err` when the driver rejects it instead of an
     /// invalid pipeline: pinned wgpu 30 never panics on validation or compile failure, it
     /// reports to the error sink and hands back a pipeline whose dispatches are silently
@@ -1563,13 +1623,9 @@ impl GpuContext {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let pipeline = self.create_pipeline(shader_source, entry_point, label);
-            let err = pollster::block_on(scope.pop());
-            match err {
-                Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
-                None => Ok(pipeline),
-            }
+            self.run_pipeline_checked(label, || {
+                self.create_pipeline(shader_source, entry_point, label)
+            })
         }
     }
 
@@ -2125,14 +2181,10 @@ impl GpuContext {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            // SAFETY: Caller guarantees desc satisfies safety invariant.
-            let pipeline = unsafe { self.stream_gemm_pipeline(label, desc, bindings) };
-            let err = pollster::block_on(scope.pop());
-            match err {
-                Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
-                None => Ok(pipeline),
-            }
+            self.run_pipeline_checked(label, || {
+                // SAFETY: Caller guarantees desc satisfies safety invariant.
+                unsafe { self.stream_gemm_pipeline(label, desc, bindings) }
+            })
         }
     }
 
@@ -3439,6 +3491,34 @@ pub(crate) fn gpu_or_skip() -> Option<GpuContext> {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    #[test]
+    fn resolve_wgpu_backends_ignores_empty_and_unrecognized_env_values() {
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| None),
+            wgpu::Backends::all()
+        );
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| Some(String::new())),
+            wgpu::Backends::all()
+        );
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("   \t ".to_string())),
+            wgpu::Backends::all()
+        );
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("d3d".to_string())),
+            wgpu::Backends::all()
+        );
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("vulkan,dx12".to_string())),
+            wgpu::Backends::VULKAN | wgpu::Backends::DX12
+        );
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("vulkan,d3d".to_string())),
+            wgpu::Backends::VULKAN
+        );
+    }
 
     /// Pack f32 pairs LE (even elem in the low bits) for KV-cache uploads,
     /// exactly as `kv_append` lays them out. One copy for every oracle that
