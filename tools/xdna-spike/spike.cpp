@@ -14,8 +14,12 @@
 #include "xrt/experimental/xrt_xclbin.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,18 +49,35 @@ static double us_since(clk::time_point t0) {
   return std::chrono::duration<double, std::micro>(clk::now() - t0).count();
 }
 
-static long parse_pos(const char* s, const char* what) {
+static int parse_pos(const char* s, const char* what) {
+  if (!s || !*s) {
+    throw std::invalid_argument(std::string(what) + " must be a positive integer, got empty string");
+  }
+  errno = 0;
   char* end = nullptr;
-  long v = std::strtol(s, &end, 10);
-  if (!*s || *end || v <= 0) throw std::invalid_argument(std::string(what) + " must be a positive integer, got '" + s + "'");
-  return v;
+  long long v = std::strtoll(s, &end, 10);
+  if (end == s || *end || errno == ERANGE || v <= 0 || v > INT_MAX - 64) {
+    throw std::invalid_argument(std::string(what) + " must be a positive integer in 1.." +
+                                std::to_string(INT_MAX - 64) + ", got '" + s + "'");
+  }
+  return int(v);
 }
 
 static size_t parse_size(const char* s, const char* what) {
-  if (*s == '-') throw std::invalid_argument(std::string(what) + " must be a positive integer, got '" + s + "'");
+  if (!s) {
+    throw std::invalid_argument(std::string(what) + " must be a positive integer, got null");
+  }
+  const char* p = s;
+  while (*p && std::isspace(static_cast<unsigned char>(*p))) ++p;
+  if (!*p || *p == '-') {
+    throw std::invalid_argument(std::string(what) + " must be a positive integer, got '" + s + "'");
+  }
+  errno = 0;
   char* end = nullptr;
-  unsigned long long v = std::strtoull(s, &end, 10);
-  if (!*s || *end || v == 0) throw std::invalid_argument(std::string(what) + " must be a positive integer, got '" + s + "'");
+  unsigned long long v = std::strtoull(p, &end, 10);
+  if (end == p || *end || errno == ERANGE || v == 0 || v > SIZE_MAX) {
+    throw std::invalid_argument(std::string(what) + " must be a positive integer within size_t, got '" + s + "'");
+  }
   return size_t(v);
 }
 
@@ -79,7 +100,8 @@ static std::vector<double> report(const char* label, std::vector<double> v, doub
 // Times `iters` start+wait cycles after `warmup` untimed ones.
 static std::vector<double> time_runs(xrt::run& run, int warmup, int iters) {
   std::vector<double> t;
-  for (int i = 0; i < warmup + iters; ++i) {
+  const int64_t total = int64_t(warmup) + int64_t(iters);
+  for (int64_t i = 0; i < total; ++i) {
     auto t0 = clk::now();
     run.start();
     run.wait2();
@@ -92,10 +114,33 @@ static std::vector<double> time_runs(xrt::run& run, int warmup, int iters) {
 // of them, after `warmup` untimed cycles. Returns each cycle's wall time.
 static std::vector<double> time_batch(std::vector<xrt::run>& runs, int warmup, int iters) {
   std::vector<double> t;
-  for (int i = 0; i < warmup + iters; ++i) {
+  const int64_t total = int64_t(warmup) + int64_t(iters);
+  for (int64_t i = 0; i < total; ++i) {
     auto t0 = clk::now();
-    for (auto& r : runs) r.start();
-    for (auto& r : runs) r.wait2();
+    size_t started = 0;
+    try {
+      for (; started < runs.size(); ++started) runs[started].start();
+    } catch (...) {
+      for (size_t j = 0; j < started; ++j) {
+        try {
+          runs[j].wait();
+        } catch (...) {
+        }
+      }
+      throw;
+    }
+    size_t waited = 0;
+    try {
+      for (; waited < runs.size(); ++waited) runs[waited].wait2();
+    } catch (...) {
+      for (size_t j = waited; j < runs.size(); ++j) {
+        try {
+          runs[j].wait();
+        } catch (...) {
+        }
+      }
+      throw;
+    }
     if (i >= warmup) t.push_back(us_since(t0));
   }
   return t;
@@ -104,7 +149,8 @@ static std::vector<double> time_batch(std::vector<xrt::run>& runs, int warmup, i
 // Same for one runlist: execute, wait, repeat.
 static std::vector<double> time_runlist(xrt::runlist& rl, int warmup, int iters) {
   std::vector<double> t;
-  for (int i = 0; i < warmup + iters; ++i) {
+  const int64_t total = int64_t(warmup) + int64_t(iters);
+  for (int64_t i = 0; i < total; ++i) {
     auto t0 = clk::now();
     rl.execute();
     rl.wait();
@@ -298,6 +344,14 @@ static xrt::run aie_run(AieKernel& k) {
   return r;
 }
 
+static ert_cmd_state wait_completed(const xrt::run& r, const char* where) {
+  auto state = r.wait();
+  if (state != ERT_CMD_STATE_COMPLETED) {
+    throw std::runtime_error(std::string(where) + " ended in non-completed ERT state " + std::to_string(int(state)));
+  }
+  return state;
+}
+
 
 // Shared by gemv and gemvchain: deterministic int16 inputs in [-1000, 1000],
 // and the reference dot product, accumulated wide and wrapped to int32 the way
@@ -317,6 +371,9 @@ static int32_t gemv_ref_row(const int16_t* a, const int16_t* b, int row, int K) 
 
 // int16 GEMV (C[M] = A[M,K] . B[K], int32 out).
 static int cmd_gemv(const char* xclbin_path, const char* insts_path, int M, int K, int iters) {
+  if (size_t(K) > SIZE_MAX / 2 || size_t(M) > SIZE_MAX / 4 || size_t(M) > SIZE_MAX / (size_t(K) * 2)) {
+    throw std::invalid_argument("gemv M*K byte size overflows size_t");
+  }
   auto k = open_mlir_aie(xclbin_path, insts_path);
   std::printf("kernel %s, %u instruction words\n", k.name.c_str(), k.n_instr);
   auto bo_a = host_bo(k, size_t(M) * K * 2, 3);
@@ -336,7 +393,7 @@ static int cmd_gemv(const char* xclbin_path, const char* insts_path, int M, int 
   run.set_arg(4, bo_b);
   run.set_arg(5, bo_c);
   run.start();
-  auto state = run.wait();
+  auto state = wait_completed(run, "gemv verify");
   bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   std::printf("first run state=%d\n", int(state));
 
@@ -356,6 +413,7 @@ static int cmd_gemv(const char* xclbin_path, const char* insts_path, int M, int 
 
 // memcpy over n int32 words (args: in, out). Reports DDR read plus write.
 static int cmd_memcpy(const char* xclbin_path, const char* insts_path, size_t n, int iters) {
+  if (n > SIZE_MAX / 4) throw std::invalid_argument("memcpy n_int32 * 4 overflows size_t");
   auto k = open_mlir_aie(xclbin_path, insts_path);
   auto bo_in = host_bo(k, n * 4, 3);
   auto bo_out = host_bo(k, n * 4, 4);
@@ -370,7 +428,7 @@ static int cmd_memcpy(const char* xclbin_path, const char* insts_path, size_t n,
   run.set_arg(3, bo_in);
   run.set_arg(4, bo_out);
   run.start();
-  auto state = run.wait();
+  auto state = wait_completed(run, "memcpy verify");
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   size_t bad = 0;
   for (size_t i = 0; i < n; ++i) bad += out[i] != in[i];
@@ -388,6 +446,9 @@ static int cmd_memcpy(const char* xclbin_path, const char* insts_path, size_t n,
 // first word of each tile of its contiguous slice into its output word 0.
 static int cmd_readbw(const char* xclbin_path, const char* insts_path, size_t n, int workers, size_t tile, int iters) {
   const size_t out_words = 16;
+  if (n > SIZE_MAX / 4 || size_t(workers) > SIZE_MAX / tile || size_t(workers) > SIZE_MAX / (out_words * 4)) {
+    throw std::invalid_argument("readbw byte or tile count overflows size_t");
+  }
   if (n % (size_t(workers) * tile)) throw std::invalid_argument("n_int32 must be a multiple of workers x tile");
   auto k = open_mlir_aie(xclbin_path, insts_path);
   size_t n_out = size_t(workers) * out_words;
@@ -404,7 +465,7 @@ static int cmd_readbw(const char* xclbin_path, const char* insts_path, size_t n,
   run.set_arg(3, bo_in);
   run.set_arg(4, bo_out);
   run.start();
-  auto state = run.wait();
+  auto state = wait_completed(run, "readbw verify");
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   size_t per_worker = n / workers;
   int bad = 0;
@@ -430,6 +491,9 @@ static int cmd_readbw(const char* xclbin_path, const char* insts_path, size_t n,
 // back-to-back start() calls. Only the first link is checked.
 static int cmd_gemvchain(const char* xclbin_path, const char* insts_path, int M, int K, int iters,
                          const std::vector<int>& lens) {
+  if (size_t(K) > SIZE_MAX / 2 || size_t(M) > SIZE_MAX / 4 || size_t(M) > SIZE_MAX / (size_t(K) * 2)) {
+    throw std::invalid_argument("gemvchain M*K byte size overflows size_t");
+  }
   if (size_t(M) * 4 < size_t(K) * 2) throw std::invalid_argument("need 4*M >= 2*K to chain C into B");
   auto k = open_mlir_aie(xclbin_path, insts_path);
   auto bo_a = host_bo(k, size_t(M) * K * 2, 3);
@@ -509,12 +573,16 @@ static int q4_out_tiles(int M) {
 
 // Random Q4_0-style weights for one shape: wq holds q - 8 in [-8, 7], wd the
 // bf16 scale of each 32-weight block, generated like cmd_q4gemv does.
-static void q4_gen_weights(int M, int K, uint32_t seed, std::vector<int8_t>& wq, std::vector<uint16_t>& wd) {
+static void q4_gen_weights(int M, int K, uint32_t seed, std::vector<int8_t>& wq, std::vector<uint16_t>& wd,
+                           float weight_scale = 1.0f) {
   const int QB = 32, nb = K / QB;
   wq.assign(size_t(M) * K, 0);
   wd.assign(size_t(M) * nb, 0);
   uint32_t s = seed;
-  auto frand = [&]() { s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; };
+  auto frand = [&]() {
+    s = s * 1664525u + 1013904223u;
+    return (float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f) * weight_scale;
+  };
   std::vector<float> wrow(K);
   for (int r = 0; r < M; ++r) {
     for (int kk = 0; kk < K; ++kk) wrow[kk] = frand();
@@ -568,19 +636,29 @@ static void q4_pack_weights(const std::vector<int8_t>& wq, const std::vector<uin
 // Q8_0-style quantization of an f32 vector (cycled to length K): one f32
 // scale per 32 elements, q = round-half-away(x / d) clamped to [-127, 127].
 static void q4_quantize_f32(const float* in, int in_len, int K, int8_t* xq, float* xd) {
+  if (in_len <= 0) throw std::invalid_argument("q4_quantize_f32: in_len must be positive");
   const int QB = 32;
   for (int b = 0; b < K / QB; ++b) {
     float amax = 0;
-    for (int j = 0; j < QB; ++j) amax = std::max(amax, std::fabs(in[(b * QB + j) % in_len]));
+    for (int j = 0; j < QB; ++j) {
+      float v = in[(b * QB + j) % in_len];
+      if (!std::isfinite(v)) throw std::runtime_error("non-finite activation in q4_quantize_f32");
+      amax = std::max(amax, std::fabs(v));
+    }
     float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
     xd[b] = d;
-    for (int j = 0; j < QB; ++j) xq[b * QB + j] = int8_t(std::lround(in[(b * QB + j) % in_len] * id));
+    for (int j = 0; j < QB; ++j) {
+      float q = std::round(in[(b * QB + j) % in_len] * id);
+      q = std::max(-127.0f, std::min(127.0f, q));
+      xq[b * QB + j] = int8_t(int(q));
+    }
   }
 }
 
 static uint16_t f32_to_bf16(float f) {
   uint32_t u;
   std::memcpy(&u, &f, 4);
+  if ((u & 0x7FFFFFFFu) > 0x7F800000u) return uint16_t((u >> 16) | 0x0040u);
   u += 0x7FFF + ((u >> 16) & 1);  // round to nearest even
   return uint16_t(u >> 16);
 }
@@ -591,6 +669,20 @@ static float bf16_to_f32(uint16_t h) {
   return f;
 }
 
+static int parse_nonneg(const char* s, const char* what) {
+  if (!s || !*s) {
+    throw std::invalid_argument(std::string(what) + " must be a non-negative integer, got empty string");
+  }
+  errno = 0;
+  char* end = nullptr;
+  long long v = std::strtoll(s, &end, 10);
+  if (end == s || *end || errno == ERANGE || v < 0 || v > INT_MAX - 64) {
+    throw std::invalid_argument(std::string(what) + " must be a non-negative integer in 0.." +
+                                std::to_string(INT_MAX - 64) + ", got '" + s + "'");
+  }
+  return int(v);
+}
+
 static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, int K, int iters) {
   // q4gemv.py: 16 workers x 16 rows per tile; the output-element grouping
   // and the split-K chunking follow q4_out_tiles / q4_chunk_k above.
@@ -598,9 +690,14 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
   if (M % (WORKERS * ROWS) || q4_out_tiles(M) == 0)
     throw std::invalid_argument("M must be a multiple of 256 with a workable output tiling (see q4gemv.py)");
   if (K % 64) throw std::invalid_argument("K must be a multiple of 64");
-  const int nb = K / QB, nb_chunk = q4_chunk_k(K) / QB, CHUNKS = K / q4_chunk_k(K);
+  const int chunk_k = q4_chunk_k(K);
+  if (K % chunk_k) throw std::invalid_argument("K must be a multiple of split-K chunk width");
+  const int nb = K / QB, nb_chunk = chunk_k / QB, CHUNKS = K / chunk_k;
   const size_t tb = size_t(nb_chunk) * (2 * 128 + ROWS * 2);
   if (size_t(K) + size_t(nb) * 4 > tb) throw std::invalid_argument("K too wide for one x slot");
+  if (size_t(M) > SIZE_MAX / size_t(K) || size_t(M / ROWS) > SIZE_MAX / (size_t(CHUNKS) * tb)) {
+    throw std::invalid_argument("q4gemv M*K weight size overflows size_t");
+  }
 
   // Random weights and activations, quantized like Q4_0 / Q8_0.
   uint32_t s = 2024;
@@ -632,7 +729,11 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
     for (int j = 0; j < QB; ++j) { xs[j] = frand(); amax = std::max(amax, std::fabs(xs[j])); }
     float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
     xd[b] = d;
-    for (int j = 0; j < QB; ++j) xq[b * QB + j] = int8_t(std::lround(xs[j] * id));
+    for (int j = 0; j < QB; ++j) {
+      float q = std::round(xs[j] * id);
+      q = std::max(-127.0f, std::min(127.0f, q));
+      xq[b * QB + j] = int8_t(int(q));
+    }
   }
 
   // Layout diagnostics (env): SPIKE_Q4_UNIT=1 sets every scale to 1 so the
@@ -678,7 +779,7 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
   };
   auto run = make();
   run.start();
-  auto state = run.wait();
+  auto state = wait_completed(run, "q4gemv verify");
   bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
   // Reference from the same quantized values; error relative to the row's
@@ -690,9 +791,19 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
   // limit the blocks summed; SPIKE_Q4_REF_MODE=1 uses x chunk 0 for every
   // chunk, =2 uses weight chunk 0 for every chunk (both assume 64-block
   // chunks). They exist to tell a stale or misindexed kernel from a bad one.
-  const int nb_ref = std::getenv("SPIKE_Q4_REF_BLOCKS") ? int(parse_pos(std::getenv("SPIKE_Q4_REF_BLOCKS"), "blocks")) : nb;
-  const int b_from = std::getenv("SPIKE_Q4_REF_FROM") ? int(std::strtol(std::getenv("SPIKE_Q4_REF_FROM"), nullptr, 10)) : 0;
-  const int ref_mode = std::getenv("SPIKE_Q4_REF_MODE") ? int(parse_pos(std::getenv("SPIKE_Q4_REF_MODE"), "mode")) : 0;
+  const int nb_ref = std::getenv("SPIKE_Q4_REF_BLOCKS")
+                         ? int(parse_pos(std::getenv("SPIKE_Q4_REF_BLOCKS"), "SPIKE_Q4_REF_BLOCKS"))
+                         : nb;
+  const int b_from = std::getenv("SPIKE_Q4_REF_FROM")
+                         ? int(parse_nonneg(std::getenv("SPIKE_Q4_REF_FROM"), "SPIKE_Q4_REF_FROM"))
+                         : 0;
+  const int ref_mode = std::getenv("SPIKE_Q4_REF_MODE")
+                           ? int(parse_nonneg(std::getenv("SPIKE_Q4_REF_MODE"), "SPIKE_Q4_REF_MODE"))
+                           : 0;
+  if (b_from > nb_ref || nb_ref > nb)
+    throw std::invalid_argument("SPIKE_Q4_REF_FROM..SPIKE_Q4_REF_BLOCKS out of bounds for K");
+  if (ref_mode > 2 || (ref_mode != 0 && nb < 64))
+    throw std::invalid_argument("SPIKE_Q4_REF_MODE must be 0, 1, or 2 (modes 1 and 2 require K >= 2048)");
   for (int r = 0; r < M; ++r) {
     double ref = 0, mag = 0;
     for (int b = b_from; b < nb_ref; ++b) {
@@ -700,7 +811,7 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
       const int bx = ref_mode == 1 ? b % 64 : b;
       const int bw = ref_mode == 2 ? b % 64 : b;
       for (int j = 0; j < QB; ++j) dot += int32_t(wq[size_t(r) * K + bw * QB + j]) * xq[bx * QB + j];
-      double term = double(dot) * bf16_to_f32(wd[size_t(r) * nb + b]) * xd[bx];
+      double term = double(dot) * bf16_to_f32(wd[size_t(r) * nb + bw]) * xd[bx];
       ref += term;
       mag += std::fabs(term);
     }
@@ -771,7 +882,9 @@ static int cmd_q4chain(const char* dir, int tokens) {
     L.w_bytes = size_t(sh.M / ROWS) * chunks * L.tb;
     std::vector<int8_t> wq;
     std::vector<uint16_t> wd;
-    q4_gen_weights(sh.M, sh.K, 2024u + unsigned(sh.M), wq, wd);
+    // Scale uniform [-1, 1] weights by sqrt(3 / K) so each GEMV preserves activation
+    // variance across the 113-link chain instead of overflowing f32 to Inf/NaN.
+    q4_gen_weights(sh.M, sh.K, 2024u + unsigned(sh.M), wq, wd, std::sqrt(3.0f / float(sh.K)));
     L.bo_w = host_bo(L.kern, L.w_bytes, 3);
     L.bo_x = host_bo(L.kern, L.tb, 4);
     L.bo_y = host_bo(L.kern, size_t(sh.M) * 4, 5);
@@ -803,12 +916,17 @@ static int cmd_q4chain(const char* dir, int tokens) {
   double bytes_per_token = 0;
   for (auto* L : seq) bytes_per_token += double(L->w_bytes);
 
-  std::vector<float> cur(2048);
+  std::vector<float> init_cur(2048);
   uint32_t s = 7;
-  for (auto& v : cur) { s = s * 1664525u + 1013904223u; v = float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+  for (auto& v : init_cur) {
+    s = s * 1664525u + 1013904223u;
+    v = float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f;
+  }
+  std::vector<float> cur;
   std::vector<int8_t> xq;
   std::vector<float> xd;
   auto run_token = [&]() {
+    cur = init_cur;
     for (auto* L : seq) {
       xq.assign(L->K, 0);
       xd.assign(L->K / 32, 0.0f);
@@ -823,10 +941,13 @@ static int cmd_q4chain(const char* dir, int tokens) {
       run.set_arg(4, L->bo_x);
       run.set_arg(5, L->bo_y);
       run.start();
-      run.wait();
+      wait_completed(run, "q4chain link");
       L->bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
       const float* y = L->bo_y.map<float*>();
       cur.assign(y, y + L->M);
+    }
+    for (float v : cur) {
+      if (!std::isfinite(v)) throw std::runtime_error("non-finite output at end of q4chain token");
     }
   };
   for (int i = 0; i < 3; ++i) run_token();  // warmup tokens, untimed
@@ -856,6 +977,7 @@ static int cmd_q4chain(const char* dir, int tokens) {
 // (attention is proxied by its input, as in the design), then timed.
 static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iters) {
   struct Stage { int in_slot, M, K, out_slot; };
+  const int ACT_SLOT = 8192, N_SLOTS = 8, ACT_TAIL = 1024, TILE_BYTES = 18432;
   // SPIKE_Q4LAYER_SPEC="in:M:K:out;..." overrides the stage list (build the
   // xclbin with the matching Q4LAYER_SPEC) for isolating stage behavior.
   std::vector<Stage> stages = {{0, 2048, 2048, 1}, {0, 512, 2048, 2}, {0, 512, 2048, 3}, {1, 2048, 2048, 4},
@@ -868,8 +990,9 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
       size_t semi = str.find(';', pos);
       std::string part = str.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
       if (!part.empty()) {
-        int in_s, M, K, out_s;
-        if (std::sscanf(part.c_str(), "%d:%d:%d:%d", &in_s, &M, &K, &out_s) != 4)
+        int in_s = 0, M = 0, K = 0, out_s = 0;
+        char extra = 0;
+        if (std::sscanf(part.c_str(), "%d:%d:%d:%d%c", &in_s, &M, &K, &out_s, &extra) != 4)
           throw std::invalid_argument("bad SPIKE_Q4LAYER_SPEC stage: " + part);
         stages.push_back({in_s, M, K, out_s});
       }
@@ -877,13 +1000,24 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
       pos = semi + 1;
     }
   }
-  const int ACT_SLOT = 8192, N_SLOTS = 8, TILE_BYTES = 18432;
+  if (stages.empty()) throw std::invalid_argument("SPIKE_Q4LAYER_SPEC must define at least one stage");
+  for (const auto& st : stages) {
+    if (st.in_slot < 0 || st.in_slot >= N_SLOTS || st.out_slot < 0 || st.out_slot >= N_SLOTS)
+      throw std::invalid_argument("q4layer stage slot out of bounds 0..7");
+    if (st.in_slot == st.out_slot)
+      throw std::invalid_argument("q4layer stage in_slot and out_slot must differ");
+    if (st.M < 512 || st.M > ACT_SLOT || st.M % 512 != 0)
+      throw std::invalid_argument("q4layer stage M must be a multiple of 512 in 512..=8192");
+    if (st.K < 2048 || st.K > ACT_SLOT || st.K % 2048 != 0)
+      throw std::invalid_argument("q4layer stage K must be a multiple of 2048 in 2048..=8192");
+  }
   auto kern = open_mlir_aie(xclbin_path, insts_path);
 
   size_t w_bytes = 0;
   for (const auto& st : stages) w_bytes += size_t(st.M / 16) * (st.K / 2048) * TILE_BYTES;
+  const size_t act_floats = size_t(N_SLOTS * ACT_SLOT + ACT_TAIL);
   auto bo_w = host_bo(kern, w_bytes, 3);
-  auto bo_y = host_bo(kern, size_t(N_SLOTS * ACT_SLOT) * 4, 4);
+  auto bo_y = host_bo(kern, act_floats * 4, 4);
   auto* w = bo_w.map<uint8_t*>();
   std::memset(w, 0, w_bytes);
 
@@ -891,9 +1025,10 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
   struct Sim { std::vector<int8_t> wq; std::vector<uint16_t> wd; };
   std::vector<Sim> sims;
   size_t base = 0;
-  for (const auto& st : stages) {
+  for (size_t si = 0; si < stages.size(); ++si) {
+    const auto& st = stages[si];
     Sim s;
-    q4_gen_weights(st.M, st.K, 2024u + unsigned(st.M * 31 + st.K), s.wq, s.wd);
+    q4_gen_weights(st.M, st.K, 2024u + unsigned(si * 997 + size_t(st.M) * 31 + size_t(st.K)), s.wq, s.wd);
     q4_pack_weights(s.wq, s.wd, st.M, st.K, w + base, false, false);
     base += size_t(st.M / 16) * (st.K / 2048) * TILE_BYTES;
     sims.push_back(std::move(s));
@@ -901,9 +1036,15 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
   bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
   auto* y = bo_y.map<float*>();
-  std::memset(y, 0, size_t(N_SLOTS * ACT_SLOT) * 4);
+  std::memset(y, 0, act_floats * 4);
   uint32_t s = 7;
-  for (int i = 0; i < 2048; ++i) { s = s * 1664525u + 1013904223u; y[i] = float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+  for (int i = 0; i < N_SLOTS * ACT_SLOT; ++i) {
+    s = s * 1664525u + 1013904223u;
+    y[i] = float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f;
+  }
+  // Snapshot initial host slots before the NPU writes into bo_y so stages that
+  // overwrite an earlier input slot cannot contaminate the host reference.
+  std::vector<float> slots(y, y + size_t(N_SLOTS * ACT_SLOT));
   bo_y.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
   auto the_run = aie_run(kern);
@@ -911,15 +1052,15 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
   the_run.set_arg(4, bo_y);
   auto run_once = [&]() {
     the_run.start();
-    return the_run.wait();
+    return wait_completed(the_run, "q4layer");
   };
   auto state = run_once();
   bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
   // Host simulation: quantize each stage's input slot the way the core does
   // (f32 math, round half away from zero), then the Q4 GEMV in double.
-  std::vector<float> slots(y, y + size_t(N_SLOTS * ACT_SLOT));
   int bad_total = 0;
+  size_t verified_rows = 0;
   for (size_t si = 0; si < stages.size(); ++si) {
     const auto& st = stages[si];
     const float* in = &slots[size_t(st.in_slot) * ACT_SLOT];
@@ -938,6 +1079,7 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
     }
     float* out = &slots[size_t(st.out_slot) * ACT_SLOT];
     int bad = 0;
+    int checked = 0;
     double worst = 0;
     for (int r = 0; r < st.M; ++r) {
       double ref = 0, mag = 0;
@@ -949,23 +1091,42 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
         mag += std::fabs(term);
       }
       out[r] = float(ref);
+      bool overwritten_later = false;
+      for (size_t sj = si + 1; sj < stages.size(); ++sj) {
+        if (stages[sj].out_slot == st.out_slot && r < stages[sj].M) {
+          overwritten_later = true;
+          break;
+        }
+      }
+      if (overwritten_later) continue;
+      ++checked;
+      ++verified_rows;
       double err = std::fabs(double(y[size_t(st.out_slot) * ACT_SLOT + r]) - ref) / (mag > 0 ? mag : 1);
-      if (!(err <= 1e-4) && r < 3) std::printf("    row %d: npu=%.6f ref=%.6f\n", r, y[size_t(st.out_slot) * ACT_SLOT + r], ref);
-      if (!(err <= 1e-4)) ++bad;
-      else worst = std::max(worst, err);
-      if (std::isnan(err)) ++bad;
+      if (!(err <= 1e-4)) {
+        if (bad < 3)
+          std::printf("    row %d: npu=%.6f ref=%.6f\n", r, y[size_t(st.out_slot) * ACT_SLOT + r], ref);
+        ++bad;
+      } else {
+        worst = std::max(worst, err);
+      }
     }
-    std::printf("  stage %zu (%dx%d -> slot %d): %d of %d rows off (worst ok %.2e) %s\n", si, st.M, st.K,
-                st.out_slot, bad, st.M, worst, bad ? "FAIL" : "PASS");
+    if (checked == 0) {
+      std::printf("  stage %zu (%dx%d -> slot %d): overwritten by later stage (propagated in host sim)\n",
+                  si, st.M, st.K, st.out_slot);
+    } else {
+      std::printf("  stage %zu (%dx%d -> slot %d): %d of %d rows off (worst ok %.2e) %s\n", si, st.M, st.K,
+                  st.out_slot, bad, checked, worst, bad ? "FAIL" : "PASS");
+    }
     bad_total += bad;
   }
+  if (verified_rows == 0) throw std::logic_error("no q4layer output rows verified");
   std::printf("kernel %s, state=%d, fused layer verify: %s\n", kern.name.c_str(), int(state),
               bad_total ? "FAIL" : "PASS");
 
-  std::vector<xrt::run> one;
   auto t = [&]() {
     std::vector<double> v;
-    for (int i = 0; i < 3 + iters; ++i) {
+    const int64_t total = 3 + int64_t(iters);
+    for (int64_t i = 0; i < total; ++i) {
       auto t0 = clk::now();
       run_once();
       if (i >= 3) v.push_back(us_since(t0));

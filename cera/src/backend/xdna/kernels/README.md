@@ -4,7 +4,7 @@ IRON (mlir-aie) designs for the AMD XDNA backend, with their compiled
 artifacts committed next to the sources. Two kernels cover a
 Llama-3.2-1B decode token under one shared hardware context:
 
-- `q4layer` — a full transformer layer (RMSNorms, seven Q4 GEMV stages
+- `q4layer`: a full transformer layer (RMSNorms, seven Q4 GEMV stages
   packed into four per-worker weight groups `(q,k,v)`, `o`, `(gate,up)`,
   `down`, interleaved-pair RoPE on `q`/`k` from L1-cached cos/sin,
   16-token block online-softmax GQA attention, on-core `SiLU(gate)*up`
@@ -12,14 +12,20 @@ Llama-3.2-1B decode token under one shared hardware context:
   streams (`insts_q4layer_c1..c8.bin` and `insts_q4layer.bin` for `c9`,
   72 cached tokens per chunk) share `q4layer.xclbin` so only populated
   KV chunks are streamed without switching hardware contexts.
-- `q4head` — the 131072x2048 GEMV for the LM head (vocab padded from
+- `q4head`: the 131072x2048 GEMV for the LM head (vocab padded from
   128256), sharing `q4layer.xclbin` (`Q4LAYER_HEAD=1`).
 
-Sources are in `iron/` (cera's own code, Apache-2.0 OR MIT, developed in
-the Phase 0b spike under `tools/xdna-spike/`). Regenerate with
+Sources in `iron/` are cera's own code (Apache-2.0 OR MIT, developed in
+the Phase 0b spike under `tools/xdna-spike/`), with `exp2f_16` in
+`iron/q4layer/q4layer.cc` adapted from `Xilinx/mlir-aie`
+`aie_kernels/aie2p/exp2f_vec.cc` (`Apache-2.0 WITH LLVM-exception`). The
+compiled `.xclbin` binaries also instantiate C++ header templates from
+`<aie_api/aie.hpp>` (MIT, Copyright (C) 2020-2026 Xilinx, Inc. and
+Advanced Micro Devices, Inc.) and mlir-aie / IRON runtime descriptors;
+full copyright lines and license texts are in `NOTICE.md` (see
+`docs/XDNA_PHASE0_RESULTS.md` section 3a). Regenerate with
 `build_kernels.sh` (WSL2, pinned mlir-aie v1.4.3 + Peano
-22.0.0.2026090701); it prints nothing to update by hand — refresh the
-hashes below in the same commit as any artifact change. Instruction binaries are deterministic: their hashes must match this table after a rebuild. The `.xclbin` files embed build metadata and are not bit-deterministic, so their hashes are provenance for the committed files only; the drift check for them is a rebuild plus a passing `xdna_layer_probe` / `xdna_probe` run.
+22.0.0.2026090701); refresh the hashes below in the same commit as any artifact change. Instruction binaries are deterministic: their hashes must match this table after a rebuild. The `.xclbin` files embed build metadata and are not bit-deterministic, so their hashes are provenance for the committed files only; the drift check for them is a rebuild plus a passing `xdna_layer_probe` / `xdna_probe` run.
 
 | Artifact | SHA-256 |
 |---|---|

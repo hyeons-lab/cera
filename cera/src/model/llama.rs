@@ -1764,6 +1764,11 @@ impl LlamaModel {
     }
 
     #[cfg(feature = "xdna")]
+    pub(crate) fn embd_weight_ref(&self) -> &WeightRef {
+        &self.embd_ref
+    }
+
+    #[cfg(feature = "xdna")]
     pub(crate) fn ensure_xdna_supported(&self) -> Result<()> {
         ensure!(
             !self.ext && self.norm_order == NormOrder::PreNorm && self.ffn_gated,
@@ -4768,6 +4773,74 @@ mod tests {
         assert!(
             err.to_string().contains("simulated OPFS read failure"),
             "{err}"
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn ensure_xdna_supported_enforces_architecture_gates() {
+        let load = |m: &Tiny, id: &str| {
+            let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(m).into_boxed_slice())).unwrap();
+            LlamaModel::from_gguf_no_repack_with_loader(gguf, 64, id.to_string(), |g, name| {
+                Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+            })
+            .unwrap()
+        };
+        let llama_base = || {
+            let mut m = build_tiny(Kind::Cohere);
+            m.arch = Some("llama");
+            for l in 0..NLAYER {
+                m.tensors
+                    .push((format!("blk.{l}.ffn_norm.weight"), vec![HS], vec![1.0; HS]));
+            }
+            m
+        };
+
+        load(&llama_base(), "test-xdna-ok")
+            .ensure_xdna_supported()
+            .unwrap();
+
+        let u32v = |v: u32| v.to_le_bytes().to_vec();
+        let f32v = |v: f32| v.to_le_bytes().to_vec();
+        let str_v = |s: &str| {
+            let mut b = Vec::new();
+            put_str(&mut b, s);
+            b
+        };
+        for (id, patch) in [
+            ("test-xdna-swa", ("attention.sliding_window", 4u32, u32v(8))),
+            (
+                "test-xdna-cap",
+                ("final_logit_softcapping", 6u32, f32v(30.0)),
+            ),
+            ("test-xdna-yarn", ("rope.scaling.type", 8u32, str_v("yarn"))),
+        ] {
+            let mut m = llama_base();
+            m.extra_kv.push(patch);
+            assert!(load(&m, id).ensure_xdna_supported().is_err(), "{id}");
+        }
+
+        // Non-zero / present attention QKV bias is also rejected.
+        let mut biased = llama_base();
+        biased.tensors.push((
+            "blk.0.attn_q.bias".into(),
+            vec![NH * HD],
+            vec![0.0; NH * HD],
+        ));
+        biased.tensors.push((
+            "blk.0.attn_k.bias".into(),
+            vec![NKV * HD],
+            vec![0.0; NKV * HD],
+        ));
+        biased.tensors.push((
+            "blk.0.attn_v.bias".into(),
+            vec![NKV * HD],
+            vec![0.0; NKV * HD],
+        ));
+        assert!(
+            load(&biased, "test-xdna-bias")
+                .ensure_xdna_supported()
+                .is_err()
         );
     }
 }

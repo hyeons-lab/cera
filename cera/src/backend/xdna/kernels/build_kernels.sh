@@ -7,31 +7,33 @@
 #
 #   bash build_kernels.sh            # rebuild all artifacts in place
 #
-# Artifacts: q4layer (fused Llama-3.2-1B layer, default 9 KV chunks plus
-# bucketed c1/c2/c4/c6 instruction streams sharing q4layer.xclbin) and q4head
-# (131072x2048 GEMV for the padded LM head). After rebuilding, update the
-# SHA-256 table in README.md; CI compares the table against the committed files.
+# Artifacts: q4layer (fused Llama-3.2-1B layer: c1..c8 bucketed instruction
+# streams plus default 9-chunk insts_q4layer.bin sharing q4layer.xclbin) and
+# q4head
+# (131072x2048 GEMV for the padded LM head, copied to q4head.xclbin alongside
+# insts_q4head.bin). After rebuilding, update the SHA-256 table in README.md;
+# CI compares the table against the committed files.
 set -eo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DST="$HOME/xdna-iron/kernels-build"
+IRON_HOME="${IRON_HOME:-$HOME/xdna-iron}"
+DST="${DST:-$IRON_HOME/kernels-build}"
 OUT="$DST/out"
 rm -rf "$DST/iron" "$OUT"
 mkdir -p "$OUT"
 cp -r "$HERE/iron" "$DST/"
+find "$DST/iron" -type d \( -name '__pycache__' -o -name '*.prj' \) -prune -exec rm -rf {} +
 python3 - "$DST/iron" <<'PY'
 import pathlib, sys
+TEXT_EXTS = {".py", ".cc", ".h", ".sh", ".md", ".txt"}
 for p in pathlib.Path(sys.argv[1]).rglob("*"):
-    if p.is_file():
+    if p.is_file() and p.suffix in TEXT_EXTS:
         data = p.read_bytes()
         if b"\r\n" in data:
             p.write_bytes(data.replace(b"\r\n", b"\n"))
 PY
-IRON_HOME="${IRON_HOME:-$HOME/xdna-iron}"
-ARGS=()
 set --  # env_setup.sh reads $1/$2 as install paths
 source "$IRON_HOME/ironenv/bin/activate"
 source "$IRON_HOME/mlir-aie/utils/env_setup.sh" >/dev/null
-set -- "${ARGS[@]}"
 set -u
 export PATH="$IRON_HOME/xrt-local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$IRON_HOME/xrt-local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"

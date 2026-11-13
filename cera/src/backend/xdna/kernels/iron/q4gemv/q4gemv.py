@@ -39,7 +39,7 @@ def out_tiles_for(tiles_per_worker):
     # Largest grouping (up to MAX_OUT_TILES) that divides the worker's tiles
     # and still leaves at least two output elements per worker. This is what
     # lets small row counts (512, 2048) use the same design as large ones.
-    cap = int(os.environ.get("SPIKE_Q4_MAX_OT", "16"))
+    cap = int(os.environ.get("SPIKE_Q4_MAX_OT", str(MAX_OUT_TILES)))
     for cand in (16, 8, 4, 2, 1):
         if cand > cap:
             continue
@@ -50,6 +50,8 @@ def out_tiles_for(tiles_per_worker):
 
 @iron.jit
 def q4gemv(w: In, x: In, out: Out, *, M: CompileTime[int], K: CompileTime[int]):
+    if M <= 0 or K <= 0:
+        raise ValueError(f"M and K must be positive, got M={M}, K={K}")
     workers_n = get_current_device().cols * NUM_CHANNELS
     chunk_k = min(K, CHUNK_K)
     if K % chunk_k:
@@ -64,6 +66,8 @@ def q4gemv(w: In, x: In, out: Out, *, M: CompileTime[int], K: CompileTime[int]):
     outs_per_worker = tiles_per_worker // out_tiles
     if K % 64:
         raise ValueError("K must be a multiple of 64 (q4gemv.cc copies x 64 bytes at a time)")
+    if K + (K // QBLK) * 4 > tb:
+        raise ValueError(f"K={K} exceeds single activation slot capacity ({tb} bytes; max K=16384)")
 
     w_ty = np.ndarray[(workers_n * tiles_per_worker * chunks * tb,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(tb,), np.dtype[np.uint8]]

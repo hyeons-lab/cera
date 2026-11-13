@@ -122,8 +122,17 @@ test-hexagon:
     cargo test -p cera-ffi --features hexagon --lib
     cargo test -p cera-cli --features hexagon
 
+# Clippy and tests for the non-default `xdna` feature, mirroring `.github/workflows/ci.yml`.
+clippy-xdna:
+    cargo clippy -p cera --features xdna --all-targets -- -D warnings
+    cargo clippy -p cera-cli --features xdna --all-targets -- -D warnings
+
+test-xdna:
+    cargo test -p cera --features xdna --lib -- xdna npu_preference_errors_name_every_vendor_that_failed
+    cargo test -p cera-cli --features xdna
+
 # Run all CI checks locally (mirrors GitHub Actions)
-ci: fmt clippy test python-test clippy-hexagon test-hexagon
+ci: fmt clippy test python-test clippy-hexagon test-hexagon clippy-xdna test-xdna
 
 # Print the host's resolved SIMD tier, then run the tier-specific kernel tests.
 # Each test self-skips unless the host has the feature it covers, so the useful

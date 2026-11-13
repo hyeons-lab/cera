@@ -89,7 +89,7 @@ extern "C" {
 
 // Single entry point so x_q and x_d live in one object: t < 0 loads x from
 // the slot, otherwise the slot is a weight tile whose 16 outputs go to
-// out[16 t ..].
+// out[16 * (t / KCHUNKS) ..].
 void q4_step(const uint8_t *slot, float *out, int32_t k, int32_t t) {
   if (t < 0)
     load_x(slot, k);

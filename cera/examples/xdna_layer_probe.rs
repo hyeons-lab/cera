@@ -7,33 +7,26 @@
 //! Usage: `xdna_layer_probe [iters]`
 
 use cera::backend::xdna::XdnaDevice;
-use cera::backend::xdna::kernels::{Q4LAYER_INSTS, Q4LAYER_XCLBIN, inst_words};
+use cera::backend::xdna::kernels::{
+    Q4LAYER_ACT_BYTES, Q4LAYER_ACT_FLOATS, Q4LAYER_ACT_SLOT, Q4LAYER_ATTN_NORM_W,
+    Q4LAYER_FFN_NORM_W, Q4LAYER_HEAD_DIM, Q4LAYER_KV_BUCKETS, Q4LAYER_N_KV_HEADS, Q4LAYER_XCLBIN,
+    init_q4layer_bo_y_norms, pack_q4layer_rope_cs, read_le_f32_slice, select_q4layer_kv_bucket,
+    try_inst_words, write_le_f32_slice, write_q4layer_kv_bf16, write_q4layer_step_params,
+};
 use cera::backend::xdna::repack::{
     f32_to_bf16, interleave_worker_stages, pack_f32_stage, stage_bytes,
 };
+use cera::quant::bf16_to_f32;
 use std::process::ExitCode;
 
-const ACT_SLOT: usize = 8192;
-const N_SLOTS: usize = 8;
-const TILE_F32: usize = 4608;
-const SILU_HALF: usize = 2304;
-/// Slot 0 is [hidden | RMSNorm weights | RoPE cos/sin | n_kv_cache]: the kernel
-/// norms + quantizes the hidden state once for (q, k, v).
-const NORM_W: usize = 2048;
-const ROPE_CS: usize = 4096;
-const ATTN_N_OFF: usize = ROPE_CS + 128;
+const ACT_SLOT: usize = Q4LAYER_ACT_SLOT;
 const ATTN_OUT: usize = 2048;
-const HEAD_DIM: usize = 64;
+const HEAD_DIM: usize = Q4LAYER_HEAD_DIM;
 const N_HEADS: usize = 32;
-const N_KV_HEADS: usize = 8;
-const ATTN_CHUNK_T: usize = 72;
-const ATTN_CHUNKS: usize = 9;
-const KV_CACHE_BASE: usize = N_SLOTS * ACT_SLOT;
-const KV_HEAD_STRIDE: usize = ATTN_CHUNKS * TILE_F32;
-const KV_SLOT: usize = N_KV_HEADS * KV_HEAD_STRIDE;
-const ACT_TOTAL: usize = KV_CACHE_BASE + KV_SLOT;
+const N_KV_HEADS: usize = Q4LAYER_N_KV_HEADS;
 const ATTN_CACHE_T: usize = 540;
 const NORM_EPS: f32 = 1e-5;
+const WAIT_TIMEOUT_MS: u32 = 30_000;
 /// (input slot, rows, cols, output slot) for a Llama-3.2-1B layer.
 const STAGES: [(usize, usize, usize, usize); 7] = [
     (0, 2048, 2048, 1),
@@ -45,8 +38,27 @@ const STAGES: [(usize, usize, usize, usize); 7] = [
     (5, 2048, 8192, 7),
 ];
 
-fn bf16_to_f32(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
+fn parse_cli(args: &[String]) -> Result<Option<usize>, String> {
+    if args.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        return Ok(None);
+    }
+    if args.len() > 2 {
+        return Err("expected at most one argument `[iters]` (pass --help for usage)".to_string());
+    }
+    if let Some(raw) = args.get(1) {
+        if raw.starts_with('-') {
+            return Err(format!("unknown flag `{raw}` (pass --help for usage)"));
+        }
+        let iters = raw
+            .parse::<usize>()
+            .map_err(|_| format!("invalid iters `{raw}`: expected non-negative integer"))?;
+        if iters > 1_000_000 {
+            return Err(format!("iters must be <= 1000000, got {iters}"));
+        }
+        Ok(Some(iters))
+    } else {
+        Ok(Some(5))
+    }
 }
 
 struct Rng(u32);
@@ -81,10 +93,30 @@ fn quantize_block(vals: &[f32]) -> ([i8; 32], f32) {
 }
 
 fn main() -> ExitCode {
-    let iters: usize = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(5);
+    let args: Vec<String> = std::env::args().collect();
+    let iters = match parse_cli(&args) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            println!("Usage: xdna_layer_probe [iters] (0 runs verification only)");
+            return ExitCode::SUCCESS;
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            eprintln!("Usage: xdna_layer_probe [iters]");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let bucket_chunks: Vec<usize> = Q4LAYER_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+    let (bucket_idx, skip_kv) = select_q4layer_kv_bucket(&bucket_chunks, ATTN_CACHE_T);
+    let insts = match try_inst_words(Q4LAYER_KV_BUCKETS[bucket_idx].1) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let device = match XdnaDevice::open(0) {
         Ok(d) => d,
         Err(e) => {
@@ -92,7 +124,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let kernel = match device.load_kernel(Q4LAYER_XCLBIN, &inst_words(Q4LAYER_INSTS)) {
+    let kernel = match device.load_kernel(Q4LAYER_XCLBIN, &insts) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("xdna unavailable: {e}");
@@ -101,10 +133,17 @@ fn main() -> ExitCode {
     };
 
     // Deterministic f32 weights per stage, packed by the Rust repack.
-    let total_w: usize = STAGES
-        .iter()
-        .map(|&(_, m, k, _)| stage_bytes(m, k).unwrap())
-        .sum();
+    let mut total_w = 0usize;
+    for &(_, m, k, _) in &STAGES {
+        let sb = match stage_bytes(m, k) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        total_w += sb;
+    }
     let mut bo_w = match kernel.alloc_bo(total_w, 3) {
         Ok(b) => b,
         Err(e) => {
@@ -118,7 +157,14 @@ fn main() -> ExitCode {
         let mut rng = Rng(2024);
         for &(_, m, k, _) in &STAGES {
             let weights: Vec<f32> = (0..m * k).map(|_| rng.next_f32()).collect();
-            let mut buf = vec![0u8; stage_bytes(m, k).unwrap()];
+            let sb = match stage_bytes(m, k) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut buf = vec![0u8; sb];
             if let Err(e) = pack_f32_stage(&mut buf, &weights, m, k) {
                 eprintln!("{e}");
                 return ExitCode::FAILURE;
@@ -128,15 +174,30 @@ fn main() -> ExitCode {
         }
         let w = bo_w.as_mut_slice();
         let mut off = 0usize;
-        off += interleave_worker_stages(
+        off += match interleave_worker_stages(
             &mut w[off..],
             &[&stage_packed[0], &stage_packed[1], &stage_packed[2]],
-        )
-        .unwrap();
+            2048,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
         w[off..off + stage_packed[3].len()].copy_from_slice(&stage_packed[3]);
         off += stage_packed[3].len();
-        off +=
-            interleave_worker_stages(&mut w[off..], &[&stage_packed[4], &stage_packed[5]]).unwrap();
+        off += match interleave_worker_stages(
+            &mut w[off..],
+            &[&stage_packed[4], &stage_packed[5]],
+            2048,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
         w[off..off + stage_packed[6].len()].copy_from_slice(&stage_packed[6]);
     }
     if let Err(e) = bo_w.sync_to_device() {
@@ -144,7 +205,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut bo_y = match kernel.alloc_bo(ACT_TOTAL * 4, 4) {
+    let mut bo_y = match kernel.alloc_bo(Q4LAYER_ACT_BYTES, 4) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{e}");
@@ -156,8 +217,12 @@ fn main() -> ExitCode {
     for v in &mut hidden {
         *v = rng.next_f32();
     }
-    let norm_w: Vec<f32> = (0..NORM_W).map(|_| 1.0 + 0.5 * rng.next_f32()).collect();
-    let ffn_norm_w: Vec<f32> = (0..NORM_W).map(|_| 1.0 + 0.5 * rng.next_f32()).collect();
+    let norm_w: Vec<f32> = (0..Q4LAYER_ATTN_NORM_W)
+        .map(|_| 1.0 + 0.5 * rng.next_f32())
+        .collect();
+    let ffn_norm_w: Vec<f32> = (0..Q4LAYER_FFN_NORM_W)
+        .map(|_| 1.0 + 0.5 * rng.next_f32())
+        .collect();
     let mut rope_cos = [0.0f32; HEAD_DIM / 2];
     let mut rope_sin = [0.0f32; HEAD_DIM / 2];
     for j in 0..HEAD_DIM / 2 {
@@ -166,14 +231,7 @@ fn main() -> ExitCode {
         rope_cos[j] = angle.cos();
         rope_sin[j] = angle.sin();
     }
-    let mut rope_cs = [0.0f32; 128];
-    for h in 0..2 {
-        let base = h * 64;
-        rope_cs[base..base + 16].copy_from_slice(&rope_cos[..16]);
-        rope_cs[base + 16..base + 32].copy_from_slice(&rope_sin[..16]);
-        rope_cs[base + 32..base + 48].copy_from_slice(&rope_cos[16..32]);
-        rope_cs[base + 48..base + 64].copy_from_slice(&rope_sin[16..32]);
-    }
+    let rope_cs = pack_q4layer_rope_cs(&rope_cos, &rope_sin);
     let kv_cache_len = N_KV_HEADS * ATTN_CACHE_T * HEAD_DIM;
     let k_cache: Vec<f32> = (0..kv_cache_len)
         .map(|_| bf16_to_f32(f32_to_bf16(rng.next_f32())))
@@ -183,36 +241,21 @@ fn main() -> ExitCode {
         .collect();
     {
         let y = bo_y.as_mut_slice();
-        y.fill(0);
-        for (i, v) in hidden.iter().chain(norm_w.iter()).enumerate() {
-            y[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        for (i, v) in rope_cs.iter().enumerate() {
-            let off = (ROPE_CS + i) * 4;
-            y[off..off + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        let n_off = ATTN_N_OFF * 4;
-        y[n_off..n_off + 4].copy_from_slice(&(ATTN_CACHE_T as i32).to_le_bytes());
+        init_q4layer_bo_y_norms(y, &norm_w, &ffn_norm_w);
+        write_le_f32_slice(y, 0, &hidden);
+        write_q4layer_step_params(y, &rope_cs, ATTN_CACHE_T, skip_kv);
         for kvh in 0..N_KV_HEADS {
             let src_base = kvh * ATTN_CACHE_T * HEAD_DIM;
             for t in 0..ATTN_CACHE_T {
-                let c = t / ATTN_CHUNK_T;
-                let rem = t % ATTN_CHUNK_T;
-                let chunk_byte_off = (KV_CACHE_BASE + (kvh * ATTN_CHUNKS + c) * TILE_F32) * 4;
-                let k_byte_off = chunk_byte_off + rem * HEAD_DIM * 2;
-                let v_byte_off = k_byte_off + SILU_HALF * 4;
-                for d in 0..HEAD_DIM {
-                    let kb = f32_to_bf16(k_cache[src_base + t * HEAD_DIM + d]).to_le_bytes();
-                    let vb = f32_to_bf16(v_cache[src_base + t * HEAD_DIM + d]).to_le_bytes();
-                    y[k_byte_off + d * 2..k_byte_off + d * 2 + 2].copy_from_slice(&kb);
-                    y[v_byte_off + d * 2..v_byte_off + d * 2 + 2].copy_from_slice(&vb);
-                }
+                let off = src_base + t * HEAD_DIM;
+                write_q4layer_kv_bf16(
+                    y,
+                    kvh,
+                    t,
+                    &k_cache[off..off + HEAD_DIM],
+                    &v_cache[off..off + HEAD_DIM],
+                );
             }
-        }
-        let ffn_off = 4 * ACT_SLOT + NORM_W;
-        for (i, v) in ffn_norm_w.iter().enumerate() {
-            let off = (ffn_off + i) * 4;
-            y[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
     }
     if let Err(e) = bo_y.sync_to_device() {
@@ -220,7 +263,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut bo_y_next = match kernel.alloc_bo(ACT_TOTAL * 4, 5) {
+    let mut bo_y_next = match kernel.alloc_bo(Q4LAYER_ACT_BYTES, 5) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{e}");
@@ -244,16 +287,9 @@ fn main() -> ExitCode {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
-    match run.wait(0) {
-        Ok(4) => {}
-        Ok(state) => {
-            eprintln!("run ended in state {state}, expected 4 (completed)");
-            return ExitCode::FAILURE;
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
+    if let Err(e) = run.wait(WAIT_TIMEOUT_MS) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
     }
     if let Err(e) = bo_y.sync_from_device() {
         eprintln!("{e}");
@@ -263,23 +299,13 @@ fn main() -> ExitCode {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
-    let mut npu_slots: Vec<f32> = bo_y
-        .as_slice()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect();
-    for (i, c) in bo_y_next
-        .as_slice()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .take(2048)
-        .enumerate()
-    {
-        npu_slots[7 * ACT_SLOT + i] = f32::from_le_bytes(*c);
-    }
+    let mut npu_slots = vec![0.0f32; Q4LAYER_ACT_FLOATS];
+    read_le_f32_slice(bo_y.as_slice(), 0, &mut npu_slots);
+    read_le_f32_slice(
+        bo_y_next.as_slice(),
+        0,
+        &mut npu_slots[7 * ACT_SLOT..7 * ACT_SLOT + 2048],
+    );
 
     // Host simulation of the same stage chain.
     let mut slots = npu_slots.clone();
@@ -386,14 +412,13 @@ fn main() -> ExitCode {
             slots[verify_slot * ACT_SLOT + r] = reference as f32;
             let got = npu_slots[verify_slot * ACT_SLOT + r] as f64;
             let err = (got - reference).abs() / if mag > 0.0 { mag } else { 1.0 };
-            if err <= 1e-4 {
-                worst = worst.max(err);
-            } else {
+            worst = worst.max(err);
+            if err > 1e-4 || err.is_nan() {
                 bad += 1;
             }
         }
         println!(
-            "  stage {si} ({m}x{k} -> slot {verify_slot}): {bad} of {m} rows off (worst ok {worst:.2e}) {}",
+            "  stage {si} ({m}x{k} -> slot {verify_slot}): {bad} of {m} rows off (worst {worst:.2e}) {}",
             if bad == 0 { "PASS" } else { "FAIL" }
         );
         bad_total += bad;
@@ -451,15 +476,14 @@ fn main() -> ExitCode {
                     slots[idx] = acc as f32;
                     let got = npu_slots[idx] as f64;
                     let err = (got - acc).abs() / if mag > 0.0 { mag } else { 1.0 };
-                    if err <= 1e-4 {
-                        attn_worst = attn_worst.max(err);
-                    } else {
+                    attn_worst = attn_worst.max(err);
+                    if err > 1e-4 || err.is_nan() {
                         attn_bad += 1;
                     }
                 }
             }
             println!(
-                "  attn ({N_HEADS} heads, {n_tok} kv tokens -> slot 1+{ATTN_OUT}): {attn_bad} of 2048 values off (worst ok {attn_worst:.2e}) {}",
+                "  attn ({N_HEADS} heads, {n_tok} kv tokens -> slot 1+{ATTN_OUT}): {attn_bad} of 2048 values off (worst {attn_worst:.2e}) {}",
                 if attn_bad == 0 { "PASS" } else { "FAIL" }
             );
             bad_total += attn_bad;
@@ -470,19 +494,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if iters == 0 {
+        println!("xdna layer probe: PASS (verification only, iters=0)");
+        return ExitCode::SUCCESS;
+    }
+
     // Timing: fresh start+wait per run, first three are warmup.
-    let mut times = Vec::new();
+    let mut times = Vec::with_capacity(iters);
     for i in 0..3 + iters {
         let t0 = std::time::Instant::now();
-        if run.start().is_err() || run.wait(0).is_err() {
-            eprintln!("timed run failed");
+        if let Err(e) = run.start().and_then(|()| run.wait(WAIT_TIMEOUT_MS)) {
+            eprintln!("timed run failed: {e}");
             return ExitCode::FAILURE;
         }
         if i >= 3 {
             times.push(t0.elapsed().as_secs_f64() * 1e6);
         }
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times.sort_by(|a, b| a.total_cmp(b));
     let p50 = times[times.len() / 2];
     println!(
         "fused layer: p50 {:.1} us over {} runs; projection 16 layers + head (2816 us) = {:.2} ms/token -> {:.1} tok/s",

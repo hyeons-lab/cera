@@ -96,12 +96,20 @@ jobs:
           python3 tests/test_format_review_comment.py
           python3 tests/api_contracts/check.py
           python3 -m unittest discover -s tests/api_contracts
-      - name: Shell syntax check (bench and kernel scripts)
+      - name: Shell and IRON generator syntax check
         # Hardware/WSL build scripts only run on-device or during kernel regen;
         # a syntax slip would otherwise surface there instead of on the PR.
         run: |
           bash -n scripts/bench_android.sh
           bash -n cera/src/backend/xdna/kernels/build_kernels.sh
+          bash -n tools/xdna-spike/fix_and_build.sh
+          bash -n tools/xdna-spike/build_spec.sh
+          bash -n tools/xdna-spike/iron/build.sh
+          python3 -m py_compile \
+            cera/src/backend/xdna/kernels/iron/q4gemv/q4gemv.py \
+            cera/src/backend/xdna/kernels/iron/q4layer/q4layer.py \
+            tools/xdna-spike/iron/q4gemv/q4gemv.py \
+            tools/xdna-spike/iron/q4layer/q4layer.py
       - name: Hexagon skel list pin
         # The DSP skel filename set lives in three hand-synced places (the
         # embedded skel dir, `HexagonArch::skel_filename`, Kotlin
@@ -293,7 +301,18 @@ jobs:
       - name: Hexagon FFI unit tests
         run: cargo test -p cera-ffi --features hexagon --lib --no-fail-fast
       - name: XDNA host-side unit tests
-        run: cargo test -p cera --features xdna --lib --no-fail-fast
+        run: |
+          set -euo pipefail
+          FILTERS="xdna npu_preference_errors_name_every_vendor_that_failed"
+          # shellcheck disable=SC2086
+          COUNT=$(cargo test -p cera --features xdna --lib -- --list $FILTERS \
+                  | grep -c ': test$' || true)
+          if [ "$COUNT" -lt 15 ]; then
+            echo "::error::expected at least 15 xdna-gated lib tests, found $COUNT" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          cargo test -p cera --features xdna --lib --no-fail-fast -- $FILTERS
 
   windows-xdna:
     name: XDNA shim & tests (windows-latest)
@@ -309,8 +328,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy XDNA (MSVC shim + Win32 loader)
         run: cargo clippy -p cera -p cera-cli --features xdna --all-targets -- -D warnings
+      - name: Verify MSVC shim DLL and has_xdna_shim cfg were emitted
+        shell: pwsh
+        run: |
+          $dlls = @(Get-ChildItem -Path target/debug/build/cera-*/out/cera_xdna_shim.dll -ErrorAction SilentlyContinue)
+          $cfgs = @(Select-String -Path target/debug/build/cera-*/output -Pattern '^cargo:rustc-cfg=has_xdna_shim$' -ErrorAction SilentlyContinue)
+          if ($dlls.Count -eq 0 -or $cfgs.Count -eq 0) {
+            Write-Error "expected build.rs to compile cera_xdna_shim.dll and emit cargo:rustc-cfg=has_xdna_shim on windows-latest"
+            exit 1
+          }
       - name: Run XDNA unit tests
-        run: cargo test -p cera --features xdna --lib --no-fail-fast
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILTERS="xdna npu_preference_errors_name_every_vendor_that_failed"
+          # shellcheck disable=SC2086
+          COUNT=$(cargo test -p cera --features xdna --lib -- --list $FILTERS \
+                  | grep -c ': test$' || true)
+          if [ "$COUNT" -lt 25 ]; then
+            echo "::error::expected at least 25 xdna-gated lib tests on Windows, found $COUNT" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          cargo test -p cera --features xdna --lib --no-fail-fast -- $FILTERS
+          cargo test -p cera-cli --features xdna
 
   # x86_64 with the default-on `avx512` crate feature OFF.
   #

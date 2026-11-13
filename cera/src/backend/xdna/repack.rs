@@ -23,9 +23,13 @@ const CHUNK_K: usize = 2048;
 /// Bytes per block in the packed stream: 256 of int4 data + 32 of scales.
 const BLOCK_BYTES: usize = 288;
 
-/// Convert f32 to bf16 with round-to-nearest-even (the spike's rule).
+/// Convert f32 to bf16 with round-to-nearest-even (the spike's rule),
+/// preserving quiet NaNs instead of rounding mantissas into infinity.
 pub fn f32_to_bf16(f: f32) -> u16 {
     let u = f.to_bits();
+    if (u & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((u >> 16) as u16) | 0x0040;
+    }
     let rounded = u.wrapping_add(0x7FFF + ((u >> 16) & 1));
     (rounded >> 16) as u16
 }
@@ -34,7 +38,12 @@ pub fn f32_to_bf16(f: f32) -> u16 {
 pub fn stage_bytes(rows: usize, cols: usize) -> Result<usize, String> {
     check_shape(rows, cols)?;
     let chunks = cols.div_ceil(CHUNK_K);
-    Ok(rows / ROWS * chunks * (CHUNK_K.min(cols) / QBLK) * BLOCK_BYTES)
+    let blocks_per_chunk = CHUNK_K.min(cols) / QBLK;
+    (rows / ROWS)
+        .checked_mul(chunks)
+        .and_then(|v| v.checked_mul(blocks_per_chunk))
+        .and_then(|v| v.checked_mul(BLOCK_BYTES))
+        .ok_or_else(|| format!("xdna stage byte size overflow for {rows}x{cols}"))
 }
 
 /// Validate a stage shape against the kernel's constraints.
@@ -58,13 +67,11 @@ fn check_shape(rows: usize, cols: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// A source of signed int4 weights (`q - 8` in [-8, 7]) and f32 row scales,
+/// A source of 32-element blocks (`q - 8` in `[-8, 7]` plus `f32` scale),
 /// addressed the way the packing loops consume them.
 trait WeightSource {
-    /// Signed int4 weight at (row, col), in [-8, 7].
-    fn wq(&self, row: usize, col: usize) -> i8;
-    /// f32 scale of (row, block).
-    fn scale(&self, row: usize, block: usize) -> f32;
+    /// Read one 32-weight block `(signed int4 weights in [-8, 7], f32 scale)`.
+    fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32);
 }
 
 /// GGUF Q4_0 bytes: 18-byte blocks of f16 scale + 32 nibbles.
@@ -76,18 +83,17 @@ struct Q4_0Source<'a> {
 }
 
 impl WeightSource for Q4_0Source<'_> {
-    fn wq(&self, row: usize, col: usize) -> i8 {
-        let block = &self.src[(row * self.nb + col / QBLK) * 18..];
-        let qs = &block[2..18];
-        let j = col % QBLK;
-        let byte = qs[j % 16];
-        let nib = if j < 16 { byte & 0xF } else { byte >> 4 };
-        nib as i8 - 8
-    }
-
-    fn scale(&self, row: usize, block: usize) -> f32 {
+    fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32) {
         let bytes = &self.src[(row * self.nb + block) * 18..];
-        f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
+        let d = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+        let qs = &bytes[2..18];
+        let mut q = [0i8; QBLK];
+        for j in 0..16 {
+            let b = qs[j];
+            q[j] = (b & 0xF) as i8 - 8;
+            q[j + 16] = (b >> 4) as i8 - 8;
+        }
+        (q, d)
     }
 }
 
@@ -101,38 +107,29 @@ struct F32Source<'a> {
 }
 
 impl WeightSource for F32Source<'_> {
-    fn wq(&self, row: usize, col: usize) -> i8 {
-        let (d, _) = self.block_scale(row, col / QBLK);
-        if d == 0.0 {
-            return 0;
-        }
-        let v = self.src[row * self.cols + col] / d;
-        // The spike's `int(v * id + 8.5f)`: truncation toward zero, clamped.
-        ((v + 8.5) as i32).clamp(0, 15) as i8 - 8
-    }
-
-    fn scale(&self, row: usize, block: usize) -> f32 {
-        self.block_scale(row, block).1
-    }
-}
-
-impl F32Source<'_> {
-    /// (scale as used to quantize signed values, f32 scale) of one block.
-    /// The kernel's `wq` is `q - 8` with values `(q-8) * d`; the spike
-    /// quantizes with `d = mx / -8`, so the stored scale is that `d`.
-    fn block_scale(&self, row: usize, block: usize) -> (f32, f32) {
-        let base = row * self.cols + block * QBLK;
+    fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32) {
+        let slice = &self.src[row * self.cols + block * QBLK..][..QBLK];
         let mut mx = 0.0f32;
         let mut amax = 0.0f32;
-        for j in 0..QBLK {
-            let v = self.src[base + j];
-            if v.abs() > amax {
-                amax = v.abs();
+        for &v in slice {
+            if v.is_nan() {
+                return ([0i8; QBLK], f32::NAN);
+            }
+            let av = v.abs();
+            if av > amax {
+                amax = av;
                 mx = v;
             }
         }
         let d = mx / -8.0;
-        (d, d)
+        let mut q = [0i8; QBLK];
+        if d != 0.0 && d.is_finite() {
+            for (dst, &v) in q.iter_mut().zip(slice.iter()) {
+                // The spike's `int(v * id + 8.5f)`: truncation toward zero, clamped.
+                *dst = ((v / d + 8.5) as i32).clamp(0, 15) as i8 - 8;
+            }
+        }
+        (q, d)
     }
 }
 
@@ -163,12 +160,19 @@ fn pack_stage<S: WeightSource>(
             let tp = (tile * chunks + ch) * tile_bytes;
             for lb in 0..nb_chunk {
                 let b = ch * nb_chunk + lb;
+                let mut qs = [[0i8; QBLK]; ROWS];
+                let mut scales = [0u16; ROWS];
+                for n in 0..ROWS {
+                    let (q, d) = source.quant_block(r0 + n, b);
+                    qs[n] = q;
+                    scales[n] = f32_to_bf16(d);
+                }
                 let bp = tp + lb * 256;
                 for h in 0..2 {
                     for kk in 0..16 {
-                        for n in 0..16 {
+                        for (n, q_row) in qs.iter().enumerate() {
                             let e = kk * 16 + n;
-                            let nib = (source.wq(r0 + n, b * QBLK + h * 16 + kk) & 0xF) as u8;
+                            let nib = (q_row[h * 16 + kk] & 0xF) as u8;
                             let byte = &mut dst[bp + h * 128 + e / 2];
                             if e % 2 == 0 {
                                 *byte |= nib;
@@ -179,8 +183,7 @@ fn pack_stage<S: WeightSource>(
                     }
                 }
                 let sp = tp + nb_chunk * 256 + lb * ROWS * 2;
-                for n in 0..16 {
-                    let bits = f32_to_bf16(source.scale(r0 + n, b));
+                for (n, &bits) in scales.iter().enumerate() {
                     dst[sp + n * 2..sp + n * 2 + 2].copy_from_slice(&bits.to_le_bytes());
                 }
             }
@@ -198,7 +201,10 @@ pub fn pack_q4_0_stage(
 ) -> Result<usize, String> {
     check_shape(rows, cols)?;
     let nb = cols / QBLK;
-    let expect = rows * nb * 18;
+    let expect = rows
+        .checked_mul(nb)
+        .and_then(|v| v.checked_mul(18))
+        .ok_or_else(|| format!("Q4_0 byte size overflow for {rows}x{cols}"))?;
     if src.len() < expect {
         return Err(format!(
             "Q4_0 tensor too small: need {expect} bytes, have {}",
@@ -217,10 +223,12 @@ pub fn pack_f32_stage(
     cols: usize,
 ) -> Result<usize, String> {
     check_shape(rows, cols)?;
-    if src.len() < rows * cols {
+    let expect = rows
+        .checked_mul(cols)
+        .ok_or_else(|| format!("f32 element count overflow for {rows}x{cols}"))?;
+    if src.len() < expect {
         return Err(format!(
-            "f32 tensor too small: need {} elements, have {}",
-            rows * cols,
+            "f32 tensor too small: need {expect} elements, have {}",
             src.len()
         ));
     }
@@ -232,20 +240,29 @@ const WORKERS: usize = 16;
 
 /// Interleave already-packed stage buffers per worker so a fused TaskGroup
 /// (`q+k+v` or `gate+up`) streams all of worker `i`'s stage slices in a single
-/// contiguous Shim DMA buffer descriptor.
-pub fn interleave_worker_stages(dst: &mut [u8], stages: &[&[u8]]) -> Result<usize, String> {
+/// contiguous Shim DMA buffer descriptor. Every stage must have been packed at
+/// width `cols` with at least one 16-row tile per worker (a multiple of 256 rows).
+pub fn interleave_worker_stages(
+    dst: &mut [u8],
+    stages: &[&[u8]],
+    cols: usize,
+) -> Result<usize, String> {
     if stages.is_empty() {
         return Err("xdna interleave requires at least one stage".to_string());
     }
+    let min_stage = stage_bytes(WORKERS * ROWS, cols)?;
     let mut total = 0usize;
     for (idx, s) in stages.iter().enumerate() {
-        if s.is_empty() || !s.len().is_multiple_of(WORKERS) {
+        if s.is_empty() || !s.len().is_multiple_of(min_stage) {
             return Err(format!(
-                "packed stage {idx} byte length {} is not a nonzero multiple of {WORKERS}",
-                s.len()
+                "packed stage {idx} byte length {} is not a nonzero multiple of {min_stage} ({} rows x {cols} cols)",
+                s.len(),
+                WORKERS * ROWS
             ));
         }
-        total += s.len();
+        total = total
+            .checked_add(s.len())
+            .ok_or_else(|| "xdna interleave byte count overflow".to_string())?;
     }
     if dst.len() < total {
         return Err(format!(
@@ -359,23 +376,121 @@ mod tests {
         let sp = 512; // nb_chunk=2: scales after 2 * 256 int4 bytes
         let scale_bits = u16::from_le_bytes([packed[sp], packed[sp + 1]]);
         assert_eq!(scale_bits, f32_to_bf16(-12.5));
+
+        let unpack_n0 = |col: usize| -> i8 {
+            let e = col * 16;
+            let byte = packed[e / 2];
+            let nib = byte & 0xF;
+            if nib >= 8 { nib as i8 - 16 } else { nib as i8 }
+        };
+        assert_eq!(unpack_n0(0), 1);
+        assert_eq!(unpack_n0(1), -1);
+        assert_eq!(unpack_n0(2), -8);
+        assert_eq!(unpack_n0(3), 0);
+
+        // Multi-tile, multi-chunk round-trip (rows = 32, cols = 4096).
+        let mt_rows = 32;
+        let mt_cols = 4096;
+        let mut mt_src = vec![0.0f32; mt_rows * mt_cols];
+        for r in 0..mt_rows {
+            mt_src[r * mt_cols + 2048] = -((r + 1) as f32) * 8.0;
+        }
+        let mut mt_packed = vec![0u8; stage_bytes(mt_rows, mt_cols).unwrap()];
+        assert_eq!(
+            pack_f32_stage(&mut mt_packed, &mt_src, mt_rows, mt_cols).unwrap(),
+            mt_packed.len()
+        );
+        let tile = 1;
+        let ch = 1;
+        let chunks = mt_cols / CHUNK_K;
+        let nb_chunk = CHUNK_K / QBLK;
+        let tp = (tile * chunks + ch) * (nb_chunk * BLOCK_BYTES);
+        let sp2 = tp + nb_chunk * 256;
+        let scale_row16 = u16::from_le_bytes([mt_packed[sp2], mt_packed[sp2 + 1]]);
+        assert_eq!(scale_row16, f32_to_bf16(17.0));
+        let nib_row16_c2048 = mt_packed[tp] & 0xF;
+        assert_eq!(
+            if nib_row16_c2048 >= 8 {
+                nib_row16_c2048 as i8 - 16
+            } else {
+                nib_row16_c2048 as i8
+            },
+            -8
+        );
+
+        let mut too_small = vec![0u8; mt_packed.len() - 1];
+        assert!(pack_f32_stage(&mut too_small, &mt_src, mt_rows, mt_cols).is_err());
+        assert!(pack_q4_0_stage(&mut too_small, &[], rows, cols).is_err());
+    }
+
+    #[test]
+    fn bf16_preserves_quiet_nans_across_payloads() {
+        for bits in [
+            0x7F80_0001u32,
+            0x7FC0_0000u32,
+            0x7FFF_FFFFu32,
+            0xFFC0_0001u32,
+            0xFFFF_FFFFu32,
+        ] {
+            let h = f32_to_bf16(f32::from_bits(bits));
+            let back = f32::from_bits((h as u32) << 16);
+            assert!(
+                back.is_nan(),
+                "f32 NaN {bits:#010x} rounded to non-NaN bf16 {h:#06x} ({back})"
+            );
+        }
+        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7F80);
+        assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xFF80);
+        assert!(stage_bytes(16, 2112).is_err());
+    }
+
+    #[test]
+    fn f32_pack_propagates_nan_scale_instead_of_zeroing_block() {
+        let rows = 16;
+        let cols = 64;
+        let mut src = vec![1.0f32; rows * cols];
+        src[5] = f32::NAN;
+        let mut packed = vec![0u8; stage_bytes(rows, cols).unwrap()];
+        pack_f32_stage(&mut packed, &src, rows, cols).unwrap();
+        let sp = 512;
+        let scale_bits = u16::from_le_bytes([packed[sp], packed[sp + 1]]);
+        assert!(
+            f32::from_bits((scale_bits as u32) << 16).is_nan(),
+            "NaN weight block must preserve NaN scale instead of zeroing: {scale_bits:#06x}"
+        );
     }
 
     #[test]
     fn interleave_worker_stages_groups_worker_slices_contiguously() {
-        let s0: Vec<u8> = (0u8..32).collect(); // 2 bytes/worker
-        let s1: Vec<u8> = (100u8..116).collect(); // 1 byte/worker
-        let mut dst = vec![0u8; 48];
-        let written = interleave_worker_stages(&mut dst, &[&s0, &s1]).unwrap();
-        assert_eq!(written, 48);
+        let cols = 64;
+        let tile = stage_bytes(ROWS, cols).unwrap(); // 576 bytes per 16-row tile at K=64
+        let mut s0 = vec![0u8; WORKERS * 2 * tile];
+        let mut s1 = vec![0u8; WORKERS * tile];
         for w in 0..WORKERS {
-            let base = w * 3;
-            assert_eq!(dst[base], (w * 2) as u8);
-            assert_eq!(dst[base + 1], (w * 2 + 1) as u8);
-            assert_eq!(dst[base + 2], (100 + w) as u8);
+            s0[w * 2 * tile..(w + 1) * 2 * tile].fill((w * 2) as u8);
+            s1[w * tile..(w + 1) * tile].fill((100 + w) as u8);
         }
-        assert!(interleave_worker_stages(&mut dst, &[]).is_err());
-        assert!(interleave_worker_stages(&mut dst, &[&[]]).is_err());
-        assert!(interleave_worker_stages(&mut dst, &[&[0u8; 15]]).is_err());
+        let mut dst = vec![0u8; s0.len() + s1.len()];
+        let written = interleave_worker_stages(&mut dst, &[&s0, &s1], cols).unwrap();
+        assert_eq!(written, dst.len());
+        for w in 0..WORKERS {
+            let base = w * 3 * tile;
+            assert!(
+                dst[base..base + 2 * tile]
+                    .iter()
+                    .all(|&b| b == (w * 2) as u8)
+            );
+            assert!(
+                dst[base + 2 * tile..base + 3 * tile]
+                    .iter()
+                    .all(|&b| b == (100 + w) as u8)
+            );
+        }
+        assert!(interleave_worker_stages(&mut dst, &[], cols).is_err());
+        assert!(interleave_worker_stages(&mut dst, &[&[]], cols).is_err());
+        // Single 16-row tile (divisible by 16 bytes, but < 256 rows) must be rejected.
+        let one_tile = vec![0u8; tile];
+        assert!(interleave_worker_stages(&mut dst, &[&one_tile], cols).is_err());
+        assert!(stage_bytes(usize::MAX - (usize::MAX % ROWS), 2048).is_err());
     }
 }

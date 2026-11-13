@@ -25,13 +25,17 @@
 #include "xrt/experimental/xrt_xclbin.h"
 
 #include <chrono>
+#include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -47,18 +51,26 @@
 // whose version it does not know.
 #define CERA_XDNA_SHIM_ABI 2
 
-struct cera_xdna_device {
-  xrt::device dev;
-  xrt::uuid ctx_uuid;
+// Shared hardware context and kernel handle for kernels loaded from the same
+// xclbin UUID and kernel name. `ctx` is declared before `kernel` so C++ member
+// destruction tears down `kernel` before `ctx`. `cera_xdna_device` holds only
+// a `weak_ptr` so dropping the last `cera_xdna_kernel` (for example after
+// `probe()`) releases the NPU column reservation immediately.
+struct cached_hw_ctx {
+  xrt::uuid uuid;
+  std::string kernel_name;
   xrt::hw_context ctx;
   xrt::kernel kernel;
-  bool has_ctx = false;
+};
+
+struct cera_xdna_device {
+  xrt::device dev;
+  std::weak_ptr<cached_hw_ctx> cached_hw;
 };
 
 struct cera_xdna_kernel {
   xrt::device dev;
-  xrt::hw_context ctx;
-  xrt::kernel kernel;
+  std::shared_ptr<cached_hw_ctx> hw;
   xrt::bo instr;
   uint32_t n_instr = 0;
 };
@@ -129,6 +141,7 @@ CERA_XDNA_API void cera_xdna_set_wakelock(int enable) {
 
 CERA_XDNA_API int cera_xdna_device_open(uint32_t index, cera_xdna_device** out, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!out) throw std::runtime_error("null out pointer passed to device_open");
     *out = new cera_xdna_device{xrt::device(index)};
     return 0;
   });
@@ -144,6 +157,7 @@ CERA_XDNA_API void cera_xdna_device_free(cera_xdna_device* d) {
 // Writes the device's BDF-style identifier (for logs) into buf.
 CERA_XDNA_API int cera_xdna_device_bdf(cera_xdna_device* d, char* buf, size_t len, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!d) throw std::runtime_error("null device handle passed to device_bdf");
     auto bdf = d->dev.get_info<xrt::info::device::bdf>();
     set_err(buf, len, bdf.c_str());
     return 0;
@@ -156,8 +170,35 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
                                         const uint32_t* instr, size_t n_instr, cera_xdna_kernel** out, char* err,
                                         size_t err_len) {
   return guarded(err, err_len, [&] {
-    if (n_instr == 0 || n_instr > UINT32_MAX) throw std::runtime_error("instruction stream is empty or too long");
-    std::vector<char> bytes(static_cast<const char*>(xclbin), static_cast<const char*>(xclbin) + xclbin_len);
+    if (!d || !out || !xclbin || !instr) throw std::runtime_error("null pointer passed to kernel_load");
+    if (n_instr == 0 || n_instr > UINT32_MAX / sizeof(uint32_t))
+      throw std::runtime_error("instruction stream is empty or too long");
+    if (xclbin_len < sizeof(axlf)) throw std::runtime_error("xclbin buffer is smaller than axlf header");
+    axlf hdr{};
+    std::memcpy(&hdr, xclbin, sizeof(hdr));
+    if (std::memcmp(hdr.m_magic, "xclbin2\0", 8) != 0) throw std::runtime_error("invalid xclbin magic");
+    const size_t base_hdr_bytes = sizeof(axlf) - sizeof(axlf_section_header);
+    if (hdr.m_header.m_length < base_hdr_bytes || hdr.m_header.m_length > xclbin_len)
+      throw std::runtime_error("xclbin header length exceeds input buffer");
+    if (hdr.m_header.m_numSections > XCLBIN_MAX_NUM_SECTION)
+      throw std::runtime_error("xclbin section count exceeds maximum");
+    const uint64_t sec_table_end = static_cast<uint64_t>(base_hdr_bytes) +
+                                   static_cast<uint64_t>(hdr.m_header.m_numSections) * sizeof(axlf_section_header);
+    if (sec_table_end > hdr.m_header.m_length)
+      throw std::runtime_error("xclbin section table exceeds container length");
+    const auto* raw = static_cast<const char*>(xclbin);
+    for (uint32_t i = 0; i < hdr.m_header.m_numSections; ++i) {
+      axlf_section_header sec{};
+      std::memcpy(&sec, raw + base_hdr_bytes + static_cast<size_t>(i) * sizeof(axlf_section_header), sizeof(sec));
+      if (sec.m_sectionOffset > hdr.m_header.m_length ||
+          sec.m_sectionSize > hdr.m_header.m_length - sec.m_sectionOffset) {
+        throw std::runtime_error("xclbin section exceeds container length");
+      }
+      if (sec.m_sectionSize > 0 && sec.m_sectionOffset < sec_table_end) {
+        throw std::runtime_error("xclbin section overlaps container header");
+      }
+    }
+    std::vector<char> bytes(raw, raw + xclbin_len);
     xrt::xclbin x{bytes};
     std::string name;
     for (auto& k : x.get_kernels())
@@ -166,14 +207,14 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
     auto k = new cera_xdna_kernel;
     try {
       k->dev = d->dev;
-      if (d->has_ctx && d->ctx_uuid == x.get_uuid()) {
-        k->ctx = d->ctx;
-        k->kernel = d->kernel;
-      } else {
+      const xrt::uuid x_uuid = x.get_uuid();
+      auto hw = d->cached_hw.lock();
+      if (!hw || !static_cast<bool>(x_uuid) || hw->uuid != x_uuid || hw->kernel_name != name) {
         k->dev.register_xclbin(x);
         // Vote for high-throughput, low-latency NPU DPM clocks via XRT QoS
         // (analogous to Hexagon's FASTRPC_CONTROL_LATENCY), falling back to a
         // lighter QoS hint or default shared context if resource limits reject it.
+        xrt::hw_context ctx;
         bool created = false;
         for (uint32_t gops : {40000u, 8000u, 1000u}) {
           try {
@@ -183,25 +224,29 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
                 {"dma_bandwidth", 55},
                 {"latency", 10},
             };
-            k->ctx = xrt::hw_context(k->dev, x.get_uuid(), qos);
+            ctx = xrt::hw_context(k->dev, x_uuid, qos);
             created = true;
             break;
           } catch (...) {
           }
         }
         if (!created) {
-          k->ctx = xrt::hw_context(k->dev, x.get_uuid());
+          ctx = xrt::hw_context(k->dev, x_uuid);
         }
-        k->kernel = xrt::kernel(k->ctx, name);
-        d->ctx_uuid = x.get_uuid();
-        d->ctx = k->ctx;
-        d->kernel = k->kernel;
-        d->has_ctx = true;
+        xrt::kernel kern(ctx, name);
+        hw = std::make_shared<cached_hw_ctx>(cached_hw_ctx{x_uuid, name, std::move(ctx), std::move(kern)});
       }
+      k->hw = hw;
       k->n_instr = static_cast<uint32_t>(n_instr);
-      k->instr = xrt::bo(k->dev, n_instr * 4, XCL_BO_FLAGS_CACHEABLE, k->kernel.group_id(1));
-      std::memcpy(k->instr.map<void*>(), instr, n_instr * 4);
+      const size_t instr_bytes = n_instr * sizeof(uint32_t);
+      k->instr = xrt::bo(k->dev, instr_bytes, XCL_BO_FLAGS_CACHEABLE, k->hw->kernel.group_id(1));
+      void* instr_map = k->instr.map<void*>();
+      if (!instr_map) throw std::runtime_error("instruction buffer mapping failed");
+      std::memcpy(instr_map, instr, instr_bytes);
       k->instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      if (static_cast<bool>(x_uuid)) {
+        d->cached_hw = hw;
+      }
     } catch (...) {
       delete k;
       throw;
@@ -223,13 +268,18 @@ CERA_XDNA_API void cera_xdna_kernel_free(cera_xdna_kernel* k) {
 CERA_XDNA_API int cera_xdna_bo_alloc(cera_xdna_kernel* k, size_t bytes, uint32_t arg, cera_xdna_bo** out, char* err,
                                      size_t err_len) {
   return guarded(err, err_len, [&] {
-    if (arg < 3) throw std::runtime_error("data arguments start at index 3");
-    *out = new cera_xdna_bo{xrt::bo(k->dev, bytes, XRT_BO_FLAGS_HOST_ONLY, k->kernel.group_id(static_cast<int>(arg)))};
+    if (!k || !k->hw || !out) throw std::runtime_error("null pointer passed to bo_alloc");
+    if (bytes == 0) throw std::runtime_error("buffer size must be non-zero");
+    if (arg < 3 || arg > static_cast<uint32_t>(INT_MAX))
+      throw std::runtime_error("data argument index out of range");
+    *out = new cera_xdna_bo{
+        xrt::bo(k->dev, bytes, XRT_BO_FLAGS_HOST_ONLY, k->hw->kernel.group_id(static_cast<int>(arg)))};
     return 0;
   });
 }
 
 CERA_XDNA_API void* cera_xdna_bo_map(cera_xdna_bo* b) {
+  if (!b) return nullptr;
   try {
     return b->bo.map<void*>();
   } catch (...) {
@@ -239,6 +289,7 @@ CERA_XDNA_API void* cera_xdna_bo_map(cera_xdna_bo* b) {
 
 CERA_XDNA_API int cera_xdna_bo_sync(cera_xdna_bo* b, int to_device, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!b) throw std::runtime_error("null buffer handle passed to bo_sync");
     b->bo.sync(to_device ? XCL_BO_SYNC_BO_TO_DEVICE : XCL_BO_SYNC_BO_FROM_DEVICE);
     return 0;
   });
@@ -247,6 +298,11 @@ CERA_XDNA_API int cera_xdna_bo_sync(cera_xdna_bo* b, int to_device, char* err, s
 CERA_XDNA_API int cera_xdna_bo_sync_range(cera_xdna_bo* b, int to_device, size_t size, size_t offset,
                                           char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!b) throw std::runtime_error("null buffer handle passed to bo_sync_range");
+    const size_t bo_size = b->bo.size();
+    if (offset > bo_size || size > bo_size - offset)
+      throw std::runtime_error("buffer sync range out of bounds");
+    if (size == 0) return 0;
     b->bo.sync(to_device ? XCL_BO_SYNC_BO_TO_DEVICE : XCL_BO_SYNC_BO_FROM_DEVICE, size, offset);
     return 0;
   });
@@ -263,12 +319,18 @@ CERA_XDNA_API void cera_xdna_bo_free(cera_xdna_bo* b) {
 CERA_XDNA_API int cera_xdna_run_create(cera_xdna_kernel* k, cera_xdna_bo* const* bos, size_t n_bos,
                                        cera_xdna_run** out, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
-    auto r = new cera_xdna_run{xrt::run(k->kernel)};
+    if (!k || !k->hw || !out || (n_bos > 0 && !bos))
+      throw std::runtime_error("null pointer passed to run_create");
+    if (n_bos > static_cast<size_t>(INT_MAX - 3)) throw std::runtime_error("too many buffer arguments");
+    auto r = new cera_xdna_run{xrt::run(k->hw->kernel)};
     try {
       r->run.set_arg(0, uint64_t(3));
       r->run.set_arg(1, k->instr);
       r->run.set_arg(2, k->n_instr);
-      for (size_t i = 0; i < n_bos; ++i) r->run.set_arg(static_cast<int>(3 + i), bos[i]->bo);
+      for (size_t i = 0; i < n_bos; ++i) {
+        if (!bos[i]) throw std::runtime_error("null buffer handle in run_create");
+        r->run.set_arg(static_cast<int>(3 + i), bos[i]->bo);
+      }
     } catch (...) {
       delete r;
       throw;
@@ -280,6 +342,7 @@ CERA_XDNA_API int cera_xdna_run_create(cera_xdna_kernel* k, cera_xdna_bo* const*
 
 CERA_XDNA_API int cera_xdna_run_start(cera_xdna_run* r, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!r) throw std::runtime_error("null run handle passed to run_start");
 #ifdef _WIN32
     SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 #endif
@@ -292,6 +355,7 @@ CERA_XDNA_API int cera_xdna_run_start(cera_xdna_run* r, char* err, size_t err_le
 // ert_cmd_state value (4 is ERT_CMD_STATE_COMPLETED), or -1 with err set.
 CERA_XDNA_API int cera_xdna_run_wait(cera_xdna_run* r, uint32_t timeout_ms, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!r) throw std::runtime_error("null run handle passed to run_wait");
     auto state = timeout_ms ? r->run.wait(std::chrono::milliseconds(timeout_ms)) : r->run.wait();
     return static_cast<int>(state);
   });
@@ -314,13 +378,15 @@ struct cera_xdna_runlist {
 CERA_XDNA_API int cera_xdna_runlist_create(cera_xdna_kernel* k, cera_xdna_runlist** out, char* err,
                                            size_t err_len) {
   return guarded(err, err_len, [&] {
-    *out = new cera_xdna_runlist{xrt::runlist(k->ctx)};
+    if (!k || !k->hw || !out) throw std::runtime_error("null pointer passed to runlist_create");
+    *out = new cera_xdna_runlist{xrt::runlist(k->hw->ctx)};
     return 0;
   });
 }
 
 CERA_XDNA_API int cera_xdna_runlist_add(cera_xdna_runlist* l, cera_xdna_run* r, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!l || !r) throw std::runtime_error("null handle passed to runlist_add");
     l->list.add(r->run);
     return 0;
   });
@@ -328,6 +394,7 @@ CERA_XDNA_API int cera_xdna_runlist_add(cera_xdna_runlist* l, cera_xdna_run* r, 
 
 CERA_XDNA_API int cera_xdna_runlist_execute(cera_xdna_runlist* l, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
+    if (!l) throw std::runtime_error("null runlist handle passed to runlist_execute");
 #ifdef _WIN32
     // Prevent Windows Modern Standby / display-off SoC fabric downclocking
     // during active NPU decode turns (see docs/XDNA_PHASE0_RESULTS.md sec. 0).
@@ -338,13 +405,17 @@ CERA_XDNA_API int cera_xdna_runlist_execute(cera_xdna_runlist* l, char* err, siz
   });
 }
 
-// Waits for the whole list; timeout_ms of 0 waits without a limit.
+// Waits for the whole list; timeout_ms of 0 waits without a limit. Returns 0
+// when all runs complete, or -1 with err set on command failure or timeout.
 CERA_XDNA_API int cera_xdna_runlist_wait(cera_xdna_runlist* l, uint32_t timeout_ms, char* err, size_t err_len) {
   return guarded(err, err_len, [&] {
-    if (timeout_ms)
-      l->list.wait(std::chrono::milliseconds(timeout_ms));
-    else
+    if (!l) throw std::runtime_error("null runlist handle passed to runlist_wait");
+    if (timeout_ms) {
+      if (l->list.wait(std::chrono::milliseconds(timeout_ms)) == std::cv_status::timeout)
+        throw std::runtime_error("runlist wait timed out");
+    } else {
       l->list.wait();
+    }
     return 0;
   });
 }

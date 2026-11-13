@@ -1444,7 +1444,7 @@ impl CeraEngine {
         self.model.clear_cache();
     }
 
-    /// The backend the loaded model runs on (`"cpu"`, `"metal"`, `"wgpu"` or `"hexagon"`),
+    /// The backend the loaded model runs on (`"cpu"`, `"metal"`, `"wgpu"`, `"hexagon"`, or `"xdna"`),
     /// which is what an `Auto` load resolved to.
     pub fn backend_name(&self) -> &'static str {
         self.model.backend_label()
@@ -2620,7 +2620,7 @@ fn load_text_model_npu(
             tracing::debug!("cera::engine: using AMD XDNA NPU backend (npu)");
             return Ok(m);
         }
-        Err(e) => tried.push(format!("XDNA: {e}")),
+        Err(e) => tried.push(format!("XDNA: {e:#}")),
     }
 
     if tried.is_empty() {
@@ -2939,6 +2939,28 @@ mod tests {
         assert!(
             msg.contains("no NPU backend is compiled into this build"),
             "{msg}"
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_npu_preference_error_preserves_anyhow_cause_chain() {
+        let mut w = crate::convert::writer::GgufWriter::new();
+        w.add_string("general.architecture", "llama");
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes)
+            .expect("write minimal llama gguf");
+        let gguf = GgufFile::from_bytes(bytes.into()).expect("parse minimal llama gguf");
+
+        let err = match load_text_model_npu(gguf, None, 128) {
+            Ok(_) => panic!("incomplete llama GGUF must fail XDNA load"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("XDNA: failed to load CPU Llama weights for XDNA")
+                && msg.contains("llama.block_count"),
+            "NPU load error must preserve inner anyhow context via {{e:#}}, got: {msg}"
         );
     }
 

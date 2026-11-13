@@ -3545,8 +3545,7 @@ impl LfmModel {
     }
 
     fn profile_decode_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_DECODE").is_some())
+        crate::backend::cpu_features::profile_decode_enabled()
     }
 
     /// Shared layer loop for prefill passes. Runs all layers and updates `hidden` in place.

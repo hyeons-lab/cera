@@ -82,6 +82,10 @@ def stage_params(M, K, workers_n):
 @iron.jit
 def q4layer(w: In, y: Out, y_next: Out):
     workers_n = get_current_device().cols * NUM_CHANNELS
+    if workers_n != 16:
+        raise ValueError(
+            f"q4layer requires 16 workers (8 AIE2P columns x 2 shim channels), got {workers_n}"
+        )
 
     q_s = stage_params(2048, 2048, workers_n)
     k_s = stage_params(512, 2048, workers_n)
@@ -110,7 +114,8 @@ def q4layer(w: In, y: Out, y_next: Out):
     act_total = KV_CACHE_BASE + KV_SLOT
     head_mode = _os.environ.get("Q4LAYER_HEAD") == "1"
     kv_chunks = int(_os.environ.get("Q4LAYER_KV_CHUNKS", str(ATTN_CHUNKS)))
-    assert 1 <= kv_chunks <= ATTN_CHUNKS
+    if not (1 <= kv_chunks <= ATTN_CHUNKS):
+        raise ValueError(f"Q4LAYER_KV_CHUNKS must be in 1..={ATTN_CHUNKS}, got {kv_chunks}")
 
     head_s = stage_params(131072, 2048, workers_n)
     head_per_worker_w = head_s["tiles_pw"] * TILE_F32
@@ -127,7 +132,7 @@ def q4layer(w: In, y: Out, y_next: Out):
         source_file=str(Path(__file__).parent / "q4layer.cc"),
         arg_types=[slot_ty, yel_ty, np.int32, np.int32],
         include_dirs=[cxx_header_path()],
-        compile_flags=[f"-DKMAX=8192", f"-DACT_CHUNK={ACT_CHUNK}"],
+        compile_flags=[f"-DKMAX={ACT_SLOT}", f"-DACT_CHUNK={ACT_CHUNK}"],
     )
 
     of_ins = [ObjectFifo(slot_ty, name=f"w_{i}") for i in range(workers_n)]

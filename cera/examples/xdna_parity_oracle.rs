@@ -2,55 +2,81 @@
 //! on `Llama-3.2-1B-Instruct-Q4_0.gguf` (Section 4 of `docs/XDNA_PHASE0_RESULTS.md`).
 //!
 //! Usage:
-//!   `cargo run --release -p cera --features xdna --example xdna_parity_oracle -- [model.gguf] [n_positions]`
+//!   `cargo run --release -p cera --features xdna --example xdna_parity_oracle -- <model.gguf> [n_positions]`
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use cera::backend::xdna::kernels::{
+    MAX_KV_CACHE_TOKENS, check_parity_thresholds, logit_cosine_similarity, top_k_logits,
+};
 use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
 use cera::model::Model;
 use cera::model::llama::LlamaModel;
 use cera::model::xdna_llama::XdnaLlamaModel;
 
-fn top_k_indices(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    pairs.select_nth_unstable_by(k, |a, b| b.1.total_cmp(&a.1));
-    pairs.truncate(k);
-    pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
-    pairs
+const PROMPT_LEN: usize = 16;
+
+fn print_usage() {
+    println!(
+        "Usage: xdna_parity_oracle <model.gguf> [n_positions]\n  <model.gguf>   Path to Llama-3.2-1B Q4_0 GGUF\n  [n_positions]  Teacher-forced decode steps in 1..={} (default: 512)",
+        MAX_KV_CACHE_TOKENS - PROMPT_LEN
+    );
 }
 
-fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
-    let mut dot = 0.0f64;
-    let mut na = 0.0f64;
-    let mut nb = 0.0f64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let xf = x as f64;
-        let yf = y as f64;
-        dot += xf * yf;
-        na += xf * xf;
-        nb += yf * yf;
+fn parse_cli(args: &[String]) -> Result<Option<(PathBuf, usize)>, String> {
+    if args.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        return Ok(None);
     }
-    if na == 0.0 || nb == 0.0 {
-        0.0
+    if args.len() < 2 || args.len() > 3 {
+        return Err("expected `<model.gguf> [n_positions]` (pass --help for usage)".to_string());
+    }
+    let raw_model = &args[1];
+    if raw_model.starts_with('-') {
+        return Err(format!(
+            "unknown flag `{raw_model}` (pass --help for usage)"
+        ));
+    }
+    let n_forced = if let Some(raw_n) = args.get(2) {
+        if raw_n.starts_with('-') {
+            return Err(format!("unknown flag `{raw_n}` (pass --help for usage)"));
+        }
+        raw_n
+            .parse::<usize>()
+            .map_err(|_| format!("invalid n_positions `{raw_n}`: expected positive integer"))?
     } else {
-        dot / (na.sqrt() * nb.sqrt())
+        512
+    };
+    let max_forced = MAX_KV_CACHE_TOKENS - PROMPT_LEN;
+    if n_forced == 0 || n_forced > max_forced {
+        return Err(format!(
+            "n_positions must be in 1..={max_forced} so prompt ({PROMPT_LEN}) + n_positions <= {MAX_KV_CACHE_TOKENS}, got {n_forced}"
+        ));
     }
+    Ok(Some((PathBuf::from(raw_model), n_forced)))
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let default_model =
-        r"C:\Users\iamst\.leap\models\Llama-3.2-1B-Instruct-Q4_0\Llama-3.2-1B-Instruct-Q4_0.gguf";
-    let model_path = PathBuf::from(args.get(1).map(String::as_str).unwrap_or(default_model));
-    let n_forced: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(512);
+    let (model_path, n_forced) = match parse_cli(&args) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            print_usage();
+            return ExitCode::SUCCESS;
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
 
     println!("Loading GGUF: {}", model_path.display());
     let gguf = match GgufFile::open(&model_path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("Failed to open GGUF: {e}");
+            eprintln!("Failed to open GGUF: {e:#}");
             return ExitCode::FAILURE;
         }
     };
@@ -60,7 +86,7 @@ fn main() -> ExitCode {
         match LlamaModel::from_gguf_with_id(gguf.clone(), ctx_len, "cpu-oracle".to_string()) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("Failed to load CPU model: {e}");
+                eprintln!("Failed to load CPU model: {e:#}");
                 return ExitCode::FAILURE;
             }
         };
@@ -68,14 +94,14 @@ fn main() -> ExitCode {
     {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("Failed to load XDNA NPU model: {e}");
+            eprintln!("Failed to load XDNA NPU model: {e:#}");
             return ExitCode::FAILURE;
         }
     };
 
-    // 16-token Llama-3 instruct prompt prefix so 16 + 512 = 528 <= 540 positions
-    // all run through the NPU decode path.
-    let prompt_tokens: [u32; 16] = [
+    // 16-token Llama-3 instruct prompt prefix so 16 + 512 = 528 <= 648 positions
+    // all run through the NPU decode path without falling back to CPU.
+    let prompt_tokens: [u32; PROMPT_LEN] = [
         128000, // <|begin_of_text|>
         128006, // <|start_header_id|>
         9125,   // system
@@ -94,17 +120,53 @@ fn main() -> ExitCode {
         128009, // <|eot_id|>
     ];
 
-    let mut cpu_state = InferenceState::from_config(cpu_model.config()).unwrap();
-    let mut npu_state = InferenceState::from_config(npu_model.config()).unwrap();
+    let vocab_size = cpu_model.config().vocab_size;
+    if vocab_size < 2 {
+        eprintln!("Invalid model vocab_size {vocab_size}: expected at least 2");
+        return ExitCode::FAILURE;
+    }
+    if let Some(&bad_tok) = prompt_tokens.iter().find(|&&t| (t as usize) >= vocab_size) {
+        eprintln!(
+            "Prompt token {bad_tok} exceeds model vocab_size {vocab_size}; expected Llama-3 tokenizer"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let mut cpu_state = match InferenceState::from_config(cpu_model.config()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to allocate CPU InferenceState: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut npu_state = match InferenceState::from_config(npu_model.config()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to allocate NPU InferenceState: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let cpu_prefill_logits = cpu_model.forward_prefill(&prompt_tokens, 0, &mut cpu_state);
+    if let Some(err) = cpu_model.take_decode_error() {
+        eprintln!("FAIL: CPU prefill fault: {err}");
+        return ExitCode::FAILURE;
+    }
     let npu_prefill_logits = npu_model.forward_prefill(&prompt_tokens, 0, &mut npu_state);
-    assert_eq!(
-        cpu_prefill_logits, npu_prefill_logits,
-        "CPU and NPU prefill logits must be bit-identical (both run CPU prefill)"
-    );
+    if let Some(err) = npu_model.take_decode_error() {
+        eprintln!("FAIL: XDNA prefill fault: {err}");
+        return ExitCode::FAILURE;
+    }
+    if cpu_prefill_logits != npu_prefill_logits {
+        eprintln!("FAIL: CPU and NPU prefill logits diverged");
+        return ExitCode::FAILURE;
+    }
+    if logit_cosine_similarity(&cpu_prefill_logits, &npu_prefill_logits).is_none() {
+        eprintln!("FAIL: degenerate, non-finite, or zero-norm prefill logits");
+        return ExitCode::FAILURE;
+    }
 
-    let mut next_tok = top_k_indices(&cpu_prefill_logits, 1)[0].0 as u32;
+    let mut next_tok = top_k_logits(&cpu_prefill_logits, 1)[0].0 as u32;
     let mut top1_exact = 0usize;
     let mut top1_disagreements: Vec<(usize, u32, u32, f32, f32)> = Vec::new();
     let mut top10_overlaps: Vec<usize> = Vec::with_capacity(n_forced);
@@ -114,15 +176,23 @@ fn main() -> ExitCode {
         let pos = prompt_tokens.len() + step;
         let in_tok = [next_tok];
         let cpu_logits = cpu_model.forward(&in_tok, pos, &mut cpu_state);
+        if let Some(err) = cpu_model.take_decode_error() {
+            eprintln!("FAIL: CPU decode fault at step {step} (pos {pos}): {err}");
+            return ExitCode::FAILURE;
+        }
         let npu_logits = npu_model.forward(&in_tok, pos, &mut npu_state);
+        if let Some(err) = npu_model.take_decode_error() {
+            eprintln!("FAIL: XDNA decode fault at step {step} (pos {pos}): {err}");
+            return ExitCode::FAILURE;
+        }
 
-        if npu_logits.iter().any(|x| !x.is_finite()) {
+        if cpu_logits.iter().any(|x| !x.is_finite()) || npu_logits.iter().any(|x| !x.is_finite()) {
             eprintln!("FAIL: non-finite logit at step {step} (pos {pos})");
             return ExitCode::FAILURE;
         }
 
-        let cpu_top10 = top_k_indices(&cpu_logits, 10);
-        let npu_top10 = top_k_indices(&npu_logits, 10);
+        let cpu_top10 = top_k_logits(&cpu_logits, 10);
+        let npu_top10 = top_k_logits(&npu_logits, 10);
 
         let cpu_top1 = cpu_top10[0].0 as u32;
         let npu_top1 = npu_top10[0].0 as u32;
@@ -147,17 +217,26 @@ fn main() -> ExitCode {
             .filter(|&&(idx, _)| npu_top10.iter().any(|&(nidx, _)| nidx == idx))
             .count();
         top10_overlaps.push(overlap);
-        cosines.push(cosine_sim(&cpu_logits, &npu_logits));
+        let Some(cos) = logit_cosine_similarity(&cpu_logits, &npu_logits) else {
+            eprintln!("FAIL: degenerate or zero-norm logit vector at step {step} (pos {pos})");
+            return ExitCode::FAILURE;
+        };
+        cosines.push(cos);
 
         // Teacher forcing: advance both with CPU's greedy token.
         next_tok = cpu_top1;
     }
 
+    let target_k = 10.min(vocab_size);
     let mean_overlap: f64 = top10_overlaps.iter().map(|&x| x as f64).sum::<f64>() / n_forced as f64;
     let min_overlap = *top10_overlaps.iter().min().unwrap_or(&0);
     let ge9_count = top10_overlaps.iter().filter(|&&x| x >= 9).count();
     let mean_cos: f64 = cosines.iter().sum::<f64>() / n_forced as f64;
     let min_cos: f64 = cosines.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_cpu_margin = top1_disagreements
+        .iter()
+        .map(|x| x.3)
+        .fold(0.0f32, f32::max);
 
     println!(
         "=== Teacher-Forced Parity ({n_forced} positions, prompt_len={}) ===",
@@ -168,7 +247,7 @@ fn main() -> ExitCode {
         100.0 * top1_exact as f64 / n_forced as f64
     );
     println!(
-        "  top-10 overlap: mean {:.2}/10, min {min_overlap}/10, >=9/10 at {ge9_count}/{n_forced} ({:.2}%) positions",
+        "  top-{target_k} overlap: mean {:.2}/{target_k}, min {min_overlap}/{target_k}, >=9/{target_k} at {ge9_count}/{n_forced} ({:.2}%) positions",
         mean_overlap,
         100.0 * ge9_count as f64 / n_forced as f64
     );
@@ -177,10 +256,6 @@ fn main() -> ExitCode {
         mean_cos, min_cos
     );
     if !top1_disagreements.is_empty() {
-        let max_cpu_margin = top1_disagreements
-            .iter()
-            .map(|x| x.3)
-            .fold(0.0f32, f32::max);
         println!(
             "  top-1 disagreements ({}): max CPU top-2 margin = {:.4}",
             top1_disagreements.len(),
@@ -191,6 +266,13 @@ fn main() -> ExitCode {
                 "    pos {pos}: cpu_top1={ct} vs npu_top1={nt} | cpu_top2_margin={cm:.4}, npu_diff={nm:.4}"
             );
         }
+    }
+
+    if let Err(msg) =
+        check_parity_thresholds(target_k, mean_overlap, mean_cos, min_cos, max_cpu_margin)
+    {
+        eprintln!("FAIL: {msg}");
+        return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS

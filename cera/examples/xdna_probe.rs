@@ -8,11 +8,19 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("usage: xdna_probe <kernel.xclbin> <insts.bin>");
+        return ExitCode::SUCCESS;
+    }
     if args.len() != 3 {
         eprintln!("usage: xdna_probe <kernel.xclbin> <insts.bin>");
         return ExitCode::FAILURE;
     }
     let xclbin = match std::fs::read(&args[1]) {
+        Ok(b) if b.is_empty() => {
+            eprintln!("{}: xclbin file is empty", args[1]);
+            return ExitCode::FAILURE;
+        }
         Ok(b) => b,
         Err(e) => {
             eprintln!("cannot read {}: {e}", args[1]);
@@ -26,22 +34,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if inst_bytes.len() % 4 != 0 {
-        eprintln!(
-            "{}: instruction file is not a whole number of words",
-            args[2]
-        );
-        return ExitCode::FAILURE;
-    }
-    let instr: Vec<u32> = (0..inst_bytes.len() / 4)
-        .map(|i| {
-            u32::from_le_bytes(
-                inst_bytes[4 * i..4 * i + 4]
-                    .try_into()
-                    .expect("4-byte window"),
-            )
-        })
-        .collect();
+    let instr = match cera::backend::xdna::kernels::try_inst_words(&inst_bytes) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{}: {e}", args[2]);
+            return ExitCode::FAILURE;
+        }
+    };
     let device = match cera::backend::xdna::XdnaDevice::open(0) {
         Ok(d) => d,
         Err(e) => {

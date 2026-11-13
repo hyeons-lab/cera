@@ -2208,7 +2208,7 @@ pub(crate) fn dequantize_row_into(
 /// Whether [`dequantize_row_slice`] has an arm for `dtype`. Loaders that
 /// accept an embedding dtype must check this, since the function panics on an
 /// unsupported one; keep it in step with the match below.
-#[cfg(feature = "hexagon")]
+#[cfg(any(feature = "hexagon", feature = "xdna"))]
 pub(crate) fn supports_row_dequant(dtype: DType) -> bool {
     matches!(
         dtype,

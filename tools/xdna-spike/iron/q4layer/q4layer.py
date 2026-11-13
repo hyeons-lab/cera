@@ -13,13 +13,13 @@
 # q/k/v read the hidden slot, o reads q's slot, gate/up read o's slot, down
 # reads gate's slot (8192 wide, split-K), and down's output is the layer out.
 import argparse
+import os
 from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
 from aie.helpers.taplib.tap import TensorAccessPattern
-from aie.iron import CompileTime, ExternalFunction, In, Out
-from aie.iron.controlflow import range_
+from aie.iron import ExternalFunction, In, Out
 from aie.iron.dataflow import ObjectFifo
 from aie.iron.program import Program
 from aie.iron.runtime import Runtime, TaskGroup
@@ -30,14 +30,15 @@ from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
 from aie.utils.hostruntime.cli import run_design_cli
 
 ROWS = 16
-QBLK = 32
 NUM_CHANNELS = 2
 CHUNK_K = 2048  # columns per streamed weight-tile chunk (split-K)
 TILE_F32 = 4608  # one stream element: 18432 bytes viewed as f32
 ACT_CHUNK = TILE_F32  # f32 activations quantized per stream element
 ACT_SLOT = 8192  # f32 stride of one activation slot in DDR (max K)
+# Extra f32 padding past the last activation slot so a 2-chunk TILE_F32 DMA
+# read at in_slot == N_SLOTS - 1 (4608 + 4608 = 9216 words) stays in bounds.
+ACT_TAIL = max(0, 2 * TILE_F32 - ACT_SLOT)
 TSTRIDE = 8  # tile/chunk encoding stride in q4_step's t (see q4layer.cc)
-MAX_OT = 16
 
 # (input slot, rows M, cols K, output slot); slots: 0 hidden, 1 q, 2 k, 3 v,
 # 4 o, 5 gate, 6 up, 7 layer out.
@@ -52,30 +53,63 @@ STAGES = [
 ]
 N_SLOTS = 8
 
+
+def _parse_spec(raw: str):
+    out = []
+    for item in raw.strip().rstrip(";").split(";"):
+        part = item.strip()
+        if not part:
+            continue
+        fields = [x.strip() for x in part.split(":")]
+        if len(fields) != 4:
+            raise ValueError(f"invalid Q4LAYER_SPEC entry '{part}': expected in_slot:M:K:out_slot")
+        out.append(tuple(int(x) for x in fields))
+    return out
+
+
 # Diagnostic: Q4LAYER_STAGES=N builds only the first N stages (the host still
 # packs and checks all seven; only the built stages can pass).
-import os as _os
-STAGES = STAGES[: int(_os.environ.get("Q4LAYER_STAGES", "7"))]
-if _os.environ.get("Q4LAYER_SPEC"):
-    STAGES = [tuple(int(x) for x in s.split(":")) for s in _os.environ["Q4LAYER_SPEC"].split(";")]
-elif _os.environ.get("Q4LAYER_PICK"):
-    STAGES = [STAGES[int(i)] for i in _os.environ["Q4LAYER_PICK"].split(",")]
+STAGES = STAGES[: int(os.environ.get("Q4LAYER_STAGES", "7"))]
+if os.environ.get("Q4LAYER_SPEC"):
+    STAGES = _parse_spec(os.environ["Q4LAYER_SPEC"])
+elif os.environ.get("Q4LAYER_PICK"):
+    STAGES = [STAGES[int(i.strip())] for i in os.environ["Q4LAYER_PICK"].split(",") if i.strip()]
+if not STAGES:
+    raise ValueError("Q4LAYER stage list must be non-empty")
 
 
-def stage_params(M, K, workers_n):
+def stage_params(in_slot, M, K, out_slot, workers_n):
     # Fixed output grouping OT=2 for every stage (as in q4gemv): each out
     # fifo element holds exactly ROWS*OT outputs and every drain consumes
     # whole elements. A drain smaller than the element leaves the fifo
     # inconsistent and the next stage reads zeros (measured: a stage after
     # a partially drained stage produces nothing).
+    if not (0 <= in_slot < N_SLOTS and 0 <= out_slot < N_SLOTS):
+        raise ValueError(f"slot index out of range 0..{N_SLOTS - 1}: in={in_slot}, out={out_slot}")
+    if in_slot == out_slot:
+        raise ValueError(f"in_slot and out_slot must differ, got slot {in_slot}")
+    min_m = workers_n * ROWS * 2
+    if M < min_m or M > ACT_SLOT or M % min_m != 0:
+        raise ValueError(
+            f"M must be a multiple of {min_m} in {min_m}..={ACT_SLOT} for OT=2, got M={M}"
+        )
+    if K < CHUNK_K or K > ACT_SLOT or K % CHUNK_K != 0:
+        raise ValueError(f"K must be a multiple of {CHUNK_K} in {CHUNK_K}..={ACT_SLOT}, got K={K}")
     rows_pw = M // workers_n
     tiles_pw = rows_pw // ROWS
+    kchunks = K // CHUNK_K
+    if kchunks > TSTRIDE:
+        raise ValueError(f"kchunks={kchunks} exceeds TSTRIDE={TSTRIDE}")
     return {
+        "in_slot": in_slot,
+        "M": M,
+        "K": K,
+        "out_slot": out_slot,
         "rows_pw": rows_pw,
         "tiles_pw": tiles_pw,
         "ot": 2,
         "outs_pw": tiles_pw // 2,
-        "kchunks": K // CHUNK_K,
+        "kchunks": kchunks,
         "achunks": (K + ACT_CHUNK - 1) // ACT_CHUNK,
     }
 
@@ -83,7 +117,9 @@ def stage_params(M, K, workers_n):
 @iron.jit
 def q4layer(w: In, y: Out):
     workers_n = get_current_device().cols * NUM_CHANNELS
-    stages = [stage_params(M, K, workers_n) | {"in_slot": i, "M": M, "K": K, "out_slot": o} for (i, M, K, o) in STAGES]
+    if workers_n != 16:
+        raise ValueError(f"q4layer requires 16 workers (8 cols x 2 channels), got {workers_n}")
+    stages = [stage_params(i, M, K, o, workers_n) for (i, M, K, o) in STAGES]
 
     # Weight stream layout (f32 words): stages in order, per stage each
     # worker's tiles contiguous, tile = TILE_F32 words.
@@ -93,17 +129,18 @@ def q4layer(w: In, y: Out):
         s["per_worker_w"] = s["tiles_pw"] * s["kchunks"] * TILE_F32
         w_total += workers_n * s["per_worker_w"]
 
+    act_total = N_SLOTS * ACT_SLOT + ACT_TAIL
     slot_ty = np.ndarray[(TILE_F32,), np.dtype[np.float32]]
     yel_ty = np.ndarray[(ROWS * 2,), np.dtype[np.float32]]
     w_ty = np.ndarray[(w_total,), np.dtype[np.float32]]
-    y_ty = np.ndarray[(N_SLOTS * ACT_SLOT,), np.dtype[np.float32]]
+    y_ty = np.ndarray[(act_total,), np.dtype[np.float32]]
 
     step = ExternalFunction(
         "q4_step",
         source_file=str(Path(__file__).parent / "q4layer.cc"),
         arg_types=[slot_ty, yel_ty, np.int32, np.int32],
         include_dirs=[cxx_header_path()],
-        compile_flags=[f"-DKMAX={max(s['K'] for s in stages)}", f"-DACT_CHUNK={ACT_CHUNK}"],
+        compile_flags=[f"-DKMAX={ACT_SLOT}", f"-DACT_CHUNK={ACT_CHUNK}"],
     )
     of_ins = [ObjectFifo(slot_ty, name=f"w_{i}") for i in range(workers_n)]
     of_outs = [ObjectFifo(yel_ty, name=f"y_{i}") for i in range(workers_n)]
@@ -116,7 +153,7 @@ def q4layer(w: In, y: Out):
                     for c in range(s["achunks"]):
                         x = of_in.acquire(1)
                         n = min(ACT_CHUNK, s["K"] - c * ACT_CHUNK)
-                        step(x, y, n, -1 if _os.environ.get("Q4LAYER_XMODE") == "-1" else -3 - c)
+                        step(x, y, n, -1 if os.environ.get("Q4LAYER_XMODE") == "-1" else -3 - c)
                         of_in.release(1)
                 for tt in range(s["ot"]):
                     for ch in range(s["kchunks"]):
@@ -127,13 +164,11 @@ def q4layer(w: In, y: Out):
 
     workers = [Worker(core_body, [of_ins[i].cons(), of_outs[i].prod(), step], stack_size=2048) for i in range(workers_n)]
 
-    act_total = N_SLOTS * ACT_SLOT
-
     def tap(total, offset, size):
         return TensorAccessPattern((1, total), offset, [1, 1, 1, size], [0, 0, 0, 1])
 
     def sequence(w_in, y_buf, in_prods, out_conses):
-        one_group = _os.environ.get("Q4LAYER_ONEGROUP") == "1"
+        one_group = os.environ.get("Q4LAYER_ONEGROUP") == "1"
         tg = TaskGroup() if one_group else None
         for s in stages:
             if not one_group:

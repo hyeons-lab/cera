@@ -77,10 +77,17 @@ static __attribute__((noinline)) aie::vector<float, 16> inv_16(aie::vector<float
   return aie::inv(v);
 }
 
-// Software f32 2^x on 16 lanes (after mlir-aie aie_kernels/aie2p/exp2f_vec.cc,
-// Apache-2.0 WITH LLVM-exception): 2^x = p(f) * 2^k, k = round(x), f = x - k
-// in [-0.5, 0.5], holding ~2.4e-6 relative error where hardware
-// aie::exp2<bfloat16> is 6-49%.
+// Software f32 2^x on 16 lanes, modified by cera from Xilinx/mlir-aie
+// `aie_kernels/aie2p/exp2f_vec.cc` (recast as a 16-lane helper with
+// loop-unrolling disabled to fit the 16 KB AIE2P program memory budget).
+//
+// Upstream attribution for `exp2f_16` (`Apache-2.0 WITH LLVM-exception`,
+// see `../../NOTICE.md`):
+//   (c) Copyright 2019-2022 Xilinx, Inc. All rights reserved.
+//   (c) Copyright 2022-2026 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Computes 2^x = p(f) * 2^k, k = round(x), f = x - k in [-0.5, 0.5], holding
+// ~2.4e-6 relative error where hardware aie::exp2<bfloat16> is 6-49%.
 static __attribute__((noinline)) aie::vector<float, 16> exp2f_16(aie::vector<float, 16> x) {
   x = aie::max(x, aie::broadcast<float, 16>(-126.0f));
   x = aie::min(x, aie::broadcast<float, 16>(126.0f));

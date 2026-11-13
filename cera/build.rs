@@ -349,10 +349,33 @@ fn compile_xdna_shim() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     println!("cargo:rerun-if-changed={shim_dir}/cera_xdna_shim.cpp");
     println!("cargo:rerun-if-changed={shim_dir}/xrt_coreutil.def");
-    println!("cargo:rerun-if-changed={shim_dir}/include");
-    let vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
-    let vs = Command::new(vswhere)
-        .args(["-latest", "-products", "*", "-property", "installationPath"])
+    let mut include_stack = vec![std::path::PathBuf::from(format!("{shim_dir}/include"))];
+    while let Some(dir) = include_stack.pop() {
+        println!("cargo:rerun-if-changed={}", dir.display());
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("failed to read xdna include dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("xdna include dir entry").path();
+            if path.is_dir() {
+                include_stack.push(path);
+            } else {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+    let pf86 =
+        std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".into());
+    let vswhere = format!("{pf86}\\Microsoft Visual Studio\\Installer\\vswhere.exe");
+    let vs = Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())

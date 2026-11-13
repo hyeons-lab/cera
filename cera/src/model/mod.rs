@@ -436,8 +436,8 @@ pub(crate) fn record_first_fault(
 
 /// Take half of [`record_first_fault`]: drain a sticky decode-fault slot,
 /// recovering through a poisoned lock (a panicked recorder must not wedge
-/// the drain). Symmetric twin so record/take stay one shape at all three
-/// backend drains.
+/// the drain). Symmetric twin so record/take stay one shape across every backend
+/// decode-fault slot.
 #[cfg(any(
     test,
     feature = "hexagon",

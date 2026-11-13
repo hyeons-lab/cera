@@ -36,6 +36,9 @@ impl VoteCounter {
 
 static POWER_VOTES: VoteCounter = VoteCounter::new();
 
+/// XRT `ert_cmd_state` value indicating a kernel run completed cleanly.
+pub const ERT_CMD_STATE_COMPLETED: i32 = 4;
+
 struct PowerVote {
     shim: &'static Shim,
     counter: &'static VoteCounter,
@@ -48,6 +51,12 @@ impl PowerVote {
     }
 }
 
+impl Clone for PowerVote {
+    fn clone(&self) -> Self {
+        Self::acquire_in(self.shim, self.counter)
+    }
+}
+
 impl Drop for PowerVote {
     fn drop(&mut self) {
         let shim = self.shim;
@@ -57,9 +66,9 @@ impl Drop for PowerVote {
 
 /// An opened XRT device (the NPU at index 0).
 ///
-/// Field declaration order matters: Rust drops `handle` via [`Drop`] before
-/// dropping `_power_vote`, so the last device closes its XRT handle before
-/// clearing the process wakelock.
+/// Field declaration order matters: Rust runs `XdnaDevice::drop` (closing
+/// `handle`) before dropping `_power_vote` in declaration order, so the last XRT
+/// handle closes before clearing the process wakelock.
 pub struct XdnaDevice {
     handle: *mut c_void,
     shim: &'static Shim,
@@ -70,6 +79,7 @@ pub struct XdnaDevice {
 pub struct XdnaKernel {
     handle: *mut c_void,
     shim: &'static Shim,
+    _power_vote: PowerVote,
 }
 
 impl XdnaDevice {
@@ -119,6 +129,18 @@ impl XdnaDevice {
     /// also the support gate: an xclbin the driver rejects (wrong silicon,
     /// wrong XRT) fails here with the driver's reason.
     pub fn load_kernel(&self, xclbin: &[u8], instr: &[u32]) -> Result<XdnaKernel, String> {
+        if xclbin.is_empty() {
+            return Err("load xclbin: xclbin payload must not be empty".to_string());
+        }
+        if instr.is_empty() {
+            return Err("load xclbin: instruction buffer must not be empty".to_string());
+        }
+        if instr.len() > (u32::MAX as usize) / std::mem::size_of::<u32>() {
+            return Err(
+                "load xclbin: instruction buffer exceeds 32-bit byte-length limit".to_string(),
+            );
+        }
+        let vote = self._power_vote.clone();
         let mut handle: *mut c_void = std::ptr::null_mut();
         let mut err = new_err_buf();
         let rc = unsafe {
@@ -137,6 +159,7 @@ impl XdnaDevice {
         Ok(XdnaKernel {
             handle,
             shim: self.shim,
+            _power_vote: vote,
         })
     }
 }
@@ -147,23 +170,39 @@ pub struct XdnaBo {
     ptr: *mut c_void,
     len: usize,
     shim: &'static Shim,
+    _power_vote: PowerVote,
 }
 
 /// One kernel invocation with its arguments bound.
 pub struct XdnaRun {
     handle: *mut c_void,
     shim: &'static Shim,
+    _power_vote: PowerVote,
 }
 
 /// A set of runs executed in submission order on one hardware context.
 pub struct XdnaRunList {
     handle: *mut c_void,
     shim: &'static Shim,
+    _power_vote: PowerVote,
 }
 
 impl XdnaKernel {
     /// Allocate a host-only buffer for data argument `arg` (3 or above).
     pub fn alloc_bo(&self, bytes: usize, arg: u32) -> Result<XdnaBo, String> {
+        if bytes == 0 {
+            return Err("allocate buffer: byte length must be positive".to_string());
+        }
+        if bytes > isize::MAX as usize {
+            return Err("allocate buffer: byte length exceeds isize::MAX".to_string());
+        }
+        if arg < 3 {
+            return Err("allocate buffer: data argument index must be >= 3".to_string());
+        }
+        if arg > i32::MAX as u32 {
+            return Err("allocate buffer: argument index exceeds INT_MAX".to_string());
+        }
+        let vote = self._power_vote.clone();
         let mut handle: *mut c_void = std::ptr::null_mut();
         let mut err = new_err_buf();
         let rc = unsafe {
@@ -187,18 +226,28 @@ impl XdnaKernel {
             ptr,
             len: bytes,
             shim: self.shim,
+            _power_vote: vote,
         })
     }
 
     /// Create a run with `bos[i]` bound to argument `3 + i`.
     pub fn create_run(&self, bos: &[&XdnaBo]) -> Result<XdnaRun, String> {
+        if bos.len() > (i32::MAX as usize) - 3 {
+            return Err("create run: too many buffer arguments".to_string());
+        }
+        let vote = self._power_vote.clone();
         let raw: Vec<*mut c_void> = bos.iter().map(|b| b.handle).collect();
+        let raw_ptr = if raw.is_empty() {
+            std::ptr::null()
+        } else {
+            raw.as_ptr()
+        };
         let mut handle: *mut c_void = std::ptr::null_mut();
         let mut err = new_err_buf();
         let rc = unsafe {
             (self.shim.run_create)(
                 self.handle,
-                raw.as_ptr(),
+                raw_ptr,
                 raw.len(),
                 &mut handle,
                 err.as_mut_ptr(),
@@ -209,11 +258,13 @@ impl XdnaKernel {
         Ok(XdnaRun {
             handle,
             shim: self.shim,
+            _power_vote: vote,
         })
     }
 
     /// Create an empty runlist on this kernel's hardware context.
     pub fn create_runlist(&self) -> Result<XdnaRunList, String> {
+        let vote = self._power_vote.clone();
         let mut handle: *mut c_void = std::ptr::null_mut();
         let mut err = new_err_buf();
         let rc = unsafe {
@@ -223,6 +274,7 @@ impl XdnaKernel {
         Ok(XdnaRunList {
             handle,
             shim: self.shim,
+            _power_vote: vote,
         })
     }
 }
@@ -273,6 +325,9 @@ impl XdnaBo {
     /// Sync `size` bytes starting at `offset` from host memory to the device.
     pub fn sync_range_to_device(&self, size: usize, offset: usize) -> Result<(), String> {
         self.check_range(size, offset)?;
+        if size == 0 {
+            return Ok(());
+        }
         let mut err = new_err_buf();
         let rc = unsafe {
             (self.shim.bo_sync_range)(self.handle, 1, size, offset, err.as_mut_ptr(), err.len())
@@ -287,6 +342,9 @@ impl XdnaBo {
     /// [`Self::as_mut_slice`] can alias the DMA write into mapped host memory.
     pub fn sync_range_from_device(&mut self, size: usize, offset: usize) -> Result<(), String> {
         self.check_range(size, offset)?;
+        if size == 0 {
+            return Ok(());
+        }
         let mut err = new_err_buf();
         let rc = unsafe {
             (self.shim.bo_sync_range)(self.handle, 0, size, offset, err.as_mut_ptr(), err.len())
@@ -311,13 +369,20 @@ impl XdnaRun {
         Ok(())
     }
 
-    /// Wait for completion; returns the `ert_cmd_state` value (4 is
-    /// `ERT_CMD_STATE_COMPLETED`). `timeout_ms` of 0 waits without a limit.
+    /// Wait for completion; verifies the run reached [`ERT_CMD_STATE_COMPLETED`]
+    /// (`4`) and returns an error on timeout, abort, or any non-completed state.
+    /// `timeout_ms` of 0 waits without a limit.
     pub fn wait(&self, timeout_ms: u32) -> Result<i32, String> {
         let mut err = new_err_buf();
         let rc =
             unsafe { (self.shim.run_wait)(self.handle, timeout_ms, err.as_mut_ptr(), err.len()) };
-        check(rc, &err, "wait for run")
+        let state = check(rc, &err, "wait for run")?;
+        if state != ERT_CMD_STATE_COMPLETED {
+            return Err(format!(
+                "wait for run: kernel ended in non-completed ERT state {state} (expected {ERT_CMD_STATE_COMPLETED})"
+            ));
+        }
+        Ok(state)
     }
 }
 
@@ -462,19 +527,115 @@ mod tests {
     }
 
     #[test]
-    fn bo_sync_range_rejects_out_of_bounds_and_overflow() {
+    fn bo_sync_range_short_circuits_zero_size_and_rejects_out_of_bounds() {
         static COUNTER: VoteCounter = VoteCounter::new();
-        let _ = with_shim(Config::default(), || {
+        let ((), events) = with_shim(Config::default(), || {
             let dev = XdnaDevice::open_with_counter(0, &COUNTER).expect("open");
             let k = dev
                 .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
                 .expect("load");
             let mut bo = k.alloc_bo(64, 3).expect("alloc");
+            assert!(bo.sync_range_to_device(0, 0).is_ok());
+            assert!(bo.sync_range_to_device(0, 64).is_ok());
+            assert!(bo.sync_range_from_device(0, 64).is_ok());
+            assert!(bo.sync_range_to_device(0, 65).is_err());
+            assert!(bo.sync_range_from_device(0, 65).is_err());
             assert!(bo.sync_range_to_device(64, 0).is_ok());
             assert!(bo.sync_range_from_device(32, 32).is_ok());
             assert!(bo.sync_range_to_device(65, 0).is_err());
             assert!(bo.sync_range_from_device(1, 64).is_err());
             assert!(bo.sync_range_to_device(1, usize::MAX).is_err());
+        });
+        let sync_events: Vec<_> = events
+            .into_iter()
+            .filter(|e| matches!(e, Event::BoSyncRange { .. }))
+            .collect();
+        assert_eq!(
+            sync_events,
+            vec![
+                Event::BoSyncRange {
+                    handle: 1,
+                    to_device: true,
+                    size: 64,
+                    offset: 0,
+                },
+                Event::BoSyncRange {
+                    handle: 1,
+                    to_device: false,
+                    size: 32,
+                    offset: 32,
+                },
+            ],
+            "zero-byte range syncs must short-circuit without calling the shim"
+        );
+    }
+
+    #[test]
+    fn child_handles_retain_power_vote_after_device_drops() {
+        static COUNTER: VoteCounter = VoteCounter::new();
+        let ((), events) = with_shim(Config::default(), || {
+            let dev = XdnaDevice::open_with_counter(0, &COUNTER).expect("open");
+            let kern = dev
+                .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
+                .expect("load");
+            let bo = kern.alloc_bo(64, 3).expect("alloc");
+            let run = kern.create_run(&[&bo]).expect("run");
+            let rl = kern.create_runlist().expect("runlist");
+            drop(dev);
+            drop(kern);
+            drop(bo);
+            drop(run);
+            drop(rl);
+        });
+        // `Wakelock(false)` must fire once, as the very last event after every
+        // device, kernel, and BO free has completed.
+        assert_eq!(events.first(), Some(&Event::Wakelock(true)));
+        assert_eq!(events.last(), Some(&Event::Wakelock(false)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Wakelock(false)))
+                .count(),
+            1,
+            "wakelock must be released once after all child handles drop: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_wait_rejects_non_completed_ert_state() {
+        static COUNTER: VoteCounter = VoteCounter::new();
+        let (err, _) = with_shim(
+            Config {
+                run_wait_state: Some(7),
+                ..Config::default()
+            },
+            || {
+                let dev = XdnaDevice::open_with_counter(0, &COUNTER).expect("open");
+                let kern = dev
+                    .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
+                    .expect("load");
+                let run = kern.create_run(&[]).expect("run");
+                run.start().expect("start");
+                run.wait(50).expect_err("non-completed ERT state must fail")
+            },
+        );
+        assert!(err.contains("non-completed ERT state 7"), "{err}");
+    }
+
+    #[test]
+    fn ffi_wrappers_reject_empty_and_out_of_range_inputs() {
+        static COUNTER: VoteCounter = VoteCounter::new();
+        let _ = with_shim(Config::default(), || {
+            let dev = XdnaDevice::open_with_counter(0, &COUNTER).expect("open");
+            assert!(dev.load_kernel(&[], &[1]).is_err());
+            assert!(dev.load_kernel(&[1, 2, 3, 4], &[]).is_err());
+            let kern = dev
+                .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
+                .expect("load");
+            assert!(kern.alloc_bo(0, 3).is_err());
+            assert!(kern.alloc_bo((isize::MAX as usize) + 1, 3).is_err());
+            assert!(kern.alloc_bo(64, 2).is_err());
+            assert!(kern.alloc_bo(64, (i32::MAX as u32) + 1).is_err());
         });
     }
 }
