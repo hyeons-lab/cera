@@ -305,6 +305,28 @@ impl ConvHistory {
         }
     }
 
+    /// Advance the ring buffer in bulk for a batch of `n` consecutive tokens
+    /// at positions `start_pos + 1 ..= start_pos + n`.
+    ///
+    /// Returns `(first_kept_tok, ring_start_slot, snapshots_mut)` where the caller
+    /// should write post-token snapshots for token indices `j in first_kept_tok..n`
+    /// into slot `((ring_start_slot + (j - first_kept_tok)) % CONV_HISTORY_CAPACITY) * self.buf_len`.
+    pub fn reserve_batch(&mut self, start_pos: usize, n: usize) -> (usize, usize, &mut [f32]) {
+        if self.buf_len == 0 || n == 0 {
+            return (n, self.head, &mut self.snapshots);
+        }
+        let keep = n.min(CONV_HISTORY_CAPACITY);
+        let first_kept = n - keep;
+        let ring_start = self.head;
+        for k in 0..keep {
+            let slot = (ring_start + k) % CONV_HISTORY_CAPACITY;
+            self.positions[slot] = start_pos + first_kept + k + 1;
+        }
+        self.head = (ring_start + keep) % CONV_HISTORY_CAPACITY;
+        self.count = (self.count + keep).min(CONV_HISTORY_CAPACITY);
+        (first_kept, ring_start, &mut self.snapshots)
+    }
+
     /// Roll back the convolution `buffer` to the state at `target_pos`.
     /// Returns `true` if the state was successfully found and restored.
     pub fn rollback_to(&mut self, target_pos: usize, buffer: &mut [f32]) -> bool {

@@ -3823,7 +3823,7 @@ impl Session {
                 || self.audio_decoder.is_none()
                 || self.detok_weights.is_none());
         let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
-        let greedy = want_greedy && opts.grammar.is_none() && !ban_audio_control;
+        let greedy = want_greedy && opts.grammar.is_none();
 
         // Speculative-decoding fast path. Engages only on the plain greedy path
         // (implied by `greedy`, which already excludes grammar) with a dense
@@ -3848,6 +3848,7 @@ impl Session {
         };
         if let Some(sd) = spec_opt
             && greedy
+            && !ban_audio_control
             && self.audio_decoder.is_none()
             && self.model.supports_all_logits()
             && !self.state.is_compressed()
@@ -3924,8 +3925,20 @@ impl Session {
         // on the prefill logits; each subsequent iteration's token comes
         // from the previous `forward_greedy()` return value. No RNG is
         // touched in this path — argmax is deterministic.
+        let ban_ids = [
+            ctrl.audio_start,
+            ctrl.audio_end,
+            ctrl.text_end,
+            ctrl.mixed_start,
+        ];
+        let mut banned_logits: Vec<f32> = Vec::new();
         let mut greedy_next: u32 = if greedy {
-            crate::sampler::argmax(&logits)
+            if ban_audio_control {
+                ban_control_ids(&logits, ban_ids, &mut banned_logits);
+                crate::sampler::argmax(&banned_logits)
+            } else {
+                crate::sampler::argmax(&logits)
+            }
         } else {
             0
         };
@@ -3991,7 +4004,6 @@ impl Session {
         };
         let mut modality_budget = text_budget;
         let mut text_done = false;
-        let mut banned_logits: Vec<f32> = Vec::new();
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -4011,17 +4023,8 @@ impl Session {
             // The ban applies to a copy: `logits` is saved as the seed of a later `generate()`
             // without an append, and a stop right after this step would leave the control ids
             // banned there (an audio turn could then never open with them).
-            if ban_audio_control {
-                ban_control_ids(
-                    &logits,
-                    [
-                        ctrl.audio_start,
-                        ctrl.audio_end,
-                        ctrl.text_end,
-                        ctrl.mixed_start,
-                    ],
-                    &mut banned_logits,
-                );
+            if ban_audio_control && !greedy {
+                ban_control_ids(&logits, ban_ids, &mut banned_logits);
             }
             let step_logits: &mut Vec<f32> = if ban_audio_control {
                 &mut banned_logits
@@ -4358,7 +4361,12 @@ impl Session {
                 // Skips the vocab-sized logits readback. `logits` goes stale
                 // — that's fine, greedy mode never reads it after the
                 // initial argmax.
-                greedy_next = self.model.forward_greedy(&[token], pos, &mut self.state);
+                greedy_next = if ban_audio_control {
+                    self.model
+                        .forward_greedy_excluding(&[token], pos, &mut self.state, &ban_ids)
+                } else {
+                    self.model.forward_greedy(&[token], pos, &mut self.state)
+                };
                 logits_fresh = false;
                 if let Err(e) = self.check_decode_error() {
                     return Err(Self::sync_frontier_on_err(

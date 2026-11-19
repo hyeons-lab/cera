@@ -84,7 +84,13 @@ pub mod whisper_hexagon;
 #[cfg(feature = "hexagon")]
 pub(crate) mod whisper_mel_hexagon;
 #[cfg(feature = "xdna")]
+pub mod xdna_lfm2;
+#[cfg(feature = "xdna")]
+pub mod xdna_lfm3;
+#[cfg(feature = "xdna")]
 pub mod xdna_llama;
+#[cfg(feature = "xdna")]
+pub mod xdna_towers;
 #[cfg(feature = "xdna")]
 pub use xdna_llama::load_model_xdna;
 
@@ -1010,6 +1016,30 @@ pub trait Model: Send + Sync {
     /// a GPU argmax kernel should override to skip the vocab-sized readback.
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         let logits = self.forward(tokens, pos, state);
+        crate::sampler::argmax(&logits)
+    }
+
+    /// Greedy single-token fast path that excludes up to a small set of banned
+    /// token IDs (e.g. audio control tokens during text-only generation).
+    ///
+    /// Default impl delegates to `forward_greedy` when `ban_ids` is empty and
+    /// otherwise falls back to `forward()` + in-place `-INF` masking.
+    fn forward_greedy_excluding(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+        ban_ids: &[u32],
+    ) -> u32 {
+        if ban_ids.is_empty() {
+            return self.forward_greedy(tokens, pos, state);
+        }
+        let mut logits = self.forward(tokens, pos, state);
+        for &id in ban_ids {
+            if let Some(slot) = logits.get_mut(id as usize) {
+                *slot = f32::NEG_INFINITY;
+            }
+        }
         crate::sampler::argmax(&logits)
     }
 

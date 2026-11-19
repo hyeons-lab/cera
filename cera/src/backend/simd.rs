@@ -15167,7 +15167,7 @@ pub(crate) mod avx512 {
 /// Emit the int8 GEMM kernels for one x86 tier, since VNNI and the AVX2
 /// emulation differ only in how they reach a `dpbusd`.
 macro_rules! int8_gemm_kernels {
-    ($feat:literal, $tile_n:expr, $tile_m:expr, $strip_n:expr, $kq_cols:expr) => {
+    ($feat:literal, $tile_n:expr, $tile_m:expr, $strip_n:expr, $kq_cols:expr, $q6k_n1_fn:path) => {
         /// Horizontal sum of the 8 f32 lanes. Called once per output element, never
         /// inside the block loop — see the module note on accumulation.
         #[target_feature(enable = $feat)]
@@ -15264,9 +15264,9 @@ macro_rules! int8_gemm_kernels {
 
         /// Q4_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
         ///
-        /// Row-parallel over the **RowPool** above `gemv_par_threshold()`, matching
-        /// the NEON pre-quantized GEMV — decode dispatches these constantly, and
-        /// rayon's fork-join barrier per call is the wrong trade there.
+        /// Row-tiled by `TILE_M` over the **RowPool** (sharing activation loads and
+        /// eliminating single-accumulator FMA latency stalls while keeping exact
+        /// block-by-block arithmetic identical to `gemm_q4_0_q8_0` at `n = 1`).
         #[target_feature(enable = $feat)]
         pub unsafe fn gemv_q4_0_q8_0(
             a_quant: &[u8],
@@ -15284,23 +15284,27 @@ macro_rules! int8_gemm_kernels {
             debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
 
             let base = a_quant.as_ptr() as usize;
-            let compute_row = |(i, yi): (usize, &mut f32)| {
-                // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`, in
-                // bounds by the assert above; `y` rows are disjoint per worker.
-                *yi = unsafe {
-                    row_dot_q4_0(
-                        (base as *const u8).add(i * row_bytes),
-                        x_scales,
-                        x_quants,
-                        nb,
-                    )
-                };
+            let handle = |(s, out_chunk): (usize, &mut [f32])| unsafe {
+                let rows = (base as *const u8).add(s * TILE_M * row_bytes);
+                if out_chunk.len() == TILE_M {
+                    gemm_q4_0_strip(rows, row_bytes, x_scales, x_quants, out_chunk, 1, nb);
+                } else {
+                    for (r, yi) in out_chunk.iter_mut().enumerate() {
+                        *yi = row_dot_q4_0(rows.add(r * row_bytes), x_scales, x_quants, nb);
+                    }
+                }
             };
 
             if m >= crate::backend::cpu::gemv_par_threshold() {
-                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+                let min_strips = (crate::backend::cpu::gemv_min_rows() / TILE_M).max(1);
+                let min_chunk = (16 / TILE_M).max(1);
+                crate::backend::cpu::par_rows_n_chunked_decode(
+                    y, TILE_M, min_strips, min_chunk, handle,
+                );
             } else {
-                y.iter_mut().enumerate().for_each(compute_row);
+                for (s, out_chunk) in y.chunks_mut(TILE_M).enumerate() {
+                    handle((s, out_chunk));
+                }
             }
         }
 
@@ -15322,22 +15326,27 @@ macro_rules! int8_gemm_kernels {
             debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
 
             let base = a_quant.as_ptr() as usize;
-            let compute_row = |(i, yi): (usize, &mut f32)| {
-                // SAFETY: as in the Q4_0 GEMV above.
-                *yi = unsafe {
-                    row_dot_q8_0(
-                        (base as *const u8).add(i * row_bytes),
-                        x_scales,
-                        x_quants,
-                        nb,
-                    )
-                };
+            let handle = |(s, out_chunk): (usize, &mut [f32])| unsafe {
+                let rows = (base as *const u8).add(s * TILE_M * row_bytes);
+                if out_chunk.len() == TILE_M {
+                    gemm_q8_0_strip(rows, row_bytes, x_scales, x_quants, out_chunk, 1, nb);
+                } else {
+                    for (r, yi) in out_chunk.iter_mut().enumerate() {
+                        *yi = row_dot_q8_0(rows.add(r * row_bytes), x_scales, x_quants, nb);
+                    }
+                }
             };
 
             if m >= crate::backend::cpu::gemv_par_threshold() {
-                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+                let min_strips = (crate::backend::cpu::gemv_min_rows() / TILE_M).max(1);
+                let min_chunk = (16 / TILE_M).max(1);
+                crate::backend::cpu::par_rows_n_chunked_decode(
+                    y, TILE_M, min_strips, min_chunk, handle,
+                );
             } else {
-                y.iter_mut().enumerate().for_each(compute_row);
+                for (s, out_chunk) in y.chunks_mut(TILE_M).enumerate() {
+                    handle((s, out_chunk));
+                }
             }
         }
 
@@ -16003,6 +16012,322 @@ macro_rules! int8_gemm_kernels {
             }
         }
 
+        /// Row-major output variant of [`gemm_q4_0_8x8_q8_0`]:
+        /// writes `out[col * m + row]` (`[n, m]`) directly without allocating
+        /// a `[m, n]` scratch buffer or transposing afterward.
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_0_8x8_q8_0_rowmajor(
+            packed: &[u8],
+            scales: &[f32],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            m: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(m % 8, 0, "repacked Q4_0 rowmajor GEMM: m % 8");
+            debug_assert_eq!(k % 32, 0, "repacked Q4_0 rowmajor GEMM: k % 32");
+            let nb = k / 32;
+            debug_assert_eq!(out.len(), m * n);
+            debug_assert!(packed.len() >= (m / 8) * nb * 128);
+            debug_assert!(scales.len() >= (m / 8) * nb * 8);
+            debug_assert!(b_quants.len() >= n * k);
+            debug_assert!(b_scales.len() >= n * nb);
+
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs_ptr = col_sums.as_ptr() as usize;
+            let packed_ptr = packed.as_ptr() as usize;
+            let scales_ptr = scales.as_ptr() as usize;
+            let b_scales_ptr = b_scales.as_ptr() as usize;
+            let b_quants_ptr = b_quants.as_ptr() as usize;
+            let out_ptr = out.as_mut_ptr() as usize;
+
+            let compute_super_row = |sr: usize| unsafe {
+                let mask = _mm_set1_epi8(0x0F);
+                let packed_p = packed_ptr as *const u8;
+                let scales_p = scales_ptr as *const f32;
+                let bs_p = b_scales_ptr as *const f32;
+                let bq_p = b_quants_ptr as *const i8;
+                let cs_p = cs_ptr as *const i32;
+                let out_p = out_ptr as *mut f32;
+                let row_base = 8 * sr;
+
+                let mut j = 0usize;
+                while j + TILE_N <= n {
+                    let mut facc = [_mm256_setzero_ps(); TILE_N];
+                    for block in 0..nb {
+                        let mut acc = [_mm256_setzero_si256(); TILE_N];
+                        let pbase = (sr * nb + block) * 128;
+                        for g in 0..8usize {
+                            let qb =
+                                _mm_loadu_si128(packed_p.add(pbase + g * 16) as *const __m128i);
+                            let lo = _mm_and_si128(qb, mask);
+                            let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+                            let w = _mm256_set_m128i(hi, lo);
+                            for (t, acc_t) in acc.iter_mut().enumerate() {
+                                let col = j + t;
+                                let a4 = (bq_p.add(col * k + block * 32 + g * 4) as *const i32)
+                                    .read_unaligned();
+                                *acc_t = _mm256_add_epi32(*acc_t, dot32u(w, _mm256_set1_epi32(a4)));
+                            }
+                        }
+                        let d_vec = _mm256_loadu_ps(scales_p.add((sr * nb + block) * 8));
+                        for (t, facc_t) in facc.iter_mut().enumerate() {
+                            let col = j + t;
+                            let xs = *bs_p.add(col * nb + block);
+                            let sx = *cs_p.add(col * nb + block);
+                            let adj = _mm256_sub_epi32(acc[t], _mm256_set1_epi32(sx << 3));
+                            let eff = _mm256_mul_ps(d_vec, _mm256_set1_ps(xs));
+                            *facc_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(adj), eff, *facc_t);
+                        }
+                    }
+                    for (t, facc_t) in facc.iter().enumerate() {
+                        _mm256_storeu_ps(out_p.add((j + t) * m + row_base), *facc_t);
+                    }
+                    j += TILE_N;
+                }
+                while j < n {
+                    let mut facc = _mm256_setzero_ps();
+                    for block in 0..nb {
+                        let mut acc = _mm256_setzero_si256();
+                        let pbase = (sr * nb + block) * 128;
+                        for g in 0..8usize {
+                            let qb =
+                                _mm_loadu_si128(packed_p.add(pbase + g * 16) as *const __m128i);
+                            let lo = _mm_and_si128(qb, mask);
+                            let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+                            let w = _mm256_set_m128i(hi, lo);
+                            let a4 = (bq_p.add(j * k + block * 32 + g * 4) as *const i32)
+                                .read_unaligned();
+                            acc = _mm256_add_epi32(acc, dot32u(w, _mm256_set1_epi32(a4)));
+                        }
+                        let d_vec = _mm256_loadu_ps(scales_p.add((sr * nb + block) * 8));
+                        let xs = *bs_p.add(j * nb + block);
+                        let sx = *cs_p.add(j * nb + block);
+                        let adj = _mm256_sub_epi32(acc, _mm256_set1_epi32(sx << 3));
+                        let eff = _mm256_mul_ps(d_vec, _mm256_set1_ps(xs));
+                        facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(adj), eff, facc);
+                    }
+                    _mm256_storeu_ps(out_p.add(j * m + row_base), facc);
+                    j += 1;
+                }
+            };
+
+            let sr_count = m / 8;
+            if sr_count >= 2 {
+                if n == 1 {
+                    crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    });
+                } else {
+                    let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                    crate::backend::cpu::par_range_prefill_active(
+                        sr_count,
+                        1,
+                        max_active,
+                        |start_sr, count| {
+                            for sr in start_sr..start_sr + count {
+                                compute_super_row(sr);
+                            }
+                        },
+                    );
+                }
+            } else {
+                (0..sr_count).for_each(compute_super_row);
+            }
+        }
+
+        /// Fused Gate + Up + SiLU repacked Q4_0 × Q8_0 GEMM writing row-major `out[n, m]`.
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_0_gate_up_silu_rowmajor(
+            gate_packed: &[u8],
+            gate_scales: &[f32],
+            up_packed: &[u8],
+            up_scales: &[f32],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            m: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(m % 8, 0, "fused Q4_0 gate/up GEMM: m % 8");
+            debug_assert_eq!(k % 32, 0, "fused Q4_0 gate/up GEMM: k % 32");
+            let nb = k / 32;
+            debug_assert_eq!(out.len(), m * n);
+            debug_assert!(gate_packed.len() >= (m / 8) * nb * 128);
+            debug_assert!(up_packed.len() >= (m / 8) * nb * 128);
+            debug_assert!(gate_scales.len() >= (m / 8) * nb * 8);
+            debug_assert!(up_scales.len() >= (m / 8) * nb * 8);
+            debug_assert!(b_quants.len() >= n * k);
+            debug_assert!(b_scales.len() >= n * nb);
+
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs_ptr = col_sums.as_ptr() as usize;
+            let gp_ptr = gate_packed.as_ptr() as usize;
+            let gs_ptr = gate_scales.as_ptr() as usize;
+            let up_ptr = up_packed.as_ptr() as usize;
+            let us_ptr = up_scales.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let out_ptr = out.as_mut_ptr() as usize;
+
+            let silu_store_8 = |dst: *mut f32, gv: __m256, uv: __m256| unsafe {
+                let mut ga = [0.0f32; 8];
+                let mut ua = [0.0f32; 8];
+                _mm256_storeu_ps(ga.as_mut_ptr(), gv);
+                _mm256_storeu_ps(ua.as_mut_ptr(), uv);
+                for r in 0..8 {
+                    let g = ga[r];
+                    *dst.add(r) = (g / (1.0 + crate::backend::cpu::ggml_expf(-g))) * ua[r];
+                }
+            };
+
+            let compute_super_row = |sr: usize| unsafe {
+                const GU_TILE: usize = 2;
+                let mask = _mm_set1_epi8(0x0F);
+                let gp = gp_ptr as *const u8;
+                let gs = gs_ptr as *const f32;
+                let up_p = up_ptr as *const u8;
+                let us = us_ptr as *const f32;
+                let bs_p = bs_ptr as *const f32;
+                let bq_p = bq_ptr as *const i8;
+                let cs_p = cs_ptr as *const i32;
+                let out_p = out_ptr as *mut f32;
+                let row_base = 8 * sr;
+
+                let mut j = 0usize;
+                while j + GU_TILE <= n {
+                    let mut gfacc = [_mm256_setzero_ps(); GU_TILE];
+                    let mut ufacc = [_mm256_setzero_ps(); GU_TILE];
+                    for block in 0..nb {
+                        let mut gacc = [_mm256_setzero_si256(); GU_TILE];
+                        let mut uacc = [_mm256_setzero_si256(); GU_TILE];
+                        let pbase = (sr * nb + block) * 128;
+                        for g in 0..8usize {
+                            let qg = _mm_loadu_si128(gp.add(pbase + g * 16) as *const __m128i);
+                            let wg = _mm256_set_m128i(
+                                _mm_and_si128(_mm_srli_epi16(qg, 4), mask),
+                                _mm_and_si128(qg, mask),
+                            );
+                            let qu = _mm_loadu_si128(up_p.add(pbase + g * 16) as *const __m128i);
+                            let wu = _mm256_set_m128i(
+                                _mm_and_si128(_mm_srli_epi16(qu, 4), mask),
+                                _mm_and_si128(qu, mask),
+                            );
+                            for t in 0..GU_TILE {
+                                let col = j + t;
+                                let a4 = (bq_p.add(col * k + block * 32 + g * 4) as *const i32)
+                                    .read_unaligned();
+                                let va = _mm256_set1_epi32(a4);
+                                gacc[t] = _mm256_add_epi32(gacc[t], dot32u(wg, va));
+                                uacc[t] = _mm256_add_epi32(uacc[t], dot32u(wu, va));
+                            }
+                        }
+                        let sbase = (sr * nb + block) * 8;
+                        let dg = _mm256_loadu_ps(gs.add(sbase));
+                        let du = _mm256_loadu_ps(us.add(sbase));
+                        for t in 0..GU_TILE {
+                            let col = j + t;
+                            let xs = *bs_p.add(col * nb + block);
+                            let sx8 = _mm256_set1_epi32((*cs_p.add(col * nb + block)) << 3);
+                            let vxs = _mm256_set1_ps(xs);
+                            let gadj = _mm256_sub_epi32(gacc[t], sx8);
+                            let uadj = _mm256_sub_epi32(uacc[t], sx8);
+                            gfacc[t] = _mm256_fmadd_ps(
+                                _mm256_cvtepi32_ps(gadj),
+                                _mm256_mul_ps(dg, vxs),
+                                gfacc[t],
+                            );
+                            ufacc[t] = _mm256_fmadd_ps(
+                                _mm256_cvtepi32_ps(uadj),
+                                _mm256_mul_ps(du, vxs),
+                                ufacc[t],
+                            );
+                        }
+                    }
+                    for t in 0..GU_TILE {
+                        silu_store_8(out_p.add((j + t) * m + row_base), gfacc[t], ufacc[t]);
+                    }
+                    j += GU_TILE;
+                }
+                while j < n {
+                    let mut gfacc = _mm256_setzero_ps();
+                    let mut ufacc = _mm256_setzero_ps();
+                    for block in 0..nb {
+                        let mut gacc = _mm256_setzero_si256();
+                        let mut uacc = _mm256_setzero_si256();
+                        let pbase = (sr * nb + block) * 128;
+                        for g in 0..8usize {
+                            let qg = _mm_loadu_si128(gp.add(pbase + g * 16) as *const __m128i);
+                            let wg = _mm256_set_m128i(
+                                _mm_and_si128(_mm_srli_epi16(qg, 4), mask),
+                                _mm_and_si128(qg, mask),
+                            );
+                            let qu = _mm_loadu_si128(up_p.add(pbase + g * 16) as *const __m128i);
+                            let wu = _mm256_set_m128i(
+                                _mm_and_si128(_mm_srli_epi16(qu, 4), mask),
+                                _mm_and_si128(qu, mask),
+                            );
+                            let a4 = (bq_p.add(j * k + block * 32 + g * 4) as *const i32)
+                                .read_unaligned();
+                            let va = _mm256_set1_epi32(a4);
+                            gacc = _mm256_add_epi32(gacc, dot32u(wg, va));
+                            uacc = _mm256_add_epi32(uacc, dot32u(wu, va));
+                        }
+                        let sbase = (sr * nb + block) * 8;
+                        let dg = _mm256_loadu_ps(gs.add(sbase));
+                        let du = _mm256_loadu_ps(us.add(sbase));
+                        let xs = *bs_p.add(j * nb + block);
+                        let sx8 = _mm256_set1_epi32((*cs_p.add(j * nb + block)) << 3);
+                        let vxs = _mm256_set1_ps(xs);
+                        gfacc = _mm256_fmadd_ps(
+                            _mm256_cvtepi32_ps(_mm256_sub_epi32(gacc, sx8)),
+                            _mm256_mul_ps(dg, vxs),
+                            gfacc,
+                        );
+                        ufacc = _mm256_fmadd_ps(
+                            _mm256_cvtepi32_ps(_mm256_sub_epi32(uacc, sx8)),
+                            _mm256_mul_ps(du, vxs),
+                            ufacc,
+                        );
+                    }
+                    silu_store_8(out_p.add(j * m + row_base), gfacc, ufacc);
+                    j += 1;
+                }
+            };
+
+            let sr_count = m / 8;
+            if sr_count >= 2 {
+                if n == 1 {
+                    crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    });
+                } else {
+                    let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                    crate::backend::cpu::par_range_prefill_active(
+                        sr_count,
+                        1,
+                        max_active,
+                        |start_sr, count| {
+                            for sr in start_sr..start_sr + count {
+                                compute_super_row(sr);
+                            }
+                        },
+                    );
+                }
+            } else {
+                (0..sr_count).for_each(compute_super_row);
+            }
+        }
+
         /// Batched Q4_K × Q8_0 GEMM on the 8-row-interleaved layout
         /// (`repack_q4_k_8x8`): `out[m,n] = A_q4_k[m,k] @ B_q8_0[k,n]`.
         ///
@@ -16643,6 +16968,13 @@ macro_rules! int8_gemm_kernels {
             debug_assert_eq!(b_scales.len(), n * nb32, "Q6_K GEMM: b_scales size");
             debug_assert_eq!(out.len(), m * n, "Q6_K GEMM: out size");
 
+            if n == 1 {
+                unsafe {
+                    $q6k_n1_fn(a_quant, b_scales, b_quants, out, m, k);
+                }
+                return;
+            }
+
             let col_sums16 = unsafe { q8_0_col_sums16(b_quants, n, k) };
             let cs16: &[i32] = &col_sums16;
 
@@ -16996,7 +17328,89 @@ pub(crate) mod avx2_int8 {
     // hosts this module actually targets. The ordering is likely to hold there
     // and the margin is not. Re-tune on a real AVX2-only part before treating
     // these as final.
-    int8_gemm_kernels!("avx2,fma", 4, 2, 4, 4);
+    /// Compute Q6_K GEMV (`n = 1`) with AVX2+FMA using precomputed column sums.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn gemm_q6_k_n1(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+    ) {
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let nh16 = k / 16;
+        let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+        let col_sums16 = unsafe { q8_0_col_sums16(b_quants, 1, k) };
+        let cs16: &[i32] = &col_sums16;
+
+        let compute_row = |(i, row_out): (usize, &mut f32)| unsafe {
+            let mask_0f = _mm256_set1_epi8(0x0F);
+            let mask_03 = _mm256_set1_epi8(0x03);
+            let row_start = i * row_bytes;
+            const NACC: usize = 4;
+            let mut facc = [_mm256_setzero_ps(); NACC];
+            let mut macc = 0.0f32;
+            let mut slot = 0usize;
+            for bi in 0..sb {
+                let blk = &*(a_quant
+                    .as_ptr()
+                    .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
+                    as *const crate::quant::BlockQ6K);
+                let d = crate::quant::f16_to_f32(blk.d);
+                let d32 = d * 32.0;
+                let ql = blk.ql.as_ptr();
+                let qh = blk.qh.as_ptr();
+                for nh in 0..2usize {
+                    let qhb = _mm256_loadu_si256(qh.add(nh * 32) as *const __m256i);
+                    for g in 0..4usize {
+                        let qlb =
+                            _mm256_loadu_si256(ql.add(nh * 64 + (g & 1) * 32) as *const __m256i);
+                        let l4 = if g < 2 {
+                            _mm256_and_si256(qlb, mask_0f)
+                        } else {
+                            _mm256_and_si256(_mm256_srli_epi16(qlb, 4), mask_0f)
+                        };
+                        let h2 = _mm256_and_si256(
+                            _mm256_srl_epi16(qhb, _mm_cvtsi32_si128(2 * g as i32)),
+                            mask_03,
+                        );
+                        let w = _mm256_or_si256(l4, _mm256_slli_epi16(h2, 4));
+                        let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
+                        let sc1 = *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
+                        let xb = bi * 8 + nh * 4 + g;
+                        let sc_split_d =
+                            _mm256_set_m128(_mm_set1_ps(sc1 * d), _mm_set1_ps(sc0 * d));
+                        let x =
+                            _mm256_loadu_si256(b_quants.as_ptr().add(xb * 32) as *const __m256i);
+                        let lanes = _mm256_cvtepi32_ps(dot32u(w, x));
+                        let xs = *b_scales.get_unchecked(xb);
+                        let sx0 = *cs16.get_unchecked(xb * 2);
+                        let sx1 = *cs16.get_unchecked(xb * 2 + 1);
+                        let scale = _mm256_mul_ps(sc_split_d, _mm256_set1_ps(xs));
+                        let acc = facc.get_unchecked_mut(slot);
+                        *acc = _mm256_fmadd_ps(lanes, scale, *acc);
+                        macc += xs * d32 * (sc0 * sx0 as f32 + sc1 * sx1 as f32);
+                        slot = (slot + 1) & (NACC - 1);
+                    }
+                }
+            }
+            let f01 = _mm256_add_ps(facc[0], facc[1]);
+            let f23 = _mm256_add_ps(facc[2], facc[3]);
+            let f = _mm256_add_ps(f01, f23);
+            *row_out = hsum256_ps(f) - macc;
+        };
+
+        if m < crate::backend::cpu::gemv_par_threshold() {
+            out.iter_mut().enumerate().for_each(compute_row);
+        } else {
+            crate::backend::cpu::par_rows(out, crate::backend::cpu::gemv_min_rows(), compute_row);
+        }
+        let _ = (nb32, nh16);
+    }
+
+    int8_gemm_kernels!("avx2,fma", 4, 2, 4, 4, gemm_q6_k_n1);
 
     #[cfg(test)]
     mod avx2_int8_tests {
@@ -17970,9 +18384,1395 @@ pub(crate) mod avx512_vnni {
         _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy)
     }
 
+    /// Pack two 256-bit float vectors into one 512-bit ZMM vector.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx2")]
+    unsafe fn pack_256x2_ps(lo: __m256, hi: __m256) -> __m512 {
+        _mm512_castsi512_ps(_mm512_inserti64x4(
+            _mm512_castsi256_si512(_mm256_castps_si256(lo)),
+            _mm256_castps_si256(hi),
+            1,
+        ))
+    }
+
+    /// Compute one Q6_K row dot product using AVX-512 VNNI.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q6k_n1_row_512(
+        row_ptr: *const u8,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+    ) -> f32 {
+        unsafe {
+            let mask_0f = _mm512_set1_epi8(0x0F);
+            let mask_03 = _mm512_set1_epi8(0x03);
+            let perm_sc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+            let zero512 = _mm512_setzero_si512();
+            let bsz = size_of::<crate::quant::BlockQ6K>();
+
+            let mut facc0 = _mm512_setzero_ps();
+            let mut facc1 = _mm512_setzero_ps();
+            let mut macc = _mm_setzero_ps();
+
+            for bi in 0..sb {
+                let blk = &*(row_ptr.add(bi * bsz) as *const crate::quant::BlockQ6K);
+                let dv = _mm_set1_ps(crate::quant::f16_to_f32(blk.d));
+
+                for nh in 0..2usize {
+                    let xb0 = bi * 8 + nh * 4;
+                    let x01 = _mm512_loadu_si512(b_quants.as_ptr().add(xb0 * 32) as *const __m512i);
+                    let x23 =
+                        _mm512_loadu_si512(b_quants.as_ptr().add((xb0 + 2) * 32) as *const __m512i);
+                    let xs01 = pack_256x2_ps(
+                        _mm256_set1_ps(*b_scales.get_unchecked(xb0)),
+                        _mm256_set1_ps(*b_scales.get_unchecked(xb0 + 1)),
+                    );
+                    let xs23 = pack_256x2_ps(
+                        _mm256_set1_ps(*b_scales.get_unchecked(xb0 + 2)),
+                        _mm256_set1_ps(*b_scales.get_unchecked(xb0 + 3)),
+                    );
+                    let mxs01 = _mm_loadu_ps(xs32_sx.as_ptr().add(xb0 * 2));
+                    let mxs23 = _mm_loadu_ps(xs32_sx.as_ptr().add((xb0 + 2) * 2));
+
+                    let ql_vec = _mm512_loadu_si512(blk.ql.as_ptr().add(nh * 64) as *const __m512i);
+                    let qhb = _mm256_loadu_si256(blk.qh.as_ptr().add(nh * 32) as *const __m256i);
+
+                    let l4_01 = _mm512_and_si512(ql_vec, mask_0f);
+                    let l4_23 = _mm512_and_si512(_mm512_srli_epi32(ql_vec, 4), mask_0f);
+                    let qh01 = _mm512_and_si512(
+                        _mm512_inserti64x4(
+                            _mm512_castsi256_si512(qhb),
+                            _mm256_srli_epi16(qhb, 2),
+                            1,
+                        ),
+                        mask_03,
+                    );
+                    let qh23 = _mm512_and_si512(
+                        _mm512_inserti64x4(
+                            _mm512_castsi256_si512(_mm256_srli_epi16(qhb, 4)),
+                            _mm256_srli_epi16(qhb, 6),
+                            1,
+                        ),
+                        mask_03,
+                    );
+                    let w01 = _mm512_or_si512(l4_01, _mm512_slli_epi32(qh01, 4));
+                    let w23 = _mm512_or_si512(l4_23, _mm512_slli_epi32(qh23, 4));
+
+                    let sc01_raw = _mm_cvtsi32_si128(core::ptr::read_unaligned(
+                        blk.scales.as_ptr().add(nh * 8) as *const i32,
+                    ));
+                    let sc23_raw = _mm_cvtsi32_si128(core::ptr::read_unaligned(
+                        blk.scales.as_ptr().add(nh * 8 + 4) as *const i32,
+                    ));
+                    let sc01_d = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(sc01_raw)), dv);
+                    let sc23_d = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(sc23_raw)), dv);
+
+                    macc = _mm_fmadd_ps(sc01_d, mxs01, macc);
+                    macc = _mm_fmadd_ps(sc23_d, mxs23, macc);
+
+                    let s01 = _mm512_mul_ps(
+                        _mm512_permutexvar_ps(perm_sc, _mm512_castps128_ps512(sc01_d)),
+                        xs01,
+                    );
+                    let s23 = _mm512_mul_ps(
+                        _mm512_permutexvar_ps(perm_sc, _mm512_castps128_ps512(sc23_d)),
+                        xs23,
+                    );
+
+                    let d01 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero512, w01, x01));
+                    let d23 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero512, w23, x23));
+
+                    facc0 = _mm512_fmadd_ps(d01, s01, facc0);
+                    facc1 = _mm512_fmadd_ps(d23, s23, facc1);
+                }
+            }
+
+            let f = _mm512_add_ps(facc0, facc1);
+            let lo = _mm512_castps512_ps256(f);
+            let hi = _mm256_castsi256_ps(_mm512_extracti64x4_epi64::<1>(_mm512_castps_si512(f)));
+            let fsum = hsum256_ps(_mm256_add_ps(lo, hi));
+            let m0 = _mm_movehl_ps(macc, macc);
+            let m1 = _mm_add_ps(macc, m0);
+            let m2 = _mm_shuffle_ps(m1, m1, 0x55);
+            let msum = _mm_cvtss_f32(_mm_add_ss(m1, m2));
+            fsum - msum
+        }
+    }
+
+    /// Inner Q6_K GEMV (`n = 1`) AVX-512 VNNI driver with optional active-worker cap.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn gemm_q6_k_n1_512_inner(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        max_active: usize,
+    ) {
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let nh16 = k / 16;
+        let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+
+        let mut stack_buf = [0.0f32; 512];
+        let mut heap_buf;
+        let xs32_sx: &mut [f32] = if nh16 <= stack_buf.len() {
+            &mut stack_buf[..nh16]
+        } else {
+            heap_buf = vec![0.0f32; nh16];
+            &mut heap_buf
+        };
+        unsafe {
+            let ones = _mm_set1_epi8(1);
+            let bp = b_quants.as_ptr();
+            for xb in 0..nb32 {
+                let xs32 = *b_scales.get_unchecked(xb) * 32.0;
+                let x0 = _mm_loadu_si128(bp.add(xb * 32) as *const __m128i);
+                let x1 = _mm_loadu_si128(bp.add(xb * 32 + 16) as *const __m128i);
+                let s0 = hsum128_epi32(dot16u(ones, x0)) as f32;
+                let s1 = hsum128_epi32(dot16u(ones, x1)) as f32;
+                *xs32_sx.get_unchecked_mut(xb * 2) = xs32 * s0;
+                *xs32_sx.get_unchecked_mut(xb * 2 + 1) = xs32 * s1;
+            }
+        }
+
+        let base = a_quant.as_ptr() as usize;
+        let xs_ref: &[f32] = xs32_sx;
+        let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
+            let rp = (base as *const u8).add(i * row_bytes);
+            if i + 1 < m {
+                _mm_prefetch::<_MM_HINT_T0>(rp.add(row_bytes) as *const i8);
+            }
+            *yi = q6k_n1_row_512(rp, b_scales, b_quants, xs_ref, sb);
+        };
+
+        if m < crate::backend::cpu::gemv_par_threshold() {
+            out.iter_mut().enumerate().for_each(compute_row);
+        } else if max_active > 0 {
+            crate::backend::cpu::par_rows_slice_active(
+                max_active,
+                out,
+                crate::backend::cpu::gemv_min_rows(),
+                |(start_row, slice)| {
+                    for (idx, yi) in slice.iter_mut().enumerate() {
+                        compute_row((start_row + idx, yi));
+                    }
+                },
+            );
+        } else {
+            crate::backend::cpu::par_rows(out, crate::backend::cpu::gemv_min_rows(), compute_row);
+        }
+    }
+
+    /// Compute Q6_K GEMV (`n = 1`) using AVX-512 VNNI across all pool workers.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn gemm_q6_k_n1_512(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            gemm_q6_k_n1_512_inner(a_quant, b_scales, b_quants, out, m, k, 0);
+        }
+    }
+
     // EVEX exposes 32 vector registers here, so the tiles are the wide ones:
     // TILE_N=8 per-row columns, and a 4x4 (16-accumulator) row-tiled strip.
-    int8_gemm_kernels!("avx512f,avx512vl,avx512vnni,avx2,fma", 8, 4, 4, 8);
+    int8_gemm_kernels!(
+        "avx512f,avx512vl,avx512vnni,avx2,fma",
+        8,
+        4,
+        4,
+        8,
+        gemm_q6_k_n1_512
+    );
+
+    /// Q6_K GEMV capped to `max_active` active workers (for XDNA CPU LM head).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemv_q6k_f32_active(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+        max_active: usize,
+    ) {
+        unsafe {
+            q8_scales.resize(k / 32, 0.0);
+            q8_quants.resize(k, 0);
+            crate::backend::cpu::quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+            gemm_q6_k_n1_512_inner(a_quant, q8_scales, q8_quants, y, m, k, max_active);
+        }
+    }
+
+    /// Packed 8-column Q8_0 panels and per-(panel, block, col) scales & sums for
+    /// cache-conflict-free ZMM GEMM, plus tail-column sums when `n % 8 != 0`.
+    #[derive(Default)]
+    struct PackedQ8Panels {
+        /// Packed quantized activation bytes (`[n_panels, nb, 8_groups, TILE_N]`).
+        quants: Vec<u8>,
+        /// Per-block Q8_0 activation scales.
+        scales: Vec<f32>,
+        /// Per-block pre-shifted column sums (`sum << 3`).
+        col_sums: Vec<i32>,
+        /// Per-block column sums for tail columns beyond full panels.
+        tail_sums: Vec<i32>,
+        /// Number of full 8-column panels packed.
+        n_panels: usize,
+    }
+
+    impl PackedQ8Panels {
+        /// Construct an empty panel scratch buffer.
+        const fn new() -> Self {
+            Self {
+                quants: Vec::new(),
+                scales: Vec::new(),
+                col_sums: Vec::new(),
+                tail_sums: Vec::new(),
+                n_panels: 0,
+            }
+        }
+    }
+
+    std::thread_local! {
+        static Q8_PANEL_SCRATCH: std::cell::Cell<PackedQ8Panels> =
+            const { std::cell::Cell::new(PackedQ8Panels::new()) };
+    }
+
+    /// Compute Q8_0 column sums for a contiguous range of columns `col_start..col_end`
+    /// into a reusable scratch buffer without shrinking or memsetting existing capacity.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q8_0_col_sums_range_avx512_into(
+        b_quants: &[i8],
+        col_start: usize,
+        col_end: usize,
+        k: usize,
+        sums: &mut Vec<i32>,
+    ) {
+        unsafe {
+            let nb = k / 32;
+            let count = col_end.saturating_sub(col_start);
+            let needed = count * nb;
+            if sums.len() < needed {
+                sums.resize(needed, 0);
+            }
+            let ones = _mm512_set1_epi32(0x0101_0101u32 as i32);
+            let ones256 = _mm256_set1_epi8(1);
+            for (idx, j) in (col_start..col_end).enumerate() {
+                let base = b_quants.as_ptr().add(j * k);
+                let out_j = sums.as_mut_ptr().add(idx * nb);
+                let mut b = 0usize;
+                while b + 2 <= nb {
+                    let x = _mm512_loadu_si512(base.add(b * 32) as *const __m512i);
+                    let s = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, x);
+                    let lo = _mm512_castsi512_si256(s);
+                    let hi = _mm512_extracti64x4_epi64::<1>(s);
+                    *out_j.add(b) = hsum256_epi32(lo);
+                    *out_j.add(b + 1) = hsum256_epi32(hi);
+                    b += 2;
+                }
+                if b < nb {
+                    let x = _mm256_loadu_si256(base.add(b * 32) as *const __m256i);
+                    let s = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones256, x);
+                    *out_j.add(b) = hsum256_epi32(s);
+                }
+            }
+        }
+    }
+
+    /// Compute Q8_0 column sums for a contiguous range of columns `col_start..col_end`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q8_0_col_sums_range_avx512(
+        b_quants: &[i8],
+        col_start: usize,
+        col_end: usize,
+        k: usize,
+    ) -> Vec<i32> {
+        let mut sums = Vec::new();
+        unsafe {
+            q8_0_col_sums_range_avx512_into(b_quants, col_start, col_end, k, &mut sums);
+        }
+        sums
+    }
+
+    /// Fast 512-bit Q8_0 per-(column, 32-block) activation sums.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q8_0_col_sums_avx512(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
+        unsafe { q8_0_col_sums_range_avx512(b_quants, 0, n, k) }
+    }
+
+    /// Pack 8-column Q8_0 panels `[panel, block, p=0..4, t=0..8, 8_i8s]` and compute
+    /// panel-contiguous `(b_scales, col_sums)` in a single parallel pass.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn pack_q8_0_panel8_avx512_into(
+        b_scales: &[f32],
+        b_quants: &[i8],
+        n: usize,
+        k: usize,
+        dst: &mut PackedQ8Panels,
+    ) {
+        unsafe {
+            let nb = k / 32;
+            let n_panels = n / 8;
+            dst.n_panels = n_panels;
+            let q_len = n_panels * nb * 256;
+            let meta_len = n_panels * nb * 8;
+            if dst.quants.len() < q_len {
+                dst.quants.resize(q_len, 0);
+            }
+            if dst.scales.len() < meta_len {
+                dst.scales.resize(meta_len, 0.0);
+            }
+            if dst.col_sums.len() < meta_len {
+                dst.col_sums.resize(meta_len, 0);
+            }
+            q8_0_col_sums_range_avx512_into(b_quants, n_panels * 8, n, k, &mut dst.tail_sums);
+
+            if n_panels > 0 {
+                let bq_ptr = b_quants.as_ptr() as usize;
+                let bs_ptr = b_scales.as_ptr() as usize;
+                let pq_ptr = dst.quants.as_mut_ptr() as usize;
+                let ps_ptr = dst.scales.as_mut_ptr() as usize;
+                let pc_ptr = dst.col_sums.as_mut_ptr() as usize;
+
+                let pack_panel = |jp: usize| {
+                    let j0 = jp * 8;
+                    let bq_p = bq_ptr as *const i8;
+                    let bs_p = bs_ptr as *const f32;
+                    let pq_p = (pq_ptr as *mut u8).add(jp * nb * 256);
+                    let ps_p = (ps_ptr as *mut f32).add(jp * nb * 8);
+                    let pc_p = (pc_ptr as *mut i32).add(jp * nb * 8);
+                    let ones = _mm256_set1_epi8(1);
+                    let zero = _mm256_setzero_si256();
+
+                    for block in 0..nb {
+                        let off = block * 32;
+                        let r0 = _mm256_loadu_si256(bq_p.add(j0 * k + off) as *const __m256i);
+                        let r1 = _mm256_loadu_si256(bq_p.add((j0 + 1) * k + off) as *const __m256i);
+                        let r2 = _mm256_loadu_si256(bq_p.add((j0 + 2) * k + off) as *const __m256i);
+                        let r3 = _mm256_loadu_si256(bq_p.add((j0 + 3) * k + off) as *const __m256i);
+                        let r4 = _mm256_loadu_si256(bq_p.add((j0 + 4) * k + off) as *const __m256i);
+                        let r5 = _mm256_loadu_si256(bq_p.add((j0 + 5) * k + off) as *const __m256i);
+                        let r6 = _mm256_loadu_si256(bq_p.add((j0 + 6) * k + off) as *const __m256i);
+                        let r7 = _mm256_loadu_si256(bq_p.add((j0 + 7) * k + off) as *const __m256i);
+
+                        // Horizontal sums for rows 0..3 and 4..7 simultaneously.
+                        let s0 = _mm256_dpbusd_epi32(zero, ones, r0);
+                        let s1 = _mm256_dpbusd_epi32(zero, ones, r1);
+                        let s2 = _mm256_dpbusd_epi32(zero, ones, r2);
+                        let s3 = _mm256_dpbusd_epi32(zero, ones, r3);
+                        let h01 = _mm256_hadd_epi32(s0, s1);
+                        let h23 = _mm256_hadd_epi32(s2, s3);
+                        let f03 = _mm256_hadd_epi32(h01, h23);
+                        let sum03 = _mm_add_epi32(
+                            _mm256_castsi256_si128(f03),
+                            _mm256_extracti128_si256::<1>(f03),
+                        );
+
+                        let s4 = _mm256_dpbusd_epi32(zero, ones, r4);
+                        let s5 = _mm256_dpbusd_epi32(zero, ones, r5);
+                        let s6 = _mm256_dpbusd_epi32(zero, ones, r6);
+                        let s7 = _mm256_dpbusd_epi32(zero, ones, r7);
+                        let h45 = _mm256_hadd_epi32(s4, s5);
+                        let h67 = _mm256_hadd_epi32(s6, s7);
+                        let f47 = _mm256_hadd_epi32(h45, h67);
+                        let sum47 = _mm_add_epi32(
+                            _mm256_castsi256_si128(f47),
+                            _mm256_extracti128_si256::<1>(f47),
+                        );
+
+                        let meta = block * 8;
+                        _mm_storeu_si128(pc_p.add(meta) as *mut __m128i, sum03);
+                        _mm_storeu_si128(pc_p.add(meta + 4) as *mut __m128i, sum47);
+                        for t in 0..8 {
+                            *ps_p.add(meta + t) = *bs_p.add((j0 + t) * nb + block);
+                        }
+
+                        // Transpose 4x4 of 64-bit chunks for rows 0..3 and 4..7 -> [p=0..4, t=0..8].
+                        let dst = pq_p.add(block * 256);
+                        let a0 = _mm256_unpacklo_epi64(r0, r1);
+                        let a1 = _mm256_unpackhi_epi64(r0, r1);
+                        let a2 = _mm256_unpacklo_epi64(r2, r3);
+                        let a3 = _mm256_unpackhi_epi64(r2, r3);
+                        let b0 = _mm256_unpacklo_epi64(r4, r5);
+                        let b1 = _mm256_unpackhi_epi64(r4, r5);
+                        let b2 = _mm256_unpacklo_epi64(r6, r7);
+                        let b3 = _mm256_unpackhi_epi64(r6, r7);
+
+                        let p0_lo = _mm256_permute2x128_si256::<0x20>(a0, a2);
+                        let p0_hi = _mm256_permute2x128_si256::<0x20>(b0, b2);
+                        let p1_lo = _mm256_permute2x128_si256::<0x20>(a1, a3);
+                        let p1_hi = _mm256_permute2x128_si256::<0x20>(b1, b3);
+                        let p2_lo = _mm256_permute2x128_si256::<0x31>(a0, a2);
+                        let p2_hi = _mm256_permute2x128_si256::<0x31>(b0, b2);
+                        let p3_lo = _mm256_permute2x128_si256::<0x31>(a1, a3);
+                        let p3_hi = _mm256_permute2x128_si256::<0x31>(b1, b3);
+
+                        _mm256_storeu_si256(dst as *mut __m256i, p0_lo);
+                        _mm256_storeu_si256(dst.add(32) as *mut __m256i, p0_hi);
+                        _mm256_storeu_si256(dst.add(64) as *mut __m256i, p1_lo);
+                        _mm256_storeu_si256(dst.add(96) as *mut __m256i, p1_hi);
+                        _mm256_storeu_si256(dst.add(128) as *mut __m256i, p2_lo);
+                        _mm256_storeu_si256(dst.add(160) as *mut __m256i, p2_hi);
+                        _mm256_storeu_si256(dst.add(192) as *mut __m256i, p3_lo);
+                        _mm256_storeu_si256(dst.add(224) as *mut __m256i, p3_hi);
+                    }
+                };
+
+                if n_panels * nb >= 256 && n_panels >= 2 {
+                    let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                    crate::backend::cpu::par_range_prefill_active(
+                        n_panels,
+                        1,
+                        max_active,
+                        |start_p, count| {
+                            for jp in start_p..start_p + count {
+                                pack_panel(jp);
+                            }
+                        },
+                    );
+                } else {
+                    for jp in 0..n_panels {
+                        pack_panel(jp);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pack Q8_0 activations into thread-local 8-column panel scratch and run `f`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn with_packed_q8_panel8_avx512<R>(
+        b_scales: &[f32],
+        b_quants: &[i8],
+        n: usize,
+        k: usize,
+        f: impl FnOnce(&PackedQ8Panels) -> R,
+    ) -> R {
+        let mut scratch = Q8_PANEL_SCRATCH.with(|cell| cell.take());
+        unsafe {
+            pack_q8_0_panel8_avx512_into(b_scales, b_quants, n, k, &mut scratch);
+        }
+        let res = f(&scratch);
+        Q8_PANEL_SCRATCH.with(|cell| cell.set(scratch));
+        res
+    }
+
+    /// Unpack two adjacent k-groups (`2 * 16` bytes) across a pair of 8-row
+    /// super-rows (`16` rows total) into two 512-bit unsigned weight vectors.
+    /// Row order inside each ZMM matches `[0..3, 8..11, 4..7, 12..15]`.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx2")]
+    unsafe fn unpack_q4_0_pair(p0: *const u8, p1: *const u8, mask: __m512i) -> (__m512i, __m512i) {
+        unsafe {
+            let r0 = _mm256_loadu_si256(p0 as *const __m256i);
+            let r1 = _mm256_loadu_si256(p1 as *const __m256i);
+            let raw = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(r0), r1);
+            let lo = _mm512_and_si512(raw, mask);
+            let hi = _mm512_and_si512(_mm512_srli_epi32(raw, 4), mask);
+            (
+                _mm512_shuffle_i32x4::<0x88>(lo, hi),
+                _mm512_shuffle_i32x4::<0xDD>(lo, hi),
+            )
+        }
+    }
+
+    /// Load 16 linear scales (`sr0` rows `0..7` and `sr1` rows `8..15`) and permute
+    /// into `[0..3, 8..11, 4..7, 12..15]` to match [`unpack_q4_0_pair`].
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn load_scales_pair_permuted(s0: *const f32, s1: *const f32) -> __m512 {
+        unsafe {
+            let d0 = _mm256_castps_pd(_mm256_loadu_ps(s0));
+            let d1 = _mm256_castps_pd(_mm256_loadu_ps(s1));
+            let lin = _mm512_castpd_ps(_mm512_insertf64x4::<1>(_mm512_castpd256_pd512(d0), d1));
+            _mm512_shuffle_f32x4::<0xD8>(lin, lin)
+        }
+    }
+
+    /// True 512-bit ZMM AVX-512 VNNI repacked Q4_0 × Q8_0 GEMM writing column-major `out[m, n]`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemm_q4_0_8x8_q8_0_zmm(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        if !m.is_multiple_of(16) || m == 0 || n == 0 {
+            unsafe {
+                gemm_q4_0_8x8_q8_0(packed, scales, b_scales, b_quants, out, m, n, k);
+            }
+            return;
+        }
+        debug_assert_eq!(k % 32, 0);
+        let nb = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb * 128);
+        debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb);
+
+        let col_sums = unsafe { q8_0_col_sums_avx512(b_quants, n, k) };
+        let cs_ptr = col_sums.as_ptr() as usize;
+        let packed_ptr = packed.as_ptr() as usize;
+        let scales_ptr = scales.as_ptr() as usize;
+        let b_scales_ptr = b_scales.as_ptr() as usize;
+        let b_quants_ptr = b_quants.as_ptr() as usize;
+
+        let compute_pair = |(sr2, chunk): (usize, &mut [f32])| unsafe {
+            const ZMM_TILE_N: usize = 8;
+            let sr0 = sr2 * 2;
+            let sr1 = sr0 + 1;
+            let mask = _mm512_set1_epi32(0x0F0F_0F0Fu32 as i32);
+            let p_base_ptr = packed_ptr as *const u8;
+            let s_base_ptr = scales_ptr as *const f32;
+            let bs_p = b_scales_ptr as *const f32;
+            let bq_p = b_quants_ptr as *const i8;
+            let cs_p = cs_ptr as *const i32;
+
+            let store_16_col = |chunk: &mut [f32], col: usize, fv: __m512| {
+                let lin = _mm512_shuffle_f32x4::<0xD8>(fv, fv);
+                let mut tmp = [0.0f32; 16];
+                _mm512_storeu_ps(tmp.as_mut_ptr(), lin);
+                for (r, &val) in tmp.iter().enumerate() {
+                    *chunk.get_unchecked_mut(r * n + col) = val;
+                }
+            };
+
+            let mut j = 0usize;
+            while j + ZMM_TILE_N <= n {
+                let mut facc = [_mm512_setzero_ps(); ZMM_TILE_N];
+                for block in 0..nb {
+                    let mut acc = [_mm512_setzero_si512(); ZMM_TILE_N];
+                    let p0_blk = p_base_ptr.add((sr0 * nb + block) * 128);
+                    let p1_blk = p_base_ptr.add((sr1 * nb + block) * 128);
+                    for p in 0..4usize {
+                        let (w0, w1) =
+                            unpack_q4_0_pair(p0_blk.add(p * 32), p1_blk.add(p * 32), mask);
+                        let gbase = block * 32 + p * 8;
+                        for (t, acc_t) in acc.iter_mut().enumerate() {
+                            let bq_col = bq_p.add((j + t) * k + gbase);
+                            let a0 = (bq_col as *const i32).read_unaligned();
+                            let a1 = (bq_col.add(4) as *const i32).read_unaligned();
+                            *acc_t = _mm512_dpbusd_epi32(*acc_t, w0, _mm512_set1_epi32(a0));
+                            *acc_t = _mm512_dpbusd_epi32(*acc_t, w1, _mm512_set1_epi32(a1));
+                        }
+                    }
+                    let d_vec = load_scales_pair_permuted(
+                        s_base_ptr.add((sr0 * nb + block) * 8),
+                        s_base_ptr.add((sr1 * nb + block) * 8),
+                    );
+                    for (t, facc_t) in facc.iter_mut().enumerate() {
+                        let col = j + t;
+                        let xs = *bs_p.add(col * nb + block);
+                        let sx = *cs_p.add(col * nb + block);
+                        let adj = _mm512_sub_epi32(acc[t], _mm512_set1_epi32(sx << 3));
+                        let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                        *facc_t = _mm512_fmadd_ps(_mm512_cvtepi32_ps(adj), eff, *facc_t);
+                    }
+                }
+                for (t, &facc_t) in facc.iter().enumerate() {
+                    store_16_col(chunk, j + t, facc_t);
+                }
+                j += ZMM_TILE_N;
+            }
+            while j < n {
+                let mut facc = _mm512_setzero_ps();
+                for block in 0..nb {
+                    let mut acc = _mm512_setzero_si512();
+                    let p0_blk = p_base_ptr.add((sr0 * nb + block) * 128);
+                    let p1_blk = p_base_ptr.add((sr1 * nb + block) * 128);
+                    for p in 0..4usize {
+                        let (w0, w1) =
+                            unpack_q4_0_pair(p0_blk.add(p * 32), p1_blk.add(p * 32), mask);
+                        let bq_col = bq_p.add(j * k + block * 32 + p * 8);
+                        let a0 = (bq_col as *const i32).read_unaligned();
+                        let a1 = (bq_col.add(4) as *const i32).read_unaligned();
+                        acc = _mm512_dpbusd_epi32(acc, w0, _mm512_set1_epi32(a0));
+                        acc = _mm512_dpbusd_epi32(acc, w1, _mm512_set1_epi32(a1));
+                    }
+                    let d_vec = load_scales_pair_permuted(
+                        s_base_ptr.add((sr0 * nb + block) * 8),
+                        s_base_ptr.add((sr1 * nb + block) * 8),
+                    );
+                    let xs = *bs_p.add(j * nb + block);
+                    let sx = *cs_p.add(j * nb + block);
+                    let adj = _mm512_sub_epi32(acc, _mm512_set1_epi32(sx << 3));
+                    let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                    facc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(adj), eff, facc);
+                }
+                store_16_col(chunk, j, facc);
+                j += 1;
+            }
+        };
+
+        let chunk_elems = 16 * n;
+        let depth = m * n * k;
+        if n == 1 {
+            crate::backend::cpu::par_rows_n(out, chunk_elems, 1, compute_pair);
+        } else {
+            crate::backend::cpu::par_rows_n_work(out, chunk_elems, 1, depth, compute_pair);
+        }
+    }
+
+    /// True 512-bit ZMM AVX-512 VNNI repacked Q4_0 × Q8_0 GEMM writing row-major `out[n, m]`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        if !m.is_multiple_of(16) {
+            unsafe {
+                gemm_q4_0_8x8_q8_0_rowmajor(packed, scales, b_scales, b_quants, out, n, m, k);
+            }
+            return;
+        }
+        debug_assert_eq!(k % 32, 0);
+        let nb = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert!(packed.len() >= (m / 8) * nb * 128);
+        debug_assert!(scales.len() >= (m / 8) * nb * 8);
+        debug_assert!(b_quants.len() >= n * k);
+        debug_assert!(b_scales.len() >= n * nb);
+
+        unsafe {
+            with_packed_q8_panel8_avx512(b_scales, b_quants, n, k, |packed_b| {
+                let pb_q_ptr = packed_b.quants.as_ptr() as usize;
+                let pb_s_ptr = packed_b.scales.as_ptr() as usize;
+                let pb_c_ptr = packed_b.col_sums.as_ptr() as usize;
+                let ts_ptr = packed_b.tail_sums.as_ptr() as usize;
+                let n_panels = packed_b.n_panels;
+                let packed_ptr = packed.as_ptr() as usize;
+                let scales_ptr = scales.as_ptr() as usize;
+                let b_scales_ptr = b_scales.as_ptr() as usize;
+                let b_quants_ptr = b_quants.as_ptr() as usize;
+                let out_ptr = out.as_mut_ptr() as usize;
+
+                let compute_pair = |sr2: usize| {
+                    const ZMM_TILE_N: usize = 8;
+                    const NB_CHUNK: usize = 128;
+                    const PANEL_BLK: usize = 8;
+                    let sr0 = sr2 * 2;
+                    let sr1 = sr0 + 1;
+                    let row_base = sr2 * 16;
+                    let mask = _mm512_set1_epi32(0x0F0F_0F0Fu32 as i32);
+                    let p_base_ptr = packed_ptr as *const u8;
+                    let s_base_ptr = scales_ptr as *const f32;
+                    let pb_q_p = pb_q_ptr as *const u8;
+                    let pb_s_p = pb_s_ptr as *const f32;
+                    let pb_c_p = pb_c_ptr as *const i32;
+                    let bs_p = b_scales_ptr as *const f32;
+                    let bq_p = b_quants_ptr as *const i8;
+                    let ts_p = ts_ptr as *const i32;
+                    let out_p = out_ptr as *mut f32;
+
+                    let p0_row = p_base_ptr.add(sr0 * nb * 128);
+                    let p1_row = p_base_ptr.add(sr1 * nb * 128);
+                    let s0_row = s_base_ptr.add(sr0 * nb * 8);
+                    let s1_row = s_base_ptr.add(sr1 * nb * 8);
+
+                    if nb <= NB_CHUNK {
+                        for jp in 0..n_panels {
+                            let j = jp * ZMM_TILE_N;
+                            let mut facc = [_mm512_setzero_ps(); ZMM_TILE_N];
+                            let pk_panel = pb_q_p.add(jp * nb * 256);
+                            let meta_panel = jp * nb * 8;
+                            for block in 0..nb {
+                                let mut acc = [_mm512_setzero_si512(); ZMM_TILE_N];
+                                let p0_blk = p0_row.add(block * 128);
+                                let p1_blk = p1_row.add(block * 128);
+                                let pk_blk = pk_panel.add(block * 256);
+                                _mm_prefetch::<_MM_HINT_T0>(p0_blk.add(256) as *const i8);
+                                _mm_prefetch::<_MM_HINT_T0>(p1_blk.add(256) as *const i8);
+                                for p in 0..4usize {
+                                    let (w0, w1) = unpack_q4_0_pair(
+                                        p0_blk.add(p * 32),
+                                        p1_blk.add(p * 32),
+                                        mask,
+                                    );
+                                    let pk = pk_blk.add(p * 64) as *const i32;
+                                    for (t, acc_t) in acc.iter_mut().enumerate() {
+                                        let a0 = *pk.add(t * 2);
+                                        let a1 = *pk.add(t * 2 + 1);
+                                        *acc_t =
+                                            _mm512_dpbusd_epi32(*acc_t, w0, _mm512_set1_epi32(a0));
+                                        *acc_t =
+                                            _mm512_dpbusd_epi32(*acc_t, w1, _mm512_set1_epi32(a1));
+                                    }
+                                }
+                                let d_vec = load_scales_pair_permuted(
+                                    s0_row.add(block * 8),
+                                    s1_row.add(block * 8),
+                                );
+                                let meta_off = meta_panel + block * 8;
+                                for (t, facc_t) in facc.iter_mut().enumerate() {
+                                    let xs = *pb_s_p.add(meta_off + t);
+                                    let sx = *pb_c_p.add(meta_off + t);
+                                    let adj = _mm512_sub_epi32(acc[t], _mm512_set1_epi32(sx << 3));
+                                    let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                                    *facc_t =
+                                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(adj), eff, *facc_t);
+                                }
+                            }
+                            for (t, &facc_t) in facc.iter().enumerate() {
+                                let lin = _mm512_shuffle_f32x4::<0xD8>(facc_t, facc_t);
+                                _mm512_storeu_ps(out_p.add((j + t) * m + row_base), lin);
+                            }
+                        }
+                    } else {
+                        // K-block when nb > 64 (k > 2048) so each (sr0, sr1) weight chunk
+                        // stays <= 16 KB in L1D across all panels in an N-tile.
+                        let mut pacc = [_mm512_setzero_ps(); PANEL_BLK * ZMM_TILE_N];
+                        let mut p0 = 0usize;
+                        while p0 < n_panels {
+                            let p1 = (p0 + PANEL_BLK).min(n_panels);
+                            let mut b0 = 0usize;
+                            while b0 < nb {
+                                let b1 = (b0 + NB_CHUNK).min(nb);
+                                let first_k = b0 == 0;
+                                let last_k = b1 == nb;
+                                for jp in p0..p1 {
+                                    let p_rel = (jp - p0) * ZMM_TILE_N;
+                                    let mut facc = if first_k {
+                                        [_mm512_setzero_ps(); ZMM_TILE_N]
+                                    } else {
+                                        [
+                                            pacc[p_rel],
+                                            pacc[p_rel + 1],
+                                            pacc[p_rel + 2],
+                                            pacc[p_rel + 3],
+                                            pacc[p_rel + 4],
+                                            pacc[p_rel + 5],
+                                            pacc[p_rel + 6],
+                                            pacc[p_rel + 7],
+                                        ]
+                                    };
+                                    let pk_panel = pb_q_p.add(jp * nb * 256);
+                                    let meta_panel = jp * nb * 8;
+                                    for block in b0..b1 {
+                                        let mut acc = [_mm512_setzero_si512(); ZMM_TILE_N];
+                                        let p0_blk = p0_row.add(block * 128);
+                                        let p1_blk = p1_row.add(block * 128);
+                                        let pk_blk = pk_panel.add(block * 256);
+                                        _mm_prefetch::<_MM_HINT_T0>(p0_blk.add(256) as *const i8);
+                                        _mm_prefetch::<_MM_HINT_T0>(p1_blk.add(256) as *const i8);
+                                        for p in 0..4usize {
+                                            let (w0, w1) = unpack_q4_0_pair(
+                                                p0_blk.add(p * 32),
+                                                p1_blk.add(p * 32),
+                                                mask,
+                                            );
+                                            let pk = pk_blk.add(p * 64) as *const i32;
+                                            for (t, acc_t) in acc.iter_mut().enumerate() {
+                                                let a0 = *pk.add(t * 2);
+                                                let a1 = *pk.add(t * 2 + 1);
+                                                *acc_t = _mm512_dpbusd_epi32(
+                                                    *acc_t,
+                                                    w0,
+                                                    _mm512_set1_epi32(a0),
+                                                );
+                                                *acc_t = _mm512_dpbusd_epi32(
+                                                    *acc_t,
+                                                    w1,
+                                                    _mm512_set1_epi32(a1),
+                                                );
+                                            }
+                                        }
+                                        let d_vec = load_scales_pair_permuted(
+                                            s0_row.add(block * 8),
+                                            s1_row.add(block * 8),
+                                        );
+                                        let meta_off = meta_panel + block * 8;
+                                        for (t, facc_t) in facc.iter_mut().enumerate() {
+                                            let xs = *pb_s_p.add(meta_off + t);
+                                            let sx = *pb_c_p.add(meta_off + t);
+                                            let adj = _mm512_sub_epi32(
+                                                acc[t],
+                                                _mm512_set1_epi32(sx << 3),
+                                            );
+                                            let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                                            *facc_t = _mm512_fmadd_ps(
+                                                _mm512_cvtepi32_ps(adj),
+                                                eff,
+                                                *facc_t,
+                                            );
+                                        }
+                                    }
+                                    if last_k {
+                                        let j = jp * ZMM_TILE_N;
+                                        for (t, &facc_t) in facc.iter().enumerate() {
+                                            let lin = _mm512_shuffle_f32x4::<0xD8>(facc_t, facc_t);
+                                            _mm512_storeu_ps(
+                                                out_p.add((j + t) * m + row_base),
+                                                lin,
+                                            );
+                                        }
+                                    } else {
+                                        pacc[p_rel..p_rel + ZMM_TILE_N].copy_from_slice(&facc);
+                                    }
+                                }
+                                b0 = b1;
+                            }
+                            p0 = p1;
+                        }
+                    }
+                    let tail_base = n_panels * ZMM_TILE_N;
+                    for j in tail_base..n {
+                        let tail_idx = j - tail_base;
+                        let mut facc = _mm512_setzero_ps();
+                        for block in 0..nb {
+                            let mut acc = _mm512_setzero_si512();
+                            let p0_blk = p0_row.add(block * 128);
+                            let p1_blk = p1_row.add(block * 128);
+                            for p in 0..4usize {
+                                let (w0, w1) =
+                                    unpack_q4_0_pair(p0_blk.add(p * 32), p1_blk.add(p * 32), mask);
+                                let bq_col = bq_p.add(j * k + block * 32 + p * 8);
+                                let a0 = (bq_col as *const i32).read_unaligned();
+                                let a1 = (bq_col.add(4) as *const i32).read_unaligned();
+                                acc = _mm512_dpbusd_epi32(acc, w0, _mm512_set1_epi32(a0));
+                                acc = _mm512_dpbusd_epi32(acc, w1, _mm512_set1_epi32(a1));
+                            }
+                            let d_vec = load_scales_pair_permuted(
+                                s0_row.add(block * 8),
+                                s1_row.add(block * 8),
+                            );
+                            let xs = *bs_p.add(j * nb + block);
+                            let sx = *ts_p.add(tail_idx * nb + block);
+                            let adj = _mm512_sub_epi32(acc, _mm512_set1_epi32(sx << 3));
+                            let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                            facc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(adj), eff, facc);
+                        }
+                        let lin = _mm512_shuffle_f32x4::<0xD8>(facc, facc);
+                        _mm512_storeu_ps(out_p.add(j * m + row_base), lin);
+                    }
+                };
+
+                let pairs = m / 16;
+                if pairs >= 2 {
+                    if n == 1 {
+                        crate::backend::cpu::par_range(pairs, 1, |start_p, count| {
+                            for sr2 in start_p..start_p + count {
+                                compute_pair(sr2);
+                            }
+                        });
+                    } else {
+                        let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                        crate::backend::cpu::par_range_prefill_active(
+                            pairs,
+                            1,
+                            max_active,
+                            |start_p, count| {
+                                for sr2 in start_p..start_p + count {
+                                    compute_pair(sr2);
+                                }
+                            },
+                        );
+                    }
+                } else {
+                    (0..pairs).for_each(compute_pair);
+                }
+            });
+        }
+    }
+
+    /// True 512-bit ZMM AVX-512 VNNI fused Gate + Up + SiLU Q4_0 × Q8_0 GEMM (`out[n, m]`).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemm_q4_0_gate_up_silu_rowmajor_zmm(
+        gate_packed: &[u8],
+        gate_scales: &[f32],
+        up_packed: &[u8],
+        up_scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        if !m.is_multiple_of(16) {
+            unsafe {
+                gemm_q4_0_gate_up_silu_rowmajor(
+                    gate_packed,
+                    gate_scales,
+                    up_packed,
+                    up_scales,
+                    b_scales,
+                    b_quants,
+                    out,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            return;
+        }
+        debug_assert_eq!(k % 32, 0);
+        let nb = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert!(gate_packed.len() >= (m / 8) * nb * 128);
+        debug_assert!(up_packed.len() >= (m / 8) * nb * 128);
+        debug_assert!(gate_scales.len() >= (m / 8) * nb * 8);
+        debug_assert!(up_scales.len() >= (m / 8) * nb * 8);
+        debug_assert!(b_quants.len() >= n * k);
+        debug_assert!(b_scales.len() >= n * nb);
+
+        unsafe {
+            with_packed_q8_panel8_avx512(b_scales, b_quants, n, k, |packed_b| {
+                let pb_q_ptr = packed_b.quants.as_ptr() as usize;
+                let pb_s_ptr = packed_b.scales.as_ptr() as usize;
+                let pb_c_ptr = packed_b.col_sums.as_ptr() as usize;
+                let ts_ptr = packed_b.tail_sums.as_ptr() as usize;
+                let n_panels = packed_b.n_panels;
+                let gp_ptr = gate_packed.as_ptr() as usize;
+                let gs_ptr = gate_scales.as_ptr() as usize;
+                let up_ptr = up_packed.as_ptr() as usize;
+                let us_ptr = up_scales.as_ptr() as usize;
+                let bs_ptr = b_scales.as_ptr() as usize;
+                let bq_ptr = b_quants.as_ptr() as usize;
+                let out_ptr = out.as_mut_ptr() as usize;
+
+                let silu_store_16 = |dst: *mut f32, gv: __m512, uv: __m512| {
+                    // Vectorized AVX-512F exp(-gv) via Cody-Waite range reduction +
+                    // degree-6 polynomial + native VSCALEFPS, then gv / (1 + exp(-gv)) * uv.
+                    let neg_g = _mm512_sub_ps(_mm512_setzero_ps(), gv);
+                    let x = _mm512_max_ps(
+                        _mm512_min_ps(neg_g, _mm512_set1_ps(88.0)),
+                        _mm512_set1_ps(-88.0),
+                    );
+                    let r = _mm512_roundscale_ps::<0>(_mm512_mul_ps(
+                        x,
+                        _mm512_set1_ps(std::f32::consts::LOG2_E),
+                    ));
+                    #[allow(clippy::excessive_precision)]
+                    let f = _mm512_fnmadd_ps(r, _mm512_set1_ps(0.693145751953125), x);
+                    #[allow(clippy::excessive_precision)]
+                    let f = _mm512_fnmadd_ps(r, _mm512_set1_ps(1.4286068203094172e-6), f);
+                    let mut p = _mm512_set1_ps(1.0 / 720.0);
+                    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0 / 120.0));
+                    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0 / 24.0));
+                    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0 / 6.0));
+                    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.5));
+                    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0));
+                    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0));
+                    let exp_neg_g = _mm512_scalef_ps(p, r);
+                    let denom = _mm512_add_ps(_mm512_set1_ps(1.0), exp_neg_g);
+                    let out_v = _mm512_mul_ps(_mm512_div_ps(gv, denom), uv);
+                    let lin = _mm512_shuffle_f32x4::<0xD8>(out_v, out_v);
+                    _mm512_storeu_ps(dst, lin);
+                };
+
+                let compute_pair = |sr2: usize| {
+                    const ZMM_TILE_N: usize = 8;
+                    const NB_CHUNK: usize = 64;
+                    const PANEL_BLK: usize = 8;
+                    let sr0 = sr2 * 2;
+                    let sr1 = sr0 + 1;
+                    let row_base = sr2 * 16;
+                    let mask = _mm512_set1_epi32(0x0F0F_0F0Fu32 as i32);
+                    let gp = gp_ptr as *const u8;
+                    let gs = gs_ptr as *const f32;
+                    let up_p = up_ptr as *const u8;
+                    let us = us_ptr as *const f32;
+                    let pb_q_p = pb_q_ptr as *const u8;
+                    let pb_s_p = pb_s_ptr as *const f32;
+                    let pb_c_p = pb_c_ptr as *const i32;
+                    let bs_p = bs_ptr as *const f32;
+                    let bq_p = bq_ptr as *const i8;
+                    let ts_p = ts_ptr as *const i32;
+                    let out_p = out_ptr as *mut f32;
+
+                    let gp0_row = gp.add(sr0 * nb * 128);
+                    let gp1_row = gp.add(sr1 * nb * 128);
+                    let up0_row = up_p.add(sr0 * nb * 128);
+                    let up1_row = up_p.add(sr1 * nb * 128);
+                    let gs0_row = gs.add(sr0 * nb * 8);
+                    let gs1_row = gs.add(sr1 * nb * 8);
+                    let us0_row = us.add(sr0 * nb * 8);
+                    let us1_row = us.add(sr1 * nb * 8);
+
+                    // Process full 8-column panels with K-tiling (`NB_CHUNK=32, PANEL_BLK=8`)
+                    // so Gate + Up weight slices (~16 KB) stay L1D-resident across all 8
+                    // panels and each Q4_0 weight pair is unpacked once per 8 columns.
+                    let mut pacc_g = [_mm512_setzero_ps(); PANEL_BLK * ZMM_TILE_N];
+                    let mut pacc_u = [_mm512_setzero_ps(); PANEL_BLK * ZMM_TILE_N];
+                    let mut p0 = 0usize;
+                    while p0 < n_panels {
+                        let p1 = (p0 + PANEL_BLK).min(n_panels);
+                        let mut b0 = 0usize;
+                        while b0 < nb {
+                            let b1 = (b0 + NB_CHUNK).min(nb);
+                            let first_k = b0 == 0;
+                            let last_k = b1 == nb;
+                            for jp in p0..p1 {
+                                let p_rel = (jp - p0) * ZMM_TILE_N;
+                                let mut gfacc = if first_k {
+                                    [_mm512_setzero_ps(); ZMM_TILE_N]
+                                } else {
+                                    let mut arr = [_mm512_setzero_ps(); ZMM_TILE_N];
+                                    arr.copy_from_slice(&pacc_g[p_rel..p_rel + ZMM_TILE_N]);
+                                    arr
+                                };
+                                let mut ufacc = if first_k {
+                                    [_mm512_setzero_ps(); ZMM_TILE_N]
+                                } else {
+                                    let mut arr = [_mm512_setzero_ps(); ZMM_TILE_N];
+                                    arr.copy_from_slice(&pacc_u[p_rel..p_rel + ZMM_TILE_N]);
+                                    arr
+                                };
+                                let pk_panel = pb_q_p.add(jp * nb * 256);
+                                let meta_panel = jp * nb * 8;
+
+                                for block in b0..b1 {
+                                    let mut gacc = [_mm512_setzero_si512(); ZMM_TILE_N];
+                                    let mut uacc = [_mm512_setzero_si512(); ZMM_TILE_N];
+                                    let gp0 = gp0_row.add(block * 128);
+                                    let gp1 = gp1_row.add(block * 128);
+                                    let up0 = up0_row.add(block * 128);
+                                    let up1 = up1_row.add(block * 128);
+                                    let pk_blk = pk_panel.add(block * 256);
+                                    _mm_prefetch::<_MM_HINT_T0>(gp0.add(256) as *const i8);
+                                    _mm_prefetch::<_MM_HINT_T0>(gp1.add(256) as *const i8);
+                                    _mm_prefetch::<_MM_HINT_T0>(up0.add(256) as *const i8);
+                                    _mm_prefetch::<_MM_HINT_T0>(up1.add(256) as *const i8);
+                                    for p in 0..4usize {
+                                        let pk = pk_blk.add(p * 64) as *const i32;
+                                        let (wg0, wg1) = unpack_q4_0_pair(
+                                            gp0.add(p * 32),
+                                            gp1.add(p * 32),
+                                            mask,
+                                        );
+                                        for (t, g_dst) in gacc.iter_mut().enumerate() {
+                                            let a0 = _mm512_set1_epi32(*pk.add(t * 2));
+                                            let a1 = _mm512_set1_epi32(*pk.add(t * 2 + 1));
+                                            *g_dst = _mm512_dpbusd_epi32(*g_dst, wg0, a0);
+                                            *g_dst = _mm512_dpbusd_epi32(*g_dst, wg1, a1);
+                                        }
+                                        let (wu0, wu1) = unpack_q4_0_pair(
+                                            up0.add(p * 32),
+                                            up1.add(p * 32),
+                                            mask,
+                                        );
+                                        for (t, u_dst) in uacc.iter_mut().enumerate() {
+                                            let a0 = _mm512_set1_epi32(*pk.add(t * 2));
+                                            let a1 = _mm512_set1_epi32(*pk.add(t * 2 + 1));
+                                            *u_dst = _mm512_dpbusd_epi32(*u_dst, wu0, a0);
+                                            *u_dst = _mm512_dpbusd_epi32(*u_dst, wu1, a1);
+                                        }
+                                    }
+                                    let dg = load_scales_pair_permuted(
+                                        gs0_row.add(block * 8),
+                                        gs1_row.add(block * 8),
+                                    );
+                                    let du = load_scales_pair_permuted(
+                                        us0_row.add(block * 8),
+                                        us1_row.add(block * 8),
+                                    );
+                                    let meta_off = meta_panel + block * 8;
+                                    for t in 0..ZMM_TILE_N {
+                                        let xs = *pb_s_p.add(meta_off + t);
+                                        let sx8 =
+                                            _mm512_set1_epi32((*pb_c_p.add(meta_off + t)) << 3);
+                                        let vxs = _mm512_set1_ps(xs);
+                                        let gadj = _mm512_sub_epi32(gacc[t], sx8);
+                                        let uadj = _mm512_sub_epi32(uacc[t], sx8);
+                                        gfacc[t] = _mm512_fmadd_ps(
+                                            _mm512_cvtepi32_ps(gadj),
+                                            _mm512_mul_ps(dg, vxs),
+                                            gfacc[t],
+                                        );
+                                        ufacc[t] = _mm512_fmadd_ps(
+                                            _mm512_cvtepi32_ps(uadj),
+                                            _mm512_mul_ps(du, vxs),
+                                            ufacc[t],
+                                        );
+                                    }
+                                }
+                                if last_k {
+                                    let j_base = jp * ZMM_TILE_N;
+                                    for t in 0..ZMM_TILE_N {
+                                        silu_store_16(
+                                            out_p.add((j_base + t) * m + row_base),
+                                            gfacc[t],
+                                            ufacc[t],
+                                        );
+                                    }
+                                } else {
+                                    pacc_g[p_rel..p_rel + ZMM_TILE_N].copy_from_slice(&gfacc);
+                                    pacc_u[p_rel..p_rel + ZMM_TILE_N].copy_from_slice(&ufacc);
+                                }
+                            }
+                            b0 = b1;
+                        }
+                        p0 = p1;
+                    }
+                    let tail_base = n_panels * 8;
+                    for j in tail_base..n {
+                        let tail_idx = j - tail_base;
+                        let mut gfacc = _mm512_setzero_ps();
+                        let mut ufacc = _mm512_setzero_ps();
+                        for block in 0..nb {
+                            let mut gacc = _mm512_setzero_si512();
+                            let mut uacc = _mm512_setzero_si512();
+                            let gp0 = gp.add((sr0 * nb + block) * 128);
+                            let gp1 = gp.add((sr1 * nb + block) * 128);
+                            let up0 = up_p.add((sr0 * nb + block) * 128);
+                            let up1 = up_p.add((sr1 * nb + block) * 128);
+                            for p in 0..4usize {
+                                let (wg0, wg1) =
+                                    unpack_q4_0_pair(gp0.add(p * 32), gp1.add(p * 32), mask);
+                                let (wu0, wu1) =
+                                    unpack_q4_0_pair(up0.add(p * 32), up1.add(p * 32), mask);
+                                let bq_col = bq_p.add(j * k + block * 32 + p * 8);
+                                let a0 = _mm512_set1_epi32((bq_col as *const i32).read_unaligned());
+                                let a1 = _mm512_set1_epi32(
+                                    (bq_col.add(4) as *const i32).read_unaligned(),
+                                );
+                                gacc = _mm512_dpbusd_epi32(gacc, wg0, a0);
+                                gacc = _mm512_dpbusd_epi32(gacc, wg1, a1);
+                                uacc = _mm512_dpbusd_epi32(uacc, wu0, a0);
+                                uacc = _mm512_dpbusd_epi32(uacc, wu1, a1);
+                            }
+                            let dg = load_scales_pair_permuted(
+                                gs.add((sr0 * nb + block) * 8),
+                                gs.add((sr1 * nb + block) * 8),
+                            );
+                            let du = load_scales_pair_permuted(
+                                us.add((sr0 * nb + block) * 8),
+                                us.add((sr1 * nb + block) * 8),
+                            );
+                            let xs = *bs_p.add(j * nb + block);
+                            let sx8 = _mm512_set1_epi32((*ts_p.add(tail_idx * nb + block)) << 3);
+                            let vxs = _mm512_set1_ps(xs);
+                            gfacc = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(_mm512_sub_epi32(gacc, sx8)),
+                                _mm512_mul_ps(dg, vxs),
+                                gfacc,
+                            );
+                            ufacc = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(_mm512_sub_epi32(uacc, sx8)),
+                                _mm512_mul_ps(du, vxs),
+                                ufacc,
+                            );
+                        }
+                        silu_store_16(out_p.add(j * m + row_base), gfacc, ufacc);
+                    }
+                };
+
+                let pairs = m / 16;
+                if pairs >= 2 {
+                    if n == 1 {
+                        crate::backend::cpu::par_range(pairs, 1, |start_p, count| {
+                            for sr2 in start_p..start_p + count {
+                                compute_pair(sr2);
+                            }
+                        });
+                    } else {
+                        let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                        crate::backend::cpu::par_range_prefill_active(
+                            pairs,
+                            1,
+                            max_active,
+                            |start_p, count| {
+                                for sr2 in start_p..start_p + count {
+                                    compute_pair(sr2);
+                                }
+                            },
+                        );
+                    }
+                } else {
+                    (0..pairs).for_each(compute_pair);
+                }
+            });
+        }
+    }
+
+    /// 4-block parallel AVX-512 + F16C quantizer matching `quantize_f32_to_q8_0_avx512` bit-for-bit.
+    #[target_feature(enable = "avx512f,avx512vl,avx2,f16c")]
+    unsafe fn quantize_f32_to_q8_0_avx512_f16c(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+        unsafe {
+            let k = x.len();
+            let nb = k / 32;
+            let abs_mask = _mm512_set1_ps(f32::from_bits(0x7FFF_FFFF));
+            let inv_127 = _mm_set1_ps(1.0 / 127.0);
+            let v_inf = _mm_set1_ps(f32::INFINITY);
+            let mut bi = 0usize;
+            while bi + 4 <= nb {
+                let base = bi * 32;
+                let xp = x.as_ptr().add(base);
+                let x0 = _mm512_loadu_ps(xp);
+                let x1 = _mm512_loadu_ps(xp.add(16));
+                let x2 = _mm512_loadu_ps(xp.add(32));
+                let x3 = _mm512_loadu_ps(xp.add(48));
+                let x4 = _mm512_loadu_ps(xp.add(64));
+                let x5 = _mm512_loadu_ps(xp.add(80));
+                let x6 = _mm512_loadu_ps(xp.add(96));
+                let x7 = _mm512_loadu_ps(xp.add(112));
+
+                let a0 = _mm512_max_ps(_mm512_and_ps(x0, abs_mask), _mm512_and_ps(x1, abs_mask));
+                let a1 = _mm512_max_ps(_mm512_and_ps(x2, abs_mask), _mm512_and_ps(x3, abs_mask));
+                let a2 = _mm512_max_ps(_mm512_and_ps(x4, abs_mask), _mm512_and_ps(x5, abs_mask));
+                let a3 = _mm512_max_ps(_mm512_and_ps(x6, abs_mask), _mm512_and_ps(x7, abs_mask));
+
+                let hi0 =
+                    _mm256_max_ps(_mm512_castps512_ps256(a0), _mm512_extractf32x8_ps::<1>(a0));
+                let hi1 =
+                    _mm256_max_ps(_mm512_castps512_ps256(a1), _mm512_extractf32x8_ps::<1>(a1));
+                let hi2 =
+                    _mm256_max_ps(_mm512_castps512_ps256(a2), _mm512_extractf32x8_ps::<1>(a2));
+                let hi3 =
+                    _mm256_max_ps(_mm512_castps512_ps256(a3), _mm512_extractf32x8_ps::<1>(a3));
+                let m0 = _mm_max_ps(_mm256_castps256_ps128(hi0), _mm256_extractf128_ps::<1>(hi0));
+                let m1 = _mm_max_ps(_mm256_castps256_ps128(hi1), _mm256_extractf128_ps::<1>(hi1));
+                let m2 = _mm_max_ps(_mm256_castps256_ps128(hi2), _mm256_extractf128_ps::<1>(hi2));
+                let m3 = _mm_max_ps(_mm256_castps256_ps128(hi3), _mm256_extractf128_ps::<1>(hi3));
+                let t0 = _mm_unpacklo_ps(m0, m1);
+                let t1 = _mm_unpackhi_ps(m0, m1);
+                let t2 = _mm_unpacklo_ps(m2, m3);
+                let t3 = _mm_unpackhi_ps(m2, m3);
+                let r0 = _mm_movelh_ps(t0, t2);
+                let r1 = _mm_movehl_ps(t2, t0);
+                let r2 = _mm_movelh_ps(t1, t3);
+                let r3 = _mm_movehl_ps(t3, t1);
+                let amax4 = _mm_max_ps(_mm_max_ps(r0, r1), _mm_max_ps(r2, r3));
+
+                // Check NaN on raw inputs BEFORE `_mm*_max_ps`: on x86 VMAXPS(NaN, finite)
+                // returns the second operand and silently drops NaNs.
+                let nan_mask = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x0, x0)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x1, x1)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x2, x2)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x3, x3)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x4, x4)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x5, x5)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x6, x6)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(x7, x7);
+                let finite4 = _mm_movemask_ps(_mm_cmplt_ps(amax4, v_inf));
+                if nan_mask != 0 || finite4 != 0xF {
+                    quantize_f32_to_q8_0_avx512_blocks(
+                        &x[base..base + 128],
+                        &mut scales[bi..bi + 4],
+                        &mut quants[base..base + 128],
+                    );
+                    bi += 4;
+                    continue;
+                }
+
+                let d4 = _mm_mul_ps(amax4, inv_127);
+                let h4 = _mm_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(d4);
+                let r4 = _mm_cvtph_ps(h4);
+                let bump = _mm_cmplt_ps(r4, d4);
+                let inc = _mm_packs_epi32(
+                    _mm_srli_epi32::<31>(_mm_castps_si128(bump)),
+                    _mm_setzero_si128(),
+                );
+                let d4_final = _mm_cvtph_ps(_mm_add_epi16(h4, inc));
+                _mm_storeu_ps(scales.as_mut_ptr().add(bi), d4_final);
+
+                let valid = _mm_and_ps(
+                    _mm_cmpneq_ps(d4_final, _mm_setzero_ps()),
+                    _mm_cmplt_ps(d4_final, v_inf),
+                );
+                let id4 = _mm_and_ps(_mm_div_ps(_mm_set1_ps(1.0), d4_final), valid);
+                let qp = quants.as_mut_ptr().add(base);
+
+                macro_rules! store_qblk {
+                    ($vx0:expr, $vx1:expr, $lane:expr, $off:expr) => {{
+                        let id_s = _mm512_castps128_ps512(_mm_permute_ps::<$lane>(id4));
+                        let idv = _mm512_broadcastss_ps(_mm512_castps512_ps128(id_s));
+                        let p0 = _mm512_mul_ps($vx0, idv);
+                        let p1 = _mm512_mul_ps($vx1, idv);
+                        let p0 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p0, p0), p0);
+                        let p1 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p1, p1), p1);
+                        _mm_storeu_si128(
+                            qp.add($off) as *mut __m128i,
+                            _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(p0)),
+                        );
+                        _mm_storeu_si128(
+                            qp.add($off + 16) as *mut __m128i,
+                            _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(p1)),
+                        );
+                    }};
+                }
+                store_qblk!(x0, x1, 0b00_00_00_00, 0);
+                store_qblk!(x2, x3, 0b01_01_01_01, 32);
+                store_qblk!(x4, x5, 0b10_10_10_10, 64);
+                store_qblk!(x6, x7, 0b11_11_11_11, 96);
+                bi += 4;
+            }
+            if bi < nb {
+                quantize_f32_to_q8_0_avx512_blocks(
+                    &x[bi * 32..],
+                    &mut scales[bi..],
+                    &mut quants[bi * 32..],
+                );
+            }
+        }
+    }
+
+    /// Quantize `f32` blocks of 32 elements into Q8_0 scales and `i8` quants using AVX-512.
+    #[target_feature(enable = "avx512f,avx512vl,avx2")]
+    unsafe fn quantize_f32_to_q8_0_avx512_blocks(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+        unsafe {
+            let k = x.len();
+            let abs_mask = _mm512_set1_ps(f32::from_bits(0x7FFF_FFFF));
+            #[allow(clippy::needless_range_loop)]
+            for bi in 0..k / 32 {
+                let scale = &mut scales[bi];
+                let base = bi * 32;
+                let x_ptr = x.as_ptr().add(base);
+                let v0 = _mm512_loadu_ps(x_ptr);
+                let v1 = _mm512_loadu_ps(x_ptr.add(16));
+
+                let has_nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v0, v0)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v1, v1);
+                let amax = if has_nan != 0 {
+                    f32::NAN
+                } else {
+                    _mm512_reduce_max_ps(_mm512_max_ps(
+                        _mm512_and_ps(v0, abs_mask),
+                        _mm512_and_ps(v1, abs_mask),
+                    ))
+                };
+
+                let d = crate::quant::q8_0_block_scale(amax);
+                let id = crate::quant::q8_0_block_recip(d);
+                *scale = d;
+
+                let idv = _mm512_set1_ps(id);
+                let p0 = _mm512_mul_ps(v0, idv);
+                let p1 = _mm512_mul_ps(v1, idv);
+                let p0 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p0, p0), p0);
+                let p1 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p1, p1), p1);
+                let q0 = _mm512_cvtps_epi32(p0);
+                let q1 = _mm512_cvtps_epi32(p1);
+                let out = quants.as_mut_ptr().add(base);
+                _mm_storeu_si128(out as *mut __m128i, _mm512_cvtsepi32_epi8(q0));
+                _mm_storeu_si128(out.add(16) as *mut __m128i, _mm512_cvtsepi32_epi8(q1));
+            }
+        }
+    }
 
     /// Quantize `x` to Q8_0 blocks (scales + int8 quants).
     ///
@@ -17992,68 +19792,826 @@ pub(crate) mod avx512_vnni {
             debug_assert!(scales.len() >= k / 32);
             debug_assert!(quants.len() >= k);
 
-            let abs_mask = _mm512_set1_ps(f32::from_bits(0x7FFF_FFFF));
-            // Indexed rather than `scales.iter_mut().take(..).enumerate()`: the
-            // iterator form measured ~6% slower on prefill (LFM2.5-350M Q4_0,
-            // Zen 5 — 175 vs 190 tok/s median over 3 reps), which is why the
-            // lint is silenced here instead of obeyed.
-            #[allow(clippy::needless_range_loop)]
-            for bi in 0..k / 32 {
-                let scale = &mut scales[bi];
-                let base = bi * 32;
-                let x_ptr = x.as_ptr().add(base);
-                let v0 = _mm512_loadu_ps(x_ptr);
-                let v1 = _mm512_loadu_ps(x_ptr.add(16));
+            if k >= 128 && is_x86_feature_detected!("f16c") {
+                quantize_f32_to_q8_0_avx512_f16c(x, scales, quants);
+            } else {
+                quantize_f32_to_q8_0_avx512_blocks(x, scales, quants);
+            }
+        }
+    }
 
-                // `_mm512_max_ps` returns its second operand when either is NaN, so a NaN
-                // would be dropped (or kept) depending on lane order. Detect it
-                // explicitly so a NaN anywhere in the block makes `amax` NaN, matching
-                // the NEON and portable quantizers.
-                let has_nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v0, v0)
-                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v1, v1);
-                let amax = if has_nan != 0 {
-                    f32::NAN
+    /// Packed Q8_0 activation panels for AVX-512 VNNI lin16 GEMM (`[n_panels, nb, 8_groups, TILE_N]`).
+    #[derive(Default)]
+    struct PackedQ8Lin16Panels {
+        /// Packed quantized activation words.
+        quants: Vec<i32>,
+        /// Per-block activation scales.
+        scales: Vec<f32>,
+        /// Per-block pre-shifted column sums (`sum << 3`) for full panels.
+        cs_shl3: Vec<i32>,
+        /// Per-block pre-shifted column sums (`sum << 3`) for remainder columns.
+        rem_cs_shl3: Vec<i32>,
+    }
+
+    std::thread_local! {
+        static Q8_LIN16_PANEL_SCRATCH: std::cell::RefCell<PackedQ8Lin16Panels> =
+            std::cell::RefCell::new(PackedQ8Lin16Panels::default());
+    }
+
+    /// Pack a tile range of Q8_0 activation columns into `PackedQ8Lin16Panels`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    #[inline(never)]
+    unsafe fn pack_q8_0_lin16_panel_worker<const TILE_N: usize>(
+        bq_ptr: usize,
+        bs_ptr: usize,
+        pq_ptr: usize,
+        ps_ptr: usize,
+        pc_ptr: usize,
+        nb: usize,
+        k: usize,
+        start_p: usize,
+        count: usize,
+    ) {
+        unsafe {
+            let ones = _mm256_set1_epi8(1);
+            let zero = _mm256_setzero_si256();
+            let bq_p = bq_ptr as *const i8;
+            let bs_p = bs_ptr as *const f32;
+            for jp in start_p..start_p + count {
+                let j0 = jp * TILE_N;
+                let pq_p = (pq_ptr as *mut i32).add(jp * nb * 8 * TILE_N);
+                let ps_p = (ps_ptr as *mut f32).add(jp * nb * TILE_N);
+                let pc_p = (pc_ptr as *mut i32).add(jp * nb * TILE_N);
+                for block in 0..nb {
+                    let off = block * 32;
+                    let q_blk = pq_p.add(block * 8 * TILE_N);
+                    let s_blk = ps_p.add(block * TILE_N);
+                    let c_blk = pc_p.add(block * TILE_N);
+                    for t in 0..TILE_N {
+                        let col = j0 + t;
+                        let r_ptr = bq_p.add(col * k + off);
+                        let v = _mm256_loadu_si256(r_ptr as *const __m256i);
+                        let dp = _mm256_dpbusd_epi32(zero, ones, v);
+                        let h1 = _mm256_hadd_epi32(dp, dp);
+                        let h2 = _mm256_hadd_epi32(h1, h1);
+                        let sum = _mm_cvtsi128_si32(_mm256_castsi256_si128(h2))
+                            + _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(h2));
+                        *c_blk.add(t) = sum << 3;
+                        *s_blk.add(t) = *bs_p.add(col * nb + block);
+                        let r_i32 = r_ptr as *const i32;
+                        for p in 0..4usize {
+                            *q_blk.add(p * 2 * TILE_N + t * 2) = r_i32.add(p).read_unaligned();
+                            *q_blk.add(p * 2 * TILE_N + t * 2 + 1) =
+                                r_i32.add(4 + p).read_unaligned();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pack `[n, k]` Q8_0 activations into thread-local `PackedQ8Lin16Panels`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn pack_q8_0_lin16_panels<const TILE_N: usize>(
+        b_scales: &[f32],
+        b_quants: &[i8],
+        n: usize,
+        k: usize,
+        scratch: &mut PackedQ8Lin16Panels,
+    ) {
+        unsafe {
+            let nb = k / 32;
+            let n_panels = n / TILE_N;
+            let rem = n - n_panels * TILE_N;
+
+            let q_words = n_panels * nb * 8 * TILE_N;
+            let meta_len = n_panels * nb * TILE_N;
+            if scratch.quants.len() < q_words {
+                scratch.quants.resize(q_words, 0);
+            }
+            if scratch.scales.len() < meta_len {
+                scratch.scales.resize(meta_len, 0.0);
+            }
+            if scratch.cs_shl3.len() < meta_len {
+                scratch.cs_shl3.resize(meta_len, 0);
+            }
+            if scratch.rem_cs_shl3.len() < rem * nb {
+                scratch.rem_cs_shl3.resize(rem * nb, 0);
+            }
+
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+            let pq_ptr = scratch.quants.as_mut_ptr() as usize;
+            let ps_ptr = scratch.scales.as_mut_ptr() as usize;
+            let pc_ptr = scratch.cs_shl3.as_mut_ptr() as usize;
+
+            if n_panels > 0 {
+                if n_panels * nb >= 192 && n_panels >= 2 {
+                    let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                    crate::backend::cpu::par_range_prefill_active(
+                        n_panels,
+                        1,
+                        max_active,
+                        |start_p, count| {
+                            pack_q8_0_lin16_panel_worker::<TILE_N>(
+                                bq_ptr, bs_ptr, pq_ptr, ps_ptr, pc_ptr, nb, k, start_p, count,
+                            );
+                        },
+                    );
                 } else {
-                    _mm512_reduce_max_ps(_mm512_max_ps(
-                        _mm512_and_ps(v0, abs_mask),
-                        _mm512_and_ps(v1, abs_mask),
-                    ))
-                };
+                    pack_q8_0_lin16_panel_worker::<TILE_N>(
+                        bq_ptr, bs_ptr, pq_ptr, ps_ptr, pc_ptr, nb, k, 0, n_panels,
+                    );
+                }
+            }
 
-                // The stored scale is the smallest f16 at least `amax / 127`, and the
-                // reciprocal comes from that stored scale, so no value quantizes
-                // past 127. A zero or non-finite scale (an all-zero block, NaN, an
-                // f16 overflow) would make `1.0 / d` infinite, and
-                // `_mm512_cvtps_epi32` maps any non-finite operand to INT_MIN,
-                // which `cvtsepi32_epi8` saturates to -128 — the one activation
-                // value `dot32`'s sign trick cannot represent. The reciprocal is
-                // therefore pinned to a defined 0 (all quants zero), and a NaN or
-                // infinity anywhere in the block gives a NaN / infinite scale (see
-                // `quant::q8_0_block_scale`), identically on every quantizer.
-                let d = crate::quant::q8_0_block_scale(amax);
-                let id = crate::quant::q8_0_block_recip(d);
-                *scale = d;
+            if rem > 0 {
+                let bq_p = b_quants.as_ptr();
+                let rc_p = scratch.rem_cs_shl3.as_mut_ptr();
+                let ones = _mm256_set1_epi8(1);
+                let zero = _mm256_setzero_si256();
+                let j_base = n_panels * TILE_N;
+                for r in 0..rem {
+                    let col = j_base + r;
+                    for block in 0..nb {
+                        let v =
+                            _mm256_loadu_si256(bq_p.add(col * k + block * 32) as *const __m256i);
+                        let dp = _mm256_dpbusd_epi32(zero, ones, v);
+                        let h1 = _mm256_hadd_epi32(dp, dp);
+                        let h2 = _mm256_hadd_epi32(h1, h1);
+                        let sum = _mm_cvtsi128_si32(_mm256_castsi256_si128(h2))
+                            + _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(h2));
+                        *rc_p.add(r * nb + block) = sum << 3;
+                    }
+                }
+            }
+        }
+    }
 
-                let idv = _mm512_set1_ps(id);
-                let p0 = _mm512_mul_ps(v0, idv);
-                let p1 = _mm512_mul_ps(v1, idv);
-                // Scrub non-finite lanes to 0 before converting. A NaN
-                // activation — or an infinity, whose product with the guarded
-                // `id` is NaN — converts to INT_MIN on x86 and saturates to
-                // -128, the one value `dot32`'s sign trick cannot represent.
-                // A block holding one now has a NaN or infinite scale and a zero
-                // `id`, so every lane's product is 0 or NaN and the scrub leaves
-                // an all-zero block (the scale carries the poison). It stays as a
-                // guard: it keeps the result independent of how `amax` was derived,
-                // and matches the scalar path's saturating `as i8` cast.
-                let p0 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p0, p0), p0);
-                let p1 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p1, p1), p1);
-                // Default rounding is round-to-nearest-even, matching NEON's `vcvtnq`.
-                let q0 = _mm512_cvtps_epi32(p0);
-                let q1 = _mm512_cvtps_epi32(p1);
-                let out = quants.as_mut_ptr().add(base);
-                _mm_storeu_si128(out as *mut __m128i, _mm512_cvtsepi32_epi8(q0));
-                _mm_storeu_si128(out.add(16) as *mut __m128i, _mm512_cvtsepi32_epi8(q1));
+    /// Pack Q8_0 activations into thread-local lin16 scratch and invoke `f`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn with_packed_q8_lin16<const TILE_N: usize, R>(
+        b_scales: &[f32],
+        b_quants: &[i8],
+        n: usize,
+        k: usize,
+        f: impl FnOnce(&PackedQ8Lin16Panels) -> R,
+    ) -> R {
+        let mut scratch = Q8_LIN16_PANEL_SCRATCH.with(|cell| cell.take());
+        unsafe {
+            pack_q8_0_lin16_panels::<TILE_N>(b_scales, b_quants, n, k, &mut scratch);
+        }
+        let res = f(&scratch);
+        Q8_LIN16_PANEL_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
+        res
+    }
+
+    /// Row-major Q4_0 lin16 ZMM GEMM worker over super-rows `[sr_start..sr_end)`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+    #[inline(never)]
+    unsafe fn lin16_rowmajor_worker<const TILE_N: usize, const K_BLK: usize>(
+        packed_ptr: usize,
+        scales_ptr: usize,
+        bp_q_ptr: usize,
+        bp_s_ptr: usize,
+        bp_c_ptr: usize,
+        rc_ptr: usize,
+        b_scales_ptr: usize,
+        b_quants_ptr: usize,
+        out_ptr: usize,
+        n_panels: usize,
+        rem: usize,
+        nb: usize,
+        m: usize,
+        k: usize,
+        sr_start: usize,
+        sr_end: usize,
+    ) {
+        unsafe {
+            let mask = _mm512_set1_epi32(0x0F0F_0F0Fu32 as i32);
+            let p_ptr = packed_ptr as *const u8;
+            let s_ptr = scales_ptr as *const u16;
+            let bp_q = bp_q_ptr as *const i32;
+            let bp_s = bp_s_ptr as *const f32;
+            let bp_c = bp_c_ptr as *const i32;
+            let out_p = out_ptr as *mut f32;
+
+            let mut kb = 0usize;
+            while kb < nb {
+                let kb_end = (kb + K_BLK).min(nb);
+                for jt in 0..n_panels {
+                    let j = jt * TILE_N;
+                    let b_tile_q = bp_q.add(jt * nb * 8 * TILE_N);
+                    let b_tile_s = bp_s.add(jt * nb * TILE_N);
+                    let b_tile_c = bp_c.add(jt * nb * TILE_N);
+                    for sr in sr_start..sr_end {
+                        let row_base = sr * 16;
+                        let mut facc = [_mm512_setzero_ps(); TILE_N];
+                        if kb > 0 {
+                            for (t, acc_f) in facc.iter_mut().enumerate() {
+                                *acc_f = _mm512_loadu_ps(out_p.add((j + t) * m + row_base));
+                            }
+                        }
+                        for block in kb..kb_end {
+                            let mut acc = [_mm512_setzero_si512(); TILE_N];
+                            let p_blk = p_ptr.add((sr * nb + block) * 256);
+                            let q_blk = b_tile_q.add(block * 8 * TILE_N);
+                            for p in 0..4usize {
+                                let raw = _mm512_loadu_si512(p_blk.add(p * 64) as *const __m512i);
+                                let w0 = _mm512_and_si512(raw, mask);
+                                let w1 = _mm512_and_si512(_mm512_srli_epi32::<4>(raw), mask);
+                                let q_p = q_blk.add(p * 2 * TILE_N);
+                                for (t, acc_t) in acc.iter_mut().enumerate() {
+                                    let va0 = _mm512_set1_epi32(*q_p.add(t * 2));
+                                    *acc_t = _mm512_dpbusd_epi32(*acc_t, w0, va0);
+                                }
+                                for (t, acc_t) in acc.iter_mut().enumerate() {
+                                    let va1 = _mm512_set1_epi32(*q_p.add(t * 2 + 1));
+                                    *acc_t = _mm512_dpbusd_epi32(*acc_t, w1, va1);
+                                }
+                            }
+                            let d_vec = _mm512_cvtph_ps(_mm256_loadu_si256(
+                                s_ptr.add((sr * nb + block) * 16) as *const __m256i,
+                            ));
+                            let s_blk = b_tile_s.add(block * TILE_N);
+                            let c_blk = b_tile_c.add(block * TILE_N);
+                            for t in 0..TILE_N {
+                                let xs = *s_blk.add(t);
+                                let sx8 = *c_blk.add(t);
+                                let adj = _mm512_sub_epi32(acc[t], _mm512_set1_epi32(sx8));
+                                let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                                facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(adj), eff, facc[t]);
+                            }
+                        }
+                        for (t, &acc_f) in facc.iter().enumerate() {
+                            _mm512_storeu_ps(out_p.add((j + t) * m + row_base), acc_f);
+                        }
+                    }
+                }
+                if rem > 0 {
+                    let j_base = n_panels * TILE_N;
+                    let bq_p = b_quants_ptr as *const i8;
+                    let bs_p = b_scales_ptr as *const f32;
+                    let rc_p = rc_ptr as *const i32;
+                    for sr in sr_start..sr_end {
+                        let row_base = sr * 16;
+                        let mut facc = [_mm512_setzero_ps(); TILE_N];
+                        if kb > 0 {
+                            for (r, acc_f) in facc[..rem].iter_mut().enumerate() {
+                                *acc_f = _mm512_loadu_ps(out_p.add((j_base + r) * m + row_base));
+                            }
+                        }
+                        for block in kb..kb_end {
+                            let mut acc = [_mm512_setzero_si512(); TILE_N];
+                            let p_blk = p_ptr.add((sr * nb + block) * 256);
+                            for p in 0..4usize {
+                                let raw = _mm512_loadu_si512(p_blk.add(p * 64) as *const __m512i);
+                                let w0 = _mm512_and_si512(raw, mask);
+                                let w1 = _mm512_and_si512(_mm512_srli_epi32::<4>(raw), mask);
+                                for (r, acc_r) in acc[..rem].iter_mut().enumerate() {
+                                    let bq_blk =
+                                        bq_p.add((j_base + r) * k + block * 32) as *const i32;
+                                    let va0 = _mm512_set1_epi32(bq_blk.add(p).read_unaligned());
+                                    *acc_r = _mm512_dpbusd_epi32(*acc_r, w0, va0);
+                                }
+                                for (r, acc_r) in acc[..rem].iter_mut().enumerate() {
+                                    let bq_blk =
+                                        bq_p.add((j_base + r) * k + block * 32) as *const i32;
+                                    let va1 = _mm512_set1_epi32(bq_blk.add(4 + p).read_unaligned());
+                                    *acc_r = _mm512_dpbusd_epi32(*acc_r, w1, va1);
+                                }
+                            }
+                            let d_vec = _mm512_cvtph_ps(_mm256_loadu_si256(
+                                s_ptr.add((sr * nb + block) * 16) as *const __m256i,
+                            ));
+                            for r in 0..rem {
+                                let xs = *bs_p.add((j_base + r) * nb + block);
+                                let sx8 = *rc_p.add(r * nb + block);
+                                let adj = _mm512_sub_epi32(acc[r], _mm512_set1_epi32(sx8));
+                                let eff = _mm512_mul_ps(d_vec, _mm512_set1_ps(xs));
+                                facc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(adj), eff, facc[r]);
+                            }
+                        }
+                        for (r, &acc_f) in facc[..rem].iter().enumerate() {
+                            _mm512_storeu_ps(out_p.add((j_base + r) * m + row_base), acc_f);
+                        }
+                    }
+                }
+                kb = kb_end;
+            }
+        }
+    }
+
+    /// Row-major `out[n, m]` GEMM using lin16-repacked Q4_0 weights and AVX-512 VNNI.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+    pub unsafe fn gemm_q4_0_lin16_rowmajor_zmm(
+        packed: &[u8],
+        scales_f16: &[u16],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        debug_assert_eq!(m % 16, 0);
+        debug_assert_eq!(k % 32, 0);
+        const TILE_N: usize = 14;
+        const K_BLK: usize = 128;
+        const M_BLK: usize = 8;
+
+        let nb = k / 32;
+        let sr_count = m / 16;
+        let n_panels = n / TILE_N;
+        let rem = n - n_panels * TILE_N;
+
+        let packed_ptr = packed.as_ptr() as usize;
+        let scales_ptr = scales_f16.as_ptr() as usize;
+        let b_scales_ptr = b_scales.as_ptr() as usize;
+        let b_quants_ptr = b_quants.as_ptr() as usize;
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        unsafe {
+            with_packed_q8_lin16::<TILE_N, _>(b_scales, b_quants, n, k, |panels| {
+                let bp_q_ptr = panels.quants.as_ptr() as usize;
+                let bp_s_ptr = panels.scales.as_ptr() as usize;
+                let bp_c_ptr = panels.cs_shl3.as_ptr() as usize;
+                let rc_ptr = panels.rem_cs_shl3.as_ptr() as usize;
+
+                let total_work = m * n * k;
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                if sr_count >= 2 && total_work >= 131_072 {
+                    crate::backend::cpu::par_range_prefill_active(
+                        sr_count,
+                        M_BLK.min(sr_count).max(1),
+                        max_active,
+                        |sr_start, count| {
+                            lin16_rowmajor_worker::<TILE_N, K_BLK>(
+                                packed_ptr,
+                                scales_ptr,
+                                bp_q_ptr,
+                                bp_s_ptr,
+                                bp_c_ptr,
+                                rc_ptr,
+                                b_scales_ptr,
+                                b_quants_ptr,
+                                out_ptr,
+                                n_panels,
+                                rem,
+                                nb,
+                                m,
+                                k,
+                                sr_start,
+                                sr_start + count,
+                            );
+                        },
+                    );
+                } else {
+                    lin16_rowmajor_worker::<TILE_N, K_BLK>(
+                        packed_ptr,
+                        scales_ptr,
+                        bp_q_ptr,
+                        bp_s_ptr,
+                        bp_c_ptr,
+                        rc_ptr,
+                        b_scales_ptr,
+                        b_quants_ptr,
+                        out_ptr,
+                        n_panels,
+                        rem,
+                        nb,
+                        m,
+                        k,
+                        0,
+                        sr_count,
+                    );
+                }
+            });
+        }
+    }
+
+    /// Column-major `out[m, n]` GEMM using lin16-repacked Q4_0 weights and AVX-512 VNNI.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
+    pub unsafe fn gemm_q4_0_lin16_colmajor_zmm(
+        packed: &[u8],
+        scales_f16: &[u16],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        debug_assert_eq!(m % 16, 0);
+        debug_assert_eq!(k % 32, 0);
+        // Compute via rowmajor tile buffers or direct scatter to out[m, n].
+        let mut rowmajor = vec![0.0f32; m * n];
+        unsafe {
+            gemm_q4_0_lin16_rowmajor_zmm(
+                packed,
+                scales_f16,
+                b_scales,
+                b_quants,
+                &mut rowmajor,
+                n,
+                m,
+                k,
+            );
+        }
+        for (r, out_row) in out.chunks_exact_mut(n).enumerate() {
+            for (c, d) in out_row.iter_mut().enumerate() {
+                *d = rowmajor[c * m + r];
+            }
+        }
+    }
+
+    /// Vectorized AVX-512F SiLU activation (`x / (1 + exp(-x))`).
+    #[target_feature(enable = "avx512f,avx512vl,avx2,fma")]
+    #[inline]
+    #[allow(clippy::excessive_precision)]
+    unsafe fn fast_silu_ps(x: __m512) -> __m512 {
+        let neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x);
+        let clamped = _mm512_max_ps(
+            _mm512_min_ps(neg_x, _mm512_set1_ps(88.0)),
+            _mm512_set1_ps(-88.0),
+        );
+        let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
+        let ln2_hi = _mm512_set1_ps(0.693359375);
+        let ln2_lo = _mm512_set1_ps(-2.1219444e-4);
+        let n = _mm512_roundscale_ps::<0x08>(_mm512_mul_ps(clamped, log2e));
+        let r = _mm512_fnmadd_ps(n, ln2_lo, _mm512_fnmadd_ps(n, ln2_hi, clamped));
+        let p = _mm512_fmadd_ps(r, _mm512_set1_ps(0.008333334), _mm512_set1_ps(0.041666668));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(0.16666667));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(0.5));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0));
+        let exp_neg = _mm512_scalef_ps(p, n);
+        _mm512_div_ps(x, _mm512_add_ps(_mm512_set1_ps(1.0), exp_neg))
+    }
+
+    /// Fused gate/up projection + SiLU worker over lin16 Q4_0 super-rows `[sr_start..sr_end)`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+    #[inline(never)]
+    unsafe fn lin16_gate_up_worker<const TILE_N: usize>(
+        pg_ptr: usize,
+        sg_ptr: usize,
+        pu_ptr: usize,
+        su_ptr: usize,
+        bp_q_ptr: usize,
+        bp_s_ptr: usize,
+        bp_c_ptr: usize,
+        rc_ptr: usize,
+        b_scales_ptr: usize,
+        b_quants_ptr: usize,
+        out_ptr: usize,
+        n_panels: usize,
+        rem: usize,
+        nb: usize,
+        m: usize,
+        k: usize,
+        sr_start: usize,
+        sr_end: usize,
+    ) {
+        unsafe {
+            let mask = _mm512_set1_epi32(0x0F0F_0F0Fu32 as i32);
+            let pg_p = pg_ptr as *const u8;
+            let sg_p = sg_ptr as *const u16;
+            let pu_p = pu_ptr as *const u8;
+            let su_p = su_ptr as *const u16;
+            let bp_q = bp_q_ptr as *const i32;
+            let bp_s = bp_s_ptr as *const f32;
+            let bp_c = bp_c_ptr as *const i32;
+            let out_p = out_ptr as *mut f32;
+
+            for jt in 0..n_panels {
+                let j = jt * TILE_N;
+                let b_tile_q = bp_q.add(jt * nb * 8 * TILE_N);
+                let b_tile_s = bp_s.add(jt * nb * TILE_N);
+                let b_tile_c = bp_c.add(jt * nb * TILE_N);
+                for sr in sr_start..sr_end {
+                    let row_base = sr * 16;
+                    let mut gfacc = [_mm512_setzero_ps(); TILE_N];
+                    let mut ufacc = [_mm512_setzero_ps(); TILE_N];
+                    for block in 0..nb {
+                        let mut gacc = [_mm512_setzero_si512(); TILE_N];
+                        let mut uacc = [_mm512_setzero_si512(); TILE_N];
+                        let pg_blk = pg_p.add((sr * nb + block) * 256);
+                        let pu_blk = pu_p.add((sr * nb + block) * 256);
+                        let q_blk = b_tile_q.add(block * 8 * TILE_N);
+                        for p in 0..4usize {
+                            let graw = _mm512_loadu_si512(pg_blk.add(p * 64) as *const __m512i);
+                            let uraw = _mm512_loadu_si512(pu_blk.add(p * 64) as *const __m512i);
+                            let gw0 = _mm512_and_si512(graw, mask);
+                            let gw1 = _mm512_and_si512(_mm512_srli_epi32::<4>(graw), mask);
+                            let uw0 = _mm512_and_si512(uraw, mask);
+                            let uw1 = _mm512_and_si512(_mm512_srli_epi32::<4>(uraw), mask);
+                            let q_p = q_blk.add(p * 2 * TILE_N);
+                            for t in 0..TILE_N {
+                                let va0 = _mm512_set1_epi32(*q_p.add(t * 2));
+                                let va1 = _mm512_set1_epi32(*q_p.add(t * 2 + 1));
+                                gacc[t] = _mm512_dpbusd_epi32(gacc[t], gw0, va0);
+                                gacc[t] = _mm512_dpbusd_epi32(gacc[t], gw1, va1);
+                                uacc[t] = _mm512_dpbusd_epi32(uacc[t], uw0, va0);
+                                uacc[t] = _mm512_dpbusd_epi32(uacc[t], uw1, va1);
+                            }
+                        }
+                        let dg = _mm512_cvtph_ps(_mm256_loadu_si256(
+                            sg_p.add((sr * nb + block) * 16) as *const __m256i,
+                        ));
+                        let du = _mm512_cvtph_ps(_mm256_loadu_si256(
+                            su_p.add((sr * nb + block) * 16) as *const __m256i,
+                        ));
+                        let s_blk = b_tile_s.add(block * TILE_N);
+                        let c_blk = b_tile_c.add(block * TILE_N);
+                        for t in 0..TILE_N {
+                            let vxs = _mm512_set1_ps(*s_blk.add(t));
+                            let vsx8 = _mm512_set1_epi32(*c_blk.add(t));
+                            let gadj = _mm512_sub_epi32(gacc[t], vsx8);
+                            let uadj = _mm512_sub_epi32(uacc[t], vsx8);
+                            gfacc[t] = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(gadj),
+                                _mm512_mul_ps(dg, vxs),
+                                gfacc[t],
+                            );
+                            ufacc[t] = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(uadj),
+                                _mm512_mul_ps(du, vxs),
+                                ufacc[t],
+                            );
+                        }
+                    }
+                    for t in 0..TILE_N {
+                        let res = _mm512_mul_ps(fast_silu_ps(gfacc[t]), ufacc[t]);
+                        _mm512_storeu_ps(out_p.add((j + t) * m + row_base), res);
+                    }
+                }
+            }
+            if rem > 0 {
+                let j_base = n_panels * TILE_N;
+                let bq_p = b_quants_ptr as *const i8;
+                let bs_p = b_scales_ptr as *const f32;
+                let rc_p = rc_ptr as *const i32;
+                for sr in sr_start..sr_end {
+                    let row_base = sr * 16;
+                    let mut gfacc = [_mm512_setzero_ps(); TILE_N];
+                    let mut ufacc = [_mm512_setzero_ps(); TILE_N];
+                    for block in 0..nb {
+                        let mut gacc = [_mm512_setzero_si512(); TILE_N];
+                        let mut uacc = [_mm512_setzero_si512(); TILE_N];
+                        let pg_blk = pg_p.add((sr * nb + block) * 256);
+                        let pu_blk = pu_p.add((sr * nb + block) * 256);
+                        for p in 0..4usize {
+                            let graw = _mm512_loadu_si512(pg_blk.add(p * 64) as *const __m512i);
+                            let uraw = _mm512_loadu_si512(pu_blk.add(p * 64) as *const __m512i);
+                            let gw0 = _mm512_and_si512(graw, mask);
+                            let gw1 = _mm512_and_si512(_mm512_srli_epi32::<4>(graw), mask);
+                            let uw0 = _mm512_and_si512(uraw, mask);
+                            let uw1 = _mm512_and_si512(_mm512_srli_epi32::<4>(uraw), mask);
+                            for r in 0..rem {
+                                let bq_blk = bq_p.add((j_base + r) * k + block * 32) as *const i32;
+                                let va0 = _mm512_set1_epi32(bq_blk.add(p).read_unaligned());
+                                let va1 = _mm512_set1_epi32(bq_blk.add(4 + p).read_unaligned());
+                                gacc[r] = _mm512_dpbusd_epi32(gacc[r], gw0, va0);
+                                gacc[r] = _mm512_dpbusd_epi32(gacc[r], gw1, va1);
+                                uacc[r] = _mm512_dpbusd_epi32(uacc[r], uw0, va0);
+                                uacc[r] = _mm512_dpbusd_epi32(uacc[r], uw1, va1);
+                            }
+                        }
+                        let dg = _mm512_cvtph_ps(_mm256_loadu_si256(
+                            sg_p.add((sr * nb + block) * 16) as *const __m256i,
+                        ));
+                        let du = _mm512_cvtph_ps(_mm256_loadu_si256(
+                            su_p.add((sr * nb + block) * 16) as *const __m256i,
+                        ));
+                        for r in 0..rem {
+                            let vxs = _mm512_set1_ps(*bs_p.add((j_base + r) * nb + block));
+                            let vsx8 = _mm512_set1_epi32(*rc_p.add(r * nb + block));
+                            gfacc[r] = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(_mm512_sub_epi32(gacc[r], vsx8)),
+                                _mm512_mul_ps(dg, vxs),
+                                gfacc[r],
+                            );
+                            ufacc[r] = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(_mm512_sub_epi32(uacc[r], vsx8)),
+                                _mm512_mul_ps(du, vxs),
+                                ufacc[r],
+                            );
+                        }
+                    }
+                    for r in 0..rem {
+                        let res = _mm512_mul_ps(fast_silu_ps(gfacc[r]), ufacc[r]);
+                        _mm512_storeu_ps(out_p.add((j_base + r) * m + row_base), res);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fused gate/up projection + SiLU (`silu(gate @ x) * (up @ x)`) into row-major `out[n, m]`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+    pub unsafe fn gemm_q4_0_lin16_gate_up_silu_rowmajor_zmm(
+        gate_packed: &[u8],
+        gate_scales_f16: &[u16],
+        up_packed: &[u8],
+        up_scales_f16: &[u16],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        debug_assert_eq!(m % 16, 0);
+        debug_assert_eq!(k % 32, 0);
+        const TILE_N: usize = 8;
+        const M_BLK: usize = 8;
+
+        let nb = k / 32;
+        let sr_count = m / 16;
+        let n_panels = n / TILE_N;
+        let rem = n - n_panels * TILE_N;
+
+        let pg_ptr = gate_packed.as_ptr() as usize;
+        let sg_ptr = gate_scales_f16.as_ptr() as usize;
+        let pu_ptr = up_packed.as_ptr() as usize;
+        let su_ptr = up_scales_f16.as_ptr() as usize;
+        let b_scales_ptr = b_scales.as_ptr() as usize;
+        let b_quants_ptr = b_quants.as_ptr() as usize;
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        unsafe {
+            with_packed_q8_lin16::<TILE_N, _>(b_scales, b_quants, n, k, |panels| {
+                let bp_q_ptr = panels.quants.as_ptr() as usize;
+                let bp_s_ptr = panels.scales.as_ptr() as usize;
+                let bp_c_ptr = panels.cs_shl3.as_ptr() as usize;
+                let rc_ptr = panels.rem_cs_shl3.as_ptr() as usize;
+
+                let total_work = m * n * k;
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                if sr_count >= 2 && total_work >= 131_072 {
+                    crate::backend::cpu::par_range_prefill_active(
+                        sr_count,
+                        M_BLK.min(sr_count).max(1),
+                        max_active,
+                        |sr_start, count| {
+                            lin16_gate_up_worker::<TILE_N>(
+                                pg_ptr,
+                                sg_ptr,
+                                pu_ptr,
+                                su_ptr,
+                                bp_q_ptr,
+                                bp_s_ptr,
+                                bp_c_ptr,
+                                rc_ptr,
+                                b_scales_ptr,
+                                b_quants_ptr,
+                                out_ptr,
+                                n_panels,
+                                rem,
+                                nb,
+                                m,
+                                k,
+                                sr_start,
+                                sr_start + count,
+                            );
+                        },
+                    );
+                } else {
+                    lin16_gate_up_worker::<TILE_N>(
+                        pg_ptr,
+                        sg_ptr,
+                        pu_ptr,
+                        su_ptr,
+                        bp_q_ptr,
+                        bp_s_ptr,
+                        bp_c_ptr,
+                        rc_ptr,
+                        b_scales_ptr,
+                        b_quants_ptr,
+                        out_ptr,
+                        n_panels,
+                        rem,
+                        nb,
+                        m,
+                        k,
+                        0,
+                        sr_count,
+                    );
+                }
+            });
+        }
+    }
+
+    /// AVX-512 fused per-head Q/K RMSNorm + precomputed-table NEOX RoPE for a single token.
+    ///
+    /// Fast-paths `head_dim == 64` (`half_dim == 32`) entirely in ZMM registers.
+    /// Caller guarantees `q.len() == n_heads * head_dim`, `k.len() == n_kv_heads * head_dim`,
+    /// `q_norm.len() == head_dim`, `k_norm.len() == head_dim`, `cos_sin.len() == head_dim`
+    /// (packed as `[cos[0..half_dim], sin[0..half_dim]]`), and `head_dim == 64`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx512f,avx512vl,avx2,fma")]
+    pub unsafe fn qk_rmsnorm_rope64_avx512(
+        q: &mut [f32],
+        k: &mut [f32],
+        q_norm: &[f32],
+        k_norm: &[f32],
+        cos_row: &[f32],
+        sin_row: &[f32],
+        eps: f32,
+        n_heads: usize,
+        n_kv_heads: usize,
+    ) {
+        unsafe {
+            debug_assert_eq!(q_norm.len(), 64);
+            debug_assert_eq!(k_norm.len(), 64);
+            debug_assert_eq!(cos_row.len(), 32);
+            debug_assert_eq!(sin_row.len(), 32);
+            let c0 = _mm512_loadu_ps(cos_row.as_ptr());
+            let c1 = _mm512_loadu_ps(cos_row.as_ptr().add(16));
+            let s0 = _mm512_loadu_ps(sin_row.as_ptr());
+            let s1 = _mm512_loadu_ps(sin_row.as_ptr().add(16));
+            let inv_n = 1.0f64 / 64.0f64;
+            let eps64 = eps as f64;
+
+            let qw0 = _mm512_loadu_ps(q_norm.as_ptr());
+            let qw1 = _mm512_loadu_ps(q_norm.as_ptr().add(16));
+            let qw2 = _mm512_loadu_ps(q_norm.as_ptr().add(32));
+            let qw3 = _mm512_loadu_ps(q_norm.as_ptr().add(48));
+
+            let q_ptr = q.as_mut_ptr();
+            for h in 0..n_heads {
+                let hp = q_ptr.add(h * 64);
+                let x0 = _mm512_loadu_ps(hp);
+                let x1 = _mm512_loadu_ps(hp.add(16));
+                let x2 = _mm512_loadu_ps(hp.add(32));
+                let x3 = _mm512_loadu_ps(hp.add(48));
+                let sq = _mm512_fmadd_ps(
+                    x3,
+                    x3,
+                    _mm512_fmadd_ps(x2, x2, _mm512_fmadd_ps(x1, x1, _mm512_mul_ps(x0, x0))),
+                );
+                let sum_sq = _mm512_reduce_add_ps(sq) as f64;
+                let inv_rms = _mm512_set1_ps((1.0 / (sum_sq * inv_n + eps64).sqrt()) as f32);
+                let y0 = _mm512_mul_ps(_mm512_mul_ps(x0, inv_rms), qw0);
+                let y1 = _mm512_mul_ps(_mm512_mul_ps(x1, inv_rms), qw1);
+                let y2 = _mm512_mul_ps(_mm512_mul_ps(x2, inv_rms), qw2);
+                let y3 = _mm512_mul_ps(_mm512_mul_ps(x3, inv_rms), qw3);
+                let out0 = _mm512_fnmadd_ps(y2, s0, _mm512_mul_ps(y0, c0));
+                let out2 = _mm512_fmadd_ps(y0, s0, _mm512_mul_ps(y2, c0));
+                let out1 = _mm512_fnmadd_ps(y3, s1, _mm512_mul_ps(y1, c1));
+                let out3 = _mm512_fmadd_ps(y1, s1, _mm512_mul_ps(y3, c1));
+                _mm512_storeu_ps(hp, out0);
+                _mm512_storeu_ps(hp.add(16), out1);
+                _mm512_storeu_ps(hp.add(32), out2);
+                _mm512_storeu_ps(hp.add(48), out3);
+            }
+
+            let kw0 = _mm512_loadu_ps(k_norm.as_ptr());
+            let kw1 = _mm512_loadu_ps(k_norm.as_ptr().add(16));
+            let kw2 = _mm512_loadu_ps(k_norm.as_ptr().add(32));
+            let kw3 = _mm512_loadu_ps(k_norm.as_ptr().add(48));
+
+            let k_ptr = k.as_mut_ptr();
+            for h in 0..n_kv_heads {
+                let hp = k_ptr.add(h * 64);
+                let x0 = _mm512_loadu_ps(hp);
+                let x1 = _mm512_loadu_ps(hp.add(16));
+                let x2 = _mm512_loadu_ps(hp.add(32));
+                let x3 = _mm512_loadu_ps(hp.add(48));
+                let sq = _mm512_fmadd_ps(
+                    x3,
+                    x3,
+                    _mm512_fmadd_ps(x2, x2, _mm512_fmadd_ps(x1, x1, _mm512_mul_ps(x0, x0))),
+                );
+                let sum_sq = _mm512_reduce_add_ps(sq) as f64;
+                let inv_rms = _mm512_set1_ps((1.0 / (sum_sq * inv_n + eps64).sqrt()) as f32);
+                let y0 = _mm512_mul_ps(_mm512_mul_ps(x0, inv_rms), kw0);
+                let y1 = _mm512_mul_ps(_mm512_mul_ps(x1, inv_rms), kw1);
+                let y2 = _mm512_mul_ps(_mm512_mul_ps(x2, inv_rms), kw2);
+                let y3 = _mm512_mul_ps(_mm512_mul_ps(x3, inv_rms), kw3);
+                let out0 = _mm512_fnmadd_ps(y2, s0, _mm512_mul_ps(y0, c0));
+                let out2 = _mm512_fmadd_ps(y0, s0, _mm512_mul_ps(y2, c0));
+                let out1 = _mm512_fnmadd_ps(y3, s1, _mm512_mul_ps(y1, c1));
+                let out3 = _mm512_fmadd_ps(y1, s1, _mm512_mul_ps(y3, c1));
+                _mm512_storeu_ps(hp, out0);
+                _mm512_storeu_ps(hp.add(16), out1);
+                _mm512_storeu_ps(hp.add(32), out2);
+                _mm512_storeu_ps(hp.add(48), out3);
             }
         }
     }
@@ -18612,6 +21170,447 @@ pub(crate) mod avx512_vnni {
                     assert!(gs[0].is_infinite(), "inf block scale ({label})");
                     assert!(gq.iter().all(|&q| q == 0), "inf block quants ({label})");
                 }
+            }
+        }
+
+        #[test]
+        fn q4_0_zmm_and_rowmajor_match_baseline() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use crate::quant::BlockQ4_0;
+            let (m, n, k) = (32usize, 19usize, 128usize);
+            let nb = k / 32;
+            let mut st = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next_u32 = || -> u32 {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (st >> 33) as u32
+            };
+
+            let mut a_q4 = vec![0u8; m * nb * size_of::<BlockQ4_0>()];
+            for row in 0..m {
+                for b in 0..nb {
+                    let off = (row * nb + b) * size_of::<BlockQ4_0>();
+                    let d = f16::from_f32(0.02 * ((row + b) % 7 + 1) as f32);
+                    a_q4[off..off + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    for q in &mut a_q4[off + 2..off + 18] {
+                        *q = next_u32() as u8;
+                    }
+                }
+            }
+            let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a_q4, m, k);
+            let b_scales: Vec<f32> = (0..n * nb).map(|i| 0.01 * ((i % 5) + 1) as f32).collect();
+            let b_quants: Vec<i8> = (0..n * k)
+                .map(|_| ((next_u32() % 255) as i32 - 127) as i8)
+                .collect();
+
+            let mut ref_col = vec![0.0f32; m * n];
+            let mut zmm_col = vec![0.0f32; m * n];
+            let mut zmm_row = vec![0.0f32; m * n];
+            let mut avx2_row = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_0_8x8_q8_0(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut ref_col,
+                    m,
+                    n,
+                    k,
+                );
+                gemm_q4_0_8x8_q8_0_zmm(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut zmm_col,
+                    m,
+                    n,
+                    k,
+                );
+                gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut zmm_row,
+                    n,
+                    m,
+                    k,
+                );
+                super::super::avx2_int8::gemm_q4_0_8x8_q8_0_rowmajor(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut avx2_row,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            for r in 0..m {
+                for c in 0..n {
+                    let want = ref_col[r * n + c];
+                    assert!(
+                        (zmm_col[r * n + c] - want).abs() <= 1e-4,
+                        "zmm col [{r},{c}]"
+                    );
+                    assert!(
+                        (zmm_row[c * m + r] - want).abs() <= 1e-4,
+                        "zmm row [{r},{c}]"
+                    );
+                    assert!(
+                        (avx2_row[c * m + r] - want).abs() <= 1e-4,
+                        "avx2 row [{r},{c}]"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn q4_0_zmm_large_k_and_n_match_baseline() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use crate::quant::BlockQ4_0;
+            // Exercises K-blocking (nb = 128 > 64) and >16 N-panels (n = 139 => 17 panels + 3 tail).
+            let (m, n, k) = (32usize, 139usize, 4096usize);
+            let nb = k / 32;
+            let mut st = 0x517c_c1b7_2722_0a95u64;
+            let mut next_u32 = || -> u32 {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (st >> 33) as u32
+            };
+
+            let mut a_q4 = vec![0u8; m * nb * size_of::<BlockQ4_0>()];
+            for row in 0..m {
+                for b in 0..nb {
+                    let off = (row * nb + b) * size_of::<BlockQ4_0>();
+                    let d = f16::from_f32(0.01 * ((row + b) % 7 + 1) as f32);
+                    a_q4[off..off + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    for q in &mut a_q4[off + 2..off + 18] {
+                        *q = next_u32() as u8;
+                    }
+                }
+            }
+            let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a_q4, m, k);
+            let b_scales: Vec<f32> = (0..n * nb).map(|i| 0.01 * ((i % 5) + 1) as f32).collect();
+            let b_quants: Vec<i8> = (0..n * k)
+                .map(|_| ((next_u32() % 255) as i32 - 127) as i8)
+                .collect();
+
+            let mut ref_col = vec![0.0f32; m * n];
+            let mut zmm_row = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_0_8x8_q8_0(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut ref_col,
+                    m,
+                    n,
+                    k,
+                );
+                gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut zmm_row,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            for r in 0..m {
+                for c in 0..n {
+                    let want = ref_col[r * n + c];
+                    assert!(
+                        (zmm_row[c * m + r] - want).abs() <= 1e-3,
+                        "large-k/n zmm row [{r},{c}]: got={} want={want}",
+                        zmm_row[c * m + r]
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn q4_0_fused_gate_up_silu_matches_unfused() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use crate::quant::BlockQ4_0;
+            let (m, n, k) = (32usize, 13usize, 128usize);
+            let nb = k / 32;
+            let mut st = 0x1234_5678_9abc_def0u64;
+            let mut next_u32 = || -> u32 {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (st >> 33) as u32
+            };
+
+            let mut make_q4 = || {
+                let mut v = vec![0u8; m * nb * size_of::<BlockQ4_0>()];
+                for row in 0..m {
+                    for b in 0..nb {
+                        let off = (row * nb + b) * size_of::<BlockQ4_0>();
+                        let d = f16::from_f32(0.015 * ((row + b) % 9 + 1) as f32);
+                        v[off..off + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+                        for q in &mut v[off + 2..off + 18] {
+                            *q = next_u32() as u8;
+                        }
+                    }
+                }
+                crate::backend::cpu::repack_q4_0_8x8(&v, m, k)
+            };
+            let (gp, gs) = make_q4();
+            let (up, us) = make_q4();
+            let b_scales: Vec<f32> = (0..n * nb).map(|i| 0.01 * ((i % 7) + 1) as f32).collect();
+            let b_quants: Vec<i8> = (0..n * k)
+                .map(|_| ((next_u32() % 255) as i32 - 127) as i8)
+                .collect();
+
+            let mut g_out = vec![0.0f32; m * n];
+            let mut u_out = vec![0.0f32; m * n];
+            let mut zmm_fused = vec![0.0f32; m * n];
+            let mut avx2_fused = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+                    &gp, &gs, &b_scales, &b_quants, &mut g_out, n, m, k,
+                );
+                gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+                    &up, &us, &b_scales, &b_quants, &mut u_out, n, m, k,
+                );
+                gemm_q4_0_gate_up_silu_rowmajor_zmm(
+                    &gp,
+                    &gs,
+                    &up,
+                    &us,
+                    &b_scales,
+                    &b_quants,
+                    &mut zmm_fused,
+                    n,
+                    m,
+                    k,
+                );
+                super::super::avx2_int8::gemm_q4_0_gate_up_silu_rowmajor(
+                    &gp,
+                    &gs,
+                    &up,
+                    &us,
+                    &b_scales,
+                    &b_quants,
+                    &mut avx2_fused,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            for i in 0..m * n {
+                let g = g_out[i];
+                let want = (g / (1.0 + crate::backend::cpu::ggml_expf(-g))) * u_out[i];
+                assert!(
+                    (zmm_fused[i] - want).abs() <= 1e-4,
+                    "zmm fused [{i}]: {} vs {want}",
+                    zmm_fused[i]
+                );
+                assert!(
+                    (avx2_fused[i] - want).abs() <= 1e-4,
+                    "avx2 fused [{i}]: {} vs {want}",
+                    avx2_fused[i]
+                );
+            }
+        }
+
+        #[test]
+        fn q4_0_lin16_gemm_and_gate_up_match_baseline() {
+            if !require_simd_or_skip(
+                "avx512vnni+f16c",
+                vnni_kernels_callable() && is_x86_feature_detected!("f16c"),
+            ) {
+                return;
+            }
+            use crate::quant::BlockQ4_0;
+            // Covers multiple panels (TILE_N=12, TILE_N=6) AND remainder columns + K-blocking.
+            let (m, n, k) = (32usize, 31usize, 4096usize);
+            let nb = k / 32;
+            let mut st = 0x9988_7766_5544_3322u64;
+            let mut next_u32 = || -> u32 {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (st >> 33) as u32
+            };
+            let mut make_q4 = || {
+                let mut v = vec![0u8; m * nb * size_of::<BlockQ4_0>()];
+                for row in 0..m {
+                    for b in 0..nb {
+                        let off = (row * nb + b) * size_of::<BlockQ4_0>();
+                        let d = f16::from_f32(0.01 * ((row + b) % 7 + 1) as f32);
+                        v[off..off + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+                        for q in &mut v[off + 2..off + 18] {
+                            *q = next_u32() as u8;
+                        }
+                    }
+                }
+                v
+            };
+            let g_raw = make_q4();
+            let u_raw = make_q4();
+            let (gp8, gs8) = crate::backend::cpu::repack_q4_0_8x8(&g_raw, m, k);
+            let (gp16, gs16) = crate::backend::cpu::repack_q4_0_lin16(&g_raw, m, k);
+            let (up16, us16) = crate::backend::cpu::repack_q4_0_lin16(&u_raw, m, k);
+
+            let b_scales: Vec<f32> = (0..n * nb).map(|i| 0.01 * ((i % 5) + 1) as f32).collect();
+            let b_quants: Vec<i8> = (0..n * k)
+                .map(|_| ((next_u32() % 255) as i32 - 127) as i8)
+                .collect();
+
+            let mut ref_row = vec![0.0f32; m * n];
+            let mut lin_row = vec![0.0f32; m * n];
+            let mut lin_col = vec![0.0f32; m * n];
+            let mut lin_gu = vec![0.0f32; m * n];
+            let mut u_ref_row = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+                    &gp8,
+                    &gs8,
+                    &b_scales,
+                    &b_quants,
+                    &mut ref_row,
+                    n,
+                    m,
+                    k,
+                );
+                gemm_q4_0_lin16_rowmajor_zmm(
+                    &gp16,
+                    &gs16,
+                    &b_scales,
+                    &b_quants,
+                    &mut lin_row,
+                    n,
+                    m,
+                    k,
+                );
+                gemm_q4_0_lin16_colmajor_zmm(
+                    &gp16,
+                    &gs16,
+                    &b_scales,
+                    &b_quants,
+                    &mut lin_col,
+                    m,
+                    n,
+                    k,
+                );
+                gemm_q4_0_lin16_rowmajor_zmm(
+                    &up16,
+                    &us16,
+                    &b_scales,
+                    &b_quants,
+                    &mut u_ref_row,
+                    n,
+                    m,
+                    k,
+                );
+                gemm_q4_0_lin16_gate_up_silu_rowmajor_zmm(
+                    &gp16,
+                    &gs16,
+                    &up16,
+                    &us16,
+                    &b_scales,
+                    &b_quants,
+                    &mut lin_gu,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            for c in 0..n {
+                for r in 0..m {
+                    let want = ref_row[c * m + r];
+                    assert!(
+                        (lin_row[c * m + r] - want).abs() <= 1e-4,
+                        "lin16 row [{r},{c}]"
+                    );
+                    assert!(
+                        (lin_col[r * n + c] - want).abs() <= 1e-4,
+                        "lin16 col [{r},{c}]"
+                    );
+                    let gu_want = (want / (1.0 + crate::backend::cpu::ggml_expf(-want)))
+                        * u_ref_row[c * m + r];
+                    assert!(
+                        (lin_gu[c * m + r] - gu_want).abs() <= 1e-3 * gu_want.abs().max(1.0),
+                        "lin16 gate_up [{r},{c}]: {} vs {gu_want}",
+                        lin_gu[c * m + r]
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn qk_rmsnorm_rope64_avx512_matches_scalar() {
+            if !require_simd_or_skip(
+                "avx512_fma",
+                is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma"),
+            ) {
+                return;
+            }
+            let (n_heads, n_kv_heads, head_dim, eps) = (16usize, 4usize, 64usize, 1e-5f32);
+            let q_orig: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.1)
+                .collect();
+            let k_orig: Vec<f32> = (0..n_kv_heads * head_dim)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.1)
+                .collect();
+            let qn: Vec<f32> = (0..head_dim).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+            let kn: Vec<f32> = (0..head_dim).map(|i| 0.7 + (i % 5) as f32 * 0.1).collect();
+            let mut cos_row = [0.0f32; 32];
+            let mut sin_row = [0.0f32; 32];
+            for i in 0..32 {
+                let angle = 7.0f32 * 10000.0f32.powf(-((2 * i) as f32) / 64.0);
+                (sin_row[i], cos_row[i]) = angle.sin_cos();
+            }
+
+            let mut q_ref = q_orig.clone();
+            let mut k_ref = k_orig.clone();
+            for h in 0..n_heads {
+                crate::backend::cpu::rmsnorm(&mut q_ref[h * 64..(h + 1) * 64], &qn, eps);
+            }
+            for h in 0..n_kv_heads {
+                crate::backend::cpu::rmsnorm(&mut k_ref[h * 64..(h + 1) * 64], &kn, eps);
+            }
+            crate::backend::cpu::rope(&mut q_ref, &mut k_ref, 7, n_heads, n_kv_heads, 64, 10000.0);
+
+            let mut q_vec = q_orig;
+            let mut k_vec = k_orig;
+            unsafe {
+                qk_rmsnorm_rope64_avx512(
+                    &mut q_vec, &mut k_vec, &qn, &kn, &cos_row, &sin_row, eps, n_heads, n_kv_heads,
+                );
+            }
+            for i in 0..q_ref.len() {
+                assert!(
+                    (q_vec[i] - q_ref[i]).abs() <= 1e-5,
+                    "q[{i}] {} vs {}",
+                    q_vec[i],
+                    q_ref[i]
+                );
+            }
+            for i in 0..k_ref.len() {
+                assert!(
+                    (k_vec[i] - k_ref[i]).abs() <= 1e-5,
+                    "k[{i}] {} vs {}",
+                    k_vec[i],
+                    k_ref[i]
+                );
             }
         }
 

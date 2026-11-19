@@ -40,6 +40,7 @@ fn tower_preference(trunk: &str, load_as: BackendPreference) -> BackendPreferenc
         "metal" => BackendPreference::Metal,
         "wgpu" => BackendPreference::Gpu,
         "hexagon" => BackendPreference::Hexagon,
+        "xdna" => BackendPreference::Npu,
         _ if load_as == BackendPreference::Auto => BackendPreference::Cpu,
         _ => load_as,
     }
@@ -346,19 +347,31 @@ impl D1Engine {
             let tower_label = match towers {
                 BackendPreference::Metal => "metal",
                 BackendPreference::Gpu => "wgpu",
-                BackendPreference::Hexagon | BackendPreference::Npu => "hexagon",
+                BackendPreference::Hexagon => "hexagon",
+                BackendPreference::Npu => {
+                    if trunk == "xdna" || (cfg!(feature = "xdna") && !cfg!(feature = "hexagon")) {
+                        "xdna"
+                    } else {
+                        "hexagon"
+                    }
+                }
                 BackendPreference::Cpu | BackendPreference::Auto => "cpu",
             };
             let place = |on: bool| if on { tower_label } else { "cpu" };
             // the NPU head takes up to `LONG_STACK_ROWS` rows a pass; a longer prompt runs on the host
-            let head_label = if head && towers == BackendPreference::Hexagon {
-                "hexagon (host above 4096 rows)"
-            } else {
-                place(head)
-            };
+            let head_label =
+                if head && matches!(towers, BackendPreference::Hexagon | BackendPreference::Npu) {
+                    if tower_label == "xdna" {
+                        "xdna (host above 4096 rows)"
+                    } else {
+                        "hexagon (host above 4096 rows)"
+                    }
+                } else {
+                    place(head)
+                };
             // an NPU part that did not load runs on the host: say which, never silently
             let mut note = note;
-            if towers == BackendPreference::Hexagon {
+            if matches!(towers, BackendPreference::Hexagon | BackendPreference::Npu) {
                 let missed: Vec<&str> = [
                     ("head", !head),
                     ("vision tower", d1.supports_images() && !vision),
@@ -368,8 +381,13 @@ impl D1Engine {
                 .filter_map(|&(name, off)| off.then_some(name))
                 .collect();
                 if !missed.is_empty() {
+                    let why = if tower_label == "xdna" {
+                        "see the XDNA/NPU lines in the log for why"
+                    } else {
+                        "see the cera-hexagon lines in the log for why"
+                    };
                     let msg = format!(
-                        "the NPU did not take the {} (see the cera-hexagon lines in the log for why); on the CPU",
+                        "the NPU did not take the {} ({why}); on the CPU",
                         missed.join(", ")
                     );
                     note = Some(match note {
@@ -607,6 +625,8 @@ mod tests {
         assert_eq!(tower_preference("hexagon", Auto), Hexagon);
         assert_eq!(tower_preference("hexagon", Hexagon), Hexagon);
         assert_eq!(tower_preference("hexagon", Npu), Hexagon);
+        assert_eq!(tower_preference("xdna", Auto), Npu);
+        assert_eq!(tower_preference("xdna", Npu), Npu);
         // an Auto request that ended on the CPU keeps the towers there
         assert_eq!(tower_preference("cpu", Auto), Cpu);
         assert_eq!(tower_preference("cpu", Cpu), Cpu);

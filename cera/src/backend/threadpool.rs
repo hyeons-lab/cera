@@ -117,11 +117,22 @@ use std::time::Instant;
 /// benchmark is the real validation.
 #[cfg(not(miri))]
 const SPIN_BEFORE_PARK: u32 = 100_000;
+/// Spin limit for prefill pools. On Windows, short condvar park/wake cycles across
+/// rapid norm/quant/GEMM barriers trigger multi-millisecond scheduler stalls, so keep
+/// prefill workers warm at the same bounded spin as decode.
+#[cfg(all(not(miri), target_os = "windows"))]
+const PREFILL_SPIN_BEFORE_PARK: u32 = 100_000;
+/// Shorter spin limit for prefill pools on non-Windows targets so workers park quickly
+/// when a chunk finishes or decode begins instead of contending for core clocks/TDP.
+#[cfg(all(not(miri), not(target_os = "windows")))]
+const PREFILL_SPIN_BEFORE_PARK: u32 = 2_000;
 /// Miri executes far too slowly to spin 100k times on idle workers; a tiny
 /// bound keeps the interpreter's data-race checking tractable while still
 /// exercising both the spin and park branches.
 #[cfg(miri)]
 const SPIN_BEFORE_PARK: u32 = 4;
+#[cfg(miri)]
+const PREFILL_SPIN_BEFORE_PARK: u32 = 4;
 
 /// Spin iterations the dispatcher burns waiting for the barrier before it
 /// starts yielding its timeslice. Workers finish within µs when running; the
@@ -739,10 +750,15 @@ impl RowPool {
         let num_threads = num_threads.max(1).min(ACTIVE_MASK as usize);
         // Spin iterations before an idle worker parks. `CERA_SPIN` overrides the
         // default for tuning the spin-vs-park trade-off on a given device.
+        let default_spin = if active_barrier {
+            PREFILL_SPIN_BEFORE_PARK
+        } else {
+            SPIN_BEFORE_PARK
+        };
         let spin_limit = std::env::var("CERA_SPIN")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(SPIN_BEFORE_PARK);
+            .unwrap_or(default_spin);
         // Only carry weights when at least one worker would actually scale down.
         // An all-`WEIGHT_FULL` vector (a host with no spread) would make
         // `worker_chunk_rows` do lookup work per dispatch to conclude nothing,
@@ -2294,7 +2310,12 @@ pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
     set_current_thread_affinity(&[core])
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "windows")]
+pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
+    set_current_thread_affinity(&[core])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 pub(crate) fn pin_current_thread_to_core(_core: usize) -> bool {
     false
 }
@@ -2316,9 +2337,18 @@ pub(crate) fn pinned_cores() -> &'static [usize] {
 /// freshly-sized topo so pins track it. The single place the `CERA_PIN`
 /// decision is made.
 fn pin_cores_in(topo: &super::cpu_features::CoreTopology) -> &[usize] {
-    if pinning_enabled() {
-        &topo.pin_cores
-    } else {
+    if !pinning_enabled() {
+        return &[];
+    }
+    if !topo.pin_cores.is_empty() {
+        return &topo.pin_cores;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        super::cpu_features::windows_ordered_cpus()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
         &[]
     }
 }
@@ -2408,7 +2438,32 @@ fn set_thread_affinity_for_tid(tid: libc::pid_t, cores: &[usize]) -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "windows")]
+pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
+    if cores.is_empty() {
+        return false;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadAffinityMask(thread: isize, thread_affinity_mask: usize) -> usize;
+    }
+    let capacity = usize::BITS as usize;
+    let mut mask = 0usize;
+    for &core in cores {
+        if core < capacity {
+            mask |= 1usize << core;
+        }
+    }
+    if mask == 0 {
+        return false;
+    }
+    // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread,
+    // and `mask` is non-zero within processor group 0's KAFFINITY bit width.
+    unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) != 0 }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 pub(crate) fn set_current_thread_affinity(_cores: &[usize]) -> bool {
     false
 }

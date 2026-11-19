@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Matrix bench: 3 devices × 2 models × 3 prompt sizes, --runs 20 --warmup 3.
-# Run order: metal first (fast), then cpu/gpu @ small prompts, then large.
+# Matrix bench: 3 devices × 2 models × 10 prompt sizes (128..32768), --warmup 3.
+# Run order: metal first (fast), then cpu/gpu @ small/medium prompts, then long.
 set -euo pipefail
 
 BIN="./target/release/cera"
@@ -15,10 +15,11 @@ echo "device,model,prompt_tokens,prefill_p50,decode_p50,prefill_mean,decode_mean
 
 run_one() {
   local device="$1" model_label="$2" model_path="$3" ptok="$4" runs="$5"
-  # Default --context-size is 4096; p=4096 + max-tokens 128 = 4224, which
-  # exceeds it and silently produces decode=0. Bump to 8192 across the
-  # board so prefill + decode always fit.
-  local cmd="$BIN bench --model $model_path --device $device --prompt-tokens $ptok --max-tokens 128 --runs $runs --warmup 3 --no-cache --context-size 8192"
+  # Default --context-size is 4096; scale dynamically per prompt length so
+  # prefill + decode always fit cleanly (minimum 8192 for short prompts).
+  local ctx=$(( ((ptok + 128 + 2047) / 2048) * 2048 ))
+  (( ctx < 8192 )) && ctx=8192
+  local cmd="$BIN bench --model $model_path --device $device --prompt-tokens $ptok --max-tokens 128 --runs $runs --warmup 3 --no-cache --context-size $ctx"
   echo "=== $(date '+%H:%M:%S') $device $model_label p=$ptok runs=$runs ===" | tee -a "$LOG"
   local out
   if ! out=$($cmd 2>&1); then
@@ -43,20 +44,26 @@ run_one() {
   echo "  -> prefill p50=$p_p50 decode p50=$d_p50" | tee -a "$LOG"
 }
 
-# Phase A: metal — fast, run all at full --runs 20.
-for ptok in 128 1024 4096; do run_one metal 450M  "$M450" "$ptok" 20; done
-for ptok in 128 1024 4096; do run_one metal 1.6B  "$M16B" "$ptok" 20; done
+# Phase A: metal — fast, run small/medium at --runs 20, long at --runs 5.
+for ptok in 128 1024 1100 2048 2100 3000 4096; do run_one metal 450M  "$M450" "$ptok" 20; done
+for ptok in 8192 16384 32768; do run_one metal 450M  "$M450" "$ptok" 5; done
+for ptok in 128 1024 1100 2048 2100 3000 4096; do run_one metal 1.6B  "$M16B" "$ptok" 20; done
+for ptok in 8192 16384 32768; do run_one metal 1.6B  "$M16B" "$ptok" 5; done
 
-# Phase B: cpu — small/medium prompts at full runs, p4096 at 10 to keep wall-time manageable.
-for ptok in 128 1024; do run_one cpu 450M "$M450" "$ptok" 20; done
-for ptok in 128 1024; do run_one cpu 1.6B "$M16B" "$ptok" 20; done
-run_one cpu 450M "$M450" 4096 10
-run_one cpu 1.6B "$M16B" 4096 10
+# Phase B: cpu — small/medium prompts at full runs, p2048..p4096 at 10, >=8192 at 3 to keep wall-time manageable.
+for ptok in 128 1024 1100; do run_one cpu 450M "$M450" "$ptok" 20; done
+for ptok in 128 1024 1100; do run_one cpu 1.6B "$M16B" "$ptok" 20; done
+for ptok in 2048 2100 3000 4096; do run_one cpu 450M "$M450" "$ptok" 10; done
+for ptok in 2048 2100 3000 4096; do run_one cpu 1.6B "$M16B" "$ptok" 10; done
+for ptok in 8192 16384 32768; do run_one cpu 450M "$M450" "$ptok" 3; done
+for ptok in 8192 16384 32768; do run_one cpu 1.6B "$M16B" "$ptok" 3; done
 
-# Phase C: gpu (wgpu) — slowest, especially at p4096.
-for ptok in 128 1024; do run_one gpu 450M "$M450" "$ptok" 20; done
-for ptok in 128 1024; do run_one gpu 1.6B "$M16B" "$ptok" 20; done
-run_one gpu 450M "$M450" 4096 10
-run_one gpu 1.6B "$M16B" 4096 10
+# Phase C: gpu (wgpu) — slowest, especially at long contexts.
+for ptok in 128 1024 1100; do run_one gpu 450M "$M450" "$ptok" 20; done
+for ptok in 128 1024 1100; do run_one gpu 1.6B "$M16B" "$ptok" 20; done
+for ptok in 2048 2100 3000 4096; do run_one gpu 450M "$M450" "$ptok" 10; done
+for ptok in 2048 2100 3000 4096; do run_one gpu 1.6B "$M16B" "$ptok" 10; done
+for ptok in 8192 16384 32768; do run_one gpu 450M "$M450" "$ptok" 3; done
+for ptok in 8192 16384 32768; do run_one gpu 1.6B "$M16B" "$ptok" 3; done
 
 echo "DONE: $(date '+%H:%M:%S')" | tee -a "$LOG"
