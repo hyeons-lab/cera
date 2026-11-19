@@ -864,6 +864,7 @@ impl CeraEngine {
         let vision_backend = match (cfg.backend, model.backend_label()) {
             (BackendPreference::Auto, "metal") => BackendPreference::Metal,
             (BackendPreference::Auto, "hexagon") => BackendPreference::Hexagon,
+            (BackendPreference::Auto, "xdna") => BackendPreference::Npu,
             (BackendPreference::Auto, "wgpu") => BackendPreference::Gpu,
             (other, _) => other,
         };

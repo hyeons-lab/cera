@@ -17,7 +17,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-ROW_ORDER = ["128", "1024", "4096"]
+ROW_ORDER = ["128", "1024", "1100", "2048", "2100", "3000", "4096", "8192", "16384", "32768"]
 COL_ORDER = ["metal", "gpu", "cpu"]
 
 
@@ -44,6 +44,8 @@ def main(csv_path: str = "bench_results.csv") -> None:
         print(head_l)
         print(sep_l)
         for ptok in ROW_ORDER:
+            if not any((dev, ptok) in cells for dev in COL_ORDER):
+                continue
             cols_pre = []
             cols_dec = []
             for dev in COL_ORDER:

@@ -41,6 +41,9 @@ static const char kUsage[] =
     "  spike q4gemv       <xclbin> <insts> <M> <K> [iters]       Q4_0-style GEMV (iron/q4gemv), checked\n"
     "  spike q4chain      <artifact-dir> [tokens]               dependent Q4 GEMV chain at Llama-3.2-1B shapes\n"
     "  spike q4layer      <xclbin> <insts> [iters]              fused Q4 layer (iron/q4layer), checked\n"
+    "  spike q4prefill    <xclbin> <insts> <N> <K> [iters]      MemTile-tiled Q4 prefill GEMM (B=32), checked\n"
+    "  spike q4prefillchain <artifact-dir> [iters]              16-layer Llama-3.2-1B prefill runlist (B=32)\n"
+    "  spike q4prefill_layer <xclbin> <insts> [pos0] [causal] [iters]  fused B=32 layer prefill, checked\n"
     "Shapes passed to the IRON commands must match the ones the xclbin was built for.\n";
 
 using clk = std::chrono::steady_clock;
@@ -1143,6 +1146,654 @@ static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iter
   return bad_total ? 1 : 0;
 }
 
+// MemTile-tiled Q4_0 prefill GEMM (iron/q4prefill): computes Y[32, N] = X[32, K] @ W[N, K]^T
+// across all 32 AIE2P cores (4 token-rows x 8 weight-cols).
+static int cmd_q4prefill(const char* xclbin_path, const char* insts_path, int N, int K, int iters) {
+  const int N_ROWS = 4, N_COLS = 8, B_CORE = 8, B = N_ROWS * B_CORE, ROWS = 16, QB = 32, CHUNK_K = 2048;
+  const int NB_CHUNK = CHUNK_K / QB, MAX_ACC_TILES = 8;
+  if (N <= 0 || N % (N_COLS * ROWS) != 0)
+    throw std::invalid_argument("q4prefill N must be a positive multiple of 128");
+  if (K <= 0 || K % CHUNK_K != 0)
+    throw std::invalid_argument("q4prefill K must be a positive multiple of 2048");
+
+  const int n_col = N / N_COLS;
+  const int tiles_per_col = n_col / ROWS;
+  const int k_chunks = K / CHUNK_K;
+  const int pass_tiles = (k_chunks > 1 && tiles_per_col > MAX_ACC_TILES) ? MAX_ACC_TILES : tiles_per_col;
+  if (tiles_per_col % pass_tiles != 0)
+    throw std::invalid_argument("q4prefill tiles_per_col not divisible by pass_tiles");
+  const int n_passes = tiles_per_col / pass_tiles;
+
+  const size_t TILE_BYTES = size_t(NB_CHUNK) * (2 * 128 + ROWS * 2);  // 18,432
+  const size_t XQ_BYTES = size_t(B_CORE) * CHUNK_K;                   // 16,384
+  const size_t XD_BYTES = size_t(B_CORE) * NB_CHUNK * 2;              // 1,024
+  const size_t X_HDR_BYTES = 64;
+  const size_t X_SLOT_BYTES = XQ_BYTES + XD_BYTES + X_HDR_BYTES;      // 17,472
+
+  const size_t w_bytes = size_t(N / ROWS) * k_chunks * TILE_BYTES;
+  const size_t x_bytes = size_t(k_chunks) * N_ROWS * X_SLOT_BYTES;
+  const size_t y_bytes = size_t(B) * N * 4;
+  const int nb = K / QB;
+
+  std::vector<int8_t> wq;
+  std::vector<uint16_t> wd;
+  q4_gen_weights(N, K, 2024u + unsigned(N), wq, wd);
+
+  std::vector<int8_t> xq(size_t(B) * K);
+  std::vector<uint16_t> xd(size_t(B) * nb);
+  uint32_t s = 1337u + unsigned(K);
+  auto frand = [&]() { s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; };
+  for (int tok = 0; tok < B; ++tok) {
+    for (int b = 0; b < nb; ++b) {
+      float xs[32], amax = 0;
+      for (int j = 0; j < QB; ++j) {
+        xs[j] = frand();
+        amax = std::max(amax, std::fabs(xs[j]));
+      }
+      float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+      uint16_t d_bf16 = f32_to_bf16(d);
+      xd[size_t(tok) * nb + b] = d_bf16;
+      // Quantize with the exact f32 value of the bf16 scale or raw d (reference uses xd[tok*nb+b]).
+      for (int j = 0; j < QB; ++j) {
+        float q = std::round(xs[j] * id);
+        q = std::max(-127.0f, std::min(127.0f, q));
+        xq[size_t(tok) * K + b * QB + j] = int8_t(int(q));
+      }
+    }
+  }
+
+  auto k = open_mlir_aie(xclbin_path, insts_path);
+  auto bo_w = host_bo(k, w_bytes, 3);
+  auto bo_x = host_bo(k, x_bytes, 4);
+  auto bo_y = host_bo(k, y_bytes, 5);
+
+  auto* w = bo_w.map<uint8_t*>();
+  std::memset(w, 0, w_bytes);
+  q4_pack_weights(wq, wd, N, K, w, false, false);
+
+  auto* x_buf = bo_x.map<uint8_t*>();
+  std::memset(x_buf, 0, x_bytes);
+  for (int ch = 0; ch < k_chunks; ++ch) {
+    for (int r = 0; r < N_ROWS; ++r) {
+      uint8_t* slot = x_buf + (size_t(ch) * N_ROWS + r) * X_SLOT_BYTES;
+      auto* xq_dst = reinterpret_cast<int8_t*>(slot);
+      auto* xd_dst = reinterpret_cast<uint16_t*>(slot + XQ_BYTES);
+      auto* hdr = reinterpret_cast<int32_t*>(slot + XQ_BYTES + XD_BYTES);
+      hdr[0] = n_passes;
+      hdr[1] = pass_tiles;
+      hdr[2] = k_chunks;
+      for (int lb = 0; lb < NB_CHUNK; ++lb) {
+        int b = ch * NB_CHUNK + lb;
+        for (int grp = 0; grp < 2; ++grp) {
+          for (int h = 0; h < 2; ++h) {
+            for (int t = 0; t < 4; ++t) {
+              int tok = r * B_CORE + grp * 4 + t;
+              for (int kk = 0; kk < 16; ++kk) {
+                xq_dst[lb * 256 + grp * 128 + h * 64 + t * 16 + kk] =
+                    xq[size_t(tok) * K + b * QB + h * 16 + kk];
+              }
+            }
+          }
+        }
+        for (int t = 0; t < B_CORE; ++t) {
+          xd_dst[lb * B_CORE + t] = xd[size_t(r * B_CORE + t) * nb + b];
+        }
+      }
+    }
+  }
+
+  auto* y = bo_y.map<float*>();
+  std::memset(y, 0, y_bytes);
+  bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_x.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_y.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  auto make = [&]() {
+    auto r = aie_run(k);
+    r.set_arg(3, bo_w);
+    r.set_arg(4, bo_x);
+    r.set_arg(5, bo_y);
+    return r;
+  };
+  auto run = make();
+  run.start();
+  auto state = wait_completed(run, "q4prefill verify");
+  bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+  int bad = 0;
+  double worst = 0;
+  bool any_nan = false;
+  double sq_err_f64 = 0.0, sq_ref_f64 = 0.0;
+  for (int tok = 0; tok < B; ++tok) {
+    for (int row = 0; row < N; ++row) {
+      double ref_bf16 = 0.0, mag_bf16 = 0.0, ref_f64 = 0.0;
+      for (int ch = 0; ch < k_chunks; ++ch) {
+        float chunk_acc = 0.0f;
+        for (int lb = 0; lb < NB_CHUNK; ++lb) {
+          int b = ch * NB_CHUNK + lb;
+          int32_t dot = 0;
+          for (int j = 0; j < QB; ++j) {
+            dot += int32_t(wq[size_t(row) * K + b * QB + j]) * xq[size_t(tok) * K + b * QB + j];
+          }
+          float dw = bf16_to_f32(wd[size_t(row) * nb + b]);
+          float dx = bf16_to_f32(xd[size_t(tok) * nb + b]);
+          float r_b = bf16_to_f32(f32_to_bf16(float(dot)));
+          float sc_b = bf16_to_f32(f32_to_bf16(dw * dx));
+          chunk_acc += r_b * sc_b;
+          mag_bf16 += std::fabs(double(r_b) * double(sc_b));
+          ref_f64 += double(dot) * double(dw) * double(dx);
+        }
+        ref_bf16 += double(chunk_acc);
+      }
+      float got = y[size_t(tok) * N + row];
+      double err = std::fabs(double(got) - ref_bf16) / (mag_bf16 > 0 ? mag_bf16 : 1.0);
+      if (!(err <= 1e-4) && bad++ < 5)
+        std::printf("  (tok=%d, row=%d): npu=%.6f ref_bf16=%.6f ref_f64=%.6f rel=%.2e\n", tok, row, got, ref_bf16,
+                    ref_f64, err);
+      if (std::isnan(err)) any_nan = true;
+      else worst = std::max(worst, err);
+      double d64 = double(got) - ref_f64;
+      sq_err_f64 += d64 * d64;
+      sq_ref_f64 += ref_f64 * ref_f64;
+    }
+  }
+  double rms_rel_f64 = sq_ref_f64 > 0.0 ? std::sqrt(sq_err_f64 / sq_ref_f64) : 0.0;
+  std::printf("kernel %s, state=%d, B=%d N=%d K=%d (n_passes=%d, pass_tiles=%d, k_chunks=%d)\n",
+              k.name.c_str(), int(state), B, N, K, n_passes, pass_tiles, k_chunks);
+  std::printf("verify vs bf16-epilogue sim: %d of %d outputs off by >1e-4 (worst %.2e%s) -> %s; rel RMS vs f64=%.4f%%\n",
+              bad, B * N, worst, any_nan ? ", NaN" : "", bad ? "FAIL" : "PASS", rms_rel_f64 * 100.0);
+
+  auto t_sw = time_runs(run, 3, iters);
+  auto s_sw = report("q4prefill start+wait", t_sw, 1.0);
+
+  const char* rl_env = std::getenv("SPIKE_Q4_RUNLIST");
+  int rl_len = rl_env ? int(parse_pos(rl_env, "SPIKE_Q4_RUNLIST")) : 16;
+  std::vector<xrt::run> rl_runs;
+  xrt::runlist rl(k.ctx);
+  for (int i = 0; i < rl_len; ++i) {
+    rl_runs.push_back(make());
+    rl.add(rl_runs.back());
+  }
+  auto t_rl = time_runlist(rl, 3, iters);
+  char label[64];
+  std::snprintf(label, sizeof label, "q4prefill runlist L=%d (/run)", rl_len);
+  auto s_rl = report(label, t_rl, rl_len);
+
+  double p50_rl = pct(s_rl, 0.5);
+  double p50_sw = pct(s_sw, 0.5);
+  double ops = 2.0 * B * N * K;
+  std::printf("weights %.2f MiB: start+wait %.2f GB/s (%.2f TOPS), runlist L=%d %.2f GB/s (%.2f TOPS) at p50\n",
+              w_bytes / 1048576.0, w_bytes / (p50_sw * 1e3), ops / (p50_sw * 1e6),
+              rl_len, w_bytes / (p50_rl * 1e3), ops / (p50_rl * 1e6));
+  return bad ? 1 : 0;
+}
+
+// 16-layer Llama-3.2-1B prefill GEMM runlist (112 runs = 16 layers x 7 stages, B=32 tokens)
+// sharing ONE q4prefill xclbin/hw_context with per-shape instruction binaries.
+static int cmd_q4prefillchain(const char* dir, int iters) {
+  const int B = 32, B_CORE = 8, N_ROWS = 4, N_COLS = 8, ROWS = 16, QB = 32, CHUNK_K = 2048;
+  const int NB_CHUNK = CHUNK_K / QB, MAX_ACC_TILES = 8;
+  const size_t TILE_BYTES = size_t(NB_CHUNK) * (2 * 128 + ROWS * 2);
+  const size_t X_SLOT_BYTES = size_t(B_CORE) * CHUNK_K + size_t(B_CORE) * NB_CHUNK * 2 + 64;
+
+  char xcl[1024], inst2048[1024];
+  std::snprintf(xcl, sizeof xcl, "%s/q4prefill_2048x2048.xclbin", dir);
+  std::snprintf(inst2048, sizeof inst2048, "%s/insts_q4prefill_2048x2048.bin", dir);
+  auto kern = open_mlir_aie(xcl, inst2048);
+
+  struct ShapeInfo {
+    int N, K;
+    int n_passes, pass_tiles, k_chunks;
+    size_t w_bytes, x_bytes, y_bytes;
+    xrt::bo instr_bo;
+    uint32_t n_instr;
+  };
+  const int specs[4][2] = {{2048, 2048}, {512, 2048}, {8192, 2048}, {2048, 8192}};
+  std::vector<ShapeInfo> shapes(4);
+  for (int i = 0; i < 4; ++i) {
+    ShapeInfo& sh = shapes[i];
+    sh.N = specs[i][0];
+    sh.K = specs[i][1];
+    int tiles_per_col = (sh.N / N_COLS) / ROWS;
+    sh.k_chunks = sh.K / CHUNK_K;
+    sh.pass_tiles = (sh.k_chunks > 1 && tiles_per_col > MAX_ACC_TILES) ? MAX_ACC_TILES : tiles_per_col;
+    sh.n_passes = tiles_per_col / sh.pass_tiles;
+    sh.w_bytes = size_t(sh.N / ROWS) * sh.k_chunks * TILE_BYTES;
+    sh.x_bytes = size_t(sh.k_chunks) * N_ROWS * X_SLOT_BYTES;
+    sh.y_bytes = size_t(B) * sh.N * 4;
+    char ipath[1024];
+    std::snprintf(ipath, sizeof ipath, "%s/insts_q4prefill_%dx%d.bin", dir, sh.N, sh.K);
+    auto words = load_insts(ipath);
+    sh.n_instr = uint32_t(words.size());
+    sh.instr_bo = xrt::bo(kern.dev, words.size() * 4, XCL_BO_FLAGS_CACHEABLE, kern.kernel.group_id(1));
+    std::memcpy(sh.instr_bo.map<void*>(), words.data(), words.size() * 4);
+    sh.instr_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+  const int stage_idx[7] = {0, 1, 1, 0, 2, 2, 3};
+
+  // Allocate per-layer weights (522 MiB total, matching real model DDR footprint) and per-stage x/y BOs.
+  std::vector<xrt::bo> bo_ws, bo_xs, bo_ys;
+  std::vector<xrt::run> runs;
+  xrt::runlist rl(kern.ctx);
+  double total_w_bytes = 0.0, total_ops = 0.0;
+
+  for (int s = 0; s < 4; ++s) {
+    const auto& sh = shapes[s];
+    auto bx = host_bo(kern, sh.x_bytes, 4);
+    auto* x_buf = bx.map<uint8_t*>();
+    std::memset(x_buf, 1, sh.x_bytes);
+    for (int ch = 0; ch < sh.k_chunks; ++ch) {
+      for (int r = 0; r < N_ROWS; ++r) {
+        uint8_t* slot = x_buf + (size_t(ch) * N_ROWS + r) * X_SLOT_BYTES;
+        auto* hdr = reinterpret_cast<int32_t*>(slot + size_t(B_CORE) * CHUNK_K + size_t(B_CORE) * NB_CHUNK * 2);
+        hdr[0] = sh.n_passes;
+        hdr[1] = sh.pass_tiles;
+        hdr[2] = sh.k_chunks;
+      }
+    }
+    bx.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_xs.push_back(std::move(bx));
+    auto by = host_bo(kern, sh.y_bytes, 5);
+    std::memset(by.map<void*>(), 0, sh.y_bytes);
+    by.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_ys.push_back(std::move(by));
+  }
+
+  for (int layer = 0; layer < 16; ++layer) {
+    for (int st = 0; st < 7; ++st) {
+      int si = stage_idx[st];
+      const auto& sh = shapes[si];
+      auto bw = host_bo(kern, sh.w_bytes, 3);
+      std::memset(bw.map<void*>(), 0x11, sh.w_bytes);
+      bw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+      xrt::run r(kern.kernel);
+      r.set_arg(0, uint64_t(3));
+      r.set_arg(1, sh.instr_bo);
+      r.set_arg(2, sh.n_instr);
+      r.set_arg(3, bw);
+      r.set_arg(4, bo_xs[si]);
+      r.set_arg(5, bo_ys[si]);
+      rl.add(r);
+
+      bo_ws.push_back(std::move(bw));
+      runs.push_back(std::move(r));
+      total_w_bytes += double(sh.w_bytes);
+      total_ops += 2.0 * B * sh.N * sh.K;
+    }
+  }
+
+  auto t = time_runlist(rl, 3, iters);
+  auto sorted = report("q4prefillchain 16L (B=32)", t, 1.0);
+  double p50_us = pct(sorted, 0.50);
+  double p90_us = pct(sorted, 0.90);
+  std::printf("Llama-3.2-1B 16-layer prefill (112 runs, B=%d, %.2f MiB weights, shared xclbin):\n",
+              B, total_w_bytes / 1048576.0);
+  std::printf("  p50=%.2f ms (%.1f tok/s, %.2f GB/s, %.2f TOPS), p90=%.2f ms (%.1f tok/s)\n",
+              p50_us / 1000.0, B * 1e6 / p50_us, total_w_bytes / (p50_us * 1e3), total_ops / (p50_us * 1e6),
+              p90_us / 1000.0, B * 1e6 / p90_us);
+  return 0;
+}
+
+static int cmd_q4prefill_layer(const char* xclbin_path, const char* insts_path,
+                               int pos0, int is_causal, int iters) {
+  const int B = 32, H = 2048, Q_DIM = 2048, KV_DIM = 512, FFN = 8192;
+  const int N_COLS = 8, ROWS = 16, QB = 32, CHUNK_K = 2048, NB_CHUNK = CHUNK_K / QB;
+  const int HEAD_DIM = 64, MAX_KV_CHUNKS = 64, W_ELEMS = 4608, X_ELEMS = 5120, N_ROWS = 4;
+  const int SLOT_HIDDEN_IN = 0;
+  const int SLOT_XQ = SLOT_HIDDEN_IN + B * H;
+  const int SLOT_Q = SLOT_XQ + 4 * N_ROWS * X_ELEMS;
+  const int SLOT_KV_F32 = SLOT_Q + N_COLS * 2 * W_ELEMS;
+  const int SLOT_KV_CUR = SLOT_KV_F32 + N_COLS * W_ELEMS;
+  const int SLOT_ATTN_OUT = SLOT_KV_CUR + N_COLS * W_ELEMS;
+  const int SLOT_O_OUT = SLOT_ATTN_OUT + B * H;
+  const int SLOT_HIDDEN_MID = SLOT_O_OUT + B * H;
+  const int SLOT_GATE = SLOT_HIDDEN_MID + B * H;
+  const int SLOT_UP = SLOT_GATE + B * FFN;
+  const int SLOT_DOWN_OUT = SLOT_UP + B * FFN;
+  const int SLOT_META = SLOT_DOWN_OUT + B * H;
+  const size_t ACT_TOTAL = size_t(SLOT_META) + 12288;
+  const size_t KV_TOTAL = size_t(N_COLS) * MAX_KV_CHUNKS * W_ELEMS;
+  const size_t TILE_BYTES = size_t(NB_CHUNK) * (2 * 128 + ROWS * 2);  // 18432
+
+  if (pos0 < 0 || pos0 + B > MAX_KV_CHUNKS * 64) {
+    throw std::invalid_argument("q4prefill_layer pos0 out of range 0.." + std::to_string(MAX_KV_CHUNKS * 64 - B));
+  }
+  const int kv_chunks = (pos0 + 63) / 64;
+
+  struct Proj { const char* name; int N, K; size_t w_off; std::vector<int8_t> wq; std::vector<uint16_t> wd; };
+  std::vector<Proj> projs = {
+      {"Q", Q_DIM, H, 0, {}, {}},
+      {"K", KV_DIM, H, 0, {}, {}},
+      {"V", KV_DIM, H, 0, {}, {}},
+      {"O", H, Q_DIM, 0, {}, {}},
+      {"Gate", FFN, H, 0, {}, {}},
+      {"Up", FFN, H, 0, {}, {}},
+      {"Down", H, FFN, 0, {}, {}},
+  };
+  size_t w_bytes = 0;
+  for (size_t i = 0; i < projs.size(); ++i) {
+    projs[i].w_off = w_bytes;
+    w_bytes += size_t(projs[i].N / ROWS) * (projs[i].K / CHUNK_K) * TILE_BYTES;
+  }
+
+  auto kern = open_mlir_aie(xclbin_path, insts_path);
+  auto bo_w = host_bo(kern, w_bytes, 3);
+  auto bo_y = host_bo(kern, ACT_TOTAL * 4, 4);
+  auto bo_y_next = host_bo(kern, ACT_TOTAL * 4, 5);
+  auto bo_kv = host_bo(kern, KV_TOTAL * 4, 6);
+
+  auto* w_ptr = bo_w.map<uint8_t*>();
+  std::memset(w_ptr, 0, w_bytes);
+  const char* ws_env = std::getenv("SPIKE_W_SCALE");
+  float w_scale = ws_env ? std::strtof(ws_env, nullptr) : 0.02f;
+  for (size_t i = 0; i < projs.size(); ++i) {
+    q4_gen_weights(projs[i].N, projs[i].K, 3000u + unsigned(i * 131), projs[i].wq, projs[i].wd, w_scale);
+    q4_pack_weights(projs[i].wq, projs[i].wd, projs[i].N, projs[i].K, w_ptr + projs[i].w_off, false, false);
+  }
+  bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  uint32_t rng = 42u;
+  auto frand = [&](float amp) {
+    rng = rng * 1664525u + 1013904223u;
+    return (float((rng >> 8) & 0xFFFF) / 32768.0f - 1.0f) * amp;
+  };
+
+  auto* y = bo_y.map<float*>();
+  auto* y_next = bo_y_next.map<float*>();
+  std::memset(y, 0, ACT_TOTAL * 4);
+  std::memset(y_next, 0, ACT_TOTAL * 4);
+
+  std::vector<float> x_in(size_t(B) * H);
+  for (size_t i = 0; i < x_in.size(); ++i) {
+    x_in[i] = frand(0.5f);
+    y[SLOT_HIDDEN_IN + i] = x_in[i];
+  }
+  std::vector<float> norm_w0(H), norm_w1(H);
+  for (int d = 0; d < H; ++d) {
+    norm_w0[d] = 1.0f + frand(0.25f);
+    norm_w1[d] = 1.0f + frand(0.25f);
+    y[SLOT_META + d] = norm_w0[d];
+    y[SLOT_META + 2048 + d] = norm_w1[d];
+  }
+  const float eps = 1e-5f;
+  int32_t eps_bits = 0;
+  std::memcpy(&eps_bits, &eps, 4);
+  auto* params = reinterpret_cast<int32_t*>(y + SLOT_META + 4096);
+  params[0] = pos0;
+  params[1] = B;
+  params[2] = kv_chunks;
+  params[3] = pos0;       // n_past_tokens
+  params[4] = is_causal;  // 1=causal, 0=bidirectional
+  params[5] = 1;          // rope_mode = NeoX
+  params[7] = eps_bits;
+
+  std::vector<float> rope_cs(size_t(B) * 64);
+  for (int t = 0; t < B; ++t) {
+    double pos = double(pos0 + t);
+    for (int i = 0; i < 32; ++i) {
+      double inv_freq = std::pow(500000.0, -double(2 * i) / 64.0);
+      double ang = pos * inv_freq;
+      rope_cs[size_t(t) * 64 + i] = float(std::cos(ang));
+      rope_cs[size_t(t) * 64 + 32 + i] = float(std::sin(ang));
+      y[SLOT_META + 4608 + size_t(t) * 64 + i] = rope_cs[size_t(t) * 64 + i];
+      y[SLOT_META + 4608 + size_t(t) * 64 + 32 + i] = rope_cs[size_t(t) * 64 + 32 + i];
+    }
+  }
+
+  auto* kv_f32 = bo_kv.map<float*>();
+  std::memset(kv_f32, 0, KV_TOTAL * 4);
+  std::vector<float> past_k(size_t(N_COLS) * pos0 * HEAD_DIM, 0.0f);
+  std::vector<float> past_v(size_t(N_COLS) * pos0 * HEAD_DIM, 0.0f);
+  for (int c = 0; c < N_COLS; ++c) {
+    for (int tp = 0; tp < pos0; ++tp) {
+      int ch = tp / 64, kt = tp % 64;
+      auto* k_dst = reinterpret_cast<uint16_t*>(kv_f32 + (size_t(c) * MAX_KV_CHUNKS + ch) * W_ELEMS);
+      auto* v_dst = reinterpret_cast<uint16_t*>(kv_f32 + (size_t(c) * MAX_KV_CHUNKS + ch) * W_ELEMS + 2304);
+      for (int d = 0; d < HEAD_DIM; ++d) {
+        uint16_t kb = f32_to_bf16(frand(0.3f));
+        uint16_t vb = f32_to_bf16(frand(0.3f));
+        k_dst[kt * HEAD_DIM + d] = kb;
+        v_dst[kt * HEAD_DIM + d] = vb;
+        past_k[(size_t(c) * pos0 + tp) * HEAD_DIM + d] = bf16_to_f32(kb);
+        past_v[(size_t(c) * pos0 + tp) * HEAD_DIM + d] = bf16_to_f32(vb);
+      }
+    }
+  }
+
+  bo_y.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_y_next.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_kv.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  auto make_run = [&]() {
+    auto r = aie_run(kern);
+    r.set_arg(3, bo_w);
+    r.set_arg(4, bo_y);
+    r.set_arg(5, bo_y_next);
+    r.set_arg(6, bo_kv);
+    return r;
+  };
+  auto run = make_run();
+  run.start();
+  auto state = wait_completed(run, "q4prefill_layer verify");
+  bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  bo_y_next.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+  // CPU f64 reference for the full transformer layer
+  auto rmsnorm_ref = [&](const std::vector<double>& in, const std::vector<float>& nw, std::vector<double>& out) {
+    out.resize(size_t(B) * H);
+    for (int t = 0; t < B; ++t) {
+      double ss = 0.0;
+      for (int d = 0; d < H; ++d) ss += in[size_t(t) * H + d] * in[size_t(t) * H + d];
+      double inv_r = 1.0 / std::sqrt(ss / double(H) + double(eps));
+      for (int d = 0; d < H; ++d) out[size_t(t) * H + d] = in[size_t(t) * H + d] * inv_r * double(nw[d]);
+    }
+  };
+  auto matmul_q4_ref = [&](const Proj& p, const std::vector<double>& in, std::vector<double>& out) {
+    out.assign(size_t(B) * p.N, 0.0);
+    int nb = p.K / QB;
+    for (int t = 0; t < B; ++t) {
+      for (int n = 0; n < p.N; ++n) {
+        double acc = 0.0;
+        for (int b = 0; b < nb; ++b) {
+          double sub = 0.0;
+          for (int j = 0; j < QB; ++j) {
+            sub += double(p.wq[size_t(n) * p.K + b * QB + j]) * in[size_t(t) * p.K + b * QB + j];
+          }
+          acc += sub * double(bf16_to_f32(p.wd[size_t(n) * nb + b]));
+        }
+        out[size_t(t) * p.N + n] = acc;
+      }
+    }
+  };
+
+  std::vector<double> x_f64(x_in.size()), xn0, q_v, k_v, v_v;
+  for (size_t i = 0; i < x_in.size(); ++i) x_f64[i] = double(x_in[i]);
+  rmsnorm_ref(x_f64, norm_w0, xn0);
+  matmul_q4_ref(projs[0], xn0, q_v);
+  matmul_q4_ref(projs[1], xn0, k_v);
+  matmul_q4_ref(projs[2], xn0, v_v);
+
+  // NeoX RoPE on Q (32 heads) and K (8 heads)
+  for (int t = 0; t < B; ++t) {
+    const float* cs = &rope_cs[size_t(t) * 64];
+    for (int h = 0; h < 32; ++h) {
+      double* qp = &q_v[size_t(t) * Q_DIM + h * HEAD_DIM];
+      for (int i = 0; i < 32; ++i) {
+        double x0 = qp[i], x1 = qp[i + 32];
+        qp[i] = x0 * cs[i] - x1 * cs[32 + i];
+        qp[i + 32] = x0 * cs[32 + i] + x1 * cs[i];
+      }
+    }
+    for (int h = 0; h < 8; ++h) {
+      double* kp = &k_v[size_t(t) * KV_DIM + h * HEAD_DIM];
+      for (int i = 0; i < 32; ++i) {
+        double x0 = kp[i], x1 = kp[i + 32];
+        kp[i] = x0 * cs[i] - x1 * cs[32 + i];
+        kp[i + 32] = x0 * cs[32 + i] + x1 * cs[i];
+      }
+    }
+  }
+
+  std::vector<double> attn_out(size_t(B) * H, 0.0);
+  const int total_k = pos0 + B;
+  for (int hq = 0; hq < 32; ++hq) {
+    int hk = hq / 4;
+    for (int t = 0; t < B; ++t) {
+      int lim = is_causal ? (pos0 + t + 1) : total_k;
+      std::vector<double> sc(lim);
+      double mx = -1e30;
+      for (int kp_i = 0; kp_i < lim; ++kp_i) {
+        double dot = 0.0;
+        const double* qp = &q_v[size_t(t) * Q_DIM + hq * HEAD_DIM];
+        if (kp_i < pos0) {
+          const float* pf = &past_k[(size_t(hk) * pos0 + kp_i) * HEAD_DIM];
+          for (int d = 0; d < HEAD_DIM; ++d) dot += qp[d] * double(pf[d]);
+        } else {
+          const double* pd = &k_v[size_t(kp_i - pos0) * KV_DIM + hk * HEAD_DIM];
+          for (int d = 0; d < HEAD_DIM; ++d) dot += qp[d] * pd[d];
+        }
+        sc[kp_i] = dot * 0.125;
+        if (sc[kp_i] > mx) mx = sc[kp_i];
+      }
+      double sum_p = 0.0;
+      for (int kp_i = 0; kp_i < lim; ++kp_i) {
+        sc[kp_i] = std::exp(sc[kp_i] - mx);
+        sum_p += sc[kp_i];
+      }
+      double* op = &attn_out[size_t(t) * H + hq * HEAD_DIM];
+      for (int kp_i = 0; kp_i < lim; ++kp_i) {
+        double w = sc[kp_i] / sum_p;
+        if (kp_i < pos0) {
+          const float* vf = &past_v[(size_t(hk) * pos0 + kp_i) * HEAD_DIM];
+          for (int d = 0; d < HEAD_DIM; ++d) op[d] += w * double(vf[d]);
+        } else {
+          const double* vd = &v_v[size_t(kp_i - pos0) * KV_DIM + hk * HEAD_DIM];
+          for (int d = 0; d < HEAD_DIM; ++d) op[d] += w * vd[d];
+        }
+      }
+    }
+  }
+
+  std::vector<double> o_out, mid(size_t(B) * H), xn1, gate_v, up_v, ffn_in(size_t(B) * FFN), down_out, ref(size_t(B) * H);
+  matmul_q4_ref(projs[3], attn_out, o_out);
+  for (size_t i = 0; i < mid.size(); ++i) mid[i] = x_f64[i] + o_out[i];
+  rmsnorm_ref(mid, norm_w1, xn1);
+  matmul_q4_ref(projs[4], xn1, gate_v);
+  matmul_q4_ref(projs[5], xn1, up_v);
+  for (size_t i = 0; i < ffn_in.size(); ++i) {
+    double g = gate_v[i];
+    ffn_in[i] = (g / (1.0 + std::exp(-g))) * up_v[i];
+  }
+  matmul_q4_ref(projs[6], ffn_in, down_out);
+  for (size_t i = 0; i < ref.size(); ++i) ref[i] = mid[i] + down_out[i];
+
+  if (std::getenv("SPIKE_DEBUG")) {
+    auto check_stage = [&](const char* lbl, const float* got_p, const std::vector<double>& ref_v) {
+      double e = 0.0, r = 0.0, mx = 0.0;
+      for (size_t i = 0; i < ref_v.size(); ++i) {
+        double d = double(got_p[i]) - ref_v[i];
+        e += d * d; r += ref_v[i] * ref_v[i];
+        mx = std::max(mx, std::fabs(d));
+      }
+      std::printf("  stage %-10s rel_RMS=%.4f%% max_abs=%.4f\n", lbl, 100.0 * std::sqrt(e / (r + 1e-30)), mx);
+    };
+    check_stage("attn_out", y + SLOT_ATTN_OUT, attn_out);
+    check_stage("o_out", y + SLOT_O_OUT, o_out);
+    check_stage("hidden_mid", y + SLOT_HIDDEN_MID, mid);
+    check_stage("gate", y + SLOT_GATE, gate_v);
+    check_stage("up", y + SLOT_UP, up_v);
+    check_stage("down_out", y + SLOT_DOWN_OUT, down_out);
+    double ke = 0, kr = 0, ve = 0, vr = 0;
+    for (int c = 0; c < N_COLS; ++c) {
+      const uint16_t* kp = reinterpret_cast<const uint16_t*>(y + SLOT_KV_CUR + size_t(c) * W_ELEMS);
+      const uint16_t* vp = reinterpret_cast<const uint16_t*>(y + SLOT_KV_CUR + size_t(c) * W_ELEMS + 2304);
+      for (int r = 0; r < N_ROWS; ++r) {
+        for (int lt = 0; lt < 8; ++lt) {
+          int t = r * 8 + lt;
+          for (int d = 0; d < HEAD_DIM; ++d) {
+            double gk = bf16_to_f32(kp[size_t(r) * 512 + lt * HEAD_DIM + d]);
+            double rk = k_v[size_t(t) * KV_DIM + c * HEAD_DIM + d];
+            ke += (gk - rk) * (gk - rk); kr += rk * rk;
+            double gv = bf16_to_f32(vp[size_t(r) * 512 + lt * HEAD_DIM + d]);
+            double rv = v_v[size_t(t) * KV_DIM + c * HEAD_DIM + d];
+            ve += (gv - rv) * (gv - rv); vr += rv * rv;
+          }
+        }
+      }
+    }
+    std::printf("  stage k_cur      rel_RMS=%.4f%%   v_cur rel_RMS=%.4f%%\n",
+                100.0 * std::sqrt(ke / (kr + 1e-30)), 100.0 * std::sqrt(ve / (vr + 1e-30)));
+    std::vector<double> npu_ffn(size_t(B) * FFN), down_from_npu;
+    for (size_t i = 0; i < npu_ffn.size(); ++i) {
+      double g = double(y[SLOT_GATE + i]);
+      npu_ffn[i] = (g / (1.0 + std::exp(-g))) * double(y[SLOT_UP + i]);
+    }
+    matmul_q4_ref(projs[6], npu_ffn, down_from_npu);
+    check_stage("down_only", y + SLOT_DOWN_OUT, down_from_npu);
+  }
+
+  double sq_err = 0.0, sq_ref = 0.0, max_diff = 0.0;
+  int nans = 0, bad_sample = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    float got = y_next[SLOT_HIDDEN_IN + i];
+    if (!std::isfinite(got)) { ++nans; continue; }
+    double diff = double(got) - ref[i];
+    sq_err += diff * diff;
+    sq_ref += ref[i] * ref[i];
+    max_diff = std::max(max_diff, std::fabs(diff));
+    if (std::fabs(diff) > 0.15 && bad_sample++ < 5) {
+      std::printf("  sample[%zu] got=%.5f ref=%.5f diff=%.5f\n", i, got, ref[i], diff);
+    }
+  }
+  double rel_rms = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
+  std::printf("kernel %s, state=%d, pos0=%d (kv_chunks=%d) is_causal=%d\n",
+              kern.name.c_str(), int(state), pos0, kv_chunks, is_causal);
+  std::printf("layer check vs f64: rel_RMS=%.4f%%, max_abs=%.4f, nans=%d -> %s\n",
+              rel_rms * 100.0, max_diff, nans, (!nans && rel_rms < 0.01) ? "PASS" : "FAIL");
+
+  if (iters > 0) {
+    auto t_sw = time_runs(run, 2, iters);
+    auto s_sw = report("q4prefill_layer start+wait", t_sw, 1.0);
+    double p50_us = pct(s_sw, 0.50);
+    std::printf("16L est at single-run p50=%.2f ms/layer -> %.2f ms (%.1f tok/s)\n",
+                p50_us / 1000.0, 16.0 * p50_us / 1000.0, (B * 1e6) / (16.0 * p50_us));
+  }
+  if (const char* rl_env = std::getenv("SPIKE_LAYER_RUNLIST")) {
+    int n_layers = int(parse_pos(rl_env, "SPIKE_LAYER_RUNLIST"));
+    std::vector<xrt::bo> rl_ws, rl_ys, rl_kvs;
+    std::vector<xrt::run> rl_runs;
+    xrt::runlist rl(kern.ctx);
+    for (int l = 0; l < n_layers; ++l) {
+      auto bw = host_bo(kern, w_bytes, 3);
+      std::memcpy(bw.map<void*>(), w_ptr, w_bytes);
+      bw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      auto by = host_bo(kern, ACT_TOTAL * 4, 4);
+      std::memcpy(by.map<void*>(), y, ACT_TOTAL * 4);
+      by.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      auto bkv = host_bo(kern, KV_TOTAL * 4, 6);
+      std::memcpy(bkv.map<void*>(), kv_f32, KV_TOTAL * 4);
+      bkv.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      auto r = aie_run(kern);
+      r.set_arg(3, bw);
+      r.set_arg(4, (l == 0) ? bo_y : rl_ys.back());
+      r.set_arg(5, by);
+      r.set_arg(6, bkv);
+      rl.add(r);
+      rl_ws.push_back(std::move(bw));
+      rl_ys.push_back(std::move(by));
+      rl_kvs.push_back(std::move(bkv));
+      rl_runs.push_back(std::move(r));
+    }
+    auto t_rl = time_runlist(rl, 2, iters > 0 ? iters : 10);
+    auto s_rl = report("q4prefill_layer runlist", t_rl, 1.0);
+    double p50_us = pct(s_rl, 0.50);
+    std::printf("%d-layer runlist: p50=%.2f ms (%.1f tok/s)\n",
+                n_layers, p50_us / 1000.0, (B * 1e6) / p50_us);
+  }
+  return (!nans && rel_rms < 0.01) ? 0 : 1;
+}
+
 static std::vector<int> parse_lens(int argc, char** argv, int first) {
   std::vector<int> lens;
   for (int i = first; i < argc; ++i) lens.push_back(int(parse_pos(argv[i], "chain length")));
@@ -1174,6 +1825,16 @@ int main(int argc, char** argv) {
       return cmd_q4chain(argv[2], argc > 3 ? int(parse_pos(argv[3], "tokens")) : 20);
     if (cmd == "q4layer" && need(4))
       return cmd_q4layer(argv[2], argv[3], argc > 4 ? int(parse_pos(argv[4], "iters")) : 30);
+    if (cmd == "q4prefill" && need(6))
+      return cmd_q4prefill(argv[2], argv[3], int(parse_pos(argv[4], "N")), int(parse_pos(argv[5], "K")),
+                           argc > 6 ? int(parse_pos(argv[6], "iters")) : 30);
+    if (cmd == "q4prefillchain" && need(3))
+      return cmd_q4prefillchain(argv[2], argc > 3 ? int(parse_pos(argv[3], "iters")) : 20);
+    if (cmd == "q4prefill_layer" && need(4))
+      return cmd_q4prefill_layer(argv[2], argv[3],
+                                 argc > 4 ? parse_nonneg(argv[4], "pos0") : 0,
+                                 argc > 5 ? parse_nonneg(argv[5], "is_causal") : 1,
+                                 argc > 6 ? parse_nonneg(argv[6], "iters") : 10);
     if (cmd == "q4gemv" && need(6))
       return cmd_q4gemv(argv[2], argv[3], int(parse_pos(argv[4], "M")), int(parse_pos(argv[5], "K")),
                         argc > 6 ? int(parse_pos(argv[6], "iters")) : 200);

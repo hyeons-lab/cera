@@ -46,6 +46,16 @@ for pair in "$@"; do
     bash iron/build.sh q4layer
     continue
   fi
+  if [[ "$pair" == q4prefill:* ]]; then
+    shape="${pair#q4prefill:}"
+    N="${shape%%,*}"
+    K="${shape#*,}"
+    if [ "$N" = "$K" ] && [[ "$shape" != *,* ]]; then
+      K=2048
+    fi
+    bash iron/build.sh q4prefill "$N" "$K"
+    continue
+  fi
   if [[ "$pair" == *,* ]]; then
     M="${pair%%,*}"
     K="${pair#*,}"

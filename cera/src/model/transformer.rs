@@ -84,10 +84,16 @@ pub enum Repacked {
         packed: Vec<u8>,
         scales: Vec<f32>,
     },
+    /// Linear 16-row Q4_0 repack (256 packed bytes + 16 f16 scales per block)
+    /// for AVX-512 VNNI + F16C hosts.
+    Q40Lin16 {
+        packed: Vec<u8>,
+        scales_f16: Vec<u16>,
+    },
     /// Smmla (i8mm) twin of [`Repacked::Q40`] (also built for Q8_0 weights, whose int8 quants
     /// repack into the identical layout): same shapes
     /// (`(m/8)*nb*256` packed bytes, `(m/8)*nb*8` f32 scales) but the
-    /// [`crate::backend::cpu::repack_q4_0_smmla_8x8`] row-pair × 8-wide
+    /// `crate::backend::cpu::repack_q4_0_smmla_8x8` row-pair × 8-wide
     /// k-chunk interleave instead of the vdot 4-wide one. Built instead of
     /// `Q40` when the process tier is `NeonI8mm`, never alongside it, so the
     /// extra-copy cost is unchanged.
@@ -102,7 +108,7 @@ pub enum Repacked {
     },
     /// Smmla (i8mm) twin of [`Repacked::Q4K`]: same shapes
     /// (`(m/8)*nb32*256` packed bytes, `(m/8)*nb32*8` f32 scales) but the
-    /// [`crate::backend::cpu::repack_q4_k_smmla_8x8`] layout. Built instead of
+    /// `crate::backend::cpu::repack_q4_k_smmla_8x8` layout. Built instead of
     /// `Q4K` when the process tier is `NeonI8mm` on aarch64.
     Q4KSmmla {
         packed: Vec<u8>,
@@ -123,7 +129,7 @@ pub enum Repacked {
     },
     /// Smmla (i8mm) twin of [`Repacked::Q6K`]: same shapes
     /// (`m*k` packed bytes, `(m/8)*nb16*8` f32 scales) but the
-    /// [`crate::backend::cpu::repack_q6_k_smmla_8x8`] layout. Built instead of
+    /// `crate::backend::cpu::repack_q6_k_smmla_8x8` layout. Built instead of
     /// `Q6K` when the process tier is `NeonI8mm` on aarch64.
     Q6KSmmla {
         packed: Vec<u8>,
@@ -150,6 +156,7 @@ impl std::fmt::Debug for RepackedWeight {
         // Never print the buffers — they can be hundreds of MiB.
         let (tag, packed_len) = match &self.kind {
             Repacked::Q40 { packed, .. } => ("Q4_0", packed.len()),
+            Repacked::Q40Lin16 { packed, .. } => ("Q4_0+lin16", packed.len()),
             Repacked::Q40Smmla { packed, .. } => ("Q4_0+smmla", packed.len()),
             Repacked::Q41Smmla { packed, .. } => ("Q4_1+smmla", packed.len()),
             Repacked::Q4K { packed, .. } => ("Q4_K", packed.len()),
@@ -375,7 +382,11 @@ impl WeightRef {
             // (env override included), so the repack always matches the
             // dispatch, and the extra-copy cost never doubles.
             if qualifies && self.dtype == DType::Q4_0 {
-                if crate::backend::cpu_features::cpu_features().tier
+                if cpu::q4_0_lin16_repack_supported(self.m, self.k) {
+                    let (packed, scales_f16) =
+                        cpu::repack_q4_0_lin16(weight_data(gguf, &self), self.m, self.k);
+                    kind = Some(Repacked::Q40Lin16 { packed, scales_f16 });
+                } else if crate::backend::cpu_features::cpu_features().tier
                     == crate::backend::cpu_features::CpuTier::NeonI8mm
                 {
                     let (packed, scales) =
@@ -815,6 +826,18 @@ mod gate_tests {
 pub(crate) fn gemv(gguf: &GgufFile, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
     let data = weight_data(gguf, wref);
     cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k, None);
+}
+
+#[cfg(feature = "xdna")]
+pub(crate) fn gemv_active(
+    max_active: usize,
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    x: &[f32],
+    y: &mut [f32],
+) {
+    let data = weight_data(gguf, wref);
+    cpu::gemv_dispatch_active(max_active, wref.dtype, data, x, y, wref.m, wref.k, None);
 }
 
 /// GEMV with pre-quantized Q8_0 input (skips re-quantizing x for each weight
@@ -1323,6 +1346,11 @@ pub(crate) fn try_repacked_gemm_rowmajor(
             Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
                 packed, scales, b_scales, b_quants, out, n, m, k,
             ),
+            Repacked::Q40Lin16 { packed, scales_f16 } => {
+                cpu::gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
+                    packed, scales_f16, b_scales, b_quants, out, n, m, k,
+                )
+            }
             Repacked::Q40Smmla { packed, scales } => {
                 cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
                     packed, scales, b_scales, b_quants, out, n, m, k,
@@ -1407,6 +1435,21 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
     debug_assert_eq!(up.k, k, "try_repacked_gate_up_silu_rowmajor: up k mismatch");
     #[allow(clippy::collapsible_if)]
     if let (Some(g_rp), Some(u_rp)) = (&gate.repacked, &up.repacked) {
+        if let (
+            Repacked::Q40Lin16 {
+                packed: gp,
+                scales_f16: gs,
+            },
+            Repacked::Q40Lin16 {
+                packed: up,
+                scales_f16: us,
+            },
+        ) = (&g_rp.kind, &u_rp.kind)
+        {
+            return cpu::gemm_preq_repacked_q4_0_lin16_gate_up_silu_dispatch(
+                gp, gs, up, us, b_scales, b_quants, out, m, n, k,
+            );
+        }
         if let (
             Repacked::Q40 {
                 packed: gp,
@@ -1539,6 +1582,11 @@ pub(crate) fn gemm_preq(
             Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_dispatch(
                 packed, scales, b_scales, b_quants, out, m, n, k,
             ),
+            Repacked::Q40Lin16 { packed, scales_f16 } => {
+                cpu::gemm_preq_repacked_q4_0_lin16_colmajor_dispatch(
+                    packed, scales_f16, b_scales, b_quants, out, m, n, k,
+                )
+            }
             Repacked::Q40Smmla { packed, scales } => cpu::gemm_preq_repacked_q4_0_smmla_dispatch(
                 packed, scales, b_scales, b_quants, out, m, n, k,
             ),
@@ -2141,12 +2189,13 @@ pub(crate) fn quantize_rows(
             let quants_ptr = quants.as_mut_ptr() as usize;
             // Rows are tokens (cheap, many): small steal chunks over the whole pool. The old
             // `min_cols` rows-per-worker floor made a 512-token chunk a 2-worker dispatch.
+            let max_active = cpu::prefill_threads_for_tokens(n);
             cpu::par_rows_n_chunked_active(
                 &mut scales[..n * nb],
                 nb,
                 1,
-                4,
-                usize::MAX,
+                16,
+                max_active,
                 move |(j, sc)| {
                     let tok_f32 = unsafe {
                         core::slice::from_raw_parts((mat_ptr as *const f32).add(j * dim), dim)

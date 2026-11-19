@@ -7,11 +7,12 @@
 #                                                   workable tiling; K a multiple of 2048 up to
 #                                                   16384, or a multiple of 64 below 2048)
 #   build.sh q4layer                             -> q4layer.*
+#   build.sh q4prefill <N> [K]                   -> q4prefill_<N>x<K>.*
 # Each design writes <name>.xclbin and insts_<name>.bin. Needs an IRON venv
 # (see ../README.md); IRON_HOME points at it.
 set -eo pipefail
 usage() {
-  echo "usage: build.sh gemv <M> <K> <n_cores> <n_cols> | memcpy <length> | readbw <length> [tile] | q4gemv <M> [K] | q4layer" >&2
+  echo "usage: build.sh gemv <M> <K> <n_cores> <n_cols> | memcpy <length> | readbw <length> [tile] | q4gemv <M> [K] | q4layer | q4prefill <N> [K]" >&2
   exit 2
 }
 # Check arguments before sourcing anything, so a mistake prints the usage line.
@@ -21,6 +22,7 @@ case "${1:-}" in
   readbw) [ $# -ge 2 ] && [ $# -le 3 ] || usage ;;
   q4gemv) [ $# -ge 2 ] && [ $# -le 3 ] || usage ;;
   q4layer) [ $# -eq 1 ] || usage ;;
+  q4prefill) [ $# -ge 2 ] && [ $# -le 3 ] || usage ;;
   *) usage ;;
 esac
 IRON_HOME="${IRON_HOME:-$HOME/xdna-iron}"
@@ -60,6 +62,11 @@ case "$1" in
     name="q4layer"
     rm -rf "$OUT_DIR/$name.prj"
     python3 "$HERE/q4layer/q4layer.py" --dev npu2 \
+      --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
+  q4prefill)
+    name="q4prefill_${2}x${3:-2048}"
+    rm -rf "$OUT_DIR/$name.prj"
+    python3 "$HERE/q4prefill/q4prefill.py" --dev npu2 -N "$2" -K "${3:-2048}" \
       --xclbin-path="$OUT_DIR/$name.xclbin" --insts-path="$OUT_DIR/insts_$name.bin" ;;
 esac
 echo "built $OUT_DIR/$name.xclbin and $OUT_DIR/insts_$name.bin"

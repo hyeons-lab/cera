@@ -74,17 +74,22 @@ trait WeightSource {
     fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32);
 }
 
-/// GGUF Q4_0 bytes: 18-byte blocks of f16 scale + 32 nibbles.
+/// GGUF Q4_0 bytes: 18-byte blocks of f16 scale + 32 nibbles. Blocks beyond
+/// `nb_src` read as zero so stages with padded K dimensions (e.g. LFM3 FFN
+/// down `7680 -> 8192`) pack cleanly without intermediate allocation.
 struct Q4_0Source<'a> {
     /// Raw tensor bytes.
     src: &'a [u8],
-    /// Blocks per row.
-    nb: usize,
+    /// Blocks per source row.
+    nb_src: usize,
 }
 
 impl WeightSource for Q4_0Source<'_> {
     fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32) {
-        let bytes = &self.src[(row * self.nb + block) * 18..];
+        if block >= self.nb_src {
+            return ([0i8; QBLK], 0.0);
+        }
+        let bytes = &self.src[(row * self.nb_src + block) * 18..];
         let d = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
         let qs = &bytes[2..18];
         let mut q = [0i8; QBLK];
@@ -135,11 +140,22 @@ impl WeightSource for F32Source<'_> {
 
 /// Pack one stage from `source` into `dst` (zeroed here first; the packing
 /// ORs nibbles in). Returns the byte count written.
+#[allow(dead_code)]
 fn pack_stage<S: WeightSource>(
     dst: &mut [u8],
     source: &S,
     rows: usize,
     cols: usize,
+) -> Result<usize, String> {
+    pack_stage_with_chunk_k(dst, source, rows, cols, CHUNK_K)
+}
+
+fn pack_stage_with_chunk_k<S: WeightSource>(
+    dst: &mut [u8],
+    source: &S,
+    rows: usize,
+    cols: usize,
+    max_chunk_k: usize,
 ) -> Result<usize, String> {
     let need = stage_bytes(rows, cols)?;
     if dst.len() < need {
@@ -150,7 +166,7 @@ fn pack_stage<S: WeightSource>(
     }
     let dst = &mut dst[..need];
     dst.fill(0);
-    let chunk_k = CHUNK_K.min(cols);
+    let chunk_k = max_chunk_k.min(cols);
     let chunks = cols / chunk_k;
     let nb_chunk = chunk_k / QBLK;
     let tile_bytes = nb_chunk * BLOCK_BYTES;
@@ -199,10 +215,21 @@ pub fn pack_q4_0_stage(
     rows: usize,
     cols: usize,
 ) -> Result<usize, String> {
+    pack_q4_0_stage_padded(dst, src, rows, cols, cols)
+}
+
+/// Pack a GGUF Q4_0 tensor (`rows` x `cols`) into 1024-K half-tiles (`9,216 B` each)
+/// for `B=64` LFM2 NPU prefill weight reuse + `W_L2L1` double-buffering.
+pub fn pack_q4_0_stage_k1024(
+    dst: &mut [u8],
+    src: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<usize, String> {
     check_shape(rows, cols)?;
-    let nb = cols / QBLK;
+    let nb_src = cols / QBLK;
     let expect = rows
-        .checked_mul(nb)
+        .checked_mul(nb_src)
         .and_then(|v| v.checked_mul(18))
         .ok_or_else(|| format!("Q4_0 byte size overflow for {rows}x{cols}"))?;
     if src.len() < expect {
@@ -211,16 +238,73 @@ pub fn pack_q4_0_stage(
             src.len()
         ));
     }
-    pack_stage(dst, &Q4_0Source { src, nb }, rows, cols)
+    pack_stage_with_chunk_k(dst, &Q4_0Source { src, nb_src }, rows, cols, 1024)
 }
 
-/// Pack f32 weights (e.g. a dequantized Q6_K head) into the stream layout,
-/// quantizing with the spike's Q4_0 rule.
-pub fn pack_f32_stage(
+/// Pack a GGUF Q4_0 tensor (`rows` x `src_cols`) into a zero-padded `padded_cols`
+/// kernel stream layout (e.g. `7680` -> `8192` for LFM3 FFN down).
+fn pack_q4_0_stage_padded_with_chunk_k(
+    dst: &mut [u8],
+    src: &[u8],
+    rows: usize,
+    src_cols: usize,
+    padded_cols: usize,
+    max_chunk_k: usize,
+) -> Result<usize, String> {
+    if src_cols == 0 || !src_cols.is_multiple_of(QBLK) || src_cols > padded_cols {
+        return Err(format!(
+            "xdna padded src_cols {src_cols} must be a nonzero multiple of {QBLK} <= padded_cols {padded_cols}"
+        ));
+    }
+    check_shape(rows, padded_cols)?;
+    let nb_src = src_cols / QBLK;
+    let expect = rows
+        .checked_mul(nb_src)
+        .and_then(|v| v.checked_mul(18))
+        .ok_or_else(|| format!("Q4_0 byte size overflow for {rows}x{src_cols}"))?;
+    if src.len() < expect {
+        return Err(format!(
+            "Q4_0 tensor too small: need {expect} bytes, have {}",
+            src.len()
+        ));
+    }
+    pack_stage_with_chunk_k(
+        dst,
+        &Q4_0Source { src, nb_src },
+        rows,
+        padded_cols,
+        max_chunk_k,
+    )
+}
+
+pub fn pack_q4_0_stage_padded(
+    dst: &mut [u8],
+    src: &[u8],
+    rows: usize,
+    src_cols: usize,
+    padded_cols: usize,
+) -> Result<usize, String> {
+    pack_q4_0_stage_padded_with_chunk_k(dst, src, rows, src_cols, padded_cols, CHUNK_K)
+}
+
+/// Pack a GGUF Q4_0 tensor (`rows` x `src_cols`) into zero-padded `padded_cols`
+/// with 1024-K half-tiles (`9,216 B` each) for `B=64` LFM3 NPU prefill.
+pub fn pack_q4_0_stage_padded_k1024(
+    dst: &mut [u8],
+    src: &[u8],
+    rows: usize,
+    src_cols: usize,
+    padded_cols: usize,
+) -> Result<usize, String> {
+    pack_q4_0_stage_padded_with_chunk_k(dst, src, rows, src_cols, padded_cols, 1024)
+}
+
+fn pack_f32_stage_with_chunk_k(
     dst: &mut [u8],
     src: &[f32],
     rows: usize,
     cols: usize,
+    max_chunk_k: usize,
 ) -> Result<usize, String> {
     check_shape(rows, cols)?;
     let expect = rows
@@ -232,7 +316,29 @@ pub fn pack_f32_stage(
             src.len()
         ));
     }
-    pack_stage(dst, &F32Source { src, cols }, rows, cols)
+    pack_stage_with_chunk_k(dst, &F32Source { src, cols }, rows, cols, max_chunk_k)
+}
+
+/// Pack f32 weights (e.g. a dequantized BF16/Q6_K tensor) into 1024-K half-tiles
+/// using Q4_0 quantization.
+pub fn pack_f32_stage_k1024(
+    dst: &mut [u8],
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<usize, String> {
+    pack_f32_stage_with_chunk_k(dst, src, rows, cols, 1024)
+}
+
+/// Pack f32 weights (e.g. a dequantized Q6_K head) into the stream layout,
+/// quantizing with the spike's Q4_0 rule.
+pub fn pack_f32_stage(
+    dst: &mut [u8],
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<usize, String> {
+    pack_f32_stage_with_chunk_k(dst, src, rows, cols, CHUNK_K)
 }
 
 /// Number of AIE2P workers across which every stage's row tiles are partitioned.
@@ -279,6 +385,119 @@ pub fn interleave_worker_stages(
         }
     }
     Ok(total)
+}
+
+/// Supported `k_chunks` bucket counts (`K_pad = k_chunks * 64`) for `gemm_bf16`.
+pub const GEMM_BF16_CHUNK_COUNTS: [usize; 14] =
+    [1, 2, 4, 8, 12, 16, 18, 24, 32, 48, 64, 68, 96, 128];
+
+/// Select the smallest `gemm_bf16` bucket `k_chunks` covering `cols` (up to `8192`).
+pub fn gemm_bf16_bucket_chunks(cols: usize) -> usize {
+    let need = cols.div_ceil(super::kernels::GEMM_BF16_K_CHUNK).max(1);
+    GEMM_BF16_CHUNK_COUNTS
+        .iter()
+        .copied()
+        .find(|&c| c >= need)
+        .unwrap_or(128)
+}
+
+/// Pack one `[<=256, <=k_chunks*64]` sub-matrix of row-major `f32` weights (`[total_rows, total_cols]`)
+/// into `gemm_bf16`'s per-column `bfloat16` layout:
+/// `[8 cols][k_chunks][k8=8][n8=4][8_k][8_n]` (`u16` words as little-endian bytes).
+#[allow(clippy::too_many_arguments)]
+pub fn pack_gemm_bf16_f32_slice(
+    dst_bytes: &mut [u8],
+    src_f32: &[f32],
+    total_rows: usize,
+    total_cols: usize,
+    row_start: usize,
+    col_start: usize,
+    col_len: usize,
+    k_chunks: usize,
+) {
+    use super::kernels::{GEMM_BF16_K_CHUNK, GEMM_BF16_N_COLS, GEMM_BF16_N_CORE, GEMM_BF16_N_TILE};
+
+    let want_bytes = GEMM_BF16_N_TILE * k_chunks * GEMM_BF16_K_CHUNK * 2;
+    assert_eq!(dst_bytes.len(), want_bytes);
+    dst_bytes.fill(0);
+
+    let k_end = (col_start + col_len).min(total_cols);
+    let words: &mut [u16] = bytemuck::cast_slice_mut(dst_bytes);
+    for c in 0..GEMM_BF16_N_COLS {
+        for n_local in 0..GEMM_BF16_N_CORE {
+            let n = row_start + c * GEMM_BF16_N_CORE + n_local;
+            if n >= total_rows {
+                break;
+            }
+            let row = &src_f32[n * total_cols..];
+            let n8 = n_local / 8;
+            let n_in = n_local % 8;
+            for kc in 0..k_chunks {
+                let k_base = col_start + kc * GEMM_BF16_K_CHUNK;
+                if k_base >= k_end {
+                    break;
+                }
+                for k8 in 0..8 {
+                    let tile_base = ((((c * k_chunks + kc) * 8 + k8) * 4 + n8) * 8) * 8 + n_in;
+                    for k_in in 0..8 {
+                        let k = k_base + k8 * 8 + k_in;
+                        if k >= k_end {
+                            break;
+                        }
+                        words[tile_base + k_in * 8] = f32_to_bf16(row[k]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Pack one `[<=256, <=k_chunks*64]` sub-matrix of an [`crate::model::weights::MmapWeight`]
+/// into `gemm_bf16`'s `bfloat16` tile layout using `MmapWeight::dequantize_row`.
+pub fn pack_gemm_bf16_weight_slice(
+    dst_bytes: &mut [u8],
+    weight: &crate::model::weights::MmapWeight,
+    row_start: usize,
+    col_start: usize,
+    col_len: usize,
+    k_chunks: usize,
+) {
+    use super::kernels::{GEMM_BF16_K_CHUNK, GEMM_BF16_N_COLS, GEMM_BF16_N_CORE, GEMM_BF16_N_TILE};
+
+    let want_bytes = GEMM_BF16_N_TILE * k_chunks * GEMM_BF16_K_CHUNK * 2;
+    assert_eq!(dst_bytes.len(), want_bytes);
+    dst_bytes.fill(0);
+
+    let k_end = (col_start + col_len).min(weight.cols);
+    let mut row_buf = vec![0.0f32; weight.cols];
+    let words: &mut [u16] = bytemuck::cast_slice_mut(dst_bytes);
+    for c in 0..GEMM_BF16_N_COLS {
+        for n_local in 0..GEMM_BF16_N_CORE {
+            let n = row_start + c * GEMM_BF16_N_CORE + n_local;
+            if n >= weight.rows {
+                break;
+            }
+            weight.dequantize_row(n, &mut row_buf);
+            let n8 = n_local / 8;
+            let n_in = n_local % 8;
+            for kc in 0..k_chunks {
+                let k_base = col_start + kc * GEMM_BF16_K_CHUNK;
+                if k_base >= k_end {
+                    break;
+                }
+                for k8 in 0..8 {
+                    let tile_base = ((((c * k_chunks + kc) * 8 + k8) * 4 + n8) * 8) * 8 + n_in;
+                    for k_in in 0..8 {
+                        let k = k_base + k8 * 8 + k_in;
+                        if k >= k_end {
+                            break;
+                        }
+                        words[tile_base + k_in * 8] = f32_to_bf16(row_buf[k]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

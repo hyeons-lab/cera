@@ -24,6 +24,7 @@
 #include "xrt/experimental/xrt_kernel.h"
 #include "xrt/experimental/xrt_xclbin.h"
 
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -65,7 +66,7 @@ struct cached_hw_ctx {
 
 struct cera_xdna_device {
   xrt::device dev;
-  std::weak_ptr<cached_hw_ctx> cached_hw;
+  std::vector<std::weak_ptr<cached_hw_ctx>> cached_hws;
 };
 
 struct cera_xdna_kernel {
@@ -208,8 +209,22 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
     try {
       k->dev = d->dev;
       const xrt::uuid x_uuid = x.get_uuid();
-      auto hw = d->cached_hw.lock();
-      if (!hw || !static_cast<bool>(x_uuid) || hw->uuid != x_uuid || hw->kernel_name != name) {
+      std::shared_ptr<cached_hw_ctx> hw;
+      auto& hws = d->cached_hws;
+      hws.erase(
+          std::remove_if(hws.begin(), hws.end(),
+                         [](const std::weak_ptr<cached_hw_ctx>& w) { return w.expired(); }),
+          hws.end());
+      if (static_cast<bool>(x_uuid)) {
+        for (const auto& w : hws) {
+          auto sp = w.lock();
+          if (sp && sp->uuid == x_uuid && sp->kernel_name == name) {
+            hw = sp;
+            break;
+          }
+        }
+      }
+      if (!hw) {
         k->dev.register_xclbin(x);
         // Vote for high-throughput, low-latency NPU DPM clocks via XRT QoS
         // (analogous to Hexagon's FASTRPC_CONTROL_LATENCY), falling back to a
@@ -235,6 +250,9 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
         }
         xrt::kernel kern(ctx, name);
         hw = std::make_shared<cached_hw_ctx>(cached_hw_ctx{x_uuid, name, std::move(ctx), std::move(kern)});
+        if (static_cast<bool>(x_uuid)) {
+          hws.push_back(hw);
+        }
       }
       k->hw = hw;
       k->n_instr = static_cast<uint32_t>(n_instr);
@@ -244,9 +262,6 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
       if (!instr_map) throw std::runtime_error("instruction buffer mapping failed");
       std::memcpy(instr_map, instr, instr_bytes);
       k->instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      if (static_cast<bool>(x_uuid)) {
-        d->cached_hw = hw;
-      }
     } catch (...) {
       delete k;
       throw;

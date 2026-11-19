@@ -15,8 +15,8 @@
 #    weights, applying interleaved RoPE to q (-> slot 1) and k (-> slot 2) and
 #    draining v (-> slot 3).
 # 2. 16-token block online-softmax GQA attention streams Q4LAYER_KV_CHUNKS
-#    (1..9) cached KV chunks plus the current (k, v) token and writes its
-#    2048-float output to slot 1 + ATTN_OUT.
+#    (1..64) cached KV chunks from standalone bo_kv plus the current (k, v)
+#    token and writes its 2048-float output to slot 1 + ATTN_OUT.
 # 3. o reads slot 1 + ATTN_OUT, adds the L1-saved slot 0 residual, and drains
 #    post-attn hidden h1 into slot 4.
 # 4. gate+up read slot 4 (FFN RMSNorm + quantize, saving worker's 128 h1
@@ -59,10 +59,9 @@ TSTRIDE = 8  # tile/chunk encoding stride in q4_step's t (see q4layer.cc)
 NORM_W = 2048
 ROPE_CS = 4096
 ATTN_OUT = 2048
-ATTN_CHUNK_T = (SILU_HALF * 2) // 64
-ATTN_CHUNKS = 9
+ATTN_CHUNK_T = 64
+ATTN_CHUNKS = 64
 N_SLOTS = 8
-KV_CACHE_BASE = N_SLOTS * ACT_SLOT
 KV_HEAD_STRIDE = ATTN_CHUNKS * TILE_F32
 KV_SLOT = 8 * KV_HEAD_STRIDE
 
@@ -80,7 +79,7 @@ def stage_params(M, K, workers_n):
 
 
 @iron.jit
-def q4layer(w: In, y: Out, y_next: Out):
+def q4layer(w: In, y: Out, y_next: Out, kv: In):
     workers_n = get_current_device().cols * NUM_CHANNELS
     if workers_n != 16:
         raise ValueError(
@@ -111,7 +110,7 @@ def q4layer(w: In, y: Out, y_next: Out):
     w_down_base = w_gu_base + workers_n * gu_pw_w
     w_total = w_down_base + workers_n * down_pw_w
 
-    act_total = KV_CACHE_BASE + KV_SLOT
+    act_total = N_SLOTS * ACT_SLOT
     head_mode = _os.environ.get("Q4LAYER_HEAD") == "1"
     kv_chunks = int(_os.environ.get("Q4LAYER_KV_CHUNKS", str(ATTN_CHUNKS)))
     if not (1 <= kv_chunks <= ATTN_CHUNKS):
@@ -126,6 +125,7 @@ def q4layer(w: In, y: Out, y_next: Out):
     yel_ty = np.ndarray[(ROWS * 2,), np.dtype[np.float32]]
     w_ty = np.ndarray[(head_w_total if head_mode else w_total,), np.dtype[np.float32]]
     y_ty = np.ndarray[(head_y_total if head_mode else act_total,), np.dtype[np.float32]]
+    kv_ty = np.ndarray[(KV_SLOT,), np.dtype[np.float32]]
 
     step = ExternalFunction(
         "q4_step",
@@ -254,7 +254,7 @@ def q4layer(w: In, y: Out, y_next: Out):
     def tap_silu(total, offset):
         return TensorAccessPattern((1, total), offset, [1, 2, 3, SILU_HALF // 3], [0, ACT_SLOT, SILU_HALF // 3, 1])
 
-    def sequence(w_in, y_buf, y_next, in_prods, out_conses):
+    def sequence(w_in, y_buf, y_next, kv_buf, in_prods, out_conses):
         if head_mode:
             tg = TaskGroup()
             for i in range(workers_n):
@@ -286,8 +286,8 @@ def q4layer(w: In, y: Out, y_next: Out):
         for i in range(workers_n):
             kv_h = i // 2
             in_prods[i].fill(
-                y_buf,
-                tap(act_total, KV_CACHE_BASE + kv_h * KV_HEAD_STRIDE, kv_chunks * TILE_F32),
+                kv_buf,
+                tap(KV_SLOT, kv_h * KV_HEAD_STRIDE, kv_chunks * TILE_F32),
                 group=tg,
             )
             in_prods[i].fill(y_buf, tap_silu(act_total, 2 * ACT_SLOT + kv_h * 64), group=tg)
@@ -322,7 +322,7 @@ def q4layer(w: In, y: Out, y_next: Out):
             out_conses[i].drain(y_next, tap(act_total, i * down_s["rows_pw"], down_s["rows_pw"]), wait=True, group=tg)
         tg.finish()
 
-    rt = Runtime(sequence, [w_ty, y_ty, y_ty, [of.prod() for of in of_ins], [of.cons() for of in of_outs]])
+    rt = Runtime(sequence, [w_ty, y_ty, y_ty, kv_ty, [of.prod() for of in of_ins], [of.cons() for of in of_outs]])
     return Program(get_current_device(), rt, workers=workers).resolve_program()
 
 

@@ -12,7 +12,7 @@
 //! a kernel port. [`encode_audio_pcm_gpu`] is the live entry point;
 //! [`encode_audio_mel_gpu`] takes a host spectrogram and exists so the parity
 //! suite can feed the GPU body the CPU front-end's output. Two implementations ship: native
-//! Metal ([`MetalAudioOps`]) and wgpu ([`WgpuAudioOps`]), the latter reusing the ViT's wgpu GEMM,
+//! Metal (`MetalAudioOps`) and wgpu (`WgpuAudioOps`), the latter reusing the ViT's wgpu GEMM,
 //! LayerNorm and elementwise kernels and dispatching the WGSL halves of the same Slang sources
 //! the Metal ops do. The Metal numeric gate is `tests/audio_encoder_metal_parity.rs`, the wgpu one
 //! `tests/audio_encoder_wgpu_parity.rs`.
@@ -2481,11 +2481,12 @@ fn try_wgpu_audio_encoder(
 enum AudioEncoderAccel {
     Wgpu,
     Hexagon,
+    Xdna,
     Metal,
 }
 
 /// The accelerators to try for an audio encoder, in order. The LFM3A encoder (hybrid short
-/// conv and attention, RMS norms) has no accelerated implementation: the Hexagon, Metal and
+/// conv and attention, RMS norms) has no accelerated implementation: the Hexagon, XDNA, Metal and
 /// wgpu encoders all stage the LFM2A Conformer layout, so sending it to one would bring a
 /// device up and then reject the weights (or run the wrong graph). It stays on the CPU.
 fn audio_encoder_candidates(
@@ -2493,19 +2494,18 @@ fn audio_encoder_candidates(
     backend: crate::engine::BackendPreference,
 ) -> &'static [AudioEncoderAccel] {
     use crate::engine::BackendPreference as BP;
-    use AudioEncoderAccel::{Hexagon, Metal, Wgpu};
+    use AudioEncoderAccel::{Hexagon, Metal, Wgpu, Xdna};
     if is_lfm3a {
         return &[];
     }
     match backend {
         BP::Cpu => &[],
         BP::Gpu => &[Wgpu],
-        // Hexagon is the only NPU with an audio encoder today; `Npu` takes the
-        // same path and gains other vendors here as they grow one.
-        BP::Hexagon | BP::Npu => &[Hexagon],
+        BP::Hexagon => &[Hexagon],
+        BP::Npu => &[Hexagon, Xdna],
         BP::Metal => &[Metal],
-        // Metal first, then the NPU, then wgpu (the order the rest of `auto` uses).
-        BP::Auto => &[Metal, Hexagon, Wgpu],
+        // Metal first, then the NPUs (Hexagon, XDNA), then wgpu.
+        BP::Auto => &[Metal, Hexagon, Xdna, Wgpu],
     }
 }
 
@@ -2514,7 +2514,7 @@ fn audio_encoder_candidates(
 /// Returns `None` for `Cpu`, for the LFM3A encoder (CPU only, see
 /// `audio_encoder_candidates`), when the chosen backend's feature isn't compiled,
 /// or when the device/context can't be created. The caller then uses the CPU
-/// encoder. `Auto` prefers Metal, then the NPU, then wgpu.
+/// encoder. `Auto` prefers Metal, then Hexagon, then XDNA, then wgpu.
 pub fn build_gpu_audio_encoder(
     weights: &std::sync::Arc<AudioEncoderWeights>,
     backend: crate::engine::BackendPreference,
@@ -2526,8 +2526,23 @@ pub fn build_gpu_audio_encoder(
     candidates.iter().find_map(|accel| match accel {
         AudioEncoderAccel::Wgpu => try_wgpu_audio_encoder(weights),
         AudioEncoderAccel::Hexagon => try_hexagon_audio_encoder(weights),
+        AudioEncoderAccel::Xdna => try_xdna_audio_encoder(weights),
         AudioEncoderAccel::Metal => try_metal_audio_encoder(weights),
     })
+}
+
+#[cfg(feature = "xdna")]
+fn try_xdna_audio_encoder(
+    weights: &std::sync::Arc<AudioEncoderWeights>,
+) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
+    crate::model::xdna_towers::try_xdna_audio_encoder(weights)
+}
+
+#[cfg(not(feature = "xdna"))]
+fn try_xdna_audio_encoder(
+    _weights: &std::sync::Arc<AudioEncoderWeights>,
+) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
+    None
 }
 
 #[cfg(feature = "hexagon")]
@@ -2602,18 +2617,23 @@ mod tests {
                 "lfm3a was routed under {backend:?}"
             );
         }
-        // the LFM2A routes are unchanged
+        // the LFM2A routes include both NPU backends
         assert_eq!(
             audio_encoder_candidates(false, BP::Auto),
             &[
                 AudioEncoderAccel::Metal,
                 AudioEncoderAccel::Hexagon,
-                AudioEncoderAccel::Wgpu
+                AudioEncoderAccel::Xdna,
+                AudioEncoderAccel::Wgpu,
             ]
         );
         assert_eq!(
-            audio_encoder_candidates(false, BP::Npu),
+            audio_encoder_candidates(false, BP::Hexagon),
             &[AudioEncoderAccel::Hexagon]
+        );
+        assert_eq!(
+            audio_encoder_candidates(false, BP::Npu),
+            &[AudioEncoderAccel::Hexagon, AudioEncoderAccel::Xdna]
         );
         assert!(audio_encoder_candidates(false, BP::Cpu).is_empty());
     }

@@ -356,8 +356,35 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
 /// of the default, now for a plainer reason: 211 at the default width beats
 /// ~200 widened, so widening buys nothing even after it stopped being
 /// catastrophic.
+/// Resolves default prefill thread width, capping homogeneous SMT hosts
+/// (unpinned fallback topology matching logical parallelism) to physical cores
+/// unless the user explicitly passed `CERA_THREADS`.
+fn prefill_width_for_topo(
+    topo: &CoreTopology,
+    phys_cores: Option<usize>,
+    logical_cpus: Option<usize>,
+    has_thread_override: bool,
+) -> usize {
+    if topo.pin_cores.is_empty()
+        && !has_thread_override
+        && let (Some(phys), Some(logical)) = (phys_cores, logical_cpus)
+        && phys > 0
+        && logical > phys
+        && topo.perf_core_count == logical
+    {
+        return phys;
+    }
+    topo.perf_core_count.max(1)
+}
+
 pub fn prefill_thread_count(topo: &CoreTopology) -> usize {
-    let default = topo.perf_core_count.max(1);
+    let logical = std::thread::available_parallelism().ok().map(|n| n.get());
+    let default = prefill_width_for_topo(
+        topo,
+        physical_core_count(),
+        logical,
+        env_usize("CERA_THREADS").is_some(),
+    );
     let Some(n) = env_usize("CERA_PREFILL_THREADS") else {
         return default;
     };
@@ -898,5 +925,29 @@ mod tests {
             core_weights: Vec::new(),
         };
         assert_eq!(prefill_thread_count(&unpinned), 10);
+    }
+
+    #[test]
+    fn prefill_width_caps_unpinned_smt_to_physical_cores() {
+        let smt_fallback = CoreTopology {
+            perf_core_count: 32,
+            pin_cores: Vec::new(),
+            fast_cores: 0,
+            core_weights: Vec::new(),
+        };
+        assert_eq!(
+            prefill_width_for_topo(&smt_fallback, Some(16), Some(32), false),
+            16
+        );
+        // Explicit CERA_THREADS=32 honors the user override.
+        assert_eq!(
+            prefill_width_for_topo(&smt_fallback, Some(16), Some(32), true),
+            32
+        );
+        // Non-SMT or unknown physical count falls back to perf_core_count.
+        assert_eq!(
+            prefill_width_for_topo(&smt_fallback, None, Some(32), false),
+            32
+        );
     }
 }

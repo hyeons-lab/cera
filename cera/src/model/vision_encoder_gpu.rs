@@ -2561,6 +2561,7 @@ pub trait VitStack: Send + Sync {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 struct StackBlock<O: VitGpuOps> {
@@ -2584,10 +2585,11 @@ struct StackBlock<O: VitGpuOps> {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
-struct GpuStack<O: VitGpuOps> {
-    ops: O,
+pub(crate) struct GpuStack<O: VitGpuOps> {
+    pub(crate) ops: O,
     width: usize,
     heads: usize,
     ffn: usize,
@@ -2600,6 +2602,7 @@ struct GpuStack<O: VitGpuOps> {
 #[cfg(any(
     feature = "gpu",
     feature = "hexagon",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 /// The caller-supplied public spec is enforced before uploading: a zero head count would
@@ -2684,10 +2687,11 @@ pub(crate) fn check_spec(spec: &VitStackSpec) -> Result<()> {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl<O: VitGpuOps> GpuStack<O> {
-    fn build(ops: O, spec: &VitStackSpec) -> Result<Self> {
+    pub(crate) fn build(ops: O, spec: &VitStackSpec) -> Result<Self> {
         check_spec(spec)?;
         if spec.activation == VitStackActivation::Relu {
             anyhow::ensure!(
@@ -2732,7 +2736,7 @@ impl<O: VitGpuOps> GpuStack<O> {
         })
     }
 
-    fn run(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
+    pub(crate) fn run(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
         let ops = &self.ops;
         let (d, ff) = (self.width, self.ffn);
         anyhow::ensure!(
@@ -2817,9 +2821,9 @@ impl VitStack for GpuStack<WgpuVitOps> {
     }
 }
 
-/// Upload `spec` to the GPU that `backend` names: `Metal`, `Gpu`, or `Auto` (Metal, then
-/// wgpu). Returns `None` for `Cpu`, `Hexagon`, and `Npu`, when the named feature is not
-/// compiled, or when no device could be opened.
+/// Upload `spec` to the device that `backend` names: `Metal`, `Gpu`, `Hexagon`, `Npu`
+/// (Hexagon then XDNA), or `Auto` (Metal, then Hexagon, then XDNA, then wgpu). Returns
+/// `None` for `Cpu`, when the named feature is not compiled, or when no device could be opened.
 pub fn build_vit_stack(
     spec: &VitStackSpec,
     backend: crate::engine::BackendPreference,
@@ -2830,16 +2834,20 @@ pub fn build_vit_stack(
         BP::Gpu => try_wgpu_stack(spec, false),
         BP::Auto => try_metal_stack(spec)
             .or_else(|| try_hexagon_stack(spec, MAX_VIT_TOKENS))
+            .or_else(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
             .or_else(|| try_wgpu_stack(spec, false)),
-        BP::Hexagon | BP::Npu => try_hexagon_stack(spec, MAX_VIT_TOKENS),
+        BP::Hexagon => try_hexagon_stack(spec, MAX_VIT_TOKENS),
+        BP::Npu => {
+            try_hexagon_stack(spec, MAX_VIT_TOKENS).or_else(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
+        }
         BP::Cpu => None,
     }
 }
 
-/// [`build_vit_stack`] for a stack that sees long sequences, which only pays on a GPU whose
-/// attention is fast: Metal, or wgpu where the adapter runs the register-tiled flash kernel
-/// (head_dim 64, see `crate::backend::wgpu::GpuContext::uses_flash_attention`). The scalar
-/// wgpu attention kernels are slower than the host's blocked kernel on a long sequence, so
+/// [`build_vit_stack`] for a stack that sees long sequences, which only pays on an accelerator
+/// whose attention or GEMM path is fast: Metal, Hexagon, XDNA, or wgpu where the adapter runs the
+/// register-tiled flash kernel (head_dim 64, see `crate::backend::wgpu::GpuContext::uses_flash_attention`).
+/// The scalar wgpu attention kernels are slower than the host's blocked kernel on a long sequence, so
 /// elsewhere this returns `None` and the caller stays on the host.
 pub fn build_vit_stack_fast(
     spec: &VitStackSpec,
@@ -2851,8 +2859,11 @@ pub fn build_vit_stack_fast(
         BP::Gpu => try_wgpu_stack(spec, true),
         BP::Auto => try_metal_stack(spec)
             .or_else(|| try_hexagon_stack(spec, LONG_STACK_ROWS))
+            .or_else(|| try_xdna_stack(spec, LONG_STACK_ROWS))
             .or_else(|| try_wgpu_stack(spec, true)),
-        BP::Hexagon | BP::Npu => try_hexagon_stack(spec, LONG_STACK_ROWS),
+        BP::Hexagon => try_hexagon_stack(spec, LONG_STACK_ROWS),
+        BP::Npu => try_hexagon_stack(spec, LONG_STACK_ROWS)
+            .or_else(|| try_xdna_stack(spec, LONG_STACK_ROWS)),
         BP::Cpu => None,
     }
 }
@@ -2863,9 +2874,10 @@ pub fn build_vit_stack_fast(
 /// (An absent device is ordinary Auto fallthrough and stays at debug at the call site.)
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
-fn warn_stack_unavailable(what: &str, e: impl std::fmt::Display) {
+pub(crate) fn warn_stack_unavailable(what: &str, e: impl std::fmt::Display) {
     tracing::warn!("vit stack: {what} unavailable: {e:#}");
     eprintln!("vit stack: {what} unavailable: {e:#}");
 }
@@ -2894,6 +2906,16 @@ fn try_hexagon_stack(spec: &VitStackSpec, rows: usize) -> Option<std::sync::Arc<
 
 #[cfg(not(feature = "hexagon"))]
 fn try_hexagon_stack(_spec: &VitStackSpec, _rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
+}
+
+#[cfg(feature = "xdna")]
+fn try_xdna_stack(spec: &VitStackSpec, rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
+    crate::model::xdna_towers::try_xdna_vit_stack(spec, rows)
+}
+
+#[cfg(not(feature = "xdna"))]
+fn try_xdna_stack(_spec: &VitStackSpec, _rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
     None
 }
 
@@ -3002,30 +3024,30 @@ fn try_wgpu_stack(_spec: &VitStackSpec, _need_flash: bool) -> Option<std::sync::
 enum VisionEncoderAccel {
     Wgpu,
     Hexagon,
+    Xdna,
     Metal,
 }
 
 /// The accelerators to try for a vision encoder, in order. The LFM3 ViT (conv-gated blocks,
 /// temporal patch embedding, `lfm3_blocks`) has no accelerated implementation: the Hexagon
-/// encoder iterates `weights.blocks`, which is empty for it, so it would run zero blocks and
-/// return wrong embeddings with no error. It stays on the CPU.
+/// and XDNA encoders iterate `weights.blocks`, which is empty for it, so they would run zero
+/// blocks and return wrong embeddings with no error. It stays on the CPU.
 fn vision_encoder_candidates(
     is_lfm3: bool,
     backend: crate::engine::BackendPreference,
 ) -> &'static [VisionEncoderAccel] {
     use crate::engine::BackendPreference as BP;
-    use VisionEncoderAccel::{Hexagon, Metal, Wgpu};
+    use VisionEncoderAccel::{Hexagon, Metal, Wgpu, Xdna};
     if is_lfm3 {
         return &[];
     }
     match backend {
         BP::Cpu => &[],
-        // Hexagon is the only NPU with a vision encoder today; `Npu` takes the
-        // same path and gains other vendors here as they grow one.
-        BP::Hexagon | BP::Npu => &[Hexagon],
+        BP::Hexagon => &[Hexagon],
+        BP::Npu => &[Hexagon, Xdna],
         BP::Metal => &[Metal],
         BP::Gpu => &[Wgpu],
-        BP::Auto => &[Metal, Hexagon, Wgpu],
+        BP::Auto => &[Metal, Hexagon, Xdna, Wgpu],
     }
 }
 
@@ -3043,11 +3065,26 @@ fn try_hexagon_vision_encoder_for(
     None
 }
 
+#[cfg(feature = "xdna")]
+fn try_xdna_vision_encoder_for(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    crate::model::xdna_towers::try_xdna_vision_encoder(weights)
+}
+
+#[cfg(not(feature = "xdna"))]
+fn try_xdna_vision_encoder_for(
+    _weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    None
+}
+
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, for an LFM3 encoder (CPU only, see `vision_encoder_candidates`),
 /// when the chosen backend's feature isn't compiled,
 /// when the device/context can't be created, or (wgpu, native only) when the blank-image warm-up
-/// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
+/// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon,
+/// then XDNA, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
     backend: crate::engine::BackendPreference,
@@ -3061,6 +3098,7 @@ pub fn build_gpu_vision_encoder(
         .find_map(|accel| match accel {
             VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
             VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
+            VisionEncoderAccel::Xdna => try_xdna_vision_encoder_for(weights),
             VisionEncoderAccel::Metal => try_metal_vision_encoder(weights),
         })
 }
@@ -3247,12 +3285,17 @@ mod tests {
             &[
                 VisionEncoderAccel::Metal,
                 VisionEncoderAccel::Hexagon,
-                VisionEncoderAccel::Wgpu
+                VisionEncoderAccel::Xdna,
+                VisionEncoderAccel::Wgpu,
             ]
         );
         assert_eq!(
             vision_encoder_candidates(false, BP::Hexagon),
             &[VisionEncoderAccel::Hexagon]
+        );
+        assert_eq!(
+            vision_encoder_candidates(false, BP::Npu),
+            &[VisionEncoderAccel::Hexagon, VisionEncoderAccel::Xdna]
         );
         assert!(vision_encoder_candidates(false, BP::Cpu).is_empty());
     }

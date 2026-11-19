@@ -15,11 +15,15 @@ use crate::backend::cpu;
 use crate::backend::xdna::device::{XdnaBo, XdnaDevice, XdnaKernel, XdnaRun, XdnaRunList};
 pub use crate::backend::xdna::kernels::MAX_KV_CACHE_TOKENS;
 use crate::backend::xdna::kernels::{
-    Q4HEAD_INSTS, Q4HEAD_XCLBIN, Q4LAYER_ACT_BYTES, Q4LAYER_ACT_SLOT, Q4LAYER_ATTN_N_OFF,
-    Q4LAYER_ATTN_NORM_W, Q4LAYER_KV_BUCKETS, Q4LAYER_KV_CACHE_BASE, Q4LAYER_KV_SLOT,
-    Q4LAYER_ROPE_CS, Q4LAYER_SILU_HALF, Q4LAYER_TILE_F32, Q4LAYER_XCLBIN, init_q4layer_bo_y_norms,
-    inst_words, pack_q4layer_rope_cs, read_le_f32_slice, select_q4layer_kv_bucket,
+    Q4HEAD_INSTS, Q4HEAD_XCLBIN, Q4LAYER_ACT_BYTES, Q4LAYER_ACT_SLOT, Q4LAYER_ATTN_CHUNK_T,
+    Q4LAYER_ATTN_CHUNKS, Q4LAYER_ATTN_N_OFF, Q4LAYER_ATTN_NORM_W, Q4LAYER_KV_BUCKETS,
+    Q4LAYER_KV_BYTES, Q4LAYER_N_KV_HEADS, Q4LAYER_ROPE_CS, Q4LAYER_SILU_HALF, Q4LAYER_TILE_F32,
+    Q4LAYER_XCLBIN, Q4PREFILL_ACT_BYTES, Q4PREFILL_B, Q4PREFILL_LAYER_KV_BUCKETS,
+    Q4PREFILL_LAYER_XCLBIN, Q4PREFILL_MAX_POS0, Q4PREFILL_SLOT_KV_CUR, Q4PREFILL_SLOT_META,
+    Q4PREFILL_W_BYTES, init_q4layer_bo_y_norms, init_q4prefill_bo_y_norms, inst_words,
+    pack_q4layer_rope_cs, read_le_f32_slice, select_q4layer_kv_bucket, select_q4prefill_kv_bucket,
     write_le_f32_slice, write_le_i32, write_q4layer_kv_bf16, write_q4layer_step_params,
+    write_q4prefill_step_params,
 };
 use crate::backend::xdna::repack::{
     interleave_worker_stages, pack_f32_stage, pack_q4_0_stage, stage_bytes,
@@ -31,7 +35,7 @@ use crate::model::transformer;
 use crate::model::{
     Model, ModelConfig, ModelSessionGate, ModelSessionLease, record_first_fault, take_fault,
 };
-use crate::quant::f32_to_f16;
+use crate::quant::{bf16_to_f32, f32_to_f16};
 use crate::session::CeraError;
 use crate::tensor::DType;
 
@@ -60,6 +64,17 @@ const LAYER_STAGE_SHAPES: [(usize, usize); 7] = [
 
 type LayerKvPair = (Vec<[f32; KV_DIM]>, Vec<[f32; KV_DIM]>);
 
+struct XdnaPrefillState {
+    bucket_chunks: Vec<usize>,
+    bucket_runlists: Vec<XdnaRunList>,
+    head_run: XdnaRun,
+    _layer_runs: Vec<Vec<XdnaRun>>,
+    bo_out: XdnaBo,
+    bo_y: Vec<XdnaBo>,
+    _bo_w: Vec<XdnaBo>,
+    _kernels: Vec<XdnaKernel>,
+}
+
 struct XdnaDecodeState {
     bucket_chunks: Vec<usize>,
     bucket_runlists: Vec<XdnaRunList>,
@@ -67,10 +82,12 @@ struct XdnaDecodeState {
     _layer_runs: Vec<Vec<XdnaRun>>,
     head_bo_y: XdnaBo,
     _head_bo_w: XdnaBo,
+    layer_bo_kv: Vec<XdnaBo>,
     layer_bo_y: Vec<XdnaBo>,
     _layer_bo_w: Vec<XdnaBo>,
     _head_kernel: XdnaKernel,
     _layer_kernels: Vec<XdnaKernel>,
+    prefill: Option<Box<XdnaPrefillState>>,
     _device: XdnaDevice,
     in_flight_bucket: Option<usize>,
     synced_kv_len: usize,
@@ -198,7 +215,7 @@ fn quiesce_in_flight(npu: &mut XdnaDecodeState) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_xdna_kv_compression(
+pub(crate) fn validate_xdna_kv_compression(
     config: &ModelConfig,
     compression: &KvCompression,
 ) -> Result<(), CeraError> {
@@ -213,10 +230,9 @@ fn validate_xdna_kv_compression(
     Ok(())
 }
 
-fn check_kv_rewind_state(
+pub(crate) fn check_xdna_kv_rewind_preconditions(
     is_causal: bool,
     state_torn: bool,
-    pending_cpu_kv: Option<&(usize, LayerKvPair)>,
     state: &InferenceState,
     len: usize,
 ) -> Result<(), KvRewindError> {
@@ -235,6 +251,17 @@ fn check_kv_rewind_state(
     if state.is_compressed() {
         return Err(KvRewindError::Compressed);
     }
+    Ok(())
+}
+
+fn check_kv_rewind_state(
+    is_causal: bool,
+    state_torn: bool,
+    pending_cpu_kv: Option<&(usize, LayerKvPair)>,
+    state: &InferenceState,
+    len: usize,
+) -> Result<(), KvRewindError> {
+    check_xdna_kv_rewind_preconditions(is_causal, state_torn, state, len)?;
     if len == state.seq_len {
         return Ok(());
     }
@@ -356,6 +383,22 @@ impl XdnaLlamaModel {
             .load_kernel(Q4HEAD_XCLBIN, &head_insts)
             .map_err(|e| anyhow::anyhow!("XDNA load q4head.xclbin failed: {e}"))?;
 
+        let mut prefill_bucket_chunks = Vec::with_capacity(Q4PREFILL_LAYER_KV_BUCKETS.len());
+        let mut prefill_kernels = Vec::with_capacity(Q4PREFILL_LAYER_KV_BUCKETS.len());
+        for &(chunks, inst_bytes) in &Q4PREFILL_LAYER_KV_BUCKETS {
+            let insts = inst_words(inst_bytes);
+            let k = device
+                .load_kernel(Q4PREFILL_LAYER_XCLBIN, &insts)
+                .map_err(|e| {
+                    anyhow::anyhow!("XDNA load q4prefill_layer (c={chunks}) failed: {e}")
+                })?;
+            prefill_bucket_chunks.push(chunks);
+            prefill_kernels.push(k);
+        }
+        let prefill_alloc_kernel = prefill_kernels
+            .last()
+            .expect("Q4PREFILL_LAYER_KV_BUCKETS is non-empty");
+
         let mut stage_sizes = [0usize; 7];
         let mut layer_w_bytes = 0usize;
         for (si, &(rows, cols)) in LAYER_STAGE_SHAPES.iter().enumerate() {
@@ -373,6 +416,9 @@ impl XdnaLlamaModel {
             .expect("Q4LAYER_KV_BUCKETS is non-empty");
         let mut layer_bo_w = Vec::with_capacity(N_LAYERS);
         let mut layer_bo_y = Vec::with_capacity(N_LAYERS);
+        let mut layer_bo_kv = Vec::with_capacity(N_LAYERS);
+        let mut prefill_bo_w = Vec::with_capacity(N_LAYERS);
+        let mut prefill_bo_y = Vec::with_capacity(N_LAYERS);
 
         let mut q_tmp = vec![0u8; stage_sizes[0]];
         let mut k_tmp = vec![0u8; stage_sizes[1]];
@@ -425,6 +471,9 @@ impl XdnaLlamaModel {
             let mut bo_y = alloc_layer_kernel
                 .alloc_bo(Q4LAYER_ACT_BYTES, 4)
                 .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_y alloc: {e}"))?;
+            let mut bo_kv = alloc_layer_kernel
+                .alloc_bo(Q4LAYER_KV_BYTES, 6)
+                .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_kv alloc: {e}"))?;
 
             let stage_refs = cpu.layer_stage_refs(il);
             let w_slice = bo_w.as_mut_slice();
@@ -500,6 +549,27 @@ impl XdnaLlamaModel {
                 6,
             )?;
 
+            let mut pf_bo_w = prefill_alloc_kernel
+                .alloc_bo(Q4PREFILL_W_BYTES, 3)
+                .map_err(|e| anyhow::anyhow!("XDNA prefill layer {il} bo_w alloc: {e}"))?;
+            {
+                let pf_w = pf_bo_w.as_mut_slice();
+                let mut off = 0usize;
+                for src in [
+                    q_tmp.as_slice(),
+                    k_tmp.as_slice(),
+                    v_tmp.as_slice(),
+                    &w_slice[o_off..gu_off],
+                    gate_tmp.as_slice(),
+                    up_tmp.as_slice(),
+                    &w_slice[down_off..],
+                ] {
+                    pf_w[off..off + src.len()].copy_from_slice(src);
+                    off += src.len();
+                }
+                debug_assert_eq!(off, Q4PREFILL_W_BYTES);
+            }
+
             bo_w.sync_to_device()
                 .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_w sync: {e}"))?;
 
@@ -510,9 +580,32 @@ impl XdnaLlamaModel {
             );
             bo_y.sync_to_device()
                 .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_y sync: {e}"))?;
+            bo_kv.as_mut_slice().fill(0);
+            bo_kv
+                .sync_to_device()
+                .map_err(|e| anyhow::anyhow!("XDNA layer {il} bo_kv sync: {e}"))?;
+
+            pf_bo_w
+                .sync_to_device()
+                .map_err(|e| anyhow::anyhow!("XDNA prefill layer {il} bo_w sync: {e}"))?;
+
+            let mut pf_bo_y = prefill_alloc_kernel
+                .alloc_bo(Q4PREFILL_ACT_BYTES, 4)
+                .map_err(|e| anyhow::anyhow!("XDNA prefill layer {il} bo_y alloc: {e}"))?;
+            init_q4prefill_bo_y_norms(
+                pf_bo_y.as_mut_slice(),
+                cpu.attn_norm_slice(il),
+                cpu.ffn_norm_slice(il),
+            );
+            pf_bo_y
+                .sync_to_device()
+                .map_err(|e| anyhow::anyhow!("XDNA prefill layer {il} bo_y sync: {e}"))?;
 
             layer_bo_w.push(bo_w);
             layer_bo_y.push(bo_y);
+            layer_bo_kv.push(bo_kv);
+            prefill_bo_w.push(pf_bo_w);
+            prefill_bo_y.push(pf_bo_y);
         }
 
         // Allocate and repack the 131,072 x 2,048 LM head in 256-row chunks.
@@ -619,12 +712,12 @@ impl XdnaLlamaModel {
                     &head_bo_y
                 };
                 let run = l_kernel
-                    .create_run(&[&layer_bo_w[il], &layer_bo_y[il], y_next])
+                    .create_run(&[&layer_bo_w[il], &layer_bo_y[il], y_next, &layer_bo_kv[il]])
                     .map_err(|e| anyhow::anyhow!("XDNA layer {il} (c={chunks}) create_run: {e}"))?;
                 b_runs.push(run);
             }
             let h_run = head_kernel
-                .create_run(&[&head_bo_w, &head_bo_y, &head_bo_y])
+                .create_run(&[&head_bo_w, &head_bo_y, &head_bo_y, &layer_bo_kv[0]])
                 .map_err(|e| anyhow::anyhow!("XDNA head (c={chunks}) create_run: {e}"))?;
 
             let mut runlist = l_kernel
@@ -644,6 +737,64 @@ impl XdnaLlamaModel {
             bucket_runlists.push(runlist);
         }
 
+        let mut pf_bo_out = prefill_alloc_kernel
+            .alloc_bo(Q4PREFILL_ACT_BYTES, 5)
+            .map_err(|e| anyhow::anyhow!("XDNA prefill bo_out alloc: {e}"))?;
+        pf_bo_out.as_mut_slice().fill(0);
+        pf_bo_out
+            .sync_to_device()
+            .map_err(|e| anyhow::anyhow!("XDNA prefill bo_out sync: {e}"))?;
+
+        let pf_head_run = head_kernel
+            .create_run(&[&head_bo_w, &head_bo_y, &head_bo_y, &layer_bo_kv[0]])
+            .map_err(|e| anyhow::anyhow!("XDNA prefill head create_run: {e}"))?;
+
+        let mut prefill_layer_runs = Vec::with_capacity(prefill_kernels.len());
+        let mut prefill_bucket_runlists = Vec::with_capacity(prefill_kernels.len());
+        for (bi, pf_kernel) in prefill_kernels.iter().enumerate() {
+            let chunks = prefill_bucket_chunks[bi];
+            let mut b_runs = Vec::with_capacity(N_LAYERS);
+            for il in 0..N_LAYERS {
+                let y_next = if il + 1 < N_LAYERS {
+                    &prefill_bo_y[il + 1]
+                } else {
+                    &pf_bo_out
+                };
+                let run = pf_kernel
+                    .create_run(&[
+                        &prefill_bo_w[il],
+                        &prefill_bo_y[il],
+                        y_next,
+                        &layer_bo_kv[il],
+                    ])
+                    .map_err(|e| {
+                        anyhow::anyhow!("XDNA prefill layer {il} (c={chunks}) create_run: {e}")
+                    })?;
+                b_runs.push(run);
+            }
+            let mut runlist = pf_kernel
+                .create_runlist()
+                .map_err(|e| anyhow::anyhow!("XDNA prefill create_runlist (c={chunks}): {e}"))?;
+            for (il, run) in b_runs.iter().enumerate() {
+                runlist.add(run).map_err(|e| {
+                    anyhow::anyhow!("XDNA prefill runlist (c={chunks}) add layer {il}: {e}")
+                })?;
+            }
+            prefill_layer_runs.push(b_runs);
+            prefill_bucket_runlists.push(runlist);
+        }
+
+        let prefill = Some(Box::new(XdnaPrefillState {
+            bucket_chunks: prefill_bucket_chunks,
+            bucket_runlists: prefill_bucket_runlists,
+            head_run: pf_head_run,
+            _layer_runs: prefill_layer_runs,
+            bo_out: pf_bo_out,
+            bo_y: prefill_bo_y,
+            _bo_w: prefill_bo_w,
+            _kernels: prefill_kernels,
+        }));
+
         Ok(Self {
             cpu,
             npu: Mutex::new(XdnaDecodeState {
@@ -653,10 +804,12 @@ impl XdnaLlamaModel {
                 _layer_runs: layer_runs,
                 head_bo_y,
                 _head_bo_w: head_bo_w,
+                layer_bo_kv,
                 layer_bo_y,
                 _layer_bo_w: layer_bo_w,
                 _head_kernel: head_kernel,
                 _layer_kernels: layer_kernels,
+                prefill,
                 _device: device,
                 in_flight_bucket: None,
                 synced_kv_len: 0,
@@ -768,7 +921,7 @@ impl XdnaLlamaModel {
         npu.spare_kv = Some((pending_k, pending_v));
     }
 
-    fn compute_rope_cs(&self, pos: usize) -> [f32; 128] {
+    fn compute_rope_pair(&self, pos: usize) -> ([f32; HEAD_DIM / 2], [f32; HEAD_DIM / 2]) {
         let cfg = self.cpu.config();
         let mut unit = [0.0f32; HEAD_DIM];
         for i in 0..HEAD_DIM / 2 {
@@ -790,6 +943,11 @@ impl XdnaLlamaModel {
             rope_cos[i] = unit[2 * i];
             rope_sin[i] = unit[2 * i + 1];
         }
+        (rope_cos, rope_sin)
+    }
+
+    fn compute_rope_cs(&self, pos: usize) -> [f32; 128] {
+        let (rope_cos, rope_sin) = self.compute_rope_pair(pos);
         pack_q4layer_rope_cs(&rope_cos, &rope_sin)
     }
 
@@ -823,7 +981,7 @@ impl XdnaLlamaModel {
         let start = npu.synced_kv_len;
         let use_f16 = state.kv_f16;
         for l in 0..N_LAYERS {
-            let y_bytes = npu.layer_bo_y[l].as_mut_slice();
+            let kv_bytes = npu.layer_bo_kv[l].as_mut_slice();
             match &state.layers[l] {
                 LayerState::Attention {
                     key_cache,
@@ -857,10 +1015,10 @@ impl XdnaLlamaModel {
                                     kh[d] = crate::quant::f16_to_f32(key_cache_f16[src_fl + d]);
                                     vh[d] = crate::quant::f16_to_f32(value_cache_f16[src_fl + d]);
                                 }
-                                write_q4layer_kv_bf16(y_bytes, kvh, t, &kh, &vh);
+                                write_q4layer_kv_bf16(kv_bytes, kvh, t, &kh, &vh);
                             } else {
                                 write_q4layer_kv_bf16(
-                                    y_bytes,
+                                    kv_bytes,
                                     kvh,
                                     t,
                                     &key_cache[src_fl..src_fl + HEAD_DIM],
@@ -876,8 +1034,8 @@ impl XdnaLlamaModel {
                     ));
                 }
             }
-            npu.layer_bo_y[l]
-                .sync_range_to_device(Q4LAYER_KV_SLOT * 4, Q4LAYER_KV_CACHE_BASE * 4)
+            npu.layer_bo_kv[l]
+                .sync_range_to_device(Q4LAYER_KV_BYTES, 0)
                 .map_err(|e| format!("layer {l} KV cache sync to device: {e}"))?;
         }
         npu.synced_kv_len = target_pos;
@@ -1150,6 +1308,7 @@ impl Model for XdnaLlamaModel {
                 vocab_size,
             );
         }
+        let mut tail_start = None;
         {
             let mut npu = self.lock_npu();
             if self.state_torn.load(Ordering::SeqCst) {
@@ -1187,8 +1346,261 @@ impl Model for XdnaLlamaModel {
                 );
             }
             Self::discard_or_flush_pending_kv(&mut npu, state, start_pos);
+
+            if tokens.len() < 16
+                || start_pos > Q4PREFILL_MAX_POS0
+                || state.lora.is_some()
+                || npu.prefill.is_none()
+            {
+                drop(npu);
+                return self.cpu.forward_prefill(tokens, start_pos, state);
+            }
+
+            // Compute BOS / pos=0 on CPU (~10ms once per session) so `blk.0`/`blk.1`
+            // `Q4_1` `ffn_down` weights preserve exact BOS sink KV activations across
+            // all layers before chunked `Q4_0` NPU prefill processes `tokens[1..]`.
+            let (npu_start_pos, npu_tokens) = if start_pos == 0 {
+                let _ = self.cpu.forward(&tokens[..1], 0, state);
+                if let Some(err) = self.cpu.take_decode_error() {
+                    return self.record_device_fault_err(err, vocab_size);
+                }
+                (1usize, &tokens[1..])
+            } else {
+                (start_pos, tokens)
+            };
+
+            if npu.synced_kv_len != npu_start_pos
+                && let Err(e) = self.sync_cpu_kv_to_npu(&mut npu, state, npu_start_pos)
+            {
+                return self.record_device_fault(e, vocab_size);
+            }
+
+            let npu_ref = &mut *npu;
+            let pf = npu_ref
+                .prefill
+                .as_deref_mut()
+                .expect("checked prefill.is_some()");
+            let layer_bo_kv = &mut npu_ref.layer_bo_kv;
+            let head_bo_y = &mut npu_ref.head_bo_y;
+            let synced_kv_len = &mut npu_ref.synced_kv_len;
+            npu_ref.cached_rope = None;
+
+            let kv_cur_bytes = Q4LAYER_N_KV_HEADS * Q4LAYER_TILE_F32 * 4;
+            let kv_row_bytes = HEAD_DIM * 2;
+            let meta_sync_off = (Q4PREFILL_SLOT_META + 4096) * 4;
+            let meta_sync_bytes = (4608 + Q4PREFILL_B * HEAD_DIM - 4096) * 4;
+            let mut k_mirror = vec![0.0f32; Q4PREFILL_B * KV_DIM];
+            let mut v_mirror = vec![0.0f32; Q4PREFILL_B * KV_DIM];
+            let mut rope_cs = [0.0f32; Q4PREFILL_B * HEAD_DIM];
+            let mut last_n_valid = 0usize;
+
+            for chunk_off in (0..npu_tokens.len()).step_by(Q4PREFILL_B) {
+                let pos0 = npu_start_pos + chunk_off;
+                if pos0 > Q4PREFILL_MAX_POS0 {
+                    tail_start = Some(pos0 - start_pos);
+                    break;
+                }
+                let n_valid = (npu_tokens.len() - chunk_off).min(Q4PREFILL_B);
+                let chunk_tokens = &npu_tokens[chunk_off..chunk_off + n_valid];
+                let (pf_bucket_idx, bucket_chunks) =
+                    select_q4prefill_kv_bucket(&pf.bucket_chunks, pos0);
+
+                {
+                    let y0 = pf.bo_y[0].as_mut_slice();
+                    for (ti, &tok) in chunk_tokens.iter().enumerate() {
+                        let emb = self.cpu.embed_token(tok, "forward_prefill");
+                        write_le_f32_slice(y0, ti * HIDDEN_SIZE, &emb);
+                    }
+                    if n_valid < Q4PREFILL_B {
+                        y0[n_valid * HIDDEN_SIZE * 4..Q4PREFILL_B * HIDDEN_SIZE * 4].fill(0);
+                    }
+                }
+                if let Err(e) = pf.bo_y[0].sync_range_to_device(Q4PREFILL_B * HIDDEN_SIZE * 4, 0) {
+                    return self.record_device_fault(
+                        format!("prefill bo_y[0] hidden sync: {e}"),
+                        vocab_size,
+                    );
+                }
+
+                for ti in 0..Q4PREFILL_B {
+                    let dst = &mut rope_cs[ti * HEAD_DIM..(ti + 1) * HEAD_DIM];
+                    if ti < n_valid {
+                        let (c, s) = self.compute_rope_pair(pos0 + ti);
+                        dst[..HEAD_DIM / 2].copy_from_slice(&c);
+                        dst[HEAD_DIM / 2..].copy_from_slice(&s);
+                    } else {
+                        dst[..HEAD_DIM / 2].fill(1.0);
+                        dst[HEAD_DIM / 2..].fill(0.0);
+                    }
+                }
+                for il in 0..N_LAYERS {
+                    write_q4prefill_step_params(
+                        pf.bo_y[il].as_mut_slice(),
+                        pos0,
+                        n_valid,
+                        bucket_chunks,
+                        pos0,
+                        true,
+                        0,
+                        cfg.rms_norm_eps,
+                        &rope_cs,
+                    );
+                    if let Err(e) = pf.bo_y[il].sync_range_to_device(meta_sync_bytes, meta_sync_off)
+                    {
+                        return self.record_device_fault(
+                            format!("prefill layer {il} meta sync: {e}"),
+                            vocab_size,
+                        );
+                    }
+                }
+
+                if let Err(e) = pf.bucket_runlists[pf_bucket_idx]
+                    .execute()
+                    .and_then(|()| pf.bucket_runlists[pf_bucket_idx].wait(QUIESCE_TIMEOUT_MS))
+                {
+                    return self
+                        .record_device_fault(format!("prefill runlist failed: {e}"), vocab_size);
+                }
+
+                let m_len = n_valid * KV_DIM;
+                for (l, kv_bo) in layer_bo_kv.iter_mut().enumerate().take(N_LAYERS) {
+                    if let Err(e) =
+                        pf.bo_y[l].sync_range_from_device(kv_cur_bytes, Q4PREFILL_SLOT_KV_CUR * 4)
+                    {
+                        return self.record_device_fault(
+                            format!("prefill layer {l} kv sync: {e}"),
+                            vocab_size,
+                        );
+                    }
+                    {
+                        let src_bytes = pf.bo_y[l].as_slice();
+                        let dst_bytes = kv_bo.as_mut_slice();
+                        for kvh in 0..N_KV_HEADS {
+                            let k_src_base = (Q4PREFILL_SLOT_KV_CUR + kvh * Q4LAYER_TILE_F32) * 4;
+                            let v_src_base = k_src_base + Q4LAYER_SILU_HALF * 4;
+                            for ti in 0..n_valid {
+                                let gpos = pos0 + ti;
+                                let c = gpos / Q4LAYER_ATTN_CHUNK_T;
+                                let rem = gpos % Q4LAYER_ATTN_CHUNK_T;
+                                let k_dst = ((kvh * Q4LAYER_ATTN_CHUNKS + c) * Q4LAYER_TILE_F32)
+                                    * 4
+                                    + rem * kv_row_bytes;
+                                let v_dst = k_dst + Q4LAYER_SILU_HALF * 4;
+                                let k_src = k_src_base + ti * kv_row_bytes;
+                                let v_src = v_src_base + ti * kv_row_bytes;
+                                dst_bytes[k_dst..k_dst + kv_row_bytes]
+                                    .copy_from_slice(&src_bytes[k_src..k_src + kv_row_bytes]);
+                                dst_bytes[v_dst..v_dst + kv_row_bytes]
+                                    .copy_from_slice(&src_bytes[v_src..v_src + kv_row_bytes]);
+                                let m_off = ti * KV_DIM + kvh * HEAD_DIM;
+                                for d in 0..HEAD_DIM {
+                                    k_mirror[m_off + d] = bf16_to_f32(u16::from_le_bytes([
+                                        src_bytes[k_src + d * 2],
+                                        src_bytes[k_src + d * 2 + 1],
+                                    ]));
+                                    v_mirror[m_off + d] = bf16_to_f32(u16::from_le_bytes([
+                                        src_bytes[v_src + d * 2],
+                                        src_bytes[v_src + d * 2 + 1],
+                                    ]));
+                                }
+                            }
+                        }
+                    }
+                    let c0 = pos0 / Q4LAYER_ATTN_CHUNK_T;
+                    let r0 = pos0 % Q4LAYER_ATTN_CHUNK_T;
+                    let n0 = (Q4LAYER_ATTN_CHUNK_T - r0).min(n_valid);
+                    let n1 = n_valid - n0;
+                    for kvh in 0..N_KV_HEADS {
+                        let k_off0 = ((kvh * Q4LAYER_ATTN_CHUNKS + c0) * Q4LAYER_TILE_F32) * 4
+                            + r0 * kv_row_bytes;
+                        for byte_off in [k_off0, k_off0 + Q4LAYER_SILU_HALF * 4] {
+                            if let Err(e) = kv_bo.sync_range_to_device(n0 * kv_row_bytes, byte_off)
+                            {
+                                return self.record_device_fault(
+                                    format!("prefill layer {l} bo_kv sync: {e}"),
+                                    vocab_size,
+                                );
+                            }
+                        }
+                        if n1 > 0 {
+                            let k_off1 =
+                                ((kvh * Q4LAYER_ATTN_CHUNKS + c0 + 1) * Q4LAYER_TILE_F32) * 4;
+                            for byte_off in [k_off1, k_off1 + Q4LAYER_SILU_HALF * 4] {
+                                if let Err(e) =
+                                    kv_bo.sync_range_to_device(n1 * kv_row_bytes, byte_off)
+                                {
+                                    return self.record_device_fault(
+                                        format!("prefill layer {l} bo_kv tail sync: {e}"),
+                                        vocab_size,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let LayerState::Attention {
+                        key_cache,
+                        value_cache,
+                        key_cache_f16,
+                        value_cache_f16,
+                        ..
+                    } = &mut state.layers[l]
+                    {
+                        if state.kv_f16 {
+                            key_cache_f16.extend(k_mirror[..m_len].iter().copied().map(f32_to_f16));
+                            value_cache_f16
+                                .extend(v_mirror[..m_len].iter().copied().map(f32_to_f16));
+                        } else {
+                            key_cache.extend_from_slice(&k_mirror[..m_len]);
+                            value_cache.extend_from_slice(&v_mirror[..m_len]);
+                        }
+                    }
+                }
+                state.seq_len = pos0 + n_valid;
+                *synced_kv_len = pos0 + n_valid;
+                last_n_valid = n_valid;
+            }
+
+            if tail_start.is_none() {
+                let last_off = (last_n_valid - 1) * HIDDEN_SIZE * 4;
+                if let Err(e) = pf.bo_out.sync_range_from_device(HIDDEN_SIZE * 4, last_off) {
+                    return self
+                        .record_device_fault(format!("prefill bo_out sync: {e}"), vocab_size);
+                }
+                head_bo_y.as_mut_slice()[..HIDDEN_SIZE * 4]
+                    .copy_from_slice(&pf.bo_out.as_slice()[last_off..last_off + HIDDEN_SIZE * 4]);
+                if let Err(e) = head_bo_y.sync_range_to_device(HIDDEN_SIZE * 4, 0) {
+                    return self
+                        .record_device_fault(format!("prefill head_bo_y sync: {e}"), vocab_size);
+                }
+                if let Err(e) = pf
+                    .head_run
+                    .start()
+                    .and_then(|()| pf.head_run.wait(QUIESCE_TIMEOUT_MS))
+                {
+                    return self
+                        .record_device_fault(format!("prefill head run failed: {e}"), vocab_size);
+                }
+                if let Err(e) =
+                    head_bo_y.sync_range_from_device(vocab_size * 4, Q4LAYER_TILE_F32 * 4)
+                {
+                    return self
+                        .record_device_fault(format!("prefill head logits sync: {e}"), vocab_size);
+                }
+                let mut logits = vec![0.0f32; vocab_size];
+                read_le_f32_slice(head_bo_y.as_slice(), Q4LAYER_TILE_F32, &mut logits);
+                if cfg.scalars.logit != 1.0 {
+                    cpu::scale_inplace(&mut logits, 1.0 / cfg.scalars.logit);
+                }
+                return logits;
+            }
         }
-        self.cpu.forward_prefill(tokens, start_pos, state)
+
+        let ts = tail_start.expect("only reached with tail tokens");
+        let mut logits = vec![0.0f32; vocab_size];
+        for (i, &tok) in tokens[ts..].iter().enumerate() {
+            logits = self.forward(&[tok], start_pos + ts + i, state);
+        }
+        logits
     }
 
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
@@ -1222,10 +1634,11 @@ impl Model for XdnaLlamaModel {
             );
         }
 
-        // Positions beyond the 648-token NPU KV stream layout (or a raw caller
-        // passing `state.lora`) fall back to CPU decode seamlessly (`state.layers`
-        // holds the full KV history because every NPU decode step mirrors K/V).
-        if pos >= MAX_KV_CACHE_TOKENS || state.lora.is_some() {
+        // Position 0 (BOS attention sink, where `blk.0`/`blk.1` `Q4_1`
+        // `ffn_down` matters most) and positions beyond `MAX_KV_CACHE_TOKENS`
+        // (or callers passing `state.lora`) fall back to CPU (`state.layers`
+        // holds the full KV history because every NPU step mirrors K/V).
+        if pos == 0 || pos >= MAX_KV_CACHE_TOKENS || state.lora.is_some() {
             {
                 let mut npu = self.lock_npu();
                 if self.state_torn.load(Ordering::SeqCst) {
@@ -1424,11 +1837,11 @@ impl Model for XdnaLlamaModel {
             }
             let mut k_offs = [0usize; N_KV_HEADS];
             {
-                let yl_mut = npu.layer_bo_y[l].as_mut_slice();
+                let kv_mut = npu.layer_bo_kv[l].as_mut_slice();
                 for (kvh, k_off) in k_offs.iter_mut().enumerate() {
                     let src_fl = kvh * HEAD_DIM;
                     *k_off = write_q4layer_kv_bf16(
-                        yl_mut,
+                        kv_mut,
                         kvh,
                         pos,
                         &k_cur[src_fl..src_fl + HEAD_DIM],
@@ -1437,14 +1850,14 @@ impl Model for XdnaLlamaModel {
                 }
             }
             for &k_byte_off in &k_offs {
-                if let Err(e) = npu.layer_bo_y[l].sync_range_to_device(HEAD_DIM * 2, k_byte_off) {
+                if let Err(e) = npu.layer_bo_kv[l].sync_range_to_device(HEAD_DIM * 2, k_byte_off) {
                     npu.spare_kv = Some((pending_k, pending_v));
                     return self.record_device_fault(
                         format!("layer {l} k sync to device: {e}"),
                         vocab_size,
                     );
                 }
-                if let Err(e) = npu.layer_bo_y[l]
+                if let Err(e) = npu.layer_bo_kv[l]
                     .sync_range_to_device(HEAD_DIM * 2, k_byte_off + Q4LAYER_SILU_HALF * 4)
                 {
                     npu.spare_kv = Some((pending_k, pending_v));
@@ -1506,11 +1919,49 @@ pub fn load_model_xdna(
     let model_id = path
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Ok(Box::new(XdnaLlamaModel::from_gguf_with_id(
-        gguf,
-        context_size,
-        model_id,
-    )?))
+    let arch = gguf
+        .get_str("general.architecture")
+        .context("missing general.architecture")?
+        .to_lowercase();
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    let decode_shape = {
+        let head_bytes = gguf
+            .tensors
+            .get("output.weight")
+            .or_else(|| gguf.tensors.get("token_embd.weight"))
+            .map(|t| t.size_bytes as u64)
+            .unwrap_or(0);
+        (head_bytes > 0).then_some(crate::backend::calibrate::DecodeShape {
+            weight_bytes: head_bytes,
+            dispatches_per_token: 1,
+        })
+    };
+    let model: Box<dyn Model> = match arch.as_str() {
+        "llama" => Box::new(XdnaLlamaModel::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
+        "lfm2" => Box::new(super::xdna_lfm2::XdnaLfm2Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
+        "lfm3" => Box::new(super::xdna_lfm3::XdnaLfm3Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
+        _ => bail!(
+            "unsupported architecture for AMD XDNA NPU: {arch} \
+             (XDNA backend supports Llama-3.2-1B, LFM2/LFM2.5-1.2B, and LFM3)"
+        ),
+    };
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    if let Some(shape) = decode_shape {
+        crate::backend::calibrate::set_decode_shape(shape);
+    }
+    Ok(model)
 }
 
 #[cfg(test)]
@@ -1546,15 +1997,15 @@ mod tests {
     #[test]
     fn kv_bucket_selection_covers_all_positions() {
         let buckets: Vec<usize> = Q4LAYER_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 0), (0, 8));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 1), (0, 8));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 72), (0, 8));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 73), (1, 7));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 144), (1, 7));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 145), (2, 6));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 576), (7, 1));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 577), (8, 0));
-        assert_eq!(select_q4layer_kv_bucket(&buckets, 647), (8, 0));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 0), (0, 63));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 1), (0, 63));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 64), (0, 63));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 65), (1, 62));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 128), (1, 62));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 129), (2, 60));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 3072), (8, 16));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 3073), (9, 0));
+        assert_eq!(select_q4layer_kv_bucket(&buckets, 4095), (9, 0));
     }
 
     #[test]
@@ -1637,10 +2088,12 @@ mod tests {
                 _layer_runs: Vec::new(),
                 head_bo_y,
                 _head_bo_w: head_bo_w,
+                layer_bo_kv: Vec::new(),
                 layer_bo_y: Vec::new(),
                 _layer_bo_w: Vec::new(),
                 _head_kernel: kernel,
                 _layer_kernels: Vec::new(),
+                prefill: None,
                 _device: device,
                 in_flight_bucket: None,
                 synced_kv_len: 16,
@@ -1702,10 +2155,12 @@ mod tests {
                 _layer_runs: Vec::new(),
                 head_bo_y,
                 _head_bo_w: head_bo_w,
+                layer_bo_kv: Vec::new(),
                 layer_bo_y: Vec::new(),
                 _layer_bo_w: Vec::new(),
                 _head_kernel: kernel,
                 _layer_kernels: Vec::new(),
+                prefill: None,
                 _device: device,
                 in_flight_bucket: Some(0),
                 synced_kv_len: 0,
@@ -1759,10 +2214,12 @@ mod tests {
                 _layer_runs: Vec::new(),
                 head_bo_y,
                 _head_bo_w: head_bo_w,
+                layer_bo_kv: Vec::new(),
                 layer_bo_y: Vec::new(),
                 _layer_bo_w: Vec::new(),
                 _head_kernel: kernel,
                 _layer_kernels: Vec::new(),
+                prefill: None,
                 _device: device,
                 in_flight_bucket: Some(0),
                 synced_kv_len: 0,
@@ -1836,10 +2293,12 @@ mod tests {
                 _layer_runs: Vec::new(),
                 head_bo_y,
                 _head_bo_w: head_bo_w,
+                layer_bo_kv: Vec::new(),
                 layer_bo_y: Vec::new(),
                 _layer_bo_w: Vec::new(),
                 _head_kernel: kernel,
                 _layer_kernels: Vec::new(),
+                prefill: None,
                 _device: device,
                 in_flight_bucket: None,
                 synced_kv_len: 5,
@@ -2032,10 +2491,12 @@ mod tests {
                 _layer_runs: Vec::new(),
                 head_bo_y,
                 _head_bo_w: head_bo_w,
+                layer_bo_kv: Vec::new(),
                 layer_bo_y: Vec::new(),
                 _layer_bo_w: Vec::new(),
                 _head_kernel: kernel,
                 _layer_kernels: Vec::new(),
+                prefill: None,
                 _device: device,
                 in_flight_bucket: None,
                 synced_kv_len: 1,

@@ -213,6 +213,9 @@ pub struct GpuContext {
     /// slang source, since `enable subgroups` fails module creation on
     /// devices lacking the feature.
     pub has_subgroup: bool,
+    /// Whether `EXPERIMENTAL_COOPERATIVE_MATRIX` (Vulkan 16x16x16 F16->F32
+    /// cooperative matrix multiply-accumulate) was available and enabled.
+    pub has_coopmat: bool,
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
@@ -259,6 +262,7 @@ impl Clone for GpuContext {
             backend: self.backend.clone(),
             shader_f16: self.shader_f16,
             has_subgroup: self.has_subgroup,
+            has_coopmat: self.has_coopmat,
             max_storage_buffer_binding_size: self.max_storage_buffer_binding_size,
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
@@ -392,6 +396,10 @@ pub(crate) const FLASH_ATTENTION_WORKGROUP_BYTES: u32 = 30_336;
 /// Workgroup storage `attention_prefill_hd64_f16.slang` needs: qs 8192 + kt 4096 + vs 4352 +
 /// ps 8192 + ph 4096 + pm 1024 + corr 256 + lsum 1024 bytes (total 31,232 bytes).
 pub(crate) const FLASH_ATTENTION_F16_WORKGROUP_BYTES: u32 = 31_232;
+
+/// Workgroup storage `attention_prefill_hd128_f16.slang` needs: qs 8192 + kt 8192 + vs 8448 +
+/// ps 4096 + ph 2048 + pm 1024 + corr 128 bytes (total 32,128 bytes).
+pub(crate) const FLASH_ATTENTION_HD128_F16_WORKGROUP_BYTES: u32 = 32_128;
 
 /// Pure predicate behind [`GpuContext::supports_flash_attention`], split out so a host test
 /// can pin it without a GPU: the kernel's workgroup storage, then OS plus vendor. `is_android`
@@ -699,13 +707,37 @@ impl GpuContext {
         {
             features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
+        let has_coopmat = backend_kind == wgpu::Backend::Vulkan
+            && adapter
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+            && adapter
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+            && adapter.cooperative_matrix_properties().iter().any(|p| {
+                p.m_size == 16
+                    && p.n_size == 16
+                    && p.k_size == 16
+                    && p.ab_type == wgpu::CooperativeScalarType::F16
+                    && p.cr_type == wgpu::CooperativeScalarType::F32
+                    && !p.saturating_accumulation
+            });
+        if has_coopmat {
+            features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("cera-gpu"),
                 required_features: features,
                 required_limits: adapter_limits.clone(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                experimental_features: if has_coopmat {
+                    // SAFETY: `has_coopmat` verified Vulkan `EXPERIMENTAL_COOPERATIVE_MATRIX`
+                    // support and 16x16x16 F16->F32 properties on the adapter above.
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -792,6 +824,7 @@ impl GpuContext {
             backend,
             shader_f16: features.contains(wgpu::Features::SHADER_F16),
             has_subgroup: features.contains(wgpu::Features::SUBGROUP),
+            has_coopmat: features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX),
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size as u64,
             max_buffer_size: adapter_limits.max_buffer_size,
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
@@ -2323,6 +2356,23 @@ impl GpuContext {
         }
     }
 
+    /// Checked build of `attention_prefill_hd128_f16.slang` (fp16, 32-query-per-workgroup prefill
+    /// attention for head_dim 128 with sliding-window support).
+    pub fn try_attention_prefill_hd128_f16_passthrough_checked(
+        &self,
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
+        unsafe {
+            self.try_stream_gemm_pipeline_checked(
+                "attention_prefill_hd128_f16_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/attention_prefill_hd128_f16.spv"
+                )),
+                &[true, true, true, false, true],
+            )
+        }
+    }
+
     /// Direct-B twin of [`Self::gemm_stream_q4_0_k64_passthrough`] (`gemm_stream_q4_0_k64_xf32.slang`):
     /// the same five bindings, parameter block and grid and bit-exact results, but binding 2 is the
     /// f32 token-major activations `x[n][k]` instead of the transposed f16 copy, so no
@@ -2370,6 +2420,46 @@ impl GpuContext {
                 wgpu::include_spirv_raw!(concat!(
                     env!("OUT_DIR"),
                     "/gemm_stream_q4_0_k64_gateup.spv"
+                )),
+                &[true, true, true, true, true, false, true],
+            )
+        }
+    }
+
+    /// Cooperative-Matrix (`VK_KHR_cooperative_matrix` 16x16x16 F16->F32) direct-B streaming
+    /// Q4_0 prefill GEMM (`gemm_coopmat_q4_0_k64_xf32.slang`): same 5 bindings as
+    /// [`Self::gemm_stream_q4_0_k64_xf32_passthrough`], grid `(ceil(m/64), ceil(n/32))`.
+    pub fn gemm_coopmat_q4_0_k64_xf32_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.has_coopmat,
+            "coopmat pipeline requested without has_coopmat"
+        );
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_coopmat_q4_0_k64_xf32_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_coopmat_q4_0_k64_xf32.spv"
+                )),
+                &[true, true, true, false, true],
+            )
+        }
+    }
+
+    /// Cooperative-Matrix (`VK_KHR_cooperative_matrix` 16x16x16 F16->F32) fused gate/up + SiLU
+    /// streaming Q4_0 prefill GEMM (`gemm_coopmat_q4_0_k64_gateup.slang`): same 7 bindings as
+    /// [`Self::gemm_stream_q4_0_k64_gateup_passthrough`], grid `(ceil(m/64), ceil(n/32))`.
+    pub fn gemm_coopmat_q4_0_k64_gateup_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.has_coopmat,
+            "coopmat pipeline requested without has_coopmat"
+        );
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_coopmat_q4_0_k64_gateup_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_coopmat_q4_0_k64_gateup.spv"
                 )),
                 &[true, true, true, true, true, false, true],
             )
@@ -2629,6 +2719,38 @@ impl GpuContext {
                 },
                 cache: None,
             })
+    }
+
+    /// Small-M high-split Q4_0 decode GEMV over the resident stream layout
+    /// (`spirv/gemv_q4_0_stream_sm.slang`, entry `main`). 5-binding interface
+    /// (q, d, x, y, params), ROWS_PER_WG=8 dispatch.
+    pub fn gemv_q4_0_stream_sm_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q4_0_stream_sm_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_0_stream_sm.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Split-K Wave32 Q4_0 decode GEMV over the resident stream layout (`m <= 2048`,
+    /// `spirv/gemv_q4_0_stream_splitk.slang`, entry `main`). 5-binding interface
+    /// (q, d, x, partial_y, params), grid `(ceil(m/32), k_splits, 1)`.
+    pub fn gemv_q4_0_stream_splitk_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q4_0_stream_splitk_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_0_stream_splitk.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Split-K GEMV reduction epilogue (`spirv/gemv_splitk_reduce.slang`, entry `main`).
+    /// 3-binding interface (partial_y, y, params), grid `(ceil(m/64), 1, 1)`.
+    pub fn gemv_splitk_reduce_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_splitk_reduce_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_splitk_reduce.spv")),
+            &[true, false, true],
+        )
     }
 
     /// Register-tiled Q4_0 GEMM over the resident stream layout
@@ -3350,6 +3472,124 @@ pub mod shaders {
     /// metal branch the two-stage `simd_shuffle_down`.
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const ARGMAX_F32: &str = include_str!(concat!(env!("OUT_DIR"), "/argmax_f32.wgsl"));
+    /// Mask up to 4 banned token IDs in `logits_buf` before `argmax_f32` so
+    /// text-only greedy decode over audio-capable tokenizers keeps using the
+    /// 4-byte GPU argmax readback instead of downloading full logits.
+    pub const MASK_TOKENS_F32: &str = r#"
+struct MaskParams {
+    vocab_size: u32,
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    ids: vec4<u32>,
+};
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> params: MaskParams;
+@compute @workgroup_size(4)
+fn mask_tokens_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.count) {
+        let idx = params.ids[i];
+        if (idx < params.vocab_size) {
+            logits[idx] = -3.402823466e+38f;
+        }
+    }
+}
+"#;
+    /// Two-stage parallel argmax over `logits_buf` (`64` workgroups * `256`
+    /// threads -> 64 partial `(val, idx)` pairs -> 1 workgroup reduce).
+    /// Eliminates the single-CU bottleneck of single-workgroup `argmax_f32`
+    /// across large vocabularies (`65k`/`128k`).
+    pub const ARGMAX_STAGE1_F32: &str = r#"
+struct StagePair {
+    val: f32,
+    idx: u32,
+};
+@group(0) @binding(0) var<storage, read> in_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> stage_buf: array<StagePair>;
+@group(0) @binding(2) var<storage, read> par_buf: array<u32>;
+var<workgroup> sm_val: array<f32, 256>;
+var<workgroup> sm_idx: array<u32, 256>;
+@compute @workgroup_size(256)
+fn argmax_stage1_f32(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let n = par_buf[0];
+    let tid = lid.x;
+    let stride = 64u * 256u;
+    var i = wid.x * 256u + tid;
+    var best_val = -3.402823466e+38f;
+    var best_idx = 0xFFFFFFFFu;
+    if (i < n) {
+        best_val = in_buf[i];
+        best_idx = i;
+        i += stride;
+        loop {
+            if (i >= n) { break; }
+            let v = in_buf[i];
+            if (v > best_val || (v == best_val && i < best_idx)) {
+                best_val = v;
+                best_idx = i;
+            }
+            i += stride;
+        }
+    }
+    sm_val[tid] = best_val;
+    sm_idx[tid] = best_idx;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            let ov = sm_val[tid + s];
+            let oi = sm_idx[tid + s];
+            if (oi != 0xFFFFFFFFu && (sm_idx[tid] == 0xFFFFFFFFu || ov > sm_val[tid] || (ov == sm_val[tid] && oi < sm_idx[tid]))) {
+                sm_val[tid] = ov;
+                sm_idx[tid] = oi;
+            }
+        }
+        workgroupBarrier();
+    }
+    if (tid == 0u) {
+        stage_buf[wid.x] = StagePair(sm_val[0], sm_idx[0]);
+    }
+}
+"#;
+    /// Stage 2 of two-stage parallel argmax: reduces 64 `(val, idx)` pairs into
+    /// `out_buf[par_buf[0].y]`.
+    pub const ARGMAX_STAGE2_F32: &str = r#"
+struct StagePair {
+    val: f32,
+    idx: u32,
+};
+@group(0) @binding(0) var<storage, read> stage_buf: array<StagePair>;
+@group(0) @binding(1) var<storage, read_write> out_buf: array<u32>;
+@group(0) @binding(2) var<storage, read> par_buf: array<u32>;
+var<workgroup> sm_val: array<f32, 64>;
+var<workgroup> sm_idx: array<u32, 64>;
+@compute @workgroup_size(64)
+fn argmax_stage2_f32(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let p = stage_buf[tid];
+    sm_val[tid] = p.val;
+    sm_idx[tid] = p.idx;
+    workgroupBarrier();
+    for (var s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            let ov = sm_val[tid + s];
+            let oi = sm_idx[tid + s];
+            if (oi != 0xFFFFFFFFu && (sm_idx[tid] == 0xFFFFFFFFu || ov > sm_val[tid] || (ov == sm_val[tid] && oi < sm_idx[tid]))) {
+                sm_val[tid] = ov;
+                sm_idx[tid] = oi;
+            }
+        }
+        workgroupBarrier();
+    }
+    if (tid == 0u) {
+        let out_idx = par_buf[1];
+        out_buf[out_idx] = select(sm_idx[0], 0u, sm_idx[0] == 0xFFFFFFFFu);
+    }
+}
+"#;
     /// RoPE (NEOX + interleaved + freq_factors), generated from
     /// `shaders/slang/rope.slang` by build.rs. A `__target_switch` port: this
     /// wgsl branch carries the full kernel; the metal branch (shared with
@@ -3362,6 +3602,11 @@ pub mod shaders {
     /// `head_dim == 64` at any context length; see `flash_attention_split.wgsl`.
     pub const FLASH_ATTENTION_SPLIT: &str = include_str!("shaders/flash_attention_split.wgsl");
     pub const FLASH_ATTENTION_MERGE: &str = include_str!("shaders/flash_attention_merge.wgsl");
+    /// Split-K decode attention and merge for `head_dim == 128`.
+    pub const FLASH_ATTENTION_SPLIT_HD128: &str =
+        include_str!("shaders/flash_attention_split_hd128.wgsl");
+    pub const FLASH_ATTENTION_MERGE_HD128: &str =
+        include_str!("shaders/flash_attention_merge_hd128.wgsl");
     /// F32-KV twin of [`FLASH_ATTENTION`] for the audio
     /// detokenizer (`wgpu_audio_decoder`): same math/grid/params, bindings 1/2
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
@@ -7133,6 +7378,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_gpu_mask_tokens_and_argmax_f32() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let mask_pipe = ctx.create_pipeline(
+            shaders::MASK_TOKENS_F32,
+            "mask_tokens_f32",
+            "mask_tokens_f32",
+        );
+        let argmax_pipe = ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32");
+
+        let n = 512usize;
+        let mut x = vec![0.25f32; n];
+        x[128] = 50.0;
+        x[131] = 25.0;
+        x[300] = 10.0;
+        let x_buf = ctx.upload_f32(&x, "mask_logits_in");
+        let out_buf = ctx.create_storage_rw(4, "mask_argmax_out");
+        let mask_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[
+                n as u32,
+                3u32,
+                0u32,
+                0u32,
+                128u32,
+                131u32,
+                9999u32,
+                u32::MAX,
+            ]),
+            "mask_params",
+        );
+        let argmax_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n as u32, 0u32]),
+            "mask_argmax_params",
+        );
+
+        let mask_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &mask_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: mask_params.as_entire_binding(),
+                },
+            ],
+        });
+        let argmax_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &argmax_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: argmax_params.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&mask_pipe);
+            pass.set_bind_group(0, &mask_bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&argmax_pipe);
+            pass.set_bind_group(0, &argmax_bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        let out = ctx.download_u32(&out_buf, 1);
+        assert_eq!(
+            out[0], 300,
+            "masked tokens 128/131 must be excluded, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn test_gpu_argmax_two_stage_f32() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let s1 = ctx.create_pipeline(
+            shaders::ARGMAX_STAGE1_F32,
+            "argmax_stage1_f32",
+            "argmax_stage1_f32",
+        );
+        let s2 = ctx.create_pipeline(
+            shaders::ARGMAX_STAGE2_F32,
+            "argmax_stage2_f32",
+            "argmax_stage2_f32",
+        );
+        let n = 128_000usize;
+        let mut x = vec![-10.0f32; n];
+        x[17_321] = 42.5;
+        x[99_999] = 42.5; // tie -> lower index must win
+        let x_buf = ctx.upload_f32(&x, "am2_in");
+        let stage_buf = ctx.create_storage_rw(64 * 8, "am2_stage");
+        let out_buf = ctx.create_storage_rw(4, "am2_out");
+        let params = ctx.upload_storage(bytemuck::cast_slice(&[n as u32, 0u32]), "am2_params");
+        let bg1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &s1.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: stage_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let bg2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &s2.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: stage_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&s1);
+            pass.set_bind_group(0, &bg1, &[]);
+            pass.dispatch_workgroups(64, 1, 1);
+            pass.set_pipeline(&s2);
+            pass.set_bind_group(0, &bg2, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        let out = ctx.download_u32(&out_buf, 1);
+        assert_eq!(out[0], 17_321, "two-stage argmax returned {}", out[0]);
+    }
+
     /// Spike: confirm WGSL `override` constants flow through the wgpu 24
     /// pipeline-creation API on this machine. If this passes, per-head-dim
     /// specialization in Phase 3 of the wgpu kernel-parity plan can ride on
@@ -9293,6 +9703,113 @@ mod tests {
                 g, 0.0,
                 "{kernel:?}: an empty window must write zeros; idx {i} = {g}"
             );
+        }
+    }
+
+    /// Head_dim == 128 tiled f16 prefill (causal + sliding window) and 2-chunk single-pass
+    /// dispatch at `start_pos = 4096` match the scalar reference without stalling.
+    #[test]
+    fn test_gpu_attention_prefill_hd128_and_two_chunk_submit() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        if !ctx.supports_flash_attention()
+            || !ctx.supports_spirv_passthrough()
+            || ctx.max_compute_workgroup_storage_size
+                < super::FLASH_ATTENTION_HD128_F16_WORKGROUP_BYTES
+        {
+            return;
+        }
+        let hd128 = ctx
+            .try_attention_prefill_hd128_f16_passthrough_checked()
+            .expect("attention_prefill_hd128_f16 must compile");
+        let scalar = ctx.create_pipeline(
+            shaders::ATTENTION_PREFILL,
+            "attention_prefill",
+            "attention_prefill",
+        );
+
+        let (n_heads, n_kv_heads, head_dim, n, start_pos) = (16u32, 4u32, 128u32, 512u32, 4096u32);
+        let f = build_attn_prefill_fixture(n_heads, n_kv_heads, head_dim, n, start_pos);
+        let q_buf = ctx.upload_f32(&f.q_batch, "q");
+        let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&f.k_cache)), "k");
+        let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&f.v_cache)), "v");
+        let out_hd128 = ctx.create_storage_rw((f.ref_out.len() as u64) * 4, "out_hd128");
+        let out_scalar = ctx.create_storage_rw((f.ref_out.len() as u64) * 4, "out_scalar");
+
+        for swa in [256u32, 0u32] {
+            for (pipeline, qpwg, out_buf, label, is_tiled) in [
+                (&hd128, 32u32, &out_hd128, "hd128_f16", true),
+                (&scalar, 8u32, &out_scalar, "scalar", false),
+            ] {
+                let mut enc = ctx.device.create_command_encoder(&Default::default());
+                let mut bgs = Vec::new();
+                for (q_base, n_sub) in [(0u32, 256u32), (256u32, 256u32)] {
+                    let params: [u32; 14] = [
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        f.kv_dim,
+                        f.max_seq,
+                        f.scale.to_bits(),
+                        start_pos,
+                        f.max_seq,
+                        f.q_stride,
+                        f.out_stride,
+                        q_base,
+                        n_sub,
+                        0,
+                        swa,
+                    ];
+                    let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "p");
+                    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: q_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: k_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: v_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: p_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    bgs.push((bg, n_sub));
+                }
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    for (bg, n_sub) in &bgs {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        if is_tiled {
+                            pass.dispatch_workgroups(n_sub.div_ceil(qpwg), n_heads, 1);
+                        } else {
+                            pass.dispatch_workgroups(n_heads, n_sub.div_ceil(qpwg), 1);
+                        }
+                    }
+                }
+                ctx.submit_encoder(enc);
+            }
+            let got_hd128 = ctx.download_f32(&out_hd128, f.ref_out.len());
+            let got_scalar = ctx.download_f32(&out_scalar, f.ref_out.len());
+            for (i, (&a, &b)) in got_hd128.iter().zip(&got_scalar).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-2 + 1e-2 * b.abs(),
+                    "swa={swa} hd128 vs scalar mismatch at {i}: hd128={a} scalar={b}"
+                );
+            }
         }
     }
 }

@@ -169,6 +169,38 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
     sign | ((e << 10) as u16) | (((rounded >> 13) & 0x03FF) as u16)
 }
 
+/// Convert one bf16 (raw bits) directly to IEEE-754 half (raw bits), matching
+/// `f32_to_f16(bf16_to_f32(bits))` across all 65536 patterns without float branching.
+#[cfg_attr(not(any(feature = "xdna", test)), allow(dead_code))]
+#[inline(always)]
+pub(crate) fn bf16_to_f16(bits: u16) -> u16 {
+    let sign = bits & 0x8000;
+    let exp = ((bits >> 7) & 0xFF) as i32;
+    let mant = bits & 0x007F;
+    if exp == 0xFF {
+        return if mant == 0 {
+            sign | 0x7C00
+        } else {
+            sign | 0x7E00 | (mant << 3)
+        };
+    }
+    let e = exp - 112;
+    if e >= 1 {
+        if e >= 0x1F {
+            return sign | 0x7C00;
+        }
+        return sign | ((e as u16) << 10) | (mant << 3);
+    }
+    if e < -10 {
+        return sign;
+    }
+    let m = u32::from(mant | 0x0080) << 16;
+    let shift = (14 - e) as u32;
+    let round = ((m >> (shift - 1)) & 1)
+        & (((m & ((1 << (shift - 1)) - 1)) != 0) as u32 | ((m >> shift) & 1));
+    sign | ((m >> shift) + round) as u16
+}
+
 /// Scale of a Q8_0 block (activations and re-quantized weights) with absolute
 /// maximum `amax`: the smallest f16 that is at least `amax / 127`, returned as f32.
 ///
@@ -1250,6 +1282,18 @@ mod tests {
                     "bits {bits:#06x}: want {want}, got {got}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bf16_to_f16_matches_f32_roundtrip_exhaustively() {
+        for bits in 0..=u16::MAX {
+            let want = f32_to_f16(bf16_to_f32(bits));
+            let got = bf16_to_f16(bits);
+            assert_eq!(
+                got, want,
+                "bits {bits:#06x}: got {got:#06x} != want {want:#06x}"
+            );
         }
     }
 
