@@ -1612,24 +1612,35 @@ impl GpuContext {
 
     /// Run `build` inside `Validation` and `Internal` error scopes on native targets,
     /// returning `Err` if either scope reports a driver error.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn run_pipeline_checked<F>(
-        &self,
-        label: &str,
-        build: F,
-    ) -> anyhow::Result<wgpu::ComputePipeline>
+    ///
+    /// Pinned `wgpu` 30 reports shader/pipeline compile errors to the device error
+    /// sink instead of failing pipeline creation synchronously and hands back invalid
+    /// pipelines whose dispatches are silently dropped. Wrapping a batch of pipeline
+    /// builds with `check_pipelines` surfaces driver rejections programmatically so
+    /// model loaders can degrade passthrough/streaming paths or fall back to CPU.
+    /// On `wasm32`, popping error scopes needs a blocking executor which `wasm32`
+    /// lacks, so `build` runs unchecked there.
+    pub(crate) fn check_pipelines<T, F>(&self, label: &str, build: F) -> anyhow::Result<T>
     where
-        F: FnOnce() -> wgpu::ComputePipeline,
+        F: FnOnce() -> T,
     {
-        let val_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let int_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
-        let pipeline = build();
-        // Pop error scopes in strict LIFO order before combining.
-        let int_err = pollster::block_on(int_scope.pop());
-        let val_err = pollster::block_on(val_scope.pop());
-        match int_err.or(val_err) {
-            Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
-            None => Ok(pipeline),
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = label;
+            Ok(build())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let val_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let int_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let out = build();
+            // Pop error scopes in strict LIFO order before combining.
+            let int_err = pollster::block_on(int_scope.pop());
+            let val_err = pollster::block_on(val_scope.pop());
+            match int_err.or(val_err) {
+                Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
+                None => Ok(out),
+            }
         }
     }
 
@@ -1637,27 +1648,17 @@ impl GpuContext {
     /// invalid pipeline: pinned wgpu 30 never panics on validation or compile failure, it
     /// reports to the error sink and hands back a pipeline whose dispatches are silently
     /// dropped, so without this check a failed build zeroes output with nothing programmatic
-    /// surfacing. Only the flash builds use it today; every other kernel is within
-    /// spec-minimum limits and builds on any conformant adapter. On wasm32 this always
-    /// returns `Ok`: popping the error scope needs a blocking executor, which wasm32 lacks
-    /// (constructors are sync; `new_async` only covers context creation), so the build is
-    /// unchecked there and callers rely on the capability gate (which keeps flash off).
+    /// surfacing. On wasm32 this always returns `Ok`: popping the error scope needs a
+    /// blocking executor, which wasm32 lacks.
     pub fn try_create_pipeline_checked(
         &self,
         shader_source: &str,
         entry_point: &str,
         label: &str,
     ) -> anyhow::Result<wgpu::ComputePipeline> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            Ok(self.create_pipeline(shader_source, entry_point, label))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.run_pipeline_checked(label, || {
-                self.create_pipeline(shader_source, entry_point, label)
-            })
-        }
+        self.check_pipelines(label, || {
+            self.create_pipeline(shader_source, entry_point, label)
+        })
     }
 
     /// Build the flash pipeline, degrading to `None` with a loud log when validation fails.
@@ -2205,18 +2206,10 @@ impl GpuContext {
         desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
         bindings: &[bool],
     ) -> anyhow::Result<wgpu::ComputePipeline> {
-        #[cfg(target_arch = "wasm32")]
-        {
+        self.check_pipelines(label, || {
             // SAFETY: Caller guarantees desc satisfies safety invariant.
-            Ok(unsafe { self.stream_gemm_pipeline(label, desc, bindings) })
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.run_pipeline_checked(label, || {
-                // SAFETY: Caller guarantees desc satisfies safety invariant.
-                unsafe { self.stream_gemm_pipeline(label, desc, bindings) }
-            })
-        }
+            unsafe { self.stream_gemm_pipeline(label, desc, bindings) }
+        })
     }
 
     /// The fp16, 64-query-per-workgroup causal prefill attention for head_dim 64

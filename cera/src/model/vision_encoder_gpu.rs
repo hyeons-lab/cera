@@ -1186,7 +1186,7 @@ impl WgpuVitOps {
         // `MetalVitOps::new`'s `.ok()?`, instead of aborting `CeraEngine`
         // construction. The flash build below checks its error scope explicitly because
         // it is the one kernel that can exceed an adapter's workgroup limit.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || -> Result<Self> {
             let (wg_m, wg_n) = (format!("{VIT_MM_WG_M}u"), format!("{VIT_MM_WG_N}u"));
             let (tile_m, tile_n) = (format!("{VIT_MM_TILE_M}u"), format!("{VIT_MM_TILE_N}u"));
             let tile_k = format!("{VIT_MM_TILE_K}u");
@@ -1206,22 +1206,99 @@ impl WgpuVitOps {
                     ],
                 )
             };
-            // f32 batched matmul — the dequantized-weight fallback path.
-            let p_linear = mk_mul_mat("vit_linear", "f32", "INIT_SRC0_SHMEM_FLOAT");
-            // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
-            // shared memory in-kernel and reuse them across the token tile.
-            let mk_quant = |label: &str, init_src0: &str| mk_mul_mat(label, "u32", init_src0);
-            let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
-            let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
+            let (
+                p_linear,
+                p_mul_mat_q8_0,
+                p_mul_mat_q4_0,
+                p_bias,
+                p_layernorm,
+                p_gelu,
+                p_relu,
+                p_attn,
+                p_attn_tiled,
+                p_add,
+            ) = ctx.check_pipelines("vit core pipelines", || {
+                // f32 batched matmul: the dequantized-weight fallback path.
+                let p_linear = mk_mul_mat("vit_linear", "f32", "INIT_SRC0_SHMEM_FLOAT");
+                // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
+                // shared memory in-kernel and reuse them across the token tile.
+                let mk_quant = |label: &str, init_src0: &str| mk_mul_mat(label, "u32", init_src0);
+                let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
+                let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
+                (
+                    p_linear,
+                    p_mul_mat_q8_0,
+                    p_mul_mat_q4_0,
+                    ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
+                    ctx.create_pipeline(
+                        shaders::LAYERNORM_BATCH,
+                        "layernorm_batch",
+                        "vit_layernorm",
+                    ),
+                    ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
+                    ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace", "vit_relu"),
+                    ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention", "vit_attention"),
+                    ctx.create_pipeline(
+                        shaders::VIT_ATTENTION_TILED,
+                        "vit_attention_tiled",
+                        "vit_attention_tiled",
+                    ),
+                    ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
+                )
+            })?;
             let stream = ctx.supports_spirv_passthrough()
                 && !crate::backend::cpu_features::env_disabled("CERA_VIT_STREAM");
-            let p_gemm_q8_stream = stream.then(|| ctx.gemm_stream_q8_0_k64_passthrough());
-            let p_transpose_f16 = stream.then(|| ctx.transpose_cast_f16_passthrough());
-            let p_attn_scores = stream.then(|| ctx.vit_attn_scores_f16_passthrough());
-            let p_attn_softmax = stream.then(|| ctx.vit_attn_softmax_t_passthrough());
-            let p_attn_pv = stream.then(|| ctx.vit_attn_pv_f16_passthrough());
-            let p_cast_f16 = stream.then(|| ctx.cast_f32_f16_passthrough());
-            Self {
+            let (
+                p_gemm_q8_stream,
+                p_transpose_f16,
+                p_attn_scores,
+                p_attn_softmax,
+                p_attn_pv,
+                p_cast_f16,
+            ) = if stream {
+                match ctx.check_pipelines("vit stream pipelines", || {
+                    (
+                        ctx.gemm_stream_q8_0_k64_passthrough(),
+                        ctx.transpose_cast_f16_passthrough(),
+                        ctx.vit_attn_scores_f16_passthrough(),
+                        ctx.vit_attn_softmax_t_passthrough(),
+                        ctx.vit_attn_pv_f16_passthrough(),
+                        ctx.cast_f32_f16_passthrough(),
+                    )
+                }) {
+                    Ok((a, b, c, d, e, f)) => {
+                        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ViT streaming SPIR-V pipelines failed validation ({e}); \
+                             falling back to WGSL kernels"
+                        );
+                        eprintln!(
+                            "[cera::wgpu] ViT streaming SPIR-V pipelines failed validation ({e}); \
+                             falling back to WGSL kernels"
+                        );
+                        (None, None, None, None, None, None)
+                    }
+                }
+            } else {
+                (None, None, None, None, None, None)
+            };
+            // Built only where the flash gate passes (the kernel needs
+            // `FLASH_ATTENTION_WORKGROUP_BYTES`, past some adapters' limit,
+            // and the checked build cannot run on wasm32, so the gate keeps
+            // flash off there); a flash-only failure falls back, far slower,
+            // instead of failing the encoder (shared tail in
+            // `build_flash_pipeline_or_log`). Built outside `check_pipelines`
+            // above so its own error scope is not nested.
+            let p_attn_flash = if ctx.uses_flash_attention(64) {
+                ctx.build_flash_pipeline_or_log(
+                    "ViT attention falls back to the tiled/scalar kernels",
+                )
+            } else {
+                None
+            };
+            Ok(Self {
                 pending: Default::default(),
                 param_cache: Default::default(),
                 pool: Default::default(),
@@ -1231,49 +1308,25 @@ impl WgpuVitOps {
                 p_attn_softmax,
                 p_attn_pv,
                 p_cast_f16,
-                p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
-                p_layernorm: ctx.create_pipeline(
-                    shaders::LAYERNORM_BATCH,
-                    "layernorm_batch",
-                    "vit_layernorm",
-                ),
-                p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
-                p_relu: ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace", "vit_relu"),
-                p_attn: ctx.create_pipeline(
-                    shaders::VIT_ATTENTION,
-                    "vit_attention",
-                    "vit_attention",
-                ),
-                p_attn_tiled: ctx.create_pipeline(
-                    shaders::VIT_ATTENTION_TILED,
-                    "vit_attention_tiled",
-                    "vit_attention_tiled",
-                ),
-                // Built only where the flash gate passes (the kernel needs
-                // `FLASH_ATTENTION_WORKGROUP_BYTES`, past some adapters' limit,
-                // and the checked build cannot run on wasm32, so the gate keeps
-                // flash off there); a flash-only failure falls back, far slower,
-                // instead of failing the encoder (shared tail in
-                // `build_flash_pipeline_or_log`).
-                p_attn_flash: if ctx.uses_flash_attention(64) {
-                    ctx.build_flash_pipeline_or_log(
-                        "ViT attention falls back to the tiled/scalar kernels",
-                    )
-                } else {
-                    None
-                },
-                p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
+                p_bias,
+                p_layernorm,
+                p_gelu,
+                p_relu,
+                p_attn,
+                p_attn_tiled,
+                p_attn_flash,
+                p_add,
                 p_mul_mat_q8_0,
                 p_mul_mat_q4_0,
                 p_linear,
                 ctx,
                 #[cfg(test)]
                 flash_dispatches: std::sync::atomic::AtomicU32::new(0),
-            }
+            })
         }))
         .map_err(|_| {
             anyhow::anyhow!("wgpu ViT pipeline creation failed (shader compile/validation)")
-        })
+        })?
     }
 
     /// Whether `attention` with `head_dim` runs on the register-tiled flash kernel: head_dim 64
