@@ -508,11 +508,11 @@ impl GpuContext {
         F: FnOnce(&str) -> Option<String>,
     {
         let Some(raw) = lookup("WGPU_BACKEND") else {
-            return wgpu::Backends::all();
+            return wgpu::Backends::PRIMARY;
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return wgpu::Backends::all();
+            return wgpu::Backends::PRIMARY;
         }
         let mut backends = wgpu::Backends::empty();
         for token in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -530,14 +530,40 @@ impl GpuContext {
         }
         if backends.is_empty() {
             tracing::warn!(
-                "cera::wgpu: unrecognized WGPU_BACKEND={trimmed:?}; falling back to all backends"
+                "cera::wgpu: unrecognized WGPU_BACKEND={trimmed:?}; falling back to primary backends"
             );
             eprintln!(
-                "[cera::wgpu] unrecognized WGPU_BACKEND={trimmed:?}; falling back to all backends"
+                "[cera::wgpu] unrecognized WGPU_BACKEND={trimmed:?}; falling back to primary backends"
             );
-            return wgpu::Backends::all();
+            return wgpu::Backends::PRIMARY;
         }
         backends
+    }
+
+    /// Reject adapters that cannot reliably host Cera's compute pipelines.
+    ///
+    /// In particular, `wgpu::Backend::Gl` (OpenGL/GLES) lacks reliable
+    /// `MAP_READ` buffer readbacks (`Fake map` on Android GLES) and reports zero
+    /// storage buffer binding limits on some drivers, causing either silent
+    /// garbage tokens or a panic at model load instead of falling back to CPU.
+    fn validate_gpu_adapter(
+        backend: wgpu::Backend,
+        adapter_name: &str,
+        max_storage_buffer_binding_size: u64,
+    ) -> Result<()> {
+        if backend == wgpu::Backend::Gl {
+            anyhow::bail!(
+                "GPU adapter {adapter_name:?} uses unsupported Gl/GLES backend; \
+                 compute inference requires Vulkan, Metal, DX12, or WebGPU"
+            );
+        }
+        if max_storage_buffer_binding_size == 0 {
+            anyhow::bail!(
+                "GPU adapter {adapter_name:?} ({backend:?}) reported \
+                 max_storage_buffer_binding_size = 0"
+            );
+        }
+        Ok(())
     }
 
     /// Initialize the GPU asynchronously: request a high-performance adapter
@@ -565,6 +591,14 @@ impl GpuContext {
         let adapter_name = adapter.get_info().name.clone();
         let backend_kind = adapter.get_info().backend;
         let backend = format!("{backend_kind:?}");
+        // Use the adapter's actual limits instead of hardcoding. This avoids
+        // failures on GPUs with smaller max_buffer_size (integrated, mobile).
+        let adapter_limits = adapter.limits();
+        Self::validate_gpu_adapter(
+            backend_kind,
+            &adapter_name,
+            adapter_limits.max_storage_buffer_binding_size,
+        )?;
         if std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1") {
             let f = adapter.features();
             eprintln!(
@@ -602,6 +636,7 @@ impl GpuContext {
         // too but reject our `spirv`-only descriptor with NotCompiledForBackend
         // (a fatal validation error). So request the feature only on Vulkan, where
         // we actually use it; every other backend falls back to WGSL/naga.
+        // Request features supported by this validated adapter.
         if backend_kind == wgpu::Backend::Vulkan
             && adapter
                 .features()
@@ -609,10 +644,6 @@ impl GpuContext {
         {
             features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
-
-        // Use the adapter's actual limits instead of hardcoding. This avoids
-        // failures on GPUs with smaller max_buffer_size (integrated, mobile).
-        let adapter_limits = adapter.limits();
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -3496,19 +3527,19 @@ mod tests {
     fn resolve_wgpu_backends_ignores_empty_and_unrecognized_env_values() {
         assert_eq!(
             GpuContext::resolve_wgpu_backends_from_lookup(|_| None),
-            wgpu::Backends::all()
+            wgpu::Backends::PRIMARY
         );
         assert_eq!(
             GpuContext::resolve_wgpu_backends_from_lookup(|_| Some(String::new())),
-            wgpu::Backends::all()
+            wgpu::Backends::PRIMARY
         );
         assert_eq!(
             GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("   \t ".to_string())),
-            wgpu::Backends::all()
+            wgpu::Backends::PRIMARY
         );
         assert_eq!(
             GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("d3d".to_string())),
-            wgpu::Backends::all()
+            wgpu::Backends::PRIMARY
         );
         assert_eq!(
             GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("vulkan,dx12".to_string())),
@@ -3518,6 +3549,41 @@ mod tests {
             GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("vulkan,d3d".to_string())),
             wgpu::Backends::VULKAN
         );
+        assert_eq!(
+            GpuContext::resolve_wgpu_backends_from_lookup(|_| Some("gl".to_string())),
+            wgpu::Backends::GL
+        );
+    }
+
+    #[test]
+    fn validate_gpu_adapter_rejects_gl_and_zero_storage_binding() {
+        let gl_err = GpuContext::validate_gpu_adapter(
+            wgpu::Backend::Gl,
+            "Android Emulator OpenGL ES Translator",
+            1 << 30,
+        )
+        .unwrap_err();
+        assert!(gl_err.to_string().contains("Gl/GLES"), "err: {gl_err}");
+
+        let zero_err =
+            GpuContext::validate_gpu_adapter(wgpu::Backend::Vulkan, "Broken Vulkan Driver", 0)
+                .unwrap_err();
+        assert!(
+            zero_err
+                .to_string()
+                .contains("max_storage_buffer_binding_size = 0"),
+            "err: {zero_err}"
+        );
+
+        for backend in [
+            wgpu::Backend::Vulkan,
+            wgpu::Backend::Metal,
+            wgpu::Backend::Dx12,
+            wgpu::Backend::BrowserWebGpu,
+        ] {
+            GpuContext::validate_gpu_adapter(backend, "Valid GPU", 128 * 1024 * 1024)
+                .expect("primary backend with non-zero storage limit must pass");
+        }
     }
 
     /// Pack f32 pairs LE (even elem in the low bits) for KV-cache uploads,
