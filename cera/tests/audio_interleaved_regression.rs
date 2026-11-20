@@ -7,6 +7,8 @@
 
 #![cfg(feature = "mmap")]
 
+mod common;
+
 use cera::kv_cache::InferenceState;
 use cera::model::Model;
 #[cfg(feature = "gpu")]
@@ -989,7 +991,7 @@ fn write_wav_file(path: &str, samples: &[f32], sample_rate: u32) -> std::io::Res
 }
 
 fn load_audio_session_bundle() -> Option<(PathBuf, PathBuf, PathBuf)> {
-    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    let home = PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?);
     let q4_dir = home.join(".leap/models/LFM2.5-Audio-1.5B-Q4_0");
     let q8_dir =
         home.join(".cache/cera/huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF-LEAP/resolve/main");
@@ -1008,27 +1010,6 @@ fn load_audio_session_bundle() -> Option<(PathBuf, PathBuf, PathBuf)> {
     candidates
         .into_iter()
         .find(|(m, p, v)| m.exists() && p.exists() && v.exists())
-}
-
-fn read_wav_pcm16_mono(path: &std::path::Path) -> (Vec<f32>, u32) {
-    let data = std::fs::read(path).expect("read wav fixture");
-    let sr = u32::from_le_bytes(data[24..28].try_into().unwrap());
-    let mut off = 12;
-    while off + 8 <= data.len() {
-        let id = &data[off..off + 4];
-        let sz = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
-        if id == b"data" {
-            let pcm = data[off + 8..off + 8 + sz]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-                .collect();
-            return (pcm, sr);
-        }
-        off += 8 + sz + (sz % 2);
-    }
-    panic!("WAV missing data chunk: {}", path.display());
 }
 
 /// Regression: end-to-end `Session` voice turns with LFM2.5-Audio under greedy
@@ -1090,7 +1071,8 @@ fn test_session_interleaved_greedy_speech_avoids_sequential_blank_loop() {
 
     let wav_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/audio/today_is_a_beautiful_day.wav");
-    let (speech_pcm, sr) = read_wav_pcm16_mono(&wav_path);
+    // `common::read_wav_f32` asserts 16 kHz mono 16-bit PCM.
+    let (speech_pcm, sr) = (common::read_wav_f32(&wav_path), 16_000u32);
     let quiet_pcm: Vec<f32> = speech_pcm.iter().map(|&s| s * 0.02).collect();
     let silence_pcm = vec![0.0f32; sr as usize];
 

@@ -241,6 +241,8 @@ impl Model for MultiRoundAudioModel {
         pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        // ScriptModel::forward ignores token ids (outside Stop check) and expects a 1-token
+        // slice so `state.seq_len` advances past `pos` in sync with real embedding steps.
         self.0.forward(&[3], pos, state);
         vec![0.0; self.0.config().hidden_size]
     }
@@ -250,14 +252,12 @@ impl Model for MultiRoundAudioModel {
         pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        // Advance `ScriptModel::state.seq_len` past `pos` and read scripted logits for `seq_len`.
         self.0.forward(&[3], pos, state)
     }
 }
 
-/// Greedy (`temperature = 0.0`) interleaved turns must advance through full
-/// `cadence.audio` frame rounds and resume text from `forward_from_embedding`.
-#[test]
-fn greedy_interleaved_round_trip_resumes_text_after_audio_cadence() {
+fn assert_interleaved_round_trip_resumes_text_after_audio_cadence(temperature: f32) {
     // Prediction table indexed by `state.seq_len`:
     // prefill token 3 at pos 0 -> seq_len 1 -> token 0 (text #1)
     // pos 1 (tok 0) -> seq_len 2 -> token 1 (text #2)
@@ -341,7 +341,7 @@ fn greedy_interleaved_round_trip_resumes_text_after_audio_cadence() {
 
     let mut sink = Sink::default();
     let interleaved_opts = GenerateOpts {
-        temperature: 0.0,
+        temperature,
         audio_mode: AudioOutputMode::Interleaved,
         ..opts()
     };
@@ -349,4 +349,18 @@ fn greedy_interleaved_round_trip_resumes_text_after_audio_cadence() {
     assert_eq!(summary.finish_reason, FinishReason::Stop);
     assert_eq!(accel.frames.load(Ordering::Relaxed), 2);
     assert_eq!(sink.tokens, [0, 1, 0, 1]);
+}
+
+/// Greedy (`temperature = 0.0`) interleaved turns must advance through full
+/// `cadence.audio` frame rounds and resume text from `forward_from_embedding`.
+#[test]
+fn greedy_interleaved_round_trip_resumes_text_after_audio_cadence() {
+    assert_interleaved_round_trip_resumes_text_after_audio_cadence(0.0);
+}
+
+/// Sampled (`temperature = 0.7`) interleaved turns must likewise step through full
+/// `cadence.audio` frame rounds and resume text without stalling.
+#[test]
+fn sampled_interleaved_round_trip_resumes_text_after_audio_cadence() {
+    assert_interleaved_round_trip_resumes_text_after_audio_cadence(0.7);
 }
