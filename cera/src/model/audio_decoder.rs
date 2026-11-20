@@ -230,6 +230,15 @@ fn try_hexagon_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccel
     None
 }
 
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+fn warn_decoder_unavailable(backend: &str, e: &anyhow::Error) {
+    tracing::warn!("audio decoder: {backend} backend unavailable: {e:#}");
+    eprintln!("audio decoder: {backend} backend unavailable: {e:#}");
+}
+
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     let dummy_path = std::path::Path::new("");
@@ -239,7 +248,7 @@ fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelera
             Some(Arc::new(d))
         }
         Err(e) => {
-            tracing::warn!("audio decoder: Metal backend unavailable: {e:#}");
+            warn_decoder_unavailable("Metal", &e);
             None
         }
     }
@@ -259,7 +268,7 @@ fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerat
             Some(Arc::new(d))
         }
         Err(e) => {
-            tracing::warn!("audio decoder: WGPU backend unavailable: {e:#}");
+            warn_decoder_unavailable("WGPU", &e);
             None
         }
     }
@@ -387,6 +396,7 @@ impl AudioDecoderWeights {
         // FFN dim from w1 shape.
         let w1_0 = MmapWeight::from_gguf(gguf, "depthformer.layers.0.feed_forward.w1.weight")?;
         let ffn_dim = w1_0.rows;
+        anyhow::ensure!(ffn_dim > 0, "depthformer ffn_dim must be > 0");
         // the declared width must be the width the weights read, or the forward asserts on the
         // first frame (the lfm3a_gen loader ties it the same way)
         anyhow::ensure!(
@@ -454,19 +464,37 @@ impl AudioDecoderWeights {
         }
 
         // Decoder model weights.
+        let n_codebook = 8;
+        let dl_info = gguf
+            .tensors
+            .get("depth_linear.weight")
+            .context("tensor not found: depth_linear.weight")?;
+        let dl_bias_info = gguf
+            .tensors
+            .get("depth_linear.bias")
+            .context("tensor not found: depth_linear.bias")?;
+        let to_logits_0_info = gguf
+            .tensors
+            .get("depth_embeddings.0.to_logits.weight")
+            .context("tensor not found: depth_embeddings.0.to_logits.weight")?;
+        let (_, n_vocab_preview) = tensor_2d_cols_rows(
+            &to_logits_0_info.shape,
+            "depth_embeddings.0.to_logits.weight",
+        )?;
+        validate_depthformer_dims(
+            n_embd,
+            n_embd_head,
+            ffn_dim,
+            n_codebook,
+            n_vocab_preview,
+            &dl_info.shape,
+            checked_tensor_numel(&dl_info.shape, "depth_linear.weight")?,
+            checked_tensor_numel(&dl_bias_info.shape, "depth_linear.bias")?,
+            HeadDimBounds::CPU,
+        )?;
         let depth_linear_w = MmapWeight::from_gguf(gguf, "depth_linear.weight")?;
         let depth_linear_b = gguf.get_tensor("depth_linear.bias")?.try_to_f32_vec()?;
-        // one `n_embd`-wide slice per codebook, and a bias for every row
-        anyhow::ensure!(
-            depth_linear_w.rows == 8 * n_embd && depth_linear_b.len() == depth_linear_w.rows,
-            "depth_linear is {} rows with a {}-entry bias; expected {} rows (8 codebooks of \
-             depthformer_n_embd {n_embd}) and a bias of the same length",
-            depth_linear_w.rows,
-            depth_linear_b.len(),
-            8 * n_embd
-        );
 
-        let n_codebook = 8;
         let mut depth_embeddings = Vec::with_capacity(n_codebook);
         for i in 0..n_codebook {
             let prefix = format!("depth_embeddings.{i}");
@@ -527,6 +555,11 @@ impl AudioDecoderWeights {
             n_embd: n_embd_llm,
             rms_norm_eps: 1e-5,
         };
+        validate_depthformer_config_geometry(
+            &depthformer_config,
+            &decoder_config,
+            HeadDimBounds::CPU,
+        )?;
 
         Ok(Self {
             lfm3a_gen: false,
@@ -2256,6 +2289,568 @@ pub fn build_default_fsq_codebook() -> Vec<f32> {
     table
 }
 
+/// Backend head-dimension constraints for shared audio decoder geometry checks.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeadDimBounds {
+    pub max: Option<usize>,
+    pub align: usize,
+}
+
+impl HeadDimBounds {
+    /// CPU path: RoPE requires even `head_dim`, with no fixed upper cap.
+    pub(crate) const CPU: Self = Self {
+        max: None,
+        align: 2,
+    };
+    /// WebGPU path: RoPE requires even `head_dim`; `flash_attention_f32.wgsl` caps shared storage at 128.
+    #[allow(dead_code)]
+    pub(crate) const WGPU: Self = Self {
+        max: Some(128),
+        align: 2,
+    };
+    /// Metal path: `flash_attention.metal` casts `half4*` (`head_dim % 4 == 0`) with 128-element cap.
+    #[allow(dead_code)]
+    pub(crate) const METAL: Self = Self {
+        max: Some(128),
+        align: 4,
+    };
+}
+
+fn check_head_dim_bounds(head_dim: usize, bounds: HeadDimBounds, role: &str) -> Result<()> {
+    anyhow::ensure!(
+        head_dim > 0,
+        "{role} n_embd_head must be > 0 (q_layernorm shape was empty)"
+    );
+    anyhow::ensure!(
+        bounds.align > 0 && head_dim.is_multiple_of(bounds.align),
+        "{role} head_dim {head_dim} must be a multiple of {}",
+        bounds.align
+    );
+    if let Some(limit) = bounds.max {
+        anyhow::ensure!(
+            head_dim <= limit,
+            "{role} head_dim {head_dim} > {limit}; flash_attention cannot size shared buffers"
+        );
+    }
+    Ok(())
+}
+
+/// Validate detokenizer tensor-derived dimensions and head divisibility before building GPU
+/// pipelines or allocating buffers, returning `(n_head, n_head_kv)`.
+pub(crate) fn validate_detokenizer_dims(
+    n_embd: usize,
+    head_dim: usize,
+    q_rows: usize,
+    k_rows: usize,
+    ffn_dim: usize,
+    bounds: HeadDimBounds,
+) -> Result<(usize, usize)> {
+    anyhow::ensure!(n_embd > 0, "detokenizer n_embd must be > 0");
+    check_head_dim_bounds(head_dim, bounds, "detokenizer")?;
+    anyhow::ensure!(
+        q_rows >= head_dim && q_rows.is_multiple_of(head_dim),
+        "detokenizer q_proj rows ({q_rows}) must be a positive multiple of n_embd_head ({head_dim})"
+    );
+    let n_head = q_rows / head_dim;
+    anyhow::ensure!(
+        k_rows >= head_dim && k_rows.is_multiple_of(head_dim),
+        "detokenizer k_proj rows ({k_rows}) must be a positive multiple of n_embd_head ({head_dim})"
+    );
+    let n_head_kv = k_rows / head_dim;
+    anyhow::ensure!(
+        n_head > 0 && n_head_kv > 0 && n_head.is_multiple_of(n_head_kv),
+        "detokenizer n_head ({n_head}) must be a positive multiple of n_head_kv ({n_head_kv})"
+    );
+    anyhow::ensure!(ffn_dim > 0, "detokenizer ffn_dim must be > 0");
+    Ok((n_head, n_head_kv))
+}
+
+pub(crate) fn checked_tensor_numel(shape: &[usize], label: &str) -> Result<usize> {
+    anyhow::ensure!(!shape.is_empty(), "tensor {label} has empty shape");
+    shape.iter().try_fold(1usize, |acc, &d| {
+        acc.checked_mul(d)
+            .with_context(|| format!("tensor {label} element count overflowed: {shape:?}"))
+    })
+}
+
+pub(crate) fn tensor_2d_cols_rows(shape: &[usize], label: &str) -> Result<(usize, usize)> {
+    let &[cols, rows] = shape else {
+        anyhow::bail!("tensor {label} must be 2-D, got {shape:?}");
+    };
+    Ok((cols, rows))
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn check_gguf_tensor_decodable_to_f32(
+    info: &crate::gguf::TensorInfo,
+    label: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        info.size_bytes > 0,
+        "tensor {label} has unsupported GGML type {} ({})",
+        info.ggml_type_id,
+        crate::gguf::ggml_type_name(info.ggml_type_id)
+    );
+    anyhow::ensure!(
+        matches!(
+            info.dtype,
+            crate::tensor::DType::F32
+                | crate::tensor::DType::F16
+                | crate::tensor::DType::BF16
+                | crate::tensor::DType::Q4_0
+                | crate::tensor::DType::Q4_1
+                | crate::tensor::DType::Q4KM
+                | crate::tensor::DType::Q5KM
+                | crate::tensor::DType::Q8_0
+                | crate::tensor::DType::Q6K
+        ),
+        "tensor {label} has unsupported non-float dtype {:?}",
+        info.dtype
+    );
+    Ok(())
+}
+
+fn check_gguf_vec_numel(
+    info: &crate::gguf::TensorInfo,
+    expected: usize,
+    label: &str,
+) -> Result<()> {
+    check_gguf_tensor_decodable_to_f32(info, label)?;
+    let got = checked_tensor_numel(&info.shape, label)?;
+    anyhow::ensure!(
+        got == expected,
+        "tensor {label} element count ({got}) mismatch expected ({expected})"
+    );
+    Ok(())
+}
+
+fn check_gguf_mat_dims(
+    info: &crate::gguf::TensorInfo,
+    expected_cols: usize,
+    expected_rows: usize,
+    label: &str,
+) -> Result<()> {
+    check_gguf_tensor_decodable_to_f32(info, label)?;
+    let (cols, rows) = tensor_2d_cols_rows(&info.shape, label)?;
+    anyhow::ensure!(
+        cols == expected_cols && rows == expected_rows,
+        "tensor {label} shape [{cols}, {rows}] mismatch expected [{expected_cols}, {expected_rows}]"
+    );
+    Ok(())
+}
+
+/// Validate depthformer and `depth_linear` dimensions before dequantizing or allocating GPU
+/// buffers so malformed weights fail cleanly instead of panicking or allocating zero-sized
+/// buffers. Returns `(n_embd_d, dl_cols, dl_rows)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_depthformer_dims(
+    n_embd: usize,
+    n_embd_head: usize,
+    ffn_dim: usize,
+    n_codebook: usize,
+    n_vocab: usize,
+    dl_shape: &[usize],
+    dl_numel: usize,
+    depth_linear_b_numel: usize,
+    bounds: HeadDimBounds,
+) -> Result<(usize, usize, usize)> {
+    anyhow::ensure!(n_embd > 0, "depthformer n_embd must be > 0");
+    check_head_dim_bounds(n_embd_head, bounds, "depthformer")?;
+    anyhow::ensure!(ffn_dim > 0, "depthformer ffn_dim must be > 0");
+    anyhow::ensure!(n_codebook > 0, "depthformer n_codebook must be > 0");
+    anyhow::ensure!(n_vocab > 0, "depthformer n_vocab must be > 0");
+    let (dl_cols, dl_rows) = tensor_2d_cols_rows(dl_shape, "depth_linear.weight")?;
+    anyhow::ensure!(dl_cols > 0, "depth_linear.weight cols must be > 0");
+    let expected_rows = n_codebook
+        .checked_mul(n_embd)
+        .context("depth_linear expected rows overflowed")?;
+    anyhow::ensure!(
+        dl_rows == expected_rows,
+        "depth_linear.weight rows ({dl_rows}) != n_codebook * n_embd ({expected_rows})"
+    );
+    let expected_numel = dl_rows
+        .checked_mul(dl_cols)
+        .context("depth_linear weight element count overflowed")?;
+    anyhow::ensure!(
+        dl_numel == expected_numel,
+        "depth_linear.weight len ({dl_numel}) != dl_rows * dl_cols ({expected_numel})"
+    );
+    anyhow::ensure!(
+        depth_linear_b_numel == dl_rows,
+        "depth_linear.bias len ({depth_linear_b_numel}) != dl_rows ({dl_rows})"
+    );
+    let n_embd_d = dl_rows / n_codebook;
+    Ok((n_embd_d, dl_cols, dl_rows))
+}
+
+/// Validate `DepthformerConfig` and `DecoderConfig` geometry invariants upfront before building
+/// caches, pipelines, or allocating GPU storage.
+pub(crate) fn validate_depthformer_config_geometry(
+    df_cfg: &DepthformerConfig,
+    dec_cfg: &DecoderConfig,
+    bounds: HeadDimBounds,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=256).contains(&df_cfg.n_layer),
+        "depthformer n_layer ({}) must be in 1..=256",
+        df_cfg.n_layer
+    );
+    anyhow::ensure!(df_cfg.n_embd > 0, "depthformer n_embd must be > 0");
+    anyhow::ensure!(df_cfg.n_head > 0, "depthformer n_head must be > 0");
+    anyhow::ensure!(df_cfg.n_head_kv > 0, "depthformer n_head_kv must be > 0");
+    anyhow::ensure!(
+        df_cfg.n_head.is_multiple_of(df_cfg.n_head_kv),
+        "depthformer n_head ({}) must be a multiple of n_head_kv ({})",
+        df_cfg.n_head,
+        df_cfg.n_head_kv
+    );
+    check_head_dim_bounds(df_cfg.n_embd_head, bounds, "depthformer")?;
+    anyhow::ensure!(df_cfg.ffn_dim > 0, "depthformer ffn_dim must be > 0");
+    anyhow::ensure!(
+        (1..=8).contains(&dec_cfg.n_codebook),
+        "depthformer n_codebook ({}) must be in 1..=8",
+        dec_cfg.n_codebook
+    );
+    anyhow::ensure!(
+        df_cfg.max_seq_len >= dec_cfg.n_codebook,
+        "depthformer max_seq_len ({}) must be >= n_codebook ({})",
+        df_cfg.max_seq_len,
+        dec_cfg.n_codebook
+    );
+    anyhow::ensure!(dec_cfg.n_vocab > 0, "depthformer n_vocab must be > 0");
+    anyhow::ensure!(dec_cfg.n_embd > 0, "decoder n_embd must be > 0");
+    Ok(())
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )),
+    allow(dead_code)
+)]
+fn lookup_tensor_info<'a>(
+    gguf: &'a GgufFile,
+    name1: &str,
+    name2: Option<&str>,
+) -> Result<&'a crate::gguf::TensorInfo> {
+    if let Some(info) = gguf.tensors.get(name1) {
+        return Ok(info);
+    }
+    if let Some(alt) = name2
+        && let Some(info) = gguf.tensors.get(alt)
+    {
+        return Ok(info);
+    }
+    match name2 {
+        Some(alt) => anyhow::bail!("tensor not found: neither `{name1}` nor `{alt}`"),
+        None => anyhow::bail!("tensor not found: `{name1}`"),
+    }
+}
+
+/// Validate all detokenizer per-layer and output-head tensor metadata shapes upfront before
+/// building GPU pipelines or uploading weights.
+#[cfg_attr(
+    not(any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn validate_detokenizer_gguf_tensors(
+    gguf: &GgufFile,
+    cfg: &DetokenizerConfig,
+    allow_blk_alias: bool,
+) -> Result<()> {
+    let pick = |name1: &str, name2: &str| {
+        lookup_tensor_info(gguf, name1, allow_blk_alias.then_some(name2))
+    };
+    let n_embd = cfg.n_embd;
+    let hd = cfg.n_embd_head;
+    let q_dim = cfg.n_head * hd;
+    let kv_dim = cfg.n_head_kv * hd;
+    let ffn = cfg.ffn_dim;
+    let spec_bins = (cfg.n_fft / 2 + 1) * 2;
+    anyhow::ensure!(
+        cfg.layer_is_conv.len() == cfg.n_layer,
+        "detokenizer layer_is_conv len {} != n_layer {}",
+        cfg.layer_is_conv.len(),
+        cfg.n_layer
+    );
+
+    for (i, &is_conv) in cfg.layer_is_conv.iter().enumerate() {
+        let pfx_lfm = format!("lfm.layers.{i}");
+        let pfx_blk = format!("blk.{i}");
+        check_gguf_vec_numel(
+            pick(
+                &format!("{pfx_lfm}.operator_norm.weight"),
+                &format!("{pfx_blk}.attn_norm.weight"),
+            )?,
+            n_embd,
+            &format!("{pfx_lfm}.operator_norm.weight"),
+        )?;
+        check_gguf_vec_numel(
+            pick(
+                &format!("{pfx_lfm}.ffn_norm.weight"),
+                &format!("{pfx_blk}.ffn_norm.weight"),
+            )?,
+            n_embd,
+            &format!("{pfx_lfm}.ffn_norm.weight"),
+        )?;
+        check_gguf_mat_dims(
+            pick(
+                &format!("{pfx_lfm}.feed_forward.w1.weight"),
+                &format!("{pfx_blk}.ffn_gate.weight"),
+            )?,
+            n_embd,
+            ffn,
+            &format!("{pfx_lfm}.feed_forward.w1.weight"),
+        )?;
+        check_gguf_mat_dims(
+            pick(
+                &format!("{pfx_lfm}.feed_forward.w2.weight"),
+                &format!("{pfx_blk}.ffn_down.weight"),
+            )?,
+            ffn,
+            n_embd,
+            &format!("{pfx_lfm}.feed_forward.w2.weight"),
+        )?;
+        check_gguf_mat_dims(
+            pick(
+                &format!("{pfx_lfm}.feed_forward.w3.weight"),
+                &format!("{pfx_blk}.ffn_up.weight"),
+            )?,
+            n_embd,
+            ffn,
+            &format!("{pfx_lfm}.feed_forward.w3.weight"),
+        )?;
+
+        if is_conv {
+            check_gguf_mat_dims(
+                pick(
+                    &format!("{pfx_lfm}.conv.in_proj.weight"),
+                    &format!("{pfx_blk}.shortconv.in_proj.weight"),
+                )?,
+                n_embd,
+                3 * n_embd,
+                &format!("{pfx_lfm}.conv.in_proj.weight"),
+            )?;
+            check_gguf_mat_dims(
+                pick(
+                    &format!("{pfx_lfm}.conv.out_proj.weight"),
+                    &format!("{pfx_blk}.shortconv.out_proj.weight"),
+                )?,
+                n_embd,
+                n_embd,
+                &format!("{pfx_lfm}.conv.out_proj.weight"),
+            )?;
+            check_gguf_vec_numel(
+                pick(
+                    &format!("{pfx_lfm}.conv.conv.weight"),
+                    &format!("{pfx_blk}.shortconv.conv.weight"),
+                )?,
+                (cfg.d_conv + 1) * n_embd,
+                &format!("{pfx_lfm}.conv.conv.weight"),
+            )?;
+        } else {
+            check_gguf_mat_dims(
+                pick(
+                    &format!("{pfx_lfm}.self_attn.q_proj.weight"),
+                    &format!("{pfx_blk}.attn_q.weight"),
+                )?,
+                n_embd,
+                q_dim,
+                &format!("{pfx_lfm}.self_attn.q_proj.weight"),
+            )?;
+            check_gguf_mat_dims(
+                pick(
+                    &format!("{pfx_lfm}.self_attn.k_proj.weight"),
+                    &format!("{pfx_blk}.attn_k.weight"),
+                )?,
+                n_embd,
+                kv_dim,
+                &format!("{pfx_lfm}.self_attn.k_proj.weight"),
+            )?;
+            check_gguf_mat_dims(
+                pick(
+                    &format!("{pfx_lfm}.self_attn.v_proj.weight"),
+                    &format!("{pfx_blk}.attn_v.weight"),
+                )?,
+                n_embd,
+                kv_dim,
+                &format!("{pfx_lfm}.self_attn.v_proj.weight"),
+            )?;
+            check_gguf_mat_dims(
+                pick(
+                    &format!("{pfx_lfm}.self_attn.out_proj.weight"),
+                    &format!("{pfx_blk}.attn_output.weight"),
+                )?,
+                q_dim,
+                n_embd,
+                &format!("{pfx_lfm}.self_attn.out_proj.weight"),
+            )?;
+            check_gguf_vec_numel(
+                pick(
+                    &format!("{pfx_lfm}.self_attn.q_layernorm.weight"),
+                    &format!("{pfx_blk}.attn_q_norm.weight"),
+                )?,
+                hd,
+                &format!("{pfx_lfm}.self_attn.q_layernorm.weight"),
+            )?;
+            check_gguf_vec_numel(
+                pick(
+                    &format!("{pfx_lfm}.self_attn.k_layernorm.weight"),
+                    &format!("{pfx_blk}.attn_k_norm.weight"),
+                )?,
+                hd,
+                &format!("{pfx_lfm}.self_attn.k_layernorm.weight"),
+            )?;
+        }
+    }
+
+    check_gguf_vec_numel(
+        pick("lfm.embedding_norm.weight", "token_embd_norm.weight")?,
+        n_embd,
+        "lfm.embedding_norm.weight",
+    )?;
+    check_gguf_mat_dims(
+        pick("lin.weight", "dense_2.weight")?,
+        n_embd,
+        spec_bins,
+        "lin.weight",
+    )?;
+    check_gguf_vec_numel(pick("lin.bias", "dense_2.bias")?, spec_bins, "lin.bias")?;
+    Ok(())
+}
+
+/// Validate all depthformer layer and codebook tensor metadata shapes upfront before GPU
+/// allocation or concatenation.
+#[cfg_attr(
+    not(any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn validate_depthformer_gguf_tensors(
+    gguf: &GgufFile,
+    df_cfg: &DepthformerConfig,
+    dec_cfg: &DecoderConfig,
+    check_last_codebook_emb: bool,
+) -> Result<()> {
+    let n_embd = df_cfg.n_embd;
+    let hd = df_cfg.n_embd_head;
+    let q_dim = df_cfg.n_head * hd;
+    let kv_dim = df_cfg.n_head_kv * hd;
+    let qkv_out = q_dim + 2 * kv_dim;
+    let ffn = df_cfg.ffn_dim;
+
+    for i in 0..df_cfg.n_layer {
+        let pfx = format!("depthformer.layers.{i}");
+        check_gguf_vec_numel(
+            lookup_tensor_info(gguf, &format!("{pfx}.operator_norm.weight"), None)?,
+            n_embd,
+            &format!("{pfx}.operator_norm.weight"),
+        )?;
+        check_gguf_mat_dims(
+            lookup_tensor_info(gguf, &format!("{pfx}.operator.qkv_proj.weight"), None)?,
+            n_embd,
+            qkv_out,
+            &format!("{pfx}.operator.qkv_proj.weight"),
+        )?;
+        check_gguf_vec_numel(
+            lookup_tensor_info(
+                gguf,
+                &format!("{pfx}.operator.attention.q_layernorm.weight"),
+                None,
+            )?,
+            hd,
+            &format!("{pfx}.operator.attention.q_layernorm.weight"),
+        )?;
+        check_gguf_vec_numel(
+            lookup_tensor_info(
+                gguf,
+                &format!("{pfx}.operator.attention.k_layernorm.weight"),
+                None,
+            )?,
+            hd,
+            &format!("{pfx}.operator.attention.k_layernorm.weight"),
+        )?;
+        check_gguf_mat_dims(
+            lookup_tensor_info(gguf, &format!("{pfx}.operator.out_proj.weight"), None)?,
+            q_dim,
+            n_embd,
+            &format!("{pfx}.operator.out_proj.weight"),
+        )?;
+        check_gguf_vec_numel(
+            lookup_tensor_info(gguf, &format!("{pfx}.ffn_norm.weight"), None)?,
+            n_embd,
+            &format!("{pfx}.ffn_norm.weight"),
+        )?;
+        check_gguf_mat_dims(
+            lookup_tensor_info(gguf, &format!("{pfx}.feed_forward.w1.weight"), None)?,
+            n_embd,
+            ffn,
+            &format!("{pfx}.feed_forward.w1.weight"),
+        )?;
+        check_gguf_mat_dims(
+            lookup_tensor_info(gguf, &format!("{pfx}.feed_forward.w2.weight"), None)?,
+            ffn,
+            n_embd,
+            &format!("{pfx}.feed_forward.w2.weight"),
+        )?;
+        check_gguf_mat_dims(
+            lookup_tensor_info(gguf, &format!("{pfx}.feed_forward.w3.weight"), None)?,
+            n_embd,
+            ffn,
+            &format!("{pfx}.feed_forward.w3.weight"),
+        )?;
+    }
+
+    for j in 0..dec_cfg.n_codebook {
+        let pfx = format!("depth_embeddings.{j}");
+        check_gguf_vec_numel(
+            lookup_tensor_info(gguf, &format!("{pfx}.embedding_norm.weight"), None)?,
+            n_embd,
+            &format!("{pfx}.embedding_norm.weight"),
+        )?;
+        check_gguf_mat_dims(
+            lookup_tensor_info(gguf, &format!("{pfx}.to_logits.weight"), None)?,
+            n_embd,
+            dec_cfg.n_vocab,
+            &format!("{pfx}.to_logits.weight"),
+        )?;
+        if check_last_codebook_emb || j < dec_cfg.n_codebook - 1 {
+            let emb_label = format!("{pfx}.embedding.weight");
+            let emb_info = lookup_tensor_info(gguf, &emb_label, None)?;
+            check_gguf_tensor_decodable_to_f32(emb_info, &emb_label)?;
+            let (emb_cols, emb_rows) = tensor_2d_cols_rows(&emb_info.shape, &emb_label)?;
+            let min_emb_rows = dec_cfg.n_vocab.saturating_sub(1).max(1);
+            anyhow::ensure!(
+                emb_cols == n_embd && emb_rows >= min_emb_rows,
+                "tensor {emb_label} shape [{emb_cols}, {emb_rows}] invalid for n_embd={n_embd}, min_rows={min_emb_rows}"
+            );
+        }
+    }
+
+    check_gguf_tensor_decodable_to_f32(
+        lookup_tensor_info(gguf, "depth_linear.weight", None)?,
+        "depth_linear.weight",
+    )?;
+    check_gguf_tensor_decodable_to_f32(
+        lookup_tensor_info(gguf, "depth_linear.bias", None)?,
+        "depth_linear.bias",
+    )?;
+
+    Ok(())
+}
+
 impl DetokenizerWeights {
     /// Returns `true` when this detokenizer uses the 12-codebook `lfm3a_gen` FSQ + ISTFT architecture.
     pub fn is_lfm3a_gen(&self) -> bool {
@@ -2278,7 +2873,6 @@ impl DetokenizerWeights {
             "blk.0.shortconv.in_proj.weight",
         )?;
         let n_embd = conv_in.cols;
-        anyhow::ensure!(n_embd > 0, "detokenizer n_embd must be > 0");
         let q_norm_w = get_detok_tensor(
             gguf,
             "lfm.layers.2.self_attn.q_layernorm.weight",
@@ -2286,47 +2880,30 @@ impl DetokenizerWeights {
         )?;
         // an empty shape is the corrupt case the guard below names; indexing it would panic first
         let n_embd_head = q_norm_w.shape().first().copied().unwrap_or(0);
-        // Guard against a corrupt vocoder GGUF reporting an empty
-        // q_layernorm shape; both `n_head` and `n_head_kv` are
-        // derived from this dim and would div-by-zero panic
-        // otherwise.
-        anyhow::ensure!(
-            n_embd_head > 0,
-            "detokenizer n_embd_head must be > 0 (q_layernorm shape was empty)"
-        );
         let q_w = get_detok_mmap_weight(
             gguf,
             "lfm.layers.2.self_attn.q_proj.weight",
             "blk.2.attn_q.weight",
         )?;
-        anyhow::ensure!(
-            q_w.rows >= n_embd_head && q_w.rows.is_multiple_of(n_embd_head),
-            "detokenizer q_proj rows ({}) must be a positive multiple of n_embd_head ({n_embd_head})",
-            q_w.rows
-        );
-        let n_head = q_w.rows / n_embd_head;
         let k_w = get_detok_mmap_weight(
             gguf,
             "lfm.layers.2.self_attn.k_proj.weight",
             "blk.2.attn_k.weight",
         )?;
-        anyhow::ensure!(
-            k_w.rows >= n_embd_head && k_w.rows.is_multiple_of(n_embd_head),
-            "detokenizer k_proj rows ({}) must be a positive multiple of n_embd_head ({n_embd_head})",
-            k_w.rows
-        );
-        let n_head_kv = k_w.rows / n_embd_head;
-        anyhow::ensure!(
-            n_head > 0 && n_head_kv > 0 && n_head.is_multiple_of(n_head_kv),
-            "detokenizer n_head ({n_head}) must be a positive multiple of n_head_kv ({n_head_kv})"
-        );
         let ffn_w1_0 = get_detok_mmap_weight(
             gguf,
             "lfm.layers.0.feed_forward.w1.weight",
             "blk.0.ffn_gate.weight",
         )?;
         let ffn_dim = ffn_w1_0.rows;
-        anyhow::ensure!(ffn_dim > 0, "detokenizer ffn_dim must be > 0");
+        let (n_head, n_head_kv) = validate_detokenizer_dims(
+            n_embd,
+            n_embd_head,
+            q_w.rows,
+            k_w.rows,
+            ffn_dim,
+            HeadDimBounds::CPU,
+        )?;
 
         let config = DetokenizerConfig {
             n_layer,
@@ -4004,7 +4581,7 @@ impl IstftStreamer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The legacy loader sizes a `Vec::with_capacity` from `depthformer_n_layer`, so an absurd
@@ -5212,5 +5789,675 @@ mod tests {
         assert_eq!(small_dec.depthformer_config.n_head, 2);
         assert_eq!(small_dec.depthformer_config.n_head_kv, 1);
         assert_eq!(small_dec.depthformer_config.n_embd_head, 2);
+    }
+
+    #[test]
+    fn validate_detokenizer_dims_rejects_zero_and_misaligned_dims() {
+        assert_eq!(
+            validate_detokenizer_dims(512, 64, 512, 256, 1024, HeadDimBounds::WGPU).unwrap(),
+            (8, 4)
+        );
+        // head_dim = 2 and 6 allowed on CPU/WGPU (align=2), rejected on Metal (align=4).
+        assert_eq!(
+            validate_detokenizer_dims(64, 2, 16, 8, 128, HeadDimBounds::WGPU).unwrap(),
+            (8, 4)
+        );
+        assert_eq!(
+            validate_detokenizer_dims(64, 6, 48, 24, 128, HeadDimBounds::WGPU).unwrap(),
+            (8, 4)
+        );
+        assert!(validate_detokenizer_dims(64, 6, 48, 24, 128, HeadDimBounds::METAL).is_err());
+        assert!(validate_detokenizer_dims(64, 2, 16, 8, 128, HeadDimBounds::METAL).is_err());
+        // Odd head_dim fails everywhere (RoPE requires even head_dim).
+        assert!(validate_detokenizer_dims(64, 3, 24, 12, 128, HeadDimBounds::CPU).is_err());
+        assert!(validate_detokenizer_dims(64, 3, 24, 12, 128, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(64, 3, 24, 12, 128, HeadDimBounds::METAL).is_err());
+
+        assert!(validate_detokenizer_dims(0, 64, 512, 256, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 0, 512, 256, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 130, 520, 260, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 256, 512, 256, 1024, HeadDimBounds::CPU).is_ok());
+        // n_head == 0 (q_rows < head_dim) must fail even though 0 % n_kv == 0.
+        assert!(validate_detokenizer_dims(512, 64, 0, 64, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 64, 32, 64, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 64, 65, 64, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 64, 512, 0, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 64, 512, 65, 1024, HeadDimBounds::WGPU).is_err());
+        // n_head not a multiple of n_kv (3 vs 2).
+        assert!(validate_detokenizer_dims(512, 64, 192, 128, 1024, HeadDimBounds::WGPU).is_err());
+        assert!(validate_detokenizer_dims(512, 64, 512, 256, 0, HeadDimBounds::WGPU).is_err());
+    }
+
+    #[test]
+    fn validate_depthformer_dims_rejects_degenerate_and_truncated_tensors() {
+        assert_eq!(
+            validate_depthformer_dims(
+                16,
+                32,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::WGPU,
+            )
+            .unwrap(),
+            (16, 12, 128)
+        );
+        // head_dim == 0 fails always; head_dim == 3 (odd) fails everywhere;
+        // head_dim == 6 passes CPU/WGPU and fails Metal (requires % 4 == 0);
+        // head_dim == 256 fails GPU (max 128) but is allowed on CPU.
+        assert!(
+            validate_depthformer_dims(
+                16,
+                0,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::CPU
+            )
+            .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                3,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::CPU
+            )
+            .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                3,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::WGPU
+            )
+            .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                6,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::WGPU
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                6,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::METAL
+            )
+            .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                132,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::WGPU
+            )
+            .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                256,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::CPU
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_depthformer_dims(16, 32, 32, 8, 64, &[12, 0], 0, 0, HeadDimBounds::WGPU)
+                .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                32,
+                0,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::WGPU
+            )
+            .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(16, 32, 32, 0, 64, &[12, 0], 0, 0, HeadDimBounds::WGPU)
+                .is_err()
+        );
+        assert!(
+            validate_depthformer_dims(
+                16,
+                32,
+                32,
+                8,
+                0,
+                &[12, 128],
+                128 * 12,
+                128,
+                HeadDimBounds::WGPU
+            )
+            .is_err()
+        );
+        // Non-2D weight shape.
+        assert!(
+            validate_depthformer_dims(16, 32, 32, 8, 64, &[128], 128, 128, HeadDimBounds::WGPU)
+                .is_err()
+        );
+        // dl_cols == 0.
+        assert!(
+            validate_depthformer_dims(16, 32, 32, 8, 64, &[0, 128], 0, 128, HeadDimBounds::WGPU)
+                .is_err()
+        );
+        // dl_rows != n_codebook * n_embd.
+        assert!(
+            validate_depthformer_dims(
+                16,
+                32,
+                32,
+                8,
+                64,
+                &[12, 64],
+                64 * 12,
+                64,
+                HeadDimBounds::WGPU
+            )
+            .is_err()
+        );
+        // Truncated weight data buffer.
+        assert!(
+            validate_depthformer_dims(16, 32, 32, 8, 64, &[12, 128], 64, 128, HeadDimBounds::WGPU)
+                .is_err()
+        );
+        // Truncated or oversized bias.
+        assert!(
+            validate_depthformer_dims(
+                16,
+                32,
+                32,
+                8,
+                64,
+                &[12, 128],
+                128 * 12,
+                16,
+                HeadDimBounds::WGPU
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_depthformer_config_geometry_rejects_bad_geometry() {
+        let base_df = DepthformerConfig {
+            n_layer: 2,
+            n_embd: 16,
+            n_head: 8,
+            n_head_kv: 2,
+            n_embd_head: 32,
+            ffn_dim: 32,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 1_000_000.0,
+            max_seq_len: 8,
+        };
+        let base_dec = DecoderConfig {
+            n_codebook: 8,
+            n_vocab: 64,
+            n_embd: 12,
+            rms_norm_eps: 1e-5,
+        };
+        assert!(
+            validate_depthformer_config_geometry(&base_df, &base_dec, HeadDimBounds::WGPU).is_ok()
+        );
+        // head_dim = 6 is valid for WGPU/CPU but rejected for Metal; head_dim = 3 fails all.
+        let mut hd6 = base_df.clone();
+        hd6.n_embd_head = 6;
+        assert!(validate_depthformer_config_geometry(&hd6, &base_dec, HeadDimBounds::WGPU).is_ok());
+        assert!(
+            validate_depthformer_config_geometry(&hd6, &base_dec, HeadDimBounds::METAL).is_err()
+        );
+
+        for (mutate_df, mutate_dec) in [
+            (
+                Box::new(|d: &mut DepthformerConfig| d.n_layer = 0)
+                    as Box<dyn Fn(&mut DepthformerConfig)>,
+                None,
+            ),
+            (Box::new(|d: &mut DepthformerConfig| d.n_layer = 257), None),
+            (Box::new(|d: &mut DepthformerConfig| d.n_head = 0), None),
+            (Box::new(|d: &mut DepthformerConfig| d.n_head_kv = 0), None),
+            (
+                Box::new(|d: &mut DepthformerConfig| {
+                    d.n_head = 7;
+                    d.n_head_kv = 4;
+                }),
+                None,
+            ),
+            (
+                Box::new(|d: &mut DepthformerConfig| d.n_embd_head = 0),
+                None,
+            ),
+            (
+                Box::new(|d: &mut DepthformerConfig| d.n_embd_head = 3),
+                None,
+            ),
+            (
+                Box::new(|d: &mut DepthformerConfig| d.n_embd_head = 132),
+                None,
+            ),
+            (Box::new(|d: &mut DepthformerConfig| d.ffn_dim = 0), None),
+            (
+                Box::new(|d: &mut DepthformerConfig| d.max_seq_len = 7),
+                None,
+            ),
+            (
+                Box::new(|_: &mut DepthformerConfig| {}),
+                Some(Box::new(|c: &mut DecoderConfig| c.n_codebook = 0)
+                    as Box<dyn Fn(&mut DecoderConfig)>),
+            ),
+            (
+                Box::new(|_: &mut DepthformerConfig| {}),
+                Some(Box::new(|c: &mut DecoderConfig| c.n_codebook = 9)),
+            ),
+            (
+                Box::new(|_: &mut DepthformerConfig| {}),
+                Some(Box::new(|c: &mut DecoderConfig| c.n_vocab = 0)),
+            ),
+            (
+                Box::new(|_: &mut DepthformerConfig| {}),
+                Some(Box::new(|c: &mut DecoderConfig| c.n_embd = 0)),
+            ),
+        ] {
+            let mut df = base_df.clone();
+            let mut dec = base_dec.clone();
+            mutate_df(&mut df);
+            if let Some(m) = mutate_dec {
+                m(&mut dec);
+            }
+            assert!(validate_depthformer_config_geometry(&df, &dec, HeadDimBounds::WGPU).is_err());
+        }
+    }
+
+    fn build_minimal_depthformer_gguf(
+        n_embd: usize,
+        head_dim: usize,
+        ffn_dim: usize,
+        dl_cols: usize,
+        n_vocab: usize,
+        include_last_codebook_emb: bool,
+        mut overrides: impl FnMut(&str, &mut Vec<usize>, &mut u32),
+    ) -> GgufFile {
+        let mut b = Some(
+            crate::gguf::GgufBuilder::new()
+                .kv_u32("depthformer_n_layer", 1)
+                .kv_u32("depthformer_n_embd", n_embd as u32),
+        );
+
+        {
+            let mut add = |name: &str, mut dims: Vec<usize>| {
+                let mut ty = 0u32; // F32
+                overrides(name, &mut dims, &mut ty);
+                let numel: usize = dims.iter().product();
+                if let Some(builder) = b.take() {
+                    b = Some(builder.tensor(name, &dims, ty, vec![0u8; numel * 4]));
+                }
+            };
+
+            let qkv_out = (32 + 2 * 8) * head_dim;
+            add("depthformer.layers.0.operator_norm.weight", vec![n_embd]);
+            add(
+                "depthformer.layers.0.operator.qkv_proj.weight",
+                vec![n_embd, qkv_out],
+            );
+            add(
+                "depthformer.layers.0.operator.attention.q_layernorm.weight",
+                vec![head_dim],
+            );
+            add(
+                "depthformer.layers.0.operator.attention.k_layernorm.weight",
+                vec![head_dim],
+            );
+            add(
+                "depthformer.layers.0.operator.out_proj.weight",
+                vec![32 * head_dim, n_embd],
+            );
+            add("depthformer.layers.0.ffn_norm.weight", vec![n_embd]);
+            add(
+                "depthformer.layers.0.feed_forward.w1.weight",
+                vec![n_embd, ffn_dim],
+            );
+            add(
+                "depthformer.layers.0.feed_forward.w2.weight",
+                vec![ffn_dim, n_embd],
+            );
+            add(
+                "depthformer.layers.0.feed_forward.w3.weight",
+                vec![n_embd, ffn_dim],
+            );
+            add("depth_linear.weight", vec![dl_cols, 8 * n_embd]);
+            add("depth_linear.bias", vec![8 * n_embd]);
+
+            for j in 0..8 {
+                add(
+                    &format!("depth_embeddings.{j}.embedding_norm.weight"),
+                    vec![n_embd],
+                );
+                add(
+                    &format!("depth_embeddings.{j}.to_logits.weight"),
+                    vec![n_embd, n_vocab],
+                );
+                if include_last_codebook_emb || j < 7 {
+                    add(
+                        &format!("depth_embeddings.{j}.embedding.weight"),
+                        vec![n_embd, n_vocab],
+                    );
+                }
+            }
+        }
+        b.unwrap().build()
+    }
+
+    pub(crate) fn build_minimal_detokenizer_gguf(
+        n_embd: usize,
+        head_dim: usize,
+        n_head: usize,
+        n_kv: usize,
+        ffn_dim: usize,
+        use_blk_alias: bool,
+        mut overrides: impl FnMut(&str, &mut Vec<usize>, &mut u32),
+    ) -> GgufFile {
+        let mut b = Some(crate::gguf::GgufBuilder::new());
+        {
+            let mut add = |name: &str, mut dims: Vec<usize>| {
+                let mut ty = 0u32; // F32
+                overrides(name, &mut dims, &mut ty);
+                let numel: usize = dims.iter().product();
+                if let Some(builder) = b.take() {
+                    b = Some(builder.tensor(name, &dims, ty, vec![0u8; numel * 4]));
+                }
+            };
+            let layer_is_conv = [true, true, false, true, false, true, false, true];
+            for (i, is_conv) in layer_is_conv.into_iter().enumerate() {
+                let pfx = if use_blk_alias {
+                    format!("blk.{i}")
+                } else {
+                    format!("lfm.layers.{i}")
+                };
+                let op_norm = if use_blk_alias {
+                    format!("{pfx}.attn_norm.weight")
+                } else {
+                    format!("{pfx}.operator_norm.weight")
+                };
+                add(&op_norm, vec![n_embd]);
+                add(&format!("{pfx}.ffn_norm.weight"), vec![n_embd]);
+                let (w1, w2, w3) = if use_blk_alias {
+                    ("ffn_gate.weight", "ffn_down.weight", "ffn_up.weight")
+                } else {
+                    (
+                        "feed_forward.w1.weight",
+                        "feed_forward.w2.weight",
+                        "feed_forward.w3.weight",
+                    )
+                };
+                add(&format!("{pfx}.{w1}"), vec![n_embd, ffn_dim]);
+                add(&format!("{pfx}.{w2}"), vec![ffn_dim, n_embd]);
+                add(&format!("{pfx}.{w3}"), vec![n_embd, ffn_dim]);
+                if is_conv {
+                    let (cin, cout, conv) = if use_blk_alias {
+                        (
+                            "shortconv.in_proj.weight",
+                            "shortconv.out_proj.weight",
+                            "shortconv.conv.weight",
+                        )
+                    } else {
+                        (
+                            "conv.in_proj.weight",
+                            "conv.out_proj.weight",
+                            "conv.conv.weight",
+                        )
+                    };
+                    add(&format!("{pfx}.{cin}"), vec![n_embd, 3 * n_embd]);
+                    add(&format!("{pfx}.{cout}"), vec![n_embd, n_embd]);
+                    add(&format!("{pfx}.{conv}"), vec![3, n_embd]);
+                } else {
+                    let (qp, kp, vp, op, qn, kn) = if use_blk_alias {
+                        (
+                            "attn_q.weight",
+                            "attn_k.weight",
+                            "attn_v.weight",
+                            "attn_output.weight",
+                            "attn_q_norm.weight",
+                            "attn_k_norm.weight",
+                        )
+                    } else {
+                        (
+                            "self_attn.q_proj.weight",
+                            "self_attn.k_proj.weight",
+                            "self_attn.v_proj.weight",
+                            "self_attn.out_proj.weight",
+                            "self_attn.q_layernorm.weight",
+                            "self_attn.k_layernorm.weight",
+                        )
+                    };
+                    add(&format!("{pfx}.{qp}"), vec![n_embd, n_head * head_dim]);
+                    add(&format!("{pfx}.{kp}"), vec![n_embd, n_kv * head_dim]);
+                    add(&format!("{pfx}.{vp}"), vec![n_embd, n_kv * head_dim]);
+                    add(&format!("{pfx}.{op}"), vec![n_head * head_dim, n_embd]);
+                    add(&format!("{pfx}.{qn}"), vec![head_dim]);
+                    add(&format!("{pfx}.{kn}"), vec![head_dim]);
+                }
+            }
+            let spec_bins = (1280 / 2 + 1) * 2;
+            if use_blk_alias {
+                add("token_embd_norm.weight", vec![n_embd]);
+                add("dense_2.weight", vec![n_embd, spec_bins]);
+                add("dense_2.bias", vec![spec_bins]);
+            } else {
+                add("lfm.embedding_norm.weight", vec![n_embd]);
+                add("lin.weight", vec![n_embd, spec_bins]);
+                add("lin.bias", vec![spec_bins]);
+            }
+        }
+        b.unwrap().build()
+    }
+
+    #[test]
+    fn validate_detokenizer_and_depthformer_gguf_tensors_reject_malformed_shapes() {
+        let df_cfg = DepthformerConfig {
+            n_layer: 1,
+            n_embd: 8,
+            n_head: 32,
+            n_head_kv: 8,
+            n_embd_head: 4,
+            ffn_dim: 16,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 1_000_000.0,
+            max_seq_len: 8,
+        };
+        let dec_cfg = DecoderConfig {
+            n_codebook: 8,
+            n_vocab: 12,
+            n_embd: 6,
+            rms_norm_eps: 1e-5,
+        };
+
+        // Valid depthformer GGUF with and without last codebook embedding.
+        let valid_df = build_minimal_depthformer_gguf(8, 4, 16, 6, 12, false, |_, _, _| {});
+        assert!(validate_depthformer_gguf_tensors(&valid_df, &df_cfg, &dec_cfg, false).is_ok());
+        // Metal mode requires depth_embeddings.7.embedding.weight as well.
+        assert!(validate_depthformer_gguf_tensors(&valid_df, &df_cfg, &dec_cfg, true).is_err());
+
+        let valid_df_full = build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |_, _, _| {});
+        assert!(validate_depthformer_gguf_tensors(&valid_df_full, &df_cfg, &dec_cfg, true).is_ok());
+
+        // Bad layer matrix shape fails upfront.
+        let bad_qkv = build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+            if name == "depthformer.layers.0.operator.qkv_proj.weight" {
+                *dims = vec![8, 4];
+            }
+        });
+        assert!(validate_depthformer_gguf_tensors(&bad_qkv, &df_cfg, &dec_cfg, true).is_err());
+
+        // Bad codebook embedding shape (both column mismatch and undersized rows) fails upfront.
+        let bad_emb = build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+            if name == "depth_embeddings.0.embedding.weight" {
+                *dims = vec![4, 12];
+            }
+        });
+        assert!(validate_depthformer_gguf_tensors(&bad_emb, &df_cfg, &dec_cfg, true).is_err());
+
+        // Severely truncated embedding.weight rows (e.g., 1 or n_vocab - 2) fail upfront,
+        // while n_vocab - 1 (EOS-omitted vocoder table) stays permitted.
+        let tiny_emb_rows =
+            build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+                if name == "depth_embeddings.0.embedding.weight" {
+                    *dims = vec![8, 1];
+                }
+            });
+        assert!(
+            validate_depthformer_gguf_tensors(&tiny_emb_rows, &df_cfg, &dec_cfg, true).is_err()
+        );
+        let below_min_rows =
+            build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+                if name == "depth_embeddings.0.embedding.weight" {
+                    *dims = vec![8, 10];
+                }
+            });
+        assert!(
+            validate_depthformer_gguf_tensors(&below_min_rows, &df_cfg, &dec_cfg, true).is_err()
+        );
+        let eos_omitted_rows =
+            build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+                if name == "depth_embeddings.0.embedding.weight" {
+                    *dims = vec![8, 11];
+                }
+            });
+        assert!(
+            validate_depthformer_gguf_tensors(&eos_omitted_rows, &df_cfg, &dec_cfg, true).is_ok()
+        );
+
+        // Detokenizer validator checks both lfm.* and blk.* aliases.
+        let detok_cfg = DetokenizerConfig {
+            n_layer: 8,
+            n_embd: 8,
+            n_head: 2,
+            n_head_kv: 1,
+            n_embd_head: 4,
+            ffn_dim: 16,
+            d_conv: 2,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 1_000_000.0,
+            swa_window_size: 30,
+            n_codes: 8,
+            n_fft: 1280,
+            hop_length: 320,
+            sample_rate: 24000,
+            layer_is_conv: vec![true, true, false, true, false, true, false, true],
+        };
+        let valid_lfm = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, false, |_, _, _| {});
+        assert!(validate_detokenizer_gguf_tensors(&valid_lfm, &detok_cfg, false).is_ok());
+        assert!(validate_detokenizer_gguf_tensors(&valid_lfm, &detok_cfg, true).is_ok());
+
+        let valid_blk = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, true, |_, _, _| {});
+        // allow_blk_alias=false (Metal) must reject blk.* GGUFs; allow_blk_alias=true (WGPU) accepts.
+        assert!(validate_detokenizer_gguf_tensors(&valid_blk, &detok_cfg, false).is_err());
+        assert!(validate_detokenizer_gguf_tensors(&valid_blk, &detok_cfg, true).is_ok());
+
+        // Mismatched conv projection matrix shape fails upfront.
+        let bad_conv = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, false, |name, dims, _| {
+            if name == "lfm.layers.0.conv.in_proj.weight" {
+                *dims = vec![8, 8];
+            }
+        });
+        assert!(validate_detokenizer_gguf_tensors(&bad_conv, &detok_cfg, false).is_err());
+
+        // Mismatched lin.bias length fails upfront.
+        let bad_bias = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, false, |name, dims, _| {
+            if name == "lin.bias" {
+                *dims = vec![4];
+            }
+        });
+        assert!(validate_detokenizer_gguf_tensors(&bad_bias, &detok_cfg, false).is_err());
+
+        // Unsupported GGML placeholder type Q2_K (10 -> size_bytes=0) and I32 (26) rejected upfront
+        // on detokenizer layer weights as well.
+        let q2k_detok = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, false, |name, _, ty| {
+            if name == "lfm.layers.0.conv.in_proj.weight" {
+                *ty = 10;
+            }
+        });
+        let q2k_detok_err = format!(
+            "{:#}",
+            validate_detokenizer_gguf_tensors(&q2k_detok, &detok_cfg, false).unwrap_err()
+        );
+        assert!(
+            q2k_detok_err.contains("unsupported GGML type 10"),
+            "{q2k_detok_err}"
+        );
+
+        let i32_detok = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, false, |name, _, ty| {
+            if name == "lin.bias" {
+                *ty = 26;
+            }
+        });
+        let i32_detok_err = format!(
+            "{:#}",
+            validate_detokenizer_gguf_tensors(&i32_detok, &detok_cfg, false).unwrap_err()
+        );
+        assert!(i32_detok_err.contains("I32"), "{i32_detok_err}");
+
+        // Unsupported GGML placeholder type Q2_K (10 -> size_bytes=0) rejected upfront on layer weights.
+        let q2k_df = build_minimal_depthformer_gguf(8, 4, 16, 6, 12, true, |name, _, ty| {
+            if name == "depthformer.layers.0.feed_forward.w1.weight" {
+                *ty = 10;
+            }
+        });
+        let q2k_err = format!(
+            "{:#}",
+            validate_depthformer_gguf_tensors(&q2k_df, &df_cfg, &dec_cfg, true).unwrap_err()
+        );
+        assert!(q2k_err.contains("unsupported GGML type 10"), "{q2k_err}");
     }
 }

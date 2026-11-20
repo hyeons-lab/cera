@@ -132,43 +132,36 @@ pub struct MetalAudioDecoder {
     session_active: AtomicBool,
 }
 
-impl MetalAudioDecoder {
-    pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
-        let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
-        let ctx = MetalContext::new()?;
+fn checked_codebook_emb_offset(tok: usize, n_embd: usize, buf_len_bytes: u64) -> Option<u64> {
+    let row_bytes = n_embd.checked_mul(std::mem::size_of::<f32>())?;
+    let offset = u64::try_from(tok.checked_mul(row_bytes)?).ok()?;
+    let end = offset.checked_add(u64::try_from(row_bytes).ok()?)?;
+    (end <= buf_len_bytes).then_some(offset)
+}
 
-        // Parse config from tensor shapes (same logic as DetokenizerWeights::from_gguf).
+impl MetalAudioDecoder {
+    fn prevalidate_detokenizer_gguf(
+        gguf: &GgufFile,
+    ) -> Result<(DetokenizerConfig, Vec<f32>, Vec<f32>)> {
         let (_, _, conv_in_cols, _) = gguf.tensor_meta("lfm.layers.0.conv.in_proj.weight")?;
         let n_embd = conv_in_cols;
         let q_norm_t = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
         let head_dim = *q_norm_t.shape().first().unwrap_or(&0);
-        anyhow::ensure!(head_dim > 0, "invalid q_layernorm head_dim");
-        anyhow::ensure!(
-            head_dim <= 128,
-            "detokenizer head_dim {head_dim} > 128; metal flash_attention cannot size q_shared"
-        );
         let (_, q_rows, _, _) = gguf.tensor_meta("lfm.layers.2.self_attn.q_proj.weight")?;
-        anyhow::ensure!(
-            q_rows.is_multiple_of(head_dim),
-            "q_proj rows ({q_rows}) must be a multiple of head_dim ({head_dim})"
-        );
-        let n_head = q_rows / head_dim;
         let (_, k_rows, _, _) = gguf.tensor_meta("lfm.layers.2.self_attn.k_proj.weight")?;
-        anyhow::ensure!(
-            k_rows.is_multiple_of(head_dim),
-            "k_proj rows ({k_rows}) must be a multiple of head_dim ({head_dim})"
-        );
-        let n_kv = k_rows / head_dim;
-        anyhow::ensure!(
-            n_kv > 0 && n_head.is_multiple_of(n_kv),
-            "detokenizer GQA requires n_kv > 0 and n_head divisible by n_kv (n_head={n_head}, n_kv={n_kv})"
-        );
         let (_, ffn_rows, _, _) = gguf.tensor_meta("lfm.layers.0.feed_forward.w1.weight")?;
         let ffn_dim = ffn_rows;
+        let (n_head, n_kv) = crate::model::audio_decoder::validate_detokenizer_dims(
+            n_embd,
+            head_dim,
+            q_rows,
+            k_rows,
+            ffn_dim,
+            crate::model::audio_decoder::HeadDimBounds::METAL,
+        )?;
 
         let layer_is_conv = vec![true, true, false, true, false, true, false, true];
         let n_layer = layer_is_conv.len();
-        let kv_dim = n_kv * head_dim;
 
         let cfg = DetokenizerConfig {
             n_layer,
@@ -187,6 +180,38 @@ impl MetalAudioDecoder {
             sample_rate: 24000,
             layer_is_conv,
         };
+        crate::model::audio_decoder::validate_detokenizer_gguf_tensors(gguf, &cfg, false)?;
+        let output_norm_f32 = gguf
+            .get_tensor("lfm.embedding_norm.weight")?
+            .try_to_f32_vec()?;
+        let lin_b_f32 = gguf.get_tensor("lin.bias")?.try_to_f32_vec()?;
+        Ok((cfg, output_norm_f32, lin_b_f32))
+    }
+
+    fn prepare_gguf(
+        gguf: &Arc<GgufFile>,
+    ) -> Result<(
+        crate::model::audio_decoder::AudioDecoderWeights,
+        DetokenizerConfig,
+        Vec<f32>,
+        Vec<f32>,
+    )> {
+        let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
+        let (cfg, output_norm_f32, lin_b_f32) = Self::prevalidate_detokenizer_gguf(gguf)?;
+        Ok((cpu_dec, cfg, output_norm_f32, lin_b_f32))
+    }
+
+    pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
+        let (cpu_dec, cfg, output_norm_f32, lin_b_f32) = Self::prepare_gguf(gguf)?;
+        let n_layer = cfg.n_layer;
+        let n_embd = cfg.n_embd;
+        let n_head = cfg.n_head;
+        let n_kv = cfg.n_head_kv;
+        let head_dim = cfg.n_embd_head;
+        let ffn_dim = cfg.ffn_dim;
+        let kv_dim = n_kv * head_dim;
+
+        let ctx = MetalContext::new()?;
 
         let pipes = Pipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32")?,
@@ -224,7 +249,7 @@ impl MetalAudioDecoder {
         // This matches the CPU detokenizer's precision path exactly.
         let make_weight = |name: &str| -> Result<MetalWeight> {
             let t = gguf.get_tensor(name)?;
-            let f32_data = t.to_f32_vec();
+            let f32_data = t.try_to_f32_vec()?;
             let shape = t.shape();
             let (rows, cols) = match shape.len() {
                 1 => (1, shape[0]),
@@ -254,7 +279,7 @@ impl MetalAudioDecoder {
                         ctx.upload_f32(
                             &gguf
                                 .get_tensor(&format!("{pfx}.conv.conv.weight"))?
-                                .to_f32_vec(),
+                                .try_to_f32_vec()?,
                         ),
                     ),
                 )
@@ -272,14 +297,14 @@ impl MetalAudioDecoder {
                         ctx.upload_f32(
                             &gguf
                                 .get_tensor(&format!("{pfx}.self_attn.q_layernorm.weight"))?
-                                .to_f32_vec(),
+                                .try_to_f32_vec()?,
                         ),
                     ),
                     Some(
                         ctx.upload_f32(
                             &gguf
                                 .get_tensor(&format!("{pfx}.self_attn.k_layernorm.weight"))?
-                                .to_f32_vec(),
+                                .try_to_f32_vec()?,
                         ),
                     ),
                 )
@@ -291,12 +316,12 @@ impl MetalAudioDecoder {
                 operator_norm: ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.operator_norm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
                 ffn_norm: ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.ffn_norm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
                 ffn_w1: make_weight(&format!("{pfx}.feed_forward.w1.weight"))?,
                 ffn_w2: make_weight(&format!("{pfx}.feed_forward.w2.weight"))?,
@@ -313,10 +338,9 @@ impl MetalAudioDecoder {
             });
         }
 
-        let output_norm =
-            ctx.upload_f32(&gguf.get_tensor("lfm.embedding_norm.weight")?.to_f32_vec());
+        let output_norm = ctx.upload_f32(&output_norm_f32);
         let lin_w = make_weight("lin.weight")?;
-        let lin_b = ctx.upload_f32(&gguf.get_tensor("lin.bias")?.to_f32_vec());
+        let lin_b = ctx.upload_f32(&lin_b_f32);
 
         // GPU ISTFT tables, built once from the config. `idft_basis` is an
         // `[n_fft x 2·n_fft_bins]` weight the per-frame gemv consumes exactly like
@@ -814,6 +838,10 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // Attention: attend to ALL cached positions
+            assert!(
+                hd.is_multiple_of(4) && hd <= 128,
+                "flash_attention.metal requires head_dim % 4 == 0 and <= 128, got {hd}"
+            );
             let attn_params = FlashAttnParams {
                 n_heads,
                 n_kv_heads: n_kv,
@@ -1132,12 +1160,71 @@ pub struct MetalDepthformer {
 }
 
 impl MetalDepthformer {
+    fn prevalidate_gguf(
+        gguf: &GgufFile,
+        df_cfg: &crate::model::audio_decoder::DepthformerConfig,
+        dec_cfg: &crate::model::audio_decoder::DecoderConfig,
+    ) -> Result<(usize, usize)> {
+        crate::model::audio_decoder::validate_depthformer_config_geometry(
+            df_cfg,
+            dec_cfg,
+            crate::model::audio_decoder::HeadDimBounds::METAL,
+        )?;
+        let dl_info = gguf
+            .tensors
+            .get("depth_linear.weight")
+            .ok_or_else(|| anyhow::anyhow!("tensor not found: `depth_linear.weight`"))?;
+        let dl_bias_info = gguf
+            .tensors
+            .get("depth_linear.bias")
+            .ok_or_else(|| anyhow::anyhow!("tensor not found: `depth_linear.bias`"))?;
+        let (n_embd_d, dl_cols, _) = crate::model::audio_decoder::validate_depthformer_dims(
+            df_cfg.n_embd,
+            df_cfg.n_embd_head,
+            df_cfg.ffn_dim,
+            dec_cfg.n_codebook,
+            dec_cfg.n_vocab,
+            &dl_info.shape,
+            crate::model::audio_decoder::checked_tensor_numel(
+                &dl_info.shape,
+                "depth_linear.weight",
+            )?,
+            crate::model::audio_decoder::checked_tensor_numel(
+                &dl_bias_info.shape,
+                "depth_linear.bias",
+            )?,
+            crate::model::audio_decoder::HeadDimBounds::METAL,
+        )?;
+        anyhow::ensure!(
+            dl_cols == dec_cfg.n_embd,
+            "depth_linear.weight cols ({dl_cols}) disagrees with decoder n_embd ({})",
+            dec_cfg.n_embd
+        );
+        crate::model::audio_decoder::validate_depthformer_gguf_tensors(
+            gguf, df_cfg, dec_cfg, true,
+        )?;
+        Ok((n_embd_d, dl_cols))
+    }
+
+    fn prepare_gguf(
+        gguf: &GgufFile,
+        df_cfg: &crate::model::audio_decoder::DepthformerConfig,
+        dec_cfg: &crate::model::audio_decoder::DecoderConfig,
+    ) -> Result<(usize, usize, Vec<f32>, Vec<f32>)> {
+        let (n_embd_d, dl_cols) = Self::prevalidate_gguf(gguf, df_cfg, dec_cfg)?;
+        let dl_f32 = gguf.get_tensor("depth_linear.weight")?.try_to_f32_vec()?;
+        let dl_b = gguf.get_tensor("depth_linear.bias")?.try_to_f32_vec()?;
+        Ok((n_embd_d, dl_cols, dl_f32, dl_b))
+    }
+
     pub fn from_gguf(
         gguf: &GgufFile,
         _vocoder_path: &Path,
         df_cfg: &crate::model::audio_decoder::DepthformerConfig,
         dec_cfg: &crate::model::audio_decoder::DecoderConfig,
     ) -> Result<Self> {
+        let (n_embd_d, dl_cols, dl_f32, dl_b) = Self::prepare_gguf(gguf, df_cfg, dec_cfg)?;
+
         let ctx = MetalContext::new()?;
         let n_embd = df_cfg.n_embd;
         let hd = df_cfg.n_embd_head;
@@ -1157,7 +1244,7 @@ impl MetalDepthformer {
         // Dequantize all weights to F32 for CPU-matching precision.
         let make_f32 = |name: &str| -> Result<MetalWeight> {
             let t = gguf.get_tensor(name)?;
-            let f32_data = t.to_f32_vec();
+            let f32_data = t.try_to_f32_vec()?;
             let shape = t.shape();
             let (rows, cols) = match shape.len() {
                 1 => (1, shape[0]),
@@ -1180,24 +1267,24 @@ impl MetalDepthformer {
                 operator_norm: ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.operator_norm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
                 wqkv: make_f32(&format!("{pfx}.operator.qkv_proj.weight"))?,
                 q_norm: ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.operator.attention.q_layernorm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
                 k_norm: ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.operator.attention.k_layernorm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
                 wo: make_f32(&format!("{pfx}.operator.out_proj.weight"))?,
                 ffn_norm: ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.ffn_norm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
                 w1: make_f32(&format!("{pfx}.feed_forward.w1.weight"))?,
                 w2: make_f32(&format!("{pfx}.feed_forward.w2.weight"))?,
@@ -1205,13 +1292,7 @@ impl MetalDepthformer {
             });
         }
 
-        // depth_linear: dequantize full matrix, then slice into 8 per-codebook chunks
-        let dl_tensor = gguf.get_tensor("depth_linear.weight")?;
-        let dl_f32 = dl_tensor.to_f32_vec();
-        let dl_shape = dl_tensor.shape();
-        let dl_cols = dl_shape[0]; // input dim (2048)
-        let dl_rows = dl_shape[1]; // output dim (8*1024)
-        let n_embd_d = dl_rows / dec_cfg.n_codebook;
+        // depth_linear: slice pre-validated matrix into per-codebook chunks
         let mut depth_linear_slices = Vec::with_capacity(dec_cfg.n_codebook);
         for j in 0..dec_cfg.n_codebook {
             let start = j * n_embd_d * dl_cols;
@@ -1227,22 +1308,11 @@ impl MetalDepthformer {
             });
         }
 
-        let dl_b = gguf
-            .get_tensor("depth_linear.bias")
-            .map(|t| t.to_f32_vec())
-            .unwrap_or_default();
         let mut depth_linear_biases = Vec::with_capacity(dec_cfg.n_codebook);
         for j in 0..dec_cfg.n_codebook {
             let b_start = j * n_embd_d;
-            let b_end = (b_start + n_embd_d).min(dl_b.len());
-            let b_slice = if b_start < dl_b.len() {
-                &dl_b[b_start..b_end]
-            } else {
-                &[]
-            };
-            let mut b_vec = vec![0.0f32; n_embd_d];
-            b_vec[..b_slice.len()].copy_from_slice(b_slice);
-            depth_linear_biases.push(ctx.upload_f32(&b_vec));
+            let b_end = b_start + n_embd_d;
+            depth_linear_biases.push(ctx.upload_f32(&dl_b[b_start..b_end]));
         }
 
         // Per-codebook weights
@@ -1255,7 +1325,7 @@ impl MetalDepthformer {
                 ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.embedding_norm.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
             );
             codebook_to_logits.push(make_f32(&format!("{pfx}.to_logits.weight"))?);
@@ -1263,7 +1333,7 @@ impl MetalDepthformer {
                 ctx.upload_f32(
                     &gguf
                         .get_tensor(&format!("{pfx}.embedding.weight"))?
-                        .to_f32_vec(),
+                        .try_to_f32_vec()?,
                 ),
             );
         }
@@ -1396,13 +1466,20 @@ impl MetalDepthformer {
             if j > 0 && prev_token >= 0 {
                 let emb_buf = &self.codebook_emb_f32[j - 1];
                 let tok = prev_token as usize;
-                let offset = (tok * n_embd * std::mem::size_of::<f32>()) as u64;
-                let params = ElementwiseParams::new(n_embd as u32);
-                enc.set_compute_pipeline_state(&self.pipes.add_inplace);
-                enc.set_buffer(0, Some(&self.hidden_buf), 0);
-                enc.set_buffer(1, Some(emb_buf), offset);
-                params.set(enc, 2);
-                enc.dispatch_thread_groups(sz1d((n_embd as u64).div_ceil(256)), sz1d(256));
+                if let Some(offset) = checked_codebook_emb_offset(tok, n_embd, emb_buf.length()) {
+                    let params = ElementwiseParams::new(n_embd as u32);
+                    enc.set_compute_pipeline_state(&self.pipes.add_inplace);
+                    enc.set_buffer(0, Some(&self.hidden_buf), 0);
+                    enc.set_buffer(1, Some(emb_buf), offset);
+                    params.set(enc, 2);
+                    enc.dispatch_thread_groups(sz1d((n_embd as u64).div_ceil(256)), sz1d(256));
+                } else if tok < dec.n_vocab.saturating_sub(1) {
+                    tracing::warn!(
+                        "Metal depthformer codebook {} prev_token {tok} out of embedding bounds ({} bytes)",
+                        j - 1,
+                        emb_buf.length()
+                    );
+                }
             }
 
             // 3. Depthformer: 6 transformer layers
@@ -1459,6 +1536,10 @@ impl MetalDepthformer {
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
 
                 // Attention (flash_attention reads `half*` KV)
+                assert!(
+                    hd.is_multiple_of(4) && hd <= 128,
+                    "flash_attention.metal requires head_dim % 4 == 0 and <= 128, got {hd}"
+                );
                 let seq_len = pos + 1;
                 let attn_params = FlashAttnParams {
                     n_heads: n_head,
@@ -1671,5 +1752,412 @@ impl crate::model::audio_decoder::AudioAccelerator for MetalAudioDecoder {
 
     fn release_session(&self) {
         self.session_active.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::audio_decoder::{DecoderConfig, DepthformerConfig};
+
+    fn build_metal_df_gguf(
+        n_embd: usize,
+        head_dim: usize,
+        ffn_dim: usize,
+        dl_cols: usize,
+        n_vocab: usize,
+        include_last_emb: bool,
+        mut overrides: impl FnMut(&str, &mut Vec<usize>, &mut u32),
+    ) -> GgufFile {
+        let mut b = Some(
+            crate::gguf::GgufBuilder::new()
+                .kv_u32("depthformer_n_layer", 1)
+                .kv_u32("depthformer_n_embd", n_embd as u32),
+        );
+        {
+            let mut add = |name: &str, mut dims: Vec<usize>| {
+                let mut ty = 0u32;
+                overrides(name, &mut dims, &mut ty);
+                let numel: usize = dims.iter().product();
+                if let Some(builder) = b.take() {
+                    b = Some(builder.tensor(name, &dims, ty, vec![0u8; numel * 4]));
+                }
+            };
+            let qkv_out = (32 + 2 * 8) * head_dim;
+            add("depthformer.layers.0.operator_norm.weight", vec![n_embd]);
+            add(
+                "depthformer.layers.0.operator.qkv_proj.weight",
+                vec![n_embd, qkv_out],
+            );
+            add(
+                "depthformer.layers.0.operator.attention.q_layernorm.weight",
+                vec![head_dim],
+            );
+            add(
+                "depthformer.layers.0.operator.attention.k_layernorm.weight",
+                vec![head_dim],
+            );
+            add(
+                "depthformer.layers.0.operator.out_proj.weight",
+                vec![32 * head_dim, n_embd],
+            );
+            add("depthformer.layers.0.ffn_norm.weight", vec![n_embd]);
+            add(
+                "depthformer.layers.0.feed_forward.w1.weight",
+                vec![n_embd, ffn_dim],
+            );
+            add(
+                "depthformer.layers.0.feed_forward.w2.weight",
+                vec![ffn_dim, n_embd],
+            );
+            add(
+                "depthformer.layers.0.feed_forward.w3.weight",
+                vec![n_embd, ffn_dim],
+            );
+            add("depth_linear.weight", vec![dl_cols, 8 * n_embd]);
+            add("depth_linear.bias", vec![8 * n_embd]);
+            for j in 0..8 {
+                add(
+                    &format!("depth_embeddings.{j}.embedding_norm.weight"),
+                    vec![n_embd],
+                );
+                add(
+                    &format!("depth_embeddings.{j}.to_logits.weight"),
+                    vec![n_embd, n_vocab],
+                );
+                if include_last_emb || j < 7 {
+                    add(
+                        &format!("depth_embeddings.{j}.embedding.weight"),
+                        vec![n_embd, n_vocab],
+                    );
+                }
+            }
+        }
+        b.unwrap().build()
+    }
+
+    #[test]
+    fn metal_depthformer_from_gguf_rejects_bad_dtypes_and_geometry_before_metal() {
+        let df_cfg = DepthformerConfig {
+            n_layer: 1,
+            n_embd: 8,
+            n_head: 32,
+            n_head_kv: 8,
+            n_embd_head: 4,
+            ffn_dim: 16,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 1_000_000.0,
+            max_seq_len: 8,
+        };
+        let dec_cfg = DecoderConfig {
+            n_codebook: 8,
+            n_vocab: 12,
+            n_embd: 6,
+            rms_norm_eps: 1e-5,
+        };
+
+        let valid = build_metal_df_gguf(8, 4, 16, 6, 12, true, |_, _, _| {});
+        assert_eq!(
+            MetalDepthformer::prepare_gguf(&valid, &df_cfg, &dec_cfg)
+                .map(|(e, c, _, _)| (e, c))
+                .unwrap(),
+            (8, 6)
+        );
+
+        let assert_fails_before_metal =
+            |res: Result<MetalDepthformer>, needle: &str, label: &str| {
+                let msg = format!(
+                    "{:#}",
+                    res.err().unwrap_or_else(|| panic!("{label}: expected Err"))
+                );
+                assert!(
+                    !msg.contains("no Metal device found"),
+                    "{label}: skipped prevalidation and reached MetalContext::new(): {msg}"
+                );
+                assert!(
+                    msg.contains(needle),
+                    "{label}: expected {needle:?}, got {msg:?}"
+                );
+            };
+
+        // Missing last codebook embedding fails prevalidation upfront (pure helper + entry point).
+        let missing_last = build_metal_df_gguf(8, 4, 16, 6, 12, false, |_, _, _| {});
+        let helper_err = format!(
+            "{:#}",
+            MetalDepthformer::prepare_gguf(&missing_last, &df_cfg, &dec_cfg).unwrap_err()
+        );
+        assert!(
+            helper_err.contains("depth_embeddings.7.embedding.weight"),
+            "{helper_err}"
+        );
+        assert_fails_before_metal(
+            MetalDepthformer::from_gguf(&missing_last, Path::new(""), &df_cfg, &dec_cfg),
+            "depth_embeddings.7.embedding.weight",
+            "missing last emb",
+        );
+
+        // Undersized embedding.weight rows rejected upfront; n_vocab - 1 stays valid.
+        let tiny_emb = build_metal_df_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+            if name == "depth_embeddings.0.embedding.weight" {
+                *dims = vec![8, 1];
+            }
+        });
+        assert!(
+            format!(
+                "{:#}",
+                MetalDepthformer::prepare_gguf(&tiny_emb, &df_cfg, &dec_cfg).unwrap_err()
+            )
+            .contains("depth_embeddings.0.embedding.weight")
+        );
+        assert_fails_before_metal(
+            MetalDepthformer::from_gguf(&tiny_emb, Path::new(""), &df_cfg, &dec_cfg),
+            "depth_embeddings.0.embedding.weight",
+            "undersized emb_rows",
+        );
+
+        // GGML_TYPE_I32 depth_linear fails cleanly via prevalidation/try_to_f32_vec instead of panicking.
+        let i32_dl = build_metal_df_gguf(8, 4, 16, 6, 12, true, |name, _, ty| {
+            if name == "depth_linear.weight" {
+                *ty = 26;
+            }
+        });
+        assert!(MetalDepthformer::prepare_gguf(&i32_dl, &df_cfg, &dec_cfg).is_err());
+        assert_fails_before_metal(
+            MetalDepthformer::from_gguf(&i32_dl, Path::new(""), &df_cfg, &dec_cfg),
+            "depth_linear.weight",
+            "i32 depth_linear",
+        );
+
+        // Mismatched dec_cfg.n_embd vs dl_cols rejected upfront (R6-G7).
+        let mut mismatch_dec = dec_cfg.clone();
+        mismatch_dec.n_embd = 8;
+        let dec_err = format!(
+            "{:#}",
+            MetalDepthformer::prepare_gguf(&valid, &df_cfg, &mismatch_dec).unwrap_err()
+        );
+        assert!(
+            dec_err.contains("disagrees with decoder n_embd"),
+            "{dec_err}"
+        );
+        assert_fails_before_metal(
+            MetalDepthformer::from_gguf(&valid, Path::new(""), &df_cfg, &mismatch_dec),
+            "disagrees with decoder n_embd",
+            "dec_cfg n_embd mismatch",
+        );
+
+        // Degenerate geometry (head_dim % 4 != 0, head_dim = 3, head_dim > 128, ffn_dim == 0,
+        // non-divisible n_head, bad dl_shape) fails upfront before MetalContext::new().
+        for (bad_df, needle, label) in [
+            (
+                {
+                    let mut d = df_cfg.clone();
+                    d.n_embd_head = 6;
+                    d
+                },
+                "multiple of 4",
+                "head_dim=6 Metal % 4",
+            ),
+            (
+                {
+                    let mut d = df_cfg.clone();
+                    d.n_embd_head = 3;
+                    d
+                },
+                "multiple of 4",
+                "head_dim=3",
+            ),
+            (
+                {
+                    let mut d = df_cfg.clone();
+                    d.n_embd_head = 132;
+                    d
+                },
+                "> 128",
+                "head_dim > 128",
+            ),
+            (
+                {
+                    let mut d = df_cfg.clone();
+                    d.ffn_dim = 0;
+                    d
+                },
+                "ffn_dim must be > 0",
+                "ffn_dim == 0",
+            ),
+            (
+                {
+                    let mut d = df_cfg.clone();
+                    d.n_head = 7;
+                    d
+                },
+                "multiple of n_head_kv",
+                "bad GQA",
+            ),
+        ] {
+            let helper_msg = format!(
+                "{:#}",
+                MetalDepthformer::prepare_gguf(&valid, &bad_df, &dec_cfg).unwrap_err()
+            );
+            assert!(helper_msg.contains(needle), "{label}: {helper_msg}");
+            assert_fails_before_metal(
+                MetalDepthformer::from_gguf(&valid, Path::new(""), &bad_df, &dec_cfg),
+                needle,
+                label,
+            );
+        }
+
+        let bad_dl_shape = build_metal_df_gguf(8, 4, 16, 6, 12, true, |name, dims, _| {
+            if name == "depth_linear.weight" {
+                *dims = vec![6 * 8 * 8];
+            }
+        });
+        assert!(MetalDepthformer::prepare_gguf(&bad_dl_shape, &df_cfg, &dec_cfg).is_err());
+        assert_fails_before_metal(
+            MetalDepthformer::from_gguf(&bad_dl_shape, Path::new(""), &df_cfg, &dec_cfg),
+            "must be 2-D",
+            "bad dl_shape",
+        );
+
+        // MetalDepthformer codebook embedding offset bounds helper (R6-G1): exact last valid row
+        // passes, while EOS/out-of-bounds/overflow returns None instead of binding OOB Metal memory.
+        let n_embd = 8usize;
+        let row_bytes = (n_embd * std::mem::size_of::<f32>()) as u64;
+        let buf_len = 2048u64 * row_bytes;
+        assert_eq!(
+            checked_codebook_emb_offset(2047, n_embd, buf_len),
+            Some(2047 * row_bytes)
+        );
+        assert_eq!(checked_codebook_emb_offset(2048, n_embd, buf_len), None);
+        assert_eq!(
+            checked_codebook_emb_offset(usize::MAX, n_embd, buf_len),
+            None
+        );
+        assert_eq!(checked_codebook_emb_offset(0, n_embd, 0), None);
+    }
+
+    #[test]
+    fn metal_audio_decoder_prepare_gguf_rejects_bad_geometry_and_dtypes_before_metal() {
+        fn build_detok(
+            n_embd: usize,
+            head_dim: usize,
+            n_head: usize,
+            n_kv: usize,
+            ffn_dim: usize,
+            mut override_ty: impl FnMut(&str, &mut u32),
+        ) -> GgufFile {
+            let mut b = Some(crate::gguf::GgufBuilder::new());
+            {
+                let mut add = |name: &str, dims: Vec<usize>| {
+                    let mut ty = 0u32;
+                    override_ty(name, &mut ty);
+                    let numel: usize = dims.iter().product();
+                    if let Some(builder) = b.take() {
+                        b = Some(builder.tensor(name, &dims, ty, vec![0u8; numel * 4]));
+                    }
+                };
+                for (i, is_conv) in [true, true, false, true, false, true, false, true]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let pfx = format!("lfm.layers.{i}");
+                    add(&format!("{pfx}.operator_norm.weight"), vec![n_embd]);
+                    add(&format!("{pfx}.ffn_norm.weight"), vec![n_embd]);
+                    add(
+                        &format!("{pfx}.feed_forward.w1.weight"),
+                        vec![n_embd, ffn_dim],
+                    );
+                    add(
+                        &format!("{pfx}.feed_forward.w2.weight"),
+                        vec![ffn_dim, n_embd],
+                    );
+                    add(
+                        &format!("{pfx}.feed_forward.w3.weight"),
+                        vec![n_embd, ffn_dim],
+                    );
+                    if is_conv {
+                        add(
+                            &format!("{pfx}.conv.in_proj.weight"),
+                            vec![n_embd, 3 * n_embd],
+                        );
+                        add(&format!("{pfx}.conv.out_proj.weight"), vec![n_embd, n_embd]);
+                        add(&format!("{pfx}.conv.conv.weight"), vec![3, n_embd]);
+                    } else {
+                        add(
+                            &format!("{pfx}.self_attn.q_proj.weight"),
+                            vec![n_embd, n_head * head_dim],
+                        );
+                        add(
+                            &format!("{pfx}.self_attn.k_proj.weight"),
+                            vec![n_embd, n_kv * head_dim],
+                        );
+                        add(
+                            &format!("{pfx}.self_attn.v_proj.weight"),
+                            vec![n_embd, n_kv * head_dim],
+                        );
+                        add(
+                            &format!("{pfx}.self_attn.out_proj.weight"),
+                            vec![n_head * head_dim, n_embd],
+                        );
+                        add(
+                            &format!("{pfx}.self_attn.q_layernorm.weight"),
+                            vec![head_dim],
+                        );
+                        add(
+                            &format!("{pfx}.self_attn.k_layernorm.weight"),
+                            vec![head_dim],
+                        );
+                    }
+                }
+                let spec_bins = (1280 / 2 + 1) * 2;
+                add("lfm.embedding_norm.weight", vec![n_embd]);
+                add("lin.weight", vec![n_embd, spec_bins]);
+                add("lin.bias", vec![spec_bins]);
+            }
+            b.unwrap().build()
+        }
+
+        // Valid head_dim=4 detokenizer passes prevalidation helper.
+        let valid_detok = build_detok(8, 4, 2, 1, 16, |_, _| {});
+        assert!(MetalAudioDecoder::prevalidate_detokenizer_gguf(&valid_detok).is_ok());
+
+        // Metal requires head_dim % 4 == 0: head_dim=6 and head_dim=3 must fail upfront.
+        let hd6_detok = build_detok(8, 6, 2, 1, 16, |_, _| {});
+        let hd6_msg = format!(
+            "{:#}",
+            MetalAudioDecoder::prevalidate_detokenizer_gguf(&hd6_detok).unwrap_err()
+        );
+        assert!(hd6_msg.contains("multiple of 4"), "{hd6_msg}");
+
+        let hd3_detok = build_detok(8, 3, 2, 1, 16, |_, _| {});
+        let hd3_msg = format!(
+            "{:#}",
+            MetalAudioDecoder::prevalidate_detokenizer_gguf(&hd3_detok).unwrap_err()
+        );
+        assert!(hd3_msg.contains("multiple of 4"), "{hd3_msg}");
+
+        // I32 lin.bias rejected cleanly by try_to_f32_vec in prevalidation helper.
+        let i32_bias = build_detok(8, 4, 2, 1, 16, |name, ty| {
+            if name == "lin.bias" {
+                *ty = 26;
+            }
+        });
+        assert!(MetalAudioDecoder::prevalidate_detokenizer_gguf(&i32_bias).is_err());
+
+        // Full entry point prepare_gguf + from_gguf reject empty/corrupt GGUF BEFORE MetalContext::new().
+        let empty = Arc::new(crate::gguf::GgufBuilder::new().build());
+        let helper_err = format!(
+            "{:#}",
+            MetalAudioDecoder::prepare_gguf(&empty)
+                .err()
+                .expect("empty gguf must fail")
+        );
+        let entry_err = format!(
+            "{:#}",
+            MetalAudioDecoder::from_gguf(&empty, Path::new(""))
+                .err()
+                .expect("empty gguf must fail")
+        );
+        assert!(!entry_err.contains("no Metal device found"), "{entry_err}");
+        assert_eq!(entry_err, helper_err);
     }
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.5
+
+- Add the Windows AMD XDNA2 (Strix Halo AIE2P) NPU decode backend for Llama-3.2-1B (`--features xdna`, `DevicePreference.npu`).
+- Fix Android `wgpu` backend selection: exclude GLES adapters (`wgpu::Backend::Gl`) and zero-limit adapters so devices without working Vulkan drivers no longer misclassify GLES as a GPU backend and instead fall back cleanly to CPU.
+- Validate WebGPU compute pipelines through explicit error scopes before allocating VRAM or uploading weights, isolate optional fast-path shaders from mandatory fallback rungs, harden GGUF geometry and dtype prevalidation across CPU, WebGPU, and Metal audio paths, and propagate GPU device loss consistently across async readbacks, audio output decoding, and `cera-wasm` sessions.
+- Align package and native artifact versions at 0.7.5.
+
 ## 0.7.4
 
 - Add `CeraEngine.fromFiles` (and `fromFilesAsync`): load a model and its multimodal projector from paths by memory mapping, so a bundle larger than the host runtime's heap limit can be loaded.

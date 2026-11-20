@@ -72,6 +72,11 @@ fn flash_attention(
     let kv_h_offset = kv_head * head_dim;
     let q_offset = head * head_dim;
 
+    // head_dim > MAX_HEAD_DIM would index past static q_shared/acc arrays.
+    if head_dim > MAX_HEAD_DIM {
+        return;
+    }
+
     // seq_len == 0 would divide by st[1] == 0 → NaN. Write zeros and bail.
     if seq_len == 0u {
         if tid < head_dim {

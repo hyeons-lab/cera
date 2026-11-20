@@ -1955,6 +1955,471 @@ struct GpuPipelines {
     moe_gemv_q4_0: wgpu::ComputePipeline,
     /// `lfm2moe` weighted sum of a token's expert outputs.
     moe_combine: wgpu::ComputePipeline,
+    /// Whether subgroup SPIR-V passthrough GEMVs (`gemv_f32`, `gemv_f16`,
+    /// `gemv_q4_0_fast`, `gemv_q4_k`, `gemv_q6_k`) were compiled instead of the
+    /// WGSL fallbacks. Stored here so `gemv_pipeline_rows_label` matches the
+    /// pipelines built after any driver validation fallback.
+    gemv_subgroup_passthrough: bool,
+}
+
+/// Ordered `(passthrough, stream_layout)` configurations tried when building
+/// GPU pipelines: streaming SPIR-V first, then raw-layout SPIR-V, then pure
+/// WGSL fallback before failing model load.
+fn pipeline_fallback_attempts(passthrough: bool, stream_layout: bool) -> Vec<(bool, bool)> {
+    let mut attempts = vec![(passthrough, stream_layout)];
+    if stream_layout {
+        attempts.push((passthrough, false));
+    }
+    if passthrough {
+        attempts.push((false, false));
+    }
+    attempts
+}
+
+fn use_gemv_subgroup_passthrough(passthrough: bool, has_subgroup: bool) -> bool {
+    passthrough && has_subgroup
+}
+
+impl GpuPipelines {
+    /// Build all required compute pipelines for the requested passthrough/stream
+    /// configuration. Optional degrading attention pipelines and `gemv_q6_k_flat`
+    /// stay `None` here and are populated independently afterward.
+    fn build_required(ctx: &GpuContext, passthrough: bool, stream_layout: bool) -> Self {
+        let gemv_subgroup_passthrough =
+            use_gemv_subgroup_passthrough(passthrough, ctx.has_subgroup);
+        Self {
+            gemv_f32: if gemv_subgroup_passthrough {
+                ctx.gemv_f32_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32")
+            },
+            gemv_f16: if gemv_subgroup_passthrough {
+                ctx.gemv_f16_passthrough()
+            } else {
+                ctx.create_pipeline_with_defines(
+                    shaders::GEMV_F32,
+                    "gemv_f32",
+                    "gemv_f16",
+                    &[("F16_A", "1")],
+                )
+            },
+            gemv_f32_accum: ctx.create_pipeline(
+                shaders::GEMV_F32,
+                "gemv_f32_accum",
+                "gemv_f32_accum",
+            ),
+            gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt", "gemm_f32_nt"),
+            gemm_f32_nt_accum: ctx.create_pipeline(
+                shaders::GEMM_F32,
+                "gemm_f32_nt_accum",
+                "gemm_f32_nt_accum",
+            ),
+            gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
+            gemv_q4_0_fast: if gemv_subgroup_passthrough {
+                ctx.gemv_q4_0_fast_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast", "gemv_q4_0_fast")
+            },
+            gemv_q4_0_stream: if stream_layout {
+                tracing::debug!("gemv_q4_0_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_0_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q4_0_stream_gateup: if stream_layout {
+                tracing::debug!("gemv_q4_0_stream_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_0_stream_gateup_passthrough())
+            } else {
+                None
+            },
+            gemv_q4_k: if gemv_subgroup_passthrough {
+                ctx.gemv_q4_k_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k")
+            },
+            gemv_q4_k_stream: if stream_layout {
+                tracing::debug!("gemv_q4_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_k_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
+            gemv_q5_k_stream: if stream_layout {
+                tracing::debug!("gemv_q5_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q5_k_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q6_k: if gemv_subgroup_passthrough {
+                ctx.gemv_q6_k_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k")
+            },
+            gemv_q6_k_flat: None,
+            gemv_q6_k_stream: if stream_layout {
+                tracing::debug!("gemv_q6_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q6_k_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
+            gemv_q8_0_stream: if stream_layout {
+                tracing::debug!("gemv_q8_0_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q8_0_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q8_0_stream_gateup: if stream_layout {
+                tracing::debug!("gemv_q8_0_stream_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q8_0_stream_gateup_passthrough())
+            } else {
+                None
+            },
+            add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
+            scaled_add_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "scaled_add_inplace",
+                "scaled_add",
+            ),
+            scale_f32: ctx.create_pipeline(shaders::SCALE_F32, "scale_f32", "scale_f32"),
+            mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
+            silu_mul_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "silu_mul_inplace",
+                "silu_mul",
+            ),
+            sigmoid_head_gate_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "sigmoid_head_gate_inplace",
+                "sigmoid_head_gate",
+            ),
+            ffn_swiglu_q4_0: ctx.create_pipeline(
+                shaders::FFN_SWIGLU_Q4_0,
+                "ffn_swiglu_q4_0",
+                "ffn_swiglu_q4_0",
+            ),
+            rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm"),
+            rmsnorm_out: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm_out", "rmsnorm_out"),
+            kv_append: ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append"),
+            per_head_rmsnorm: ctx.create_pipeline(
+                shaders::PER_HEAD_RMSNORM,
+                "per_head_rmsnorm",
+                "per_head_rmsnorm",
+            ),
+            rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
+            kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
+            flash_attention: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION,
+                "flash_attention",
+                "flash_attention",
+            ),
+            flash_attention_split: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION_SPLIT,
+                "flash_attention_split",
+                "flash_attention_split",
+            ),
+            flash_attention_merge: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION_MERGE,
+                "flash_attention_merge",
+                "flash_attention_merge",
+            ),
+            conv1d_fused: ctx.create_pipeline(
+                shaders::CONV1D_FUSED,
+                "conv1d_fused",
+                "conv1d_fused",
+            ),
+            argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
+            rmsnorm_batch: ctx.create_pipeline(
+                shaders::RMSNORM_BATCH,
+                "rmsnorm_batch",
+                "rmsnorm_batch",
+            ),
+            add_rmsnorm_batch: ctx.create_pipeline(
+                shaders::RMSNORM_BATCH,
+                "add_rmsnorm_batch",
+                "add_rmsnorm_batch",
+            ),
+            qk_norm_rope_batch: ctx.create_pipeline(
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "qk_norm_rope_batch",
+            ),
+            conv1d_fused_batch: ctx.create_pipeline(
+                shaders::CONV1D_FUSED_BATCH,
+                "conv1d_fused_batch",
+                "conv1d_fused_batch",
+            ),
+            bidir_split: ctx.create_pipeline(shaders::BIDIRECTIONAL, "bidir_split", "bidir_split"),
+            bidir_conv_centered: ctx.create_pipeline(
+                shaders::BIDIRECTIONAL,
+                "bidir_conv_centered",
+                "bidir_conv_centered",
+            ),
+            bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
+            mul_mat_reg_tile_q4_0: if passthrough {
+                tracing::debug!("mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q4_0_passthrough()
+            } else {
+                build_mul_mat_pipeline(ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0", "u32")
+            },
+            mul_mat_reg_tile_q4_0_stream: if stream_layout {
+                tracing::debug!("mul_mat_reg_tile_q4_0_stream: SPIR-V passthrough (slang)");
+                Some(ctx.mul_mat_reg_tile_q4_0_stream_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_xf32: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_xf32: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_xf32_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_r2: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_r2: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_r2_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_gateup: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_gateup_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_k: if stream_layout {
+                tracing::debug!("gemm_stream_q4_k: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_k_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q5_k: if stream_layout {
+                tracing::debug!("gemm_stream_q5_k: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q5_k_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q6_k_k64: if stream_layout {
+                tracing::debug!("gemm_stream_q6_k_k64: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q6_k_k64_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q8_0_k64: if stream_layout {
+                tracing::debug!("gemm_stream_q8_0_k64: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q8_0_k64_passthrough())
+            } else {
+                None
+            },
+            transpose_cast_f16: if stream_layout {
+                tracing::debug!("transpose_cast_f16: SPIR-V passthrough (slang)");
+                Some(ctx.transpose_cast_f16_passthrough())
+            } else {
+                None
+            },
+            mul_mat_reg_tile_q8_0: if passthrough {
+                tracing::debug!("mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q8_0_passthrough()
+            } else {
+                build_mul_mat_pipeline(ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0", "u32")
+            },
+            mul_mat_reg_tile_q4_k: if passthrough {
+                tracing::debug!("mul_mat_reg_tile_q4_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q4_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(ctx, "mul_mat_q4_k", "INIT_SRC0_SHMEM_Q4_K", "u32")
+            },
+            mul_mat_reg_tile_q5_k: if passthrough {
+                tracing::debug!("mul_mat_reg_tile_q5_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q5_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(ctx, "mul_mat_q5_k", "INIT_SRC0_SHMEM_Q5_K", "u32")
+            },
+            mul_mat_reg_tile_q6_k: if passthrough {
+                tracing::debug!("mul_mat_reg_tile_q6_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q6_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(ctx, "mul_mat_q6_k", "INIT_SRC0_SHMEM_Q6_K", "u32")
+            },
+            mul_mat_reg_tile_f32: build_mul_mat_pipeline(
+                ctx,
+                "mul_mat_f32",
+                "INIT_SRC0_SHMEM_FLOAT",
+                "f32",
+            ),
+            attention_prefill: ctx.create_pipeline(
+                shaders::ATTENTION_PREFILL,
+                "attention_prefill",
+                "attention_prefill",
+            ),
+            attention_flash_hd64: None,
+            attention_prefill_hd64: None,
+            attention_prefill_hd64_f16: None,
+            moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
+            moe_gemv_q4_0: ctx.create_pipeline(
+                shaders::MOE_GEMV_Q4_0,
+                "moe_gemv_q4_0",
+                "moe_gemv_q4_0",
+            ),
+            moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine", "moe_combine"),
+            gemv_subgroup_passthrough,
+        }
+    }
+
+    /// Populate the optional register-tiled attention kernels outside the core
+    /// `check_pipelines` scope so a large-workgroup failure degrades cleanly to the
+    /// generic attention kernel without nesting error scopes. Aborts immediately
+    /// with `Err` if the device is lost.
+    fn populate_optional_attention(
+        &mut self,
+        ctx: &GpuContext,
+        head_dim: usize,
+        passthrough: bool,
+    ) -> Result<()> {
+        self.attention_flash_hd64 = if ctx.uses_flash_attention(head_dim) {
+            ctx.build_flash_pipeline_or_log(
+                "bidirectional prefill falls back to the generic kernel",
+            )?
+        } else {
+            None
+        };
+        self.attention_prefill_hd64 = if ctx.uses_flash_attention(head_dim) {
+            ctx.degrade_pipeline_err(
+                "attention_prefill_hd64",
+                "causal prefill falls back to generic kernel",
+                ctx.try_create_pipeline_checked(
+                    shaders::ATTENTION_PREFILL_HD64,
+                    "main",
+                    "attention_prefill_hd64",
+                ),
+            )?
+        } else {
+            None
+        };
+        self.attention_prefill_hd64_f16 = if ctx.uses_flash_attention(head_dim)
+            && ctx.max_compute_workgroup_storage_size
+                >= crate::backend::wgpu::FLASH_ATTENTION_F16_WORKGROUP_BYTES
+            && passthrough
+        {
+            let pipe = ctx.degrade_pipeline_err(
+                "attention_prefill_hd64_f16",
+                "causal prefill falls back to f32 or generic kernel",
+                ctx.try_attention_prefill_hd64_f16_passthrough_checked(),
+            )?;
+            if pipe.is_some() {
+                tracing::debug!("attention_prefill_hd64_f16: SPIR-V passthrough (slang)");
+            }
+            pipe
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Populate the optional `gemv_q6_k_flat` SPIR-V passthrough kernel in its own
+    /// `check_pipelines` scope so a rejection degrades cleanly to the interleaved
+    /// `gemv_q6_k` kernel without forcing streaming or passthrough fallback. Aborts
+    /// immediately with `Err` on device loss.
+    fn populate_optional_flat_q6k(&mut self, ctx: &GpuContext) -> Result<bool> {
+        let pipe = ctx.degrade_pipeline_err(
+            "gemv_q6_k_flat_passthrough",
+            "Q6_K LM head falls back to interleaved gemv_q6_k",
+            ctx.check_pipelines("gemv_q6_k_flat_passthrough", || {
+                ctx.gemv_q6_k_flat_passthrough()
+            }),
+        )?;
+        if pipe.is_some() {
+            tracing::debug!("gemv_q6_k_flat: SPIR-V passthrough (slang)");
+        }
+        let built = pipe.is_some();
+        self.gemv_q6_k_flat = pipe;
+        Ok(built)
+    }
+
+    /// Orchestration seam behind [`Self::build_validated`] with injected probes so
+    /// every fallback transition, flag update, and lost-device abort is testable on
+    /// host without a GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn build_validated_with<P>(
+        passthrough: bool,
+        stream_layout: bool,
+        want_flat_q6k: bool,
+        mut device_lost_detail: impl FnMut() -> Option<String>,
+        mut try_required: impl FnMut(bool, bool) -> Result<P>,
+        mut try_optional_attention: impl FnMut(&mut P, bool) -> Result<()>,
+        mut try_optional_flat_q6k: impl FnMut(&mut P) -> Result<bool>,
+    ) -> Result<(P, bool, bool)> {
+        if let Some(detail) = device_lost_detail() {
+            anyhow::bail!("gpu_lfm2 pipelines: GPU device lost ({detail})");
+        }
+        let attempts = pipeline_fallback_attempts(passthrough, stream_layout);
+        let mut last_err = None;
+        for (idx, &(attempt_p, attempt_s)) in attempts.iter().enumerate() {
+            match try_required(attempt_p, attempt_s) {
+                Ok(mut pipelines) => {
+                    try_optional_attention(&mut pipelines, attempt_p)?;
+                    let flat_q6k = if attempt_p && !attempt_s && want_flat_q6k {
+                        try_optional_flat_q6k(&mut pipelines)?
+                    } else {
+                        false
+                    };
+                    return Ok((pipelines, attempt_s, flat_q6k));
+                }
+                Err(err) => {
+                    if device_lost_detail().is_some() {
+                        return Err(err);
+                    }
+                    if let Some(&(next_p, next_s)) = attempts.get(idx + 1) {
+                        let next_mode = if attempt_s && !next_s && next_p {
+                            "raw weight layout"
+                        } else {
+                            "WGSL shaders"
+                        };
+                        tracing::warn!(
+                            "GPU pipeline validation failed ({err}); falling back to {next_mode}"
+                        );
+                        eprintln!(
+                            "[cera::wgpu] GPU pipeline validation failed ({err}); \
+                             falling back to {next_mode}"
+                        );
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.expect("pipeline_fallback_attempts is non-empty"))
+    }
+
+    /// Build and validate compute pipelines before weight upload, degrading
+    /// streaming layout and SPIR-V passthrough to WGSL if the driver rejects them.
+    fn build_validated(ctx: &GpuContext, head_dim: usize) -> Result<(Self, bool, bool)> {
+        Self::build_validated_with(
+            use_spirv_passthrough(ctx),
+            use_stream_layout(ctx),
+            use_flat_q6k(ctx),
+            || ctx.device_lost_detail(),
+            |passthrough, stream_layout| {
+                ctx.check_pipelines("gpu_lfm2 pipelines", || {
+                    Self::build_required(ctx, passthrough, stream_layout)
+                })
+            },
+            |pipelines, passthrough| {
+                pipelines.populate_optional_attention(ctx, head_dim, passthrough)
+            },
+            |pipelines| pipelines.populate_optional_flat_q6k(ctx),
+        )
+    }
 }
 
 /// One LoRA target's low-rank factors uploaded to GPU. The apply is two GEMV
@@ -2702,10 +3167,11 @@ impl GpuLfmModel {
             config.vocab_size
         );
 
-        // Resident stream layout (one decision for pipelines and upload
-        // alike): eligible Q4_0 weights upload pre-transposed. Same bytes as
-        // raw, so there is no budget and no per-model size gate.
-        let stream_layout = use_stream_layout(&ctx);
+        // Build and validate compute pipelines before repacking/uploading weights
+        // so unsupported drivers either degrade cleanly (streaming -> raw -> WGSL)
+        // or fail back to CPU before allocating weight buffers.
+        let (pipelines, stream_layout, flat_q6k) = GpuPipelines::build_validated(&ctx, head_dim)?;
+        debug_assert_eq!(flat_q6k, pipelines.gemv_q6_k_flat.is_some());
         if stream_layout {
             tracing::info!(
                 "streaming layout: Q4_0 weights upload pre-transposed; \
@@ -2840,8 +3306,7 @@ impl GpuLfmModel {
                 // with no funnel shifts. When `resident_stream` is active, `main`
                 // already rides `gemv_q6_k_stream` and `gemm_stream_q6_k_k64`,
                 // so no duplicate flat buffer is uploaded.
-                let flat = if !resident_stream && lm_head_dtype == DType::Q6K && use_flat_q6k(&ctx)
-                {
+                let flat = if !resident_stream && lm_head_dtype == DType::Q6K && flat_q6k {
                     let flat_bytes =
                         repack_q6_k_flat(lm_head_bytes, config.vocab_size, config.hidden_size);
                     Some(Box::new(GpuWeight {
@@ -3459,370 +3924,6 @@ impl GpuLfmModel {
             "argmax_params",
         );
 
-        // Compile compute pipelines after all fallible weight reads and
-        // scratch-sizing validations have succeeded.
-        let pipelines = GpuPipelines {
-            gemv_f32: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                ctx.gemv_f32_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32")
-            },
-            gemv_f16: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                ctx.gemv_f16_passthrough()
-            } else {
-                ctx.create_pipeline_with_defines(
-                    shaders::GEMV_F32,
-                    "gemv_f32",
-                    "gemv_f16",
-                    &[("F16_A", "1")],
-                )
-            },
-            gemv_f32_accum: ctx.create_pipeline(
-                shaders::GEMV_F32,
-                "gemv_f32_accum",
-                "gemv_f32_accum",
-            ),
-            gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt", "gemm_f32_nt"),
-            gemm_f32_nt_accum: ctx.create_pipeline(
-                shaders::GEMM_F32,
-                "gemm_f32_nt_accum",
-                "gemm_f32_nt_accum",
-            ),
-            gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
-            gemv_q4_0_fast: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                // Vulkan: subgroup-reduction twin via passthrough (naga
-                // cannot parse `enable subgroups`, so the WGSL twin below
-                // carries the tree instead). Same bindings, same NR=8.
-                ctx.gemv_q4_0_fast_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast", "gemv_q4_0_fast")
-            },
-            gemv_q4_0_stream: if stream_layout {
-                tracing::debug!("gemv_q4_0_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q4_0_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q4_0_stream_gateup: if stream_layout {
-                tracing::debug!("gemv_q4_0_stream_gateup: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q4_0_stream_gateup_passthrough())
-            } else {
-                None
-            },
-            gemv_q4_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                ctx.gemv_q4_k_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k")
-            },
-            gemv_q4_k_stream: if stream_layout {
-                tracing::debug!("gemv_q4_k_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q4_k_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
-            gemv_q5_k_stream: if stream_layout {
-                tracing::debug!("gemv_q5_k_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q5_k_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q6_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                // Vulkan: 64-thread subgroup twin via passthrough. Same
-                // bindings, NR=1 (WGSL fallback is NR=2: the rows gate in
-                // `gemv_pipeline_rows_label` mirrors this condition).
-                ctx.gemv_q6_k_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k")
-            },
-            gemv_q6_k_flat: if use_flat_q6k(&ctx) {
-                tracing::debug!("gemv_q6_k_flat: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q6_k_flat_passthrough())
-            } else {
-                None
-            },
-            gemv_q6_k_stream: if stream_layout {
-                tracing::debug!("gemv_q6_k_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q6_k_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
-            gemv_q8_0_stream: if stream_layout {
-                tracing::debug!("gemv_q8_0_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q8_0_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q8_0_stream_gateup: if stream_layout {
-                tracing::debug!("gemv_q8_0_stream_gateup: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q8_0_stream_gateup_passthrough())
-            } else {
-                None
-            },
-            add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
-            scaled_add_inplace: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "scaled_add_inplace",
-                "scaled_add",
-            ),
-            scale_f32: ctx.create_pipeline(shaders::SCALE_F32, "scale_f32", "scale_f32"),
-            mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
-            silu_mul_inplace: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "silu_mul_inplace",
-                "silu_mul",
-            ),
-            sigmoid_head_gate_inplace: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "sigmoid_head_gate_inplace",
-                "sigmoid_head_gate",
-            ),
-            ffn_swiglu_q4_0: ctx.create_pipeline(
-                shaders::FFN_SWIGLU_Q4_0,
-                "ffn_swiglu_q4_0",
-                "ffn_swiglu_q4_0",
-            ),
-            rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm"),
-            rmsnorm_out: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm_out", "rmsnorm_out"),
-            kv_append: ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append"),
-            per_head_rmsnorm: ctx.create_pipeline(
-                shaders::PER_HEAD_RMSNORM,
-                "per_head_rmsnorm",
-                "per_head_rmsnorm",
-            ),
-            rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
-            kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
-            flash_attention: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION,
-                "flash_attention",
-                "flash_attention",
-            ),
-            flash_attention_split: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION_SPLIT,
-                "flash_attention_split",
-                "flash_attention_split",
-            ),
-            flash_attention_merge: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION_MERGE,
-                "flash_attention_merge",
-                "flash_attention_merge",
-            ),
-            conv1d_fused: ctx.create_pipeline(
-                shaders::CONV1D_FUSED,
-                "conv1d_fused",
-                "conv1d_fused",
-            ),
-            argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
-            rmsnorm_batch: ctx.create_pipeline(
-                shaders::RMSNORM_BATCH,
-                "rmsnorm_batch",
-                "rmsnorm_batch",
-            ),
-            add_rmsnorm_batch: ctx.create_pipeline(
-                shaders::RMSNORM_BATCH,
-                "add_rmsnorm_batch",
-                "add_rmsnorm_batch",
-            ),
-            qk_norm_rope_batch: ctx.create_pipeline(
-                shaders::QK_NORM_ROPE_BATCH,
-                "qk_norm_rope_batch",
-                "qk_norm_rope_batch",
-            ),
-            conv1d_fused_batch: ctx.create_pipeline(
-                shaders::CONV1D_FUSED_BATCH,
-                "conv1d_fused_batch",
-                "conv1d_fused_batch",
-            ),
-            bidir_split: ctx.create_pipeline(shaders::BIDIRECTIONAL, "bidir_split", "bidir_split"),
-            bidir_conv_centered: ctx.create_pipeline(
-                shaders::BIDIRECTIONAL,
-                "bidir_conv_centered",
-                "bidir_conv_centered",
-            ),
-            bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
-
-            mul_mat_reg_tile_q4_0: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q4_0_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0", "u32")
-            },
-            mul_mat_reg_tile_q4_0_stream: if stream_layout {
-                tracing::debug!("mul_mat_reg_tile_q4_0_stream: SPIR-V passthrough (slang)");
-                Some(ctx.mul_mat_reg_tile_q4_0_stream_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64_xf32: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64_xf32: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_xf32_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64_r2: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64_r2: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_r2_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64_gateup: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64_gateup: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_gateup_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_k: if stream_layout {
-                tracing::debug!("gemm_stream_q4_k: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_k_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q5_k: if stream_layout {
-                tracing::debug!("gemm_stream_q5_k: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q5_k_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q6_k_k64: if stream_layout {
-                tracing::debug!("gemm_stream_q6_k_k64: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q6_k_k64_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q8_0_k64: if stream_layout {
-                tracing::debug!("gemm_stream_q8_0_k64: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q8_0_k64_passthrough())
-            } else {
-                None
-            },
-            transpose_cast_f16: if stream_layout {
-                tracing::debug!("transpose_cast_f16: SPIR-V passthrough (slang)");
-                Some(ctx.transpose_cast_f16_passthrough())
-            } else {
-                None
-            },
-            // Every quantized weight goes through the register-tiled kernel (weight
-            // reuse across the token tile), NOT the batched-GEMV-shaped gemm_* kernels:
-            // those re-dequantize the weight once per token, so they buy submit count
-            // and no compute, and measured *slower* than the per-token fallback they
-            // were meant to replace.
-            mul_mat_reg_tile_q8_0: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q8_0_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0", "u32")
-            },
-            mul_mat_reg_tile_q4_k: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q4_k: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q4_k_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q4_k", "INIT_SRC0_SHMEM_Q4_K", "u32")
-            },
-            mul_mat_reg_tile_q5_k: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q5_k: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q5_k_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q5_k", "INIT_SRC0_SHMEM_Q5_K", "u32")
-            },
-            mul_mat_reg_tile_q6_k: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q6_k: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q6_k_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q6_k", "INIT_SRC0_SHMEM_Q6_K", "u32")
-            },
-            // Dense-f32 fallback loader. Stays on naga: the Slang SPIR-V
-            // passthrough is Vulkan-only and covers just the quantized loaders
-            // (the dense f32 loader was never naga-regressed).
-            mul_mat_reg_tile_f32: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_f32",
-                "INIT_SRC0_SHMEM_FLOAT",
-                "f32",
-            ),
-            attention_prefill: ctx.create_pipeline(
-                shaders::ATTENTION_PREFILL,
-                "attention_prefill",
-                "attention_prefill",
-            ),
-            // The generic kernel above always builds, so a flash-only failure falls
-            // back instead of failing the load (shared tail in
-            // `build_flash_pipeline_or_log`).
-            attention_flash_hd64: if ctx.uses_flash_attention(head_dim) {
-                ctx.build_flash_pipeline_or_log(
-                    "bidirectional prefill falls back to the generic kernel",
-                )
-            } else {
-                None
-            },
-            attention_prefill_hd64: if ctx.uses_flash_attention(head_dim) {
-                match ctx.try_create_pipeline_checked(
-                    shaders::ATTENTION_PREFILL_HD64,
-                    "main",
-                    "attention_prefill_hd64",
-                ) {
-                    Ok(pipe) => Some(pipe),
-                    Err(e) => {
-                        tracing::warn!(
-                            "attention_prefill_hd64 pipeline validation failed ({e}); \
-                             causal prefill falls back to generic kernel"
-                        );
-                        eprintln!(
-                            "[cera::wgpu] attention_prefill_hd64 pipeline validation failed ({e}); \
-                             causal prefill falls back to generic kernel"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            },
-            attention_prefill_hd64_f16: if ctx.uses_flash_attention(head_dim)
-                && ctx.max_compute_workgroup_storage_size
-                    >= crate::backend::wgpu::FLASH_ATTENTION_F16_WORKGROUP_BYTES
-                && use_spirv_passthrough(&ctx)
-            {
-                match ctx.try_attention_prefill_hd64_f16_passthrough_checked() {
-                    Ok(pipe) => {
-                        tracing::debug!("attention_prefill_hd64_f16: SPIR-V passthrough (slang)");
-                        Some(pipe)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "attention_prefill_hd64_f16 pipeline validation failed ({e}); \
-                             causal prefill falls back to f32 or generic kernel"
-                        );
-                        eprintln!(
-                            "[cera::wgpu] attention_prefill_hd64_f16 pipeline validation failed ({e}); \
-                             causal prefill falls back to f32 or generic kernel"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            },
-            moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
-            moe_gemv_q4_0: ctx.create_pipeline(
-                shaders::MOE_GEMV_Q4_0,
-                "moe_gemv_q4_0",
-                "moe_gemv_q4_0",
-            ),
-            moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine", "moe_combine"),
-        };
-
         let argmax_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("argmax_bg"),
             layout: &pipelines.argmax_f32.get_bind_group_layout(0),
@@ -3882,7 +3983,7 @@ impl GpuLfmModel {
             "lora_tmp_batched",
         );
 
-        let mut model = Self {
+        let model = Self {
             ctx,
             config,
             pipelines,
@@ -3968,7 +4069,20 @@ impl GpuLfmModel {
             stream_gemm_bg_cache: Mutex::new((u32::MAX, 0, 0, Vec::new())),
             fuse_gate_up_active: AtomicBool::new(false),
         };
-        model.cache_bind_groups();
+        Self::finish_load_with(model, Self::cache_bind_groups, |m, context| {
+            m.ctx.ensure_alive(context)
+        })
+    }
+
+    /// Orchestration seam behind the post-upload tail of [`Self::from_weight_source_with_ctx`]
+    /// so post-upload device-loss checks remain testable on host without a GPU.
+    fn finish_load_with<M>(
+        mut model: M,
+        cache_bind_groups: impl FnOnce(&mut M),
+        ensure_alive: impl FnOnce(&M, &str) -> Result<()>,
+    ) -> Result<M> {
+        cache_bind_groups(&mut model);
+        ensure_alive(&model, "gpu_lfm2 weight upload")?;
         Ok(model)
     }
 
@@ -4545,7 +4659,7 @@ impl GpuLfmModel {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 8, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
             DType::Q4KM => {
-                let rows = if self.ctx.supports_spirv_passthrough() && self.ctx.has_subgroup {
+                let rows = if self.pipelines.gemv_subgroup_passthrough {
                     4
                 } else {
                     2
@@ -4565,7 +4679,7 @@ impl GpuLfmModel {
                         .expect("flat Q6_K weight without a gemv_q6_k_flat pipeline");
                     return (pipe, 8, "gemv_q6f");
                 }
-                let rows = if self.ctx.supports_spirv_passthrough() && self.ctx.has_subgroup {
+                let rows = if self.pipelines.gemv_subgroup_passthrough {
                     1
                 } else {
                     2
@@ -6421,6 +6535,92 @@ impl GpuLfmModel {
     }
 }
 
+async fn finish_seq_readback_with<F, Fut, R>(
+    expected_bytes: usize,
+    label: &str,
+    gpu_seq_len: &AtomicUsize,
+    state_seq_len: &mut usize,
+    next_seq_len: usize,
+    read: impl FnOnce() -> Fut,
+    decode: F,
+) -> Result<R>
+where
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    F: FnOnce(&[u8]) -> Result<R>,
+{
+    let bytes = read().await?;
+    if bytes.len() < expected_bytes {
+        anyhow::bail!(
+            "{label} readback buffer truncated (expected {expected_bytes} bytes, got {})",
+            bytes.len()
+        );
+    }
+    let out = decode(&bytes[..expected_bytes])?;
+    gpu_seq_len.store(next_seq_len, Ordering::Relaxed);
+    *state_seq_len = next_seq_len;
+    Ok(out)
+}
+
+async fn recv_exact_snapshot_bytes_with<Fut>(
+    expected_bytes: usize,
+    label: &str,
+    read: Option<impl FnOnce() -> Fut>,
+) -> Result<Vec<u8>>
+where
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    if expected_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    let read_fn = read.ok_or_else(|| {
+        anyhow::anyhow!("snapshot {label} missing pending readback for {expected_bytes} bytes")
+    })?;
+    let bytes = read_fn().await?;
+    anyhow::ensure!(
+        bytes.len() == expected_bytes,
+        "GPU snapshot {label} readback length mismatch (expected {expected_bytes} bytes, got {})",
+        bytes.len()
+    );
+    Ok(bytes)
+}
+
+fn unpack_f16_kv_snapshot_bytes(
+    packed_le: &[u8],
+    expected_elems: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let expected_packed = expected_elems
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| anyhow::anyhow!("GPU snapshot {label} packed size overflow"))?;
+    anyhow::ensure!(
+        packed_le.len() == expected_packed,
+        "GPU snapshot {label} packed length mismatch (expected {expected_packed} bytes, got {})",
+        packed_le.len()
+    );
+    let unpacked_bytes = expected_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("GPU snapshot {label} unpacked size overflow"))?;
+    let mut out = Vec::with_capacity(unpacked_bytes);
+    for &pair in packed_le.as_chunks::<2>().0 {
+        let val = half::f16::from_bits(u16::from_le_bytes(pair)).to_f32();
+        out.extend_from_slice(&val.to_le_bytes());
+    }
+    Ok(out)
+}
+
+async fn recv_and_unpack_f16_kv_snapshot_with<Fut>(
+    expected_elems: usize,
+    packed_bytes: usize,
+    label: &str,
+    read: Option<impl FnOnce() -> Fut>,
+) -> Result<Vec<u8>>
+where
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let packed = recv_exact_snapshot_bytes_with(packed_bytes, label, read).await?;
+    unpack_f16_kv_snapshot_bytes(&packed, expected_elems, label)
+}
+
 impl GpuLfmModel {
     /// Lock-free body of [`Model::forward`]. Callers must already hold
     /// `infer_lock` — enter via the trait's `forward()` for a single
@@ -6978,18 +7178,19 @@ impl GpuLfmModel {
                 None
             }
             DecodeTail::HiddenUnsubmitted => {
-                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-                state.seq_len += 1;
+                // Async caller commits `gpu_state.seq_len` and `state.seq_len` only after
+                // readback completes and passes length validation.
                 self.ctx.finish_profiler();
                 Some(enc)
             }
             DecodeTail::Logits(_) | DecodeTail::LogitsUnsubmitted(_) => {
-                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-                state.seq_len += 1;
-                self.ctx.finish_profiler();
                 if matches!(tail, DecodeTail::LogitsUnsubmitted(_)) {
+                    self.ctx.finish_profiler();
                     Some(enc)
                 } else {
+                    self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                    state.seq_len += 1;
+                    self.ctx.finish_profiler();
                     self.submit_and_wait(enc);
                     None
                 }
@@ -7688,6 +7889,7 @@ impl GpuLfmModel {
     ) -> Result<u32> {
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("forward_greedy_async")?;
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
@@ -7707,15 +7909,16 @@ impl GpuLfmModel {
             ))
         }?;
 
-        let bytes = pending.recv().await?;
-        if bytes.len() < 4 {
-            anyhow::bail!(
-                "GPU argmax readback buffer truncated (expected 4 bytes, got {})",
-                bytes.len()
-            );
-        }
-        let token = bytemuck::pod_read_unaligned::<u32>(&bytes[..4]);
-        Ok(token)
+        finish_seq_readback_with(
+            std::mem::size_of::<u32>(),
+            "GPU argmax",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            pos + 1,
+            || pending.recv(),
+            |slice| Ok(bytemuck::pod_read_unaligned::<u32>(slice)),
+        )
+        .await
     }
 
     /// Async (wasm/WebGPU) decode step returning the full logits row, for
@@ -7743,6 +7946,7 @@ impl GpuLfmModel {
         let expected_bytes = vocab * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("forward_logits_async")?;
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
@@ -7762,18 +7966,22 @@ impl GpuLfmModel {
             ))
         }?;
 
-        let bytes = pending.recv().await?;
-        if bytes.len() < expected_bytes {
-            anyhow::bail!(
-                "GPU logits readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                bytes.len()
-            );
-        }
-        // Copy into an aligned Vec rather than casting the byte slice: the
-        // readback's buffer carries no f32 alignment guarantee.
-        let mut out = vec![0f32; vocab];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
-        Ok(out)
+        finish_seq_readback_with(
+            expected_bytes,
+            "GPU logits",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            pos + 1,
+            || pending.recv(),
+            |slice| {
+                // Copy into an aligned Vec rather than casting the byte slice: the
+                // readback's buffer carries no f32 alignment guarantee.
+                let mut out = vec![0f32; vocab];
+                bytemuck::cast_slice_mut(&mut out).copy_from_slice(slice);
+                Ok(out)
+            },
+        )
+        .await
     }
 
     /// Async decode step returning the hidden state embedding on GPU, for vocoder conditioning.
@@ -7787,6 +7995,7 @@ impl GpuLfmModel {
         let expected_bytes = hidden_size * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("forward_embedding_async")?;
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             let enc = self
@@ -7798,16 +8007,20 @@ impl GpuLfmModel {
                 expected_bytes as u64,
             ))
         }?;
-        let bytes = pending.recv().await?;
-        if bytes.len() < expected_bytes {
-            anyhow::bail!(
-                "GPU hidden readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                bytes.len()
-            );
-        }
-        let mut out = vec![0f32; hidden_size];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
-        Ok(out)
+        finish_seq_readback_with(
+            expected_bytes,
+            "GPU hidden",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            pos + 1,
+            || pending.recv(),
+            |slice| {
+                let mut out = vec![0f32; hidden_size];
+                bytemuck::cast_slice_mut(&mut out).copy_from_slice(slice);
+                Ok(out)
+            },
+        )
+        .await
     }
 
     /// Async decode step returning the hidden state embedding when seeded by an audio embedding.
@@ -7821,6 +8034,8 @@ impl GpuLfmModel {
         let expected_bytes = hidden_size * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx
+                .ensure_alive("forward_hidden_from_embedding_async")?;
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             let enc = self
@@ -7837,16 +8052,20 @@ impl GpuLfmModel {
                 expected_bytes as u64,
             ))
         }?;
-        let bytes = pending.recv().await?;
-        if bytes.len() < expected_bytes {
-            anyhow::bail!(
-                "GPU hidden readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                bytes.len()
-            );
-        }
-        let mut out = vec![0f32; hidden_size];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
-        Ok(out)
+        finish_seq_readback_with(
+            expected_bytes,
+            "GPU hidden",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            pos + 1,
+            || pending.recv(),
+            |slice| {
+                let mut out = vec![0f32; hidden_size];
+                bytemuck::cast_slice_mut(&mut out).copy_from_slice(slice);
+                Ok(out)
+            },
+        )
+        .await
     }
 
     /// Decode step computing hidden state for a token and keeping it in `hidden_buf` on the GPU with no host readback.
@@ -7857,6 +8076,7 @@ impl GpuLfmModel {
         state: &mut InferenceState,
     ) -> Result<&wgpu::Buffer> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.ctx.ensure_alive("forward_hidden_gpu")?;
         let _lora_guard = self.resolve_lora(state);
         self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
         self.forward_inner_compute_tail(&[token], pos, state, DecodeTail::Hidden);
@@ -7871,6 +8091,7 @@ impl GpuLfmModel {
         state: &mut InferenceState,
     ) -> Result<&wgpu::Buffer> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.ctx.ensure_alive("forward_hidden_from_embedding_gpu")?;
         let _lora_guard = self.resolve_lora(state);
         self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
         self.forward_inner_compute_tail_seeded(
@@ -7898,6 +8119,8 @@ impl GpuLfmModel {
         let expected_bytes = vocab_size * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx
+                .ensure_alive("forward_logits_from_embedding_async")?;
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             let enc = self
@@ -7914,16 +8137,20 @@ impl GpuLfmModel {
                 expected_bytes as u64,
             ))
         }?;
-        let bytes = pending.recv().await?;
-        if bytes.len() < expected_bytes {
-            anyhow::bail!(
-                "GPU logits readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                bytes.len()
-            );
-        }
-        let mut out = vec![0f32; vocab_size];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
-        Ok(out)
+        finish_seq_readback_with(
+            expected_bytes,
+            "GPU logits",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            pos + 1,
+            || pending.recv(),
+            |slice| {
+                let mut out = vec![0f32; vocab_size];
+                bytemuck::cast_slice_mut(&mut out).copy_from_slice(slice);
+                Ok(out)
+            },
+        )
+        .await
     }
 
     /// Async decode step returning the argmax token directly when seeded by an audio embedding.
@@ -7935,6 +8162,8 @@ impl GpuLfmModel {
     ) -> Result<u32> {
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx
+                .ensure_alive("forward_greedy_from_embedding_async")?;
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             let enc = self
@@ -7951,15 +8180,16 @@ impl GpuLfmModel {
                 std::mem::size_of::<u32>() as u64,
             ))
         }?;
-        let bytes = pending.recv().await?;
-        if bytes.len() < 4 {
-            anyhow::bail!(
-                "GPU argmax readback buffer truncated (expected 4 bytes, got {})",
-                bytes.len()
-            );
-        }
-        let token = bytemuck::pod_read_unaligned::<u32>(&bytes[..4]);
-        Ok(token)
+        finish_seq_readback_with(
+            std::mem::size_of::<u32>(),
+            "GPU argmax",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            pos + 1,
+            || pending.recv(),
+            |slice| Ok(bytemuck::pod_read_unaligned::<u32>(slice)),
+        )
+        .await
     }
 
     /// Projects a hidden state vector to the vocab-sized logits using the GPU-resident LM head
@@ -7974,6 +8204,7 @@ impl GpuLfmModel {
         );
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("lm_head_argmax_async")?;
             self.ctx
                 .queue
                 .write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(hidden));
@@ -10656,6 +10887,7 @@ impl GpuLfmModel {
     ) -> Result<Vec<f32>> {
         let n = tokens.len();
         if n == 0 {
+            self.ctx.ensure_alive("forward_prefill_logits_all_async")?;
             return Ok(Vec::new());
         }
         if n > MAX_ALL_LOGITS_TOKENS {
@@ -10665,8 +10897,10 @@ impl GpuLfmModel {
             anyhow::bail!("batched prefill verification not supported for this model");
         }
         let vocab = self.config.vocab_size;
+        let expected_bytes = n * vocab * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("forward_prefill_logits_all_async")?;
             let _lora_guard = self.resolve_lora(state);
             let enc = self.encode_prefill_batched_locked(
                 PrefillInput::Tokens(tokens),
@@ -10675,28 +10909,27 @@ impl GpuLfmModel {
                 true,
                 true,
             );
-            self.gpu_state
-                .seq_len
-                .store(start_pos + n, Ordering::Relaxed);
-            state.seq_len = start_pos + n;
-            self.ctx.begin_download_with_encoder(
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.prefill_all_logits_buf,
-                (n * vocab * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+                expected_bytes as u64,
+            ))
+        }?;
 
-        let bytes = pending.recv().await?;
-        let expected_bytes = n * vocab * std::mem::size_of::<f32>();
-        if bytes.len() < expected_bytes {
-            anyhow::bail!(
-                "GPU prefill logits readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                bytes.len()
-            );
-        }
-        let mut out = vec![0.0f32; n * vocab];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
-        Ok(out)
+        finish_seq_readback_with(
+            expected_bytes,
+            "GPU prefill logits",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            start_pos + n,
+            || pending.recv(),
+            |slice| {
+                let mut out = vec![0.0f32; n * vocab];
+                bytemuck::cast_slice_mut(&mut out).copy_from_slice(slice);
+                Ok(out)
+            },
+        )
+        .await
     }
 
     /// Async (wasm/WebGPU) batched verification step returning argmax token IDs `[n]`,
@@ -10709,6 +10942,7 @@ impl GpuLfmModel {
     ) -> Result<Vec<u32>> {
         let n = tokens.len();
         if n == 0 {
+            self.ctx.ensure_alive("forward_prefill_argmax_all_async")?;
             return Ok(Vec::new());
         }
         if n > MAX_ALL_LOGITS_TOKENS {
@@ -10718,8 +10952,10 @@ impl GpuLfmModel {
             anyhow::bail!("batched prefill verification not supported for this model");
         }
         let vocab = self.config.vocab_size;
+        let expected_bytes = std::mem::size_of_val(tokens);
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("forward_prefill_argmax_all_async")?;
             let _lora_guard = self.resolve_lora(state);
             let mut enc = self.encode_prefill_batched_locked(
                 PrefillInput::Tokens(tokens),
@@ -10728,10 +10964,6 @@ impl GpuLfmModel {
                 true,
                 true,
             );
-            self.gpu_state
-                .seq_len
-                .store(start_pos + n, Ordering::Relaxed);
-            state.seq_len = start_pos + n;
 
             // Run argmax on each row of prefill_all_logits_buf on GPU.
             // Copy row j to logits_buf (offset 0) to avoid WebGPU 256-byte storage buffer
@@ -10774,24 +11006,27 @@ impl GpuLfmModel {
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
-            self.ctx.begin_download_with_encoder(
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.argmax_out_buf,
-                std::mem::size_of_val(tokens) as u64,
-            )
-        };
+                expected_bytes as u64,
+            ))
+        }?;
 
-        let bytes = pending.recv().await?;
-        let expected_bytes = std::mem::size_of_val(tokens);
-        if bytes.len() < expected_bytes {
-            anyhow::bail!(
-                "GPU prefill argmax readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                bytes.len()
-            );
-        }
-        let mut out = vec![0u32; n];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
-        Ok(out)
+        finish_seq_readback_with(
+            expected_bytes,
+            "GPU prefill argmax",
+            &self.gpu_state.seq_len,
+            &mut state.seq_len,
+            start_pos + n,
+            || pending.recv(),
+            |slice| {
+                let mut out = vec![0u32; n];
+                bytemuck::cast_slice_mut(&mut out).copy_from_slice(slice);
+                Ok(out)
+            },
+        )
+        .await
     }
 
     /// Truncate the on-GPU KV cache sequence length and state for speculative rollback.
@@ -11116,6 +11351,7 @@ impl GpuLfmModel {
     pub async fn snapshot_session_state_async(&self) -> Result<StateSnapshot, anyhow::Error> {
         let (seq_len, pending_layers) = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.ensure_alive("snapshot_session_state_async")?;
             if self.tq_cache().is_some() {
                 anyhow::bail!("async session snapshot is not supported with GPU TurboQuant cache");
             }
@@ -11128,9 +11364,17 @@ impl GpuLfmModel {
             let mut pending_layers = Vec::with_capacity(cfg.n_layers);
             for i in 0..cfg.n_layers {
                 if cfg.block_types[i] == BlockType::Attention {
-                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
-                    let count = seq_len * kv_dim;
-                    let size = (count * std::mem::size_of::<f32>()) as u64;
+                    let kv_dim = cfg.kv_heads_per_layer[i]
+                        .checked_mul(head_dim)
+                        .ok_or_else(|| anyhow::anyhow!("snapshot layer {i} kv_dim overflow"))?;
+                    let count = seq_len
+                        .checked_mul(kv_dim)
+                        .ok_or_else(|| anyhow::anyhow!("snapshot layer {i} count overflow"))?;
+                    let packed_bytes = count
+                        .checked_mul(std::mem::size_of::<u16>())
+                        .ok_or_else(|| anyhow::anyhow!("snapshot layer {i} byte size overflow"))?;
+                    let size = u64::try_from(packed_bytes)
+                        .map_err(|_| anyhow::anyhow!("snapshot layer {i} size exceeds u64"))?;
                     let (k_buf, v_buf) = self.active_kv(i);
                     let (k_pending, v_pending) = if size > 0 {
                         (
@@ -11140,10 +11384,19 @@ impl GpuLfmModel {
                     } else {
                         (None, None)
                     };
-                    pending_layers.push((true, k_pending, v_pending));
+                    pending_layers.push((true, count, packed_bytes, k_pending, v_pending));
                 } else {
-                    let count = d_conv * cfg.hidden_size;
-                    let size = (count * std::mem::size_of::<f32>()) as u64;
+                    let count = d_conv
+                        .checked_mul(cfg.hidden_size)
+                        .ok_or_else(|| anyhow::anyhow!("snapshot conv layer {i} count overflow"))?;
+                    let expected_bytes =
+                        count
+                            .checked_mul(std::mem::size_of::<f32>())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("snapshot conv layer {i} byte size overflow")
+                            })?;
+                    let size = u64::try_from(expected_bytes)
+                        .map_err(|_| anyhow::anyhow!("snapshot conv layer {i} size exceeds u64"))?;
                     let conv_buf = self.gpu_state.conv_buffers[i].as_ref().ok_or_else(|| {
                         anyhow::anyhow!("conv layer {i} must have rolling buffer")
                     })?;
@@ -11152,32 +11405,39 @@ impl GpuLfmModel {
                     } else {
                         None
                     };
-                    pending_layers.push((false, pending, None));
+                    pending_layers.push((false, count, expected_bytes, pending, None));
                 }
             }
             (seq_len, pending_layers)
         };
 
         let mut layers = Vec::with_capacity(pending_layers.len());
-        for (is_attention, p1, p2) in pending_layers {
+        for (i, (is_attention, elem_count, expected_bytes, p1, p2)) in
+            pending_layers.into_iter().enumerate()
+        {
             if is_attention {
-                let k_data = if let Some(p) = p1 {
-                    p.recv().await?
-                } else {
-                    Vec::new()
-                };
-                let v_data = if let Some(p) = p2 {
-                    p.recv().await?
-                } else {
-                    Vec::new()
-                };
+                let k_data = recv_and_unpack_f16_kv_snapshot_with(
+                    elem_count,
+                    expected_bytes,
+                    &format!("layer {i} K"),
+                    p1.map(|p| || p.recv()),
+                )
+                .await?;
+                let v_data = recv_and_unpack_f16_kv_snapshot_with(
+                    elem_count,
+                    expected_bytes,
+                    &format!("layer {i} V"),
+                    p2.map(|p| || p.recv()),
+                )
+                .await?;
                 layers.push(LayerSnapshot::Attention { k_data, v_data });
             } else {
-                let buffer = if let Some(p) = p1 {
-                    p.recv().await?
-                } else {
-                    Vec::new()
-                };
+                let buffer = recv_exact_snapshot_bytes_with(
+                    expected_bytes,
+                    &format!("layer {i} conv"),
+                    p1.map(|p| || p.recv()),
+                )
+                .await?;
                 layers.push(LayerSnapshot::Conv { buffer });
             }
         }
@@ -14663,6 +14923,302 @@ mod tests {
         assert!(!stream_layout_eligible(DType::F32, 2048));
     }
 
+    #[test]
+    fn pipeline_fallback_ladder_degrades_stream_then_passthrough() {
+        use super::pipeline_fallback_attempts;
+        assert_eq!(
+            pipeline_fallback_attempts(true, true),
+            vec![(true, true), (true, false), (false, false)]
+        );
+        assert_eq!(
+            pipeline_fallback_attempts(true, false),
+            vec![(true, false), (false, false)]
+        );
+        assert_eq!(
+            pipeline_fallback_attempts(false, false),
+            vec![(false, false)]
+        );
+    }
+
+    #[test]
+    fn build_validated_with_exercises_fallbacks_flag_consistency_and_lost_device_aborts() {
+        use super::{GpuPipelines, use_gemv_subgroup_passthrough};
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct FakePipelines {
+            passthrough: bool,
+            stream_layout: bool,
+            gemv_subgroup_passthrough: bool,
+            attention_passthrough: bool,
+            flat_q6k: bool,
+        }
+
+        let make_fake = |p: bool, s: bool, has_subgroup: bool| FakePipelines {
+            passthrough: p,
+            stream_layout: s,
+            gemv_subgroup_passthrough: use_gemv_subgroup_passthrough(p, has_subgroup),
+            attention_passthrough: false,
+            flat_q6k: false,
+        };
+
+        // 1. Happy path (true, true, want_flat=true): streaming stays on, flat_q6k stays skipped.
+        let mut flat_calls = 0usize;
+        let (p1, s1, f1) = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || None,
+            |p, s| Ok(make_fake(p, s, true)),
+            |pipe, p| {
+                pipe.attention_passthrough = p;
+                Ok(())
+            },
+            |pipe| {
+                flat_calls += 1;
+                pipe.flat_q6k = true;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(s1 && !f1);
+        assert_eq!(flat_calls, 0);
+        assert!(p1.gemv_subgroup_passthrough && p1.attention_passthrough && !p1.flat_q6k);
+
+        // 2. Non-stream passthrough with optional flat_q6k failure stays on (true, false) without
+        //    downgrading to pure WGSL.
+        let mut seen = Vec::new();
+        let (p2, s2, f2) = GpuPipelines::build_validated_with(
+            true,
+            false,
+            true,
+            || None,
+            |p, s| {
+                seen.push((p, s));
+                Ok(make_fake(p, s, true))
+            },
+            |pipe, p| {
+                pipe.attention_passthrough = p;
+                Ok(())
+            },
+            |_pipe| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(seen, vec![(true, false)]);
+        assert!(!s2 && !f2);
+        assert!(p2.passthrough && p2.gemv_subgroup_passthrough && p2.attention_passthrough);
+
+        // 3. Rung 1 -> Rung 2 degradation: (true, true) fails non-fatally; (true, false) succeeds
+        //    and now builds optional flat_q6k while keeping gemv_subgroup_passthrough = true.
+        let mut seen = Vec::new();
+        let (p3, s3, f3) = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || None,
+            |p, s| {
+                seen.push((p, s));
+                if s {
+                    anyhow::bail!("stream validation failed");
+                }
+                Ok(make_fake(p, s, true))
+            },
+            |pipe, p| {
+                pipe.attention_passthrough = p;
+                Ok(())
+            },
+            |pipe| {
+                pipe.flat_q6k = true;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![(true, true), (true, false)]);
+        assert!(!s3 && f3);
+        assert!(p3.passthrough && p3.gemv_subgroup_passthrough && p3.flat_q6k);
+
+        // 4. Full degradation (true, true) -> (true, false) -> (false, false): flat_q6k is never
+        //    attempted on WGSL and gemv_subgroup_passthrough clears to false.
+        let mut seen = Vec::new();
+        let mut flat_calls = 0usize;
+        let (p4, s4, f4) = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || None,
+            |p, s| {
+                seen.push((p, s));
+                if p {
+                    anyhow::bail!("spirv rejected");
+                }
+                Ok(make_fake(p, s, true))
+            },
+            |pipe, p| {
+                pipe.attention_passthrough = p;
+                Ok(())
+            },
+            |_pipe| {
+                flat_calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![(true, true), (true, false), (false, false)]);
+        assert!(!s4 && !f4);
+        assert_eq!(flat_calls, 0);
+        assert!(!p4.gemv_subgroup_passthrough && !p4.attention_passthrough);
+
+        // 5. All rungs fail (device alive) -> final Err returned.
+        let mut seen = Vec::new();
+        let err_all = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || None,
+            |p, s| {
+                seen.push((p, s));
+                anyhow::bail!("all failed at ({p}, {s})")
+            },
+            |_: &mut FakePipelines, _| Ok(()),
+            |_| Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(seen, vec![(true, true), (true, false), (false, false)]);
+        assert!(err_all.to_string().contains("all failed at (false, false)"));
+
+        // 6. Pre-existing device loss aborts before any attempt runs.
+        let mut calls = 0usize;
+        let err_pre = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || Some("pre-lost".to_string()),
+            |p, s| {
+                calls += 1;
+                Ok(make_fake(p, s, true))
+            },
+            |_, _| Ok(()),
+            |_| Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 0);
+        assert!(err_pre.to_string().contains("pre-lost"));
+
+        // 7. Device loss during rung 1 aborts immediately without retrying rung 2 or rung 3.
+        let mut seen = Vec::new();
+        let lost = std::cell::RefCell::new(None);
+        let err_r1 = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || lost.borrow().clone(),
+            |p, s| {
+                seen.push((p, s));
+                *lost.borrow_mut() = Some("lost on rung 1".to_string());
+                anyhow::bail!("rung 1 device lost")
+            },
+            |_: &mut FakePipelines, _| Ok(()),
+            |_| Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(seen, vec![(true, true)]);
+        assert!(err_r1.to_string().contains("rung 1 device lost"));
+
+        // 8. Device loss during rung 2 aborts immediately without falling back to WGSL.
+        let mut seen = Vec::new();
+        let lost = std::cell::RefCell::new(None);
+        let err_r2 = GpuPipelines::build_validated_with(
+            true,
+            true,
+            true,
+            || lost.borrow().clone(),
+            |p, s| {
+                seen.push((p, s));
+                if !s {
+                    *lost.borrow_mut() = Some("lost on rung 2".to_string());
+                }
+                anyhow::bail!("rung failed")
+            },
+            |_: &mut FakePipelines, _| Ok(()),
+            |_| Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(seen, vec![(true, true), (true, false)]);
+        assert!(err_r2.to_string().contains("rung failed"));
+
+        // 9. Device loss inside optional attention or optional flat_q6k aborts immediately.
+        let mut flat_calls = 0usize;
+        let err_attn = GpuPipelines::build_validated_with(
+            true,
+            false,
+            true,
+            || None,
+            |p, s| Ok(make_fake(p, s, true)),
+            |_, _| anyhow::bail!("attn device lost"),
+            |_| {
+                flat_calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(flat_calls, 0);
+        assert!(err_attn.to_string().contains("attn device lost"));
+
+        let err_flat = GpuPipelines::build_validated_with(
+            true,
+            false,
+            true,
+            || None,
+            |p, s| Ok(make_fake(p, s, true)),
+            |_, _| Ok(()),
+            |_| anyhow::bail!("flat_q6k device lost"),
+        )
+        .unwrap_err();
+        assert!(err_flat.to_string().contains("flat_q6k device lost"));
+    }
+
+    #[test]
+    fn build_validated_aborts_when_device_is_lost() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        ctx.simulate_device_lost("test: lost before build_validated");
+        let err = match super::GpuPipelines::build_validated(&ctx, 64) {
+            Ok(_) => panic!("build_validated must fail on a lost device"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("test: lost before build_validated"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn finish_load_with_aborts_on_post_upload_device_loss() {
+        let mut cached = false;
+        let err = super::GpuLfmModel::finish_load_with(
+            123u32,
+            |m| {
+                assert_eq!(*m, 123);
+                cached = true;
+            },
+            |_, stage| anyhow::bail!("{stage}: GPU device lost (post-upload lfm2 loss)"),
+        )
+        .unwrap_err();
+        assert!(cached);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gpu_lfm2 weight upload"), "{msg}");
+        assert!(msg.contains("post-upload lfm2 loss"), "{msg}");
+
+        let ok = super::GpuLfmModel::finish_load_with(
+            123u32,
+            |m| *m += 1,
+            |m, _| {
+                assert_eq!(*m, 124);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ok, 124);
+    }
+
     /// The input-embedding gather reads rows from the mmap'd table
     /// (`MmapWeight::dequantize_row`) instead of a pre-dequantized f32 host
     /// copy: the rows must be bit-identical to `to_f32_vec` slices, or every
@@ -16263,5 +16819,240 @@ mod tests {
         let logits_header = gpu_from_header.forward(&[1], 0, &mut state_header);
         let logits_full = gpu_from_full.forward(&[1], 0, &mut state_full);
         assert_eq!(logits_header, logits_full);
+    }
+
+    #[test]
+    fn async_readback_helpers_defer_seq_len_and_validate_snapshot_lengths() {
+        use std::sync::atomic::Ordering;
+
+        let gpu_seq = std::sync::atomic::AtomicUsize::new(5);
+        let mut state_seq = 5usize;
+
+        // Truncated readback must fail WITHOUT advancing gpu_seq or state_seq.
+        let err_short = pollster::block_on(super::finish_seq_readback_with(
+            16,
+            "GPU logits",
+            &gpu_seq,
+            &mut state_seq,
+            6,
+            || async { Ok(vec![0u8; 8]) },
+            |_| Ok(1u32),
+        ))
+        .unwrap_err();
+        assert!(format!("{err_short:#}").contains("truncated"));
+        assert_eq!(gpu_seq.load(Ordering::Relaxed), 5);
+        assert_eq!(state_seq, 5);
+
+        // Readback channel/map failure must fail WITHOUT advancing gpu_seq or state_seq.
+        let err_recv = pollster::block_on(super::finish_seq_readback_with(
+            4,
+            "GPU argmax",
+            &gpu_seq,
+            &mut state_seq,
+            6,
+            || async { Err::<Vec<u8>, _>(anyhow::anyhow!("GPU device lost (mid-flight)")) },
+            |_| Ok(1u32),
+        ))
+        .unwrap_err();
+        assert!(format!("{err_recv:#}").contains("GPU device lost"));
+        assert_eq!(gpu_seq.load(Ordering::Relaxed), 5);
+        assert_eq!(state_seq, 5);
+
+        // Valid readback decodes and commits both gpu_seq and state_seq.
+        let ok = pollster::block_on(super::finish_seq_readback_with(
+            4,
+            "GPU argmax",
+            &gpu_seq,
+            &mut state_seq,
+            6,
+            || async { Ok(42u32.to_le_bytes().to_vec()) },
+            |slice| Ok(bytemuck::pod_read_unaligned::<u32>(slice)),
+        ))
+        .unwrap();
+        assert_eq!(ok, 42);
+        assert_eq!(gpu_seq.load(Ordering::Relaxed), 6);
+        assert_eq!(state_seq, 6);
+
+        // Snapshot exact-length helper rejects truncated or mismatched buffers and accepts exact/empty.
+        assert_eq!(
+            pollster::block_on(super::recv_exact_snapshot_bytes_with(
+                0,
+                "layer 0 K",
+                None::<fn() -> std::future::Ready<anyhow::Result<Vec<u8>>>>,
+            ))
+            .unwrap(),
+            Vec::<u8>::new()
+        );
+        let snap_short = pollster::block_on(super::recv_exact_snapshot_bytes_with(
+            16,
+            "layer 0 K",
+            Some(|| async { Ok(vec![0u8; 8]) }),
+        ))
+        .unwrap_err();
+        assert!(format!("{snap_short:#}").contains("length mismatch"));
+        assert_eq!(
+            pollster::block_on(super::recv_exact_snapshot_bytes_with(
+                8,
+                "layer 0 conv",
+                Some(|| async { Ok(vec![7u8; 8]) }),
+            ))
+            .unwrap(),
+            vec![7u8; 8]
+        );
+    }
+
+    #[test]
+    fn snapshot_f16_kv_unpack_validates_for_model_and_roundtrips_at_high_seq_len() {
+        use crate::kv_cache::{InferenceState, LayerSnapshot, StateSnapshot};
+        use crate::model::{BlockType, Model};
+
+        let gguf = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
+        let max_seq_len = 8usize;
+        let cpu = crate::model::lfm2::LfmModel::from_gguf(gguf.clone(), max_seq_len).unwrap();
+        let cfg = cpu.config();
+        let seq_len = 6usize; // > max_seq_len / 2: exercises packed-f16 stride vs f32 buffer size
+        assert!(seq_len > max_seq_len / 2);
+
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            if cfg.block_types[i] == BlockType::Attention {
+                let kv_dim = cfg.kv_heads_per_layer[i] * cfg.head_dim;
+                let count = seq_len * kv_dim;
+                let packed_bytes = count * std::mem::size_of::<u16>();
+                let pack_pattern = |bias: f32| -> Vec<u8> {
+                    let mut out = Vec::with_capacity(packed_bytes);
+                    for idx in 0..count {
+                        let v = half::f16::from_f32(((idx % 7) as f32 - 3.0) * 0.25 + bias);
+                        out.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    out
+                };
+                let k_packed = pack_pattern(0.5);
+                let v_packed = pack_pattern(-0.25);
+
+                let k_data = pollster::block_on(super::recv_and_unpack_f16_kv_snapshot_with(
+                    count,
+                    packed_bytes,
+                    "layer K",
+                    Some(|| async { Ok(k_packed.clone()) }),
+                ))
+                .unwrap();
+                let v_data = pollster::block_on(super::recv_and_unpack_f16_kv_snapshot_with(
+                    count,
+                    packed_bytes,
+                    "layer V",
+                    Some(|| async { Ok(v_packed.clone()) }),
+                ))
+                .unwrap();
+                assert_eq!(k_data.len(), count * std::mem::size_of::<f32>());
+                assert_eq!(v_data.len(), count * std::mem::size_of::<f32>());
+
+                // Re-packing the unpacked f32 stream restores the exact original packed-f16 bytes.
+                let repacked_k: Vec<u8> = k_data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|&c| {
+                        half::f16::from_f32(f32::from_le_bytes(c))
+                            .to_bits()
+                            .to_le_bytes()
+                    })
+                    .collect();
+                assert_eq!(repacked_k, k_packed);
+                layers.push(LayerSnapshot::Attention { k_data, v_data });
+            } else {
+                let d_conv = cfg.conv_kernel_size.unwrap_or(3).saturating_sub(1);
+                layers.push(LayerSnapshot::Conv {
+                    buffer: vec![0u8; d_conv * cfg.hidden_size * std::mem::size_of::<f32>()],
+                });
+            }
+        }
+
+        let snap = StateSnapshot::new(layers, seq_len);
+        snap.validate_for_model(cfg).unwrap();
+        let state = InferenceState::from_config(cfg).unwrap();
+        state.validate_snapshot(&snap).unwrap();
+
+        // Mismatched packed length fails loudly in unpack helper.
+        let mismatch = super::unpack_f16_kv_snapshot_bytes(&[0u8; 4], 4, "bad K").unwrap_err();
+        assert!(format!("{mismatch:#}").contains("packed length mismatch"));
+
+        // Live GPU roundtrip at seq_len > max_seq_len / 2 when a GPU adapter is available.
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        let model =
+            super::GpuLfmModel::from_gguf_with_ctx(gguf, max_seq_len, "snap-f16-test".into(), ctx)
+                .unwrap();
+        let mut live_state = InferenceState::from_config(model.config()).unwrap();
+        let tokens: Vec<u32> = (1..=(seq_len as u32)).collect();
+        model.forward_prefill(&tokens, 0, &mut live_state);
+        assert_eq!(live_state.seq_len, seq_len);
+
+        let snap_live = pollster::block_on(model.snapshot_session_state_async()).unwrap();
+        assert_eq!(snap_live.seq_len, seq_len);
+        snap_live.validate_for_model(model.config()).unwrap();
+        live_state.validate_snapshot(&snap_live).unwrap();
+
+        model.reset_session_state();
+        model.restore_session_state(&snap_live);
+        let snap_after = pollster::block_on(model.snapshot_session_state_async()).unwrap();
+        assert_eq!(snap_live, snap_after);
+    }
+
+    #[test]
+    fn gpu_lfm_async_readback_methods_abort_on_lost_device_without_mutating_seq_len() {
+        use crate::kv_cache::InferenceState;
+        use crate::model::Model;
+
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        let probe = ctx.clone();
+        let gguf = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
+        let model =
+            super::GpuLfmModel::from_gguf_with_ctx(gguf, 256, "async-lost-test".into(), ctx)
+                .unwrap();
+        let n_embd = model.config().hidden_size;
+        let vocab = model.config().vocab_size;
+        let mut state = InferenceState::from_config(model.config()).unwrap();
+        // Advance once cleanly so pos=1 tests check that pos is not overwritten to 2.
+        let tok0 = pollster::block_on(model.forward_greedy_async(1, 0, &mut state)).unwrap();
+        assert!((tok0 as usize) < vocab);
+        assert_eq!(state.seq_len, 1);
+
+        probe.simulate_device_lost("test: async model lost");
+        let embed = vec![0.0f32; n_embd];
+
+        let err_greedy =
+            pollster::block_on(model.forward_greedy_async(1, 1, &mut state)).unwrap_err();
+        assert!(format!("{err_greedy:#}").contains("test: async model lost"));
+        assert_eq!(state.seq_len, 1);
+
+        assert!(pollster::block_on(model.forward_logits_async(1, 1, &mut state)).is_err());
+        assert!(pollster::block_on(model.forward_embedding_async(1, 1, &mut state)).is_err());
+        assert!(
+            pollster::block_on(model.forward_hidden_from_embedding_async(&embed, 1, &mut state))
+                .is_err()
+        );
+        assert!(
+            pollster::block_on(model.forward_logits_from_embedding_async(&embed, 1, &mut state))
+                .is_err()
+        );
+        assert!(
+            pollster::block_on(model.forward_greedy_from_embedding_async(&embed, 1, &mut state))
+                .is_err()
+        );
+        assert!(pollster::block_on(model.lm_head_argmax_async(&embed)).is_err());
+        assert!(
+            pollster::block_on(model.forward_prefill_logits_all_async(&[1, 2], 1, &mut state))
+                .is_err()
+        );
+        assert!(
+            pollster::block_on(model.forward_prefill_argmax_all_async(&[1, 2], 1, &mut state))
+                .is_err()
+        );
+        assert!(pollster::block_on(model.snapshot_session_state_async()).is_err());
+        assert_eq!(state.seq_len, 1);
     }
 }

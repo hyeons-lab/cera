@@ -628,7 +628,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Clippy (metal feature)
+        run: cargo clippy -p cera --features metal --all-targets -- -D warnings
       # Filtered like the `simd-i8mm` leg: these are the only `metal`-gated
       # unit tests in the library, and an unfiltered `--lib` would re-run the
       # whole crate suite that `test (macos-latest)` already covers.
@@ -644,15 +647,15 @@ jobs:
           # that module; the module's CPU tests already run in the default legs.
           # `d1::vision::tests::the_gpu_blocks` likewise covers the dual-backend vision stack
           # on Metal (the wgpu leg only exercises its wgpu half).
-          FILTERS="metal::tests:: prefill_qpt_tests:: bidirectional_tests:: d1::head::tests::the_gpu_layers d1::vision::tests::the_gpu_blocks"
+          FILTERS="metal::tests:: prefill_qpt_tests:: bidirectional_tests:: d1::head::tests::the_gpu_layers d1::vision::tests::the_gpu_blocks model::metal_audio_decoder::tests:: model::metal_turboquant::tests::"
           # shellcheck disable=SC2086
           # `|| true`: grep -c exits 1 on zero matches, which under `set -e`
           # would abort here — precisely in the case this check exists to
           # report, and before the annotation below could explain why.
           COUNT=$(cargo test -p cera --features metal --lib -- --list $FILTERS \
                   | grep -c ': test$' || true)
-          if [ "$COUNT" -ne 8 ]; then
-            echo "::error::expected 8 metal-gated lib tests, found $COUNT: did a module get renamed? Update the filters in this job." >&2
+          if [ "$COUNT" -ne 11 ]; then
+            echo "::error::expected 11 metal-gated lib tests, found $COUNT: did a module get renamed? Update the filters in this job." >&2
             exit 1
           fi
           # `--nocapture` so `test_metal_context_init`'s device name reaches the
