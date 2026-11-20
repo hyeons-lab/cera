@@ -197,3 +197,156 @@ fn audio_start_is_honored_by_sequential_but_not_text_only() {
     );
     assert_eq!(frames_for(script, cadence, AudioOutputMode::TextOnly), 0);
 }
+
+#[derive(Default)]
+struct CyclingAudio {
+    frames: AtomicUsize,
+}
+
+impl AudioAccelerator for CyclingAudio {
+    fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        [0; 8]
+    }
+    fn detokenize_to_spectrum(&self, _: &DetokenizerWeights, _: &[i32]) -> Vec<f32> {
+        vec![0.0; 6]
+    }
+    fn reset_depthformer(&self) {}
+    fn reset_detokenizer(&self) {}
+    fn supports_depthformer(&self) -> bool {
+        true
+    }
+}
+
+struct MultiRoundAudioModel(Arc<ScriptModel>);
+
+impl Model for MultiRoundAudioModel {
+    fn config(&self) -> &ModelConfig {
+        self.0.config()
+    }
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        self.0.forward(tokens, pos, state)
+    }
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.0.forward_embedding(tokens, pos, state)
+    }
+    fn forward_hidden_from_embedding(
+        &self,
+        _embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.0.forward(&[3], pos, state);
+        vec![0.0; self.0.config().hidden_size]
+    }
+    fn forward_from_embedding(
+        &self,
+        _embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.0.forward(&[3], pos, state)
+    }
+}
+
+/// Greedy (`temperature = 0.0`) interleaved turns must advance through full
+/// `cadence.audio` frame rounds and resume text from `forward_from_embedding`.
+#[test]
+fn greedy_interleaved_round_trip_resumes_text_after_audio_cadence() {
+    // Prediction table indexed by `state.seq_len`:
+    // prefill token 3 at pos 0 -> seq_len 1 -> token 0 (text #1)
+    // pos 1 (tok 0) -> seq_len 2 -> token 1 (text #2)
+    // pos 2 (tok 1) -> seq_len 3 -> token 0 (text #3, triggers 2 audio frames)
+    // forward_embedding at pos 3 -> seq_len 4; forward_hidden_from_embedding at pos 4 -> seq_len 5
+    // forward_from_embedding at pos 5 -> seq_len 6 -> returns token 1 (resumed text #4)
+    // pos 6 (tok 1) -> seq_len 7 -> token 2 (<eos>)
+    let predictions = vec![0, 0, 1, 0, 0, 0, 1, 2];
+    let (core, original) = ScriptModel::session(predictions, false, 128);
+    let model = Arc::new(MultiRoundAudioModel(core));
+    let mut session = Session::new(
+        model,
+        original.tokenizer_arc(),
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: false,
+            audio_out: true,
+            image_in: false,
+        },
+        original.config.clone(),
+    )
+    .unwrap();
+    session.config.gpu_depthformer = true;
+    session.append_tokens(&[3]).unwrap();
+
+    let dec_w = AudioDecoderWeights {
+        lfm3a_gen: false,
+        depthformer_config: DepthformerConfig {
+            n_layer: 0,
+            n_embd: 2,
+            n_head: 1,
+            n_head_kv: 1,
+            n_embd_head: 2,
+            ffn_dim: 2,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 10_000.0,
+            max_seq_len: 16,
+        },
+        decoder_config: DecoderConfig {
+            n_codebook: 8,
+            n_vocab: 2,
+            n_embd: 2,
+            rms_norm_eps: 1e-5,
+        },
+        depthformer_layers: vec![],
+        depth_linear_w: weight(),
+        depth_linear_b: vec![0.0; 2],
+        depth_embeddings: vec![],
+        audio_embedding: codebook(),
+        interleave: InterleaveCadence { text: 3, audio: 2 },
+    };
+    let detok_w = DetokenizerWeights {
+        config: DetokenizerConfig {
+            n_layer: 0,
+            n_embd: 2,
+            n_head: 1,
+            n_head_kv: 1,
+            n_embd_head: 2,
+            ffn_dim: 2,
+            d_conv: 2,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 10_000.0,
+            swa_window_size: 8,
+            n_codes: 8,
+            n_fft: 4,
+            hop_length: 2,
+            sample_rate: 16_000,
+            layer_is_conv: vec![],
+        },
+        output_norm: vec![1.0; 2],
+        emb_weight: weight(),
+        lin_w: weight(),
+        lin_b: vec![0.0; 2],
+        layers: vec![],
+        lfm3_fsq: None,
+    };
+    session.attach_vocoder(Arc::new(dec_w), Arc::new(detok_w));
+    let accel = Arc::new(CyclingAudio::default());
+    session.attach_audio_accelerator(accel.clone());
+
+    let mut sink = Sink::default();
+    let interleaved_opts = GenerateOpts {
+        temperature: 0.0,
+        audio_mode: AudioOutputMode::Interleaved,
+        ..opts()
+    };
+    let summary = session.generate(&interleaved_opts, &mut sink).unwrap();
+    assert_eq!(summary.finish_reason, FinishReason::Stop);
+    assert_eq!(accel.frames.load(Ordering::Relaxed), 2);
+    assert_eq!(sink.tokens, [0, 1, 0, 1]);
+}

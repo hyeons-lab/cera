@@ -987,3 +987,194 @@ fn write_wav_file(path: &str, samples: &[f32], sample_rate: u32) -> std::io::Res
     }
     Ok(())
 }
+
+fn load_audio_session_bundle() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    let q4_dir = home.join(".leap/models/LFM2.5-Audio-1.5B-Q4_0");
+    let q8_dir =
+        home.join(".cache/cera/huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF-LEAP/resolve/main");
+    let candidates = [
+        (
+            q4_dir.join("LFM2.5-Audio-1.5B-Q4_0.gguf"),
+            q4_dir.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf"),
+            q4_dir.join("vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf"),
+        ),
+        (
+            q8_dir.join("LFM2.5-Audio-1.5B-Q8_0.gguf"),
+            q8_dir.join("mmproj-LFM2.5-Audio-1.5B-Q8_0.gguf"),
+            q8_dir.join("vocoder-LFM2.5-Audio-1.5B-Q8_0.gguf"),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .find(|(m, p, v)| m.exists() && p.exists() && v.exists())
+}
+
+fn read_wav_pcm16_mono(path: &std::path::Path) -> (Vec<f32>, u32) {
+    let data = std::fs::read(path).expect("read wav fixture");
+    let sr = u32::from_le_bytes(data[24..28].try_into().unwrap());
+    let mut off = 12;
+    while off + 8 <= data.len() {
+        let id = &data[off..off + 4];
+        let sz = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
+        if id == b"data" {
+            let pcm = data[off + 8..off + 8 + sz]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+                .collect();
+            return (pcm, sr);
+        }
+        off += 8 + sz + (sz % 2);
+    }
+    panic!("WAV missing data chunk: {}", path.display());
+}
+
+/// Regression: end-to-end `Session` voice turns with LFM2.5-Audio under greedy
+/// decoding (`temperature = 0.0`) complete with coherent text and audio when
+/// `AudioOutputMode::Interleaved` is set, whereas omitting it (`Sequential`)
+/// leaves LFM2.5-Audio stalling on U+00A0 with no audio.
+#[test]
+fn test_session_interleaved_greedy_speech_avoids_sequential_blank_loop() {
+    use cera::manifest::InferenceType;
+    use cera::tokenizer::{ChatMessage, apply_chat_template};
+    use cera::{
+        AudioOutputMode, BackendPreference, FinishReason, LoadConfig, ModalitySink, ModelFiles,
+        ModelLoader, ModelSource, SessionConfig,
+    };
+    use std::collections::HashMap;
+
+    struct CaptureSink {
+        tok: Arc<cera::tokenizer::BpeTokenizer>,
+        pieces: Vec<String>,
+        audio: Vec<f32>,
+    }
+    impl ModalitySink for CaptureSink {
+        fn on_text_tokens(&mut self, tokens: &[u32]) {
+            for &t in tokens {
+                self.pieces.push(self.tok.decode(&[t]));
+            }
+        }
+        fn on_audio_frames(&mut self, samples: &[f32], _sr: u32) {
+            self.audio.extend_from_slice(samples);
+        }
+        fn on_done(&mut self, _reason: FinishReason) {}
+    }
+
+    let Some((model, projector, vocoder)) = load_audio_session_bundle() else {
+        eprintln!("No complete LFM2.5-Audio bundle found; skipping Session interleaved test");
+        return;
+    };
+
+    let files = ModelFiles {
+        model,
+        multimodal_projector: Some(projector),
+        audio_decoder: Some(vocoder),
+        audio_tokenizer: None,
+        draft_model: None,
+        extras: HashMap::new(),
+        inference_type: Some(InferenceType::LlamaCppLfm2AudioV1),
+        chat_template: None,
+    };
+    let engine = ModelLoader::new(ModelSource::Files(files))
+        .config(LoadConfig {
+            context_size: 4096,
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .build_generative()
+        .expect("load LFM2.5-Audio generative engine")
+        .engine();
+    let tok = engine.tokenizer_arc();
+
+    let wav_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/audio/today_is_a_beautiful_day.wav");
+    let (speech_pcm, sr) = read_wav_pcm16_mono(&wav_path);
+    let quiet_pcm: Vec<f32> = speech_pcm.iter().map(|&s| s * 0.02).collect();
+    let silence_pcm = vec![0.0f32; sr as usize];
+
+    let sentinel = "__CERA_MEDIA_TEST__AUDIO_0_";
+    let msgs = [
+        ChatMessage {
+            role: "system".into(),
+            content: "Respond with interleaved text and audio.".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: sentinel.into(),
+        },
+    ];
+    let rendered = apply_chat_template(&tok, &msgs, true).expect("chat template");
+    let parts: Vec<&str> = rendered.split(sentinel).collect();
+    assert_eq!(parts.len(), 2);
+    let prefix = tok.encode_special(parts[0], false);
+    let suffix = tok.encode_special(parts[1], false);
+
+    let run = |pcm: &[f32], audio_mode: AudioOutputMode, max_tokens: u32| {
+        let mut session = engine
+            .new_session(SessionConfig {
+                max_seq_len: Some(4096),
+                ..Default::default()
+            })
+            .expect("new_session");
+        if !prefix.is_empty() {
+            session.append_tokens(&prefix).expect("append prefix");
+        }
+        session.append_audio(pcm, sr).expect("append audio");
+        if !suffix.is_empty() {
+            session.append_tokens(&suffix).expect("append suffix");
+        }
+        let mut sink = CaptureSink {
+            tok: Arc::clone(&tok),
+            pieces: Vec::new(),
+            audio: Vec::new(),
+        };
+        let opts = cera::GenerateOpts {
+            max_tokens,
+            temperature: 0.0,
+            flush_every_tokens: 1,
+            audio_mode,
+            ..Default::default()
+        };
+        let summary = session.generate(&opts, &mut sink).expect("generate");
+        (summary, sink)
+    };
+
+    // Without Interleaved mode, greedy LFM2.5-Audio stalls on U+00A0 with no audio.
+    let (seq_summary, seq_sink) = run(&speech_pcm, AudioOutputMode::Sequential, 32);
+    let seq_blanks = seq_sink
+        .pieces
+        .iter()
+        .filter(|s| s.trim().is_empty())
+        .count();
+    assert_eq!(seq_summary.finish_reason, FinishReason::MaxTokens);
+    assert!(seq_sink.audio.is_empty());
+    assert!(
+        seq_blanks >= 20,
+        "expected Sequential greedy speech to stall in blank tokens, got {seq_blanks}"
+    );
+
+    // With Interleaved mode, greedy decoding produces clean speech + audio across inputs.
+    for (name, pcm) in [
+        ("speech", speech_pcm.as_slice()),
+        ("quiet", quiet_pcm.as_slice()),
+        ("silence", silence_pcm.as_slice()),
+    ] {
+        let (summary, sink) = run(pcm, AudioOutputMode::Interleaved, 128);
+        let text: String = sink.pieces.concat();
+        let blanks = sink.pieces.iter().filter(|s| s.trim().is_empty()).count();
+        let rms = (sink.audio.iter().map(|&s| s * s).sum::<f32>() / sink.audio.len().max(1) as f32)
+            .sqrt();
+        assert_eq!(
+            summary.finish_reason,
+            FinishReason::Stop,
+            "{name}: {text:?}"
+        );
+        assert!(
+            !text.trim().is_empty() && blanks == 0,
+            "{name}: unexpected blanks={blanks} in {text:?}"
+        );
+        assert!(rms > 0.001, "{name}: expected voiced audio rms, got {rms}");
+    }
+}
