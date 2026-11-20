@@ -14561,6 +14561,7 @@ mod tests {
             Vec<i8>,
             Vec<f32>,
         ) {
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let (mut packed, scales, bs, bq, out) = repacked_guard_base_args();
             #[cfg(target_arch = "x86_64")]
             packed.truncate(128);
