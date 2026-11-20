@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.5
+
+- Include the `cera_ffi` 0.7.5 changes: AMD XDNA2 NPU decode backend on Windows, Android `wgpu` GLES exclusion, WebGPU compute pipeline error-scope validation before VRAM upload, stricter GGUF audio prevalidation across CPU, WebGPU, and Metal, and consistent GPU device-loss propagation into CPU fallback.
+- Align platform manifests and the dependency on `cera_ffi` at 0.7.5.
+
 ## 0.7.4
 
 - Include the `cera_ffi` 0.7.4 changes: `CeraEngine.fromFiles` for memory-mapped multimodal loading, the CPU pool pin released when a call returns, the refreshed Hexagon NPU skels, and load errors that carry the whole error chain.
