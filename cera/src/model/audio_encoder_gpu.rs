@@ -1891,6 +1891,7 @@ impl WgpuAudioOps {
             p_mel_project,
             p_mel_norm,
         ] = pipelines;
+        vit.ctx.save_pipeline_cache();
         Ok(Self {
             vit,
             p_silu,

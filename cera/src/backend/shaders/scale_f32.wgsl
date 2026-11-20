@@ -11,12 +11,24 @@
 // Dispatch: (ceil(n / 256), 1, 1) workgroups
 
 @group(0) @binding(0) var<storage, read_write> a: array<f32>;
+#ifdef IMMEDIATES
+struct ImmParams {
+    v: vec2<u32>,
+}
+var<immediate> imm: ImmParams;
+#else
 @group(0) @binding(1) var<storage, read> params: vec2<u32>;
+#endif
 
 @compute @workgroup_size(256, 1, 1)
 fn scale_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    let n = params.x;
+#ifdef IMMEDIATES
+    let p = imm.v;
+#else
+    let p = params;
+#endif
+    let n = p.x;
     if i >= n { return; }
-    a[i] = a[i] * bitcast<f32>(params.y);
+    a[i] = a[i] * bitcast<f32>(p.y);
 }

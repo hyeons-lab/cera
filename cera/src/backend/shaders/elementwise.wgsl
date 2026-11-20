@@ -10,12 +10,28 @@
 
 @group(0) @binding(0) var<storage, read_write> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
+#ifdef IMMEDIATES
+struct ImmParams {
+    v: vec2<u32>,
+}
+var<immediate> imm: ImmParams;
+#else
 @group(0) @binding(2) var<storage, read> params: vec2<u32>;
+#endif
+
+fn get_params() -> vec2<u32> {
+#ifdef IMMEDIATES
+    return imm.v;
+#else
+    return params;
+#endif
+}
 
 @compute @workgroup_size(256, 1, 1)
 fn add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * (65535u * 256u);
-    let n = params.x;
+    let p = get_params();
+    let n = p.x;
     if i >= n { return; }
     a[i] = a[i] + b[i];
 }
@@ -26,15 +42,17 @@ fn add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256, 1, 1)
 fn scaled_add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * (65535u * 256u);
-    let n = params.x;
+    let p = get_params();
+    let n = p.x;
     if i >= n { return; }
-    a[i] = a[i] + bitcast<f32>(params.y) * b[i];
+    a[i] = a[i] + bitcast<f32>(p.y) * b[i];
 }
 
 @compute @workgroup_size(256, 1, 1)
 fn mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * (65535u * 256u);
-    let n = params.x;
+    let p = get_params();
+    let n = p.x;
     if i >= n { return; }
     a[i] = a[i] * b[i];
 }
@@ -42,7 +60,8 @@ fn mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256, 1, 1)
 fn silu_mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * (65535u * 256u);
-    let n = params.x;
+    let p = get_params();
+    let n = p.x;
     if i >= n { return; }
     let g = a[i];
     let clamped_g = clamp(g, -80.0, 80.0);
@@ -52,8 +71,9 @@ fn silu_mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256, 1, 1)
 fn sigmoid_head_gate_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * (65535u * 256u);
-    let n = params.x;
-    let head_dim = params.y;
+    let p = get_params();
+    let n = p.x;
+    let head_dim = p.y;
     if i >= n || head_dim == 0u { return; }
     let g = clamp(b[i / head_dim], -80.0, 80.0);
     a[i] = a[i] / (1.0 + exp(-g));

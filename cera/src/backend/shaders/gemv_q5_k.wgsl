@@ -40,6 +40,12 @@
 // shift. Blocks whose size is only 2-byte aligned have to fund one themselves,
 // and the siblings differ on how.
 
+#ifdef SUBGROUP
+#ifdef WEBGPU_SUBGROUPS
+enable subgroups;
+#endif
+#endif
+
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
@@ -57,9 +63,16 @@ const Q5K_BYTES: u32 = 176u;
 // surplus is deliberate and exists to drive the early return below. Changing NR
 // alone compiles and silently drops rows.
 const NR: u32 = 2u;
+#ifdef SUBGROUP
+const WG_SIZE: u32 = 32u;
+const MAX_SUBGROUPS: u32 = 32u;
+
+var<workgroup> sg_sums: array<f32, NR * MAX_SUBGROUPS>;
+#else
 const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, NR * WG_SIZE>;
+#endif
 
 // Extract byte `b` (0..=11) of the 12-byte scales array from its three
 // preloaded words `s0`/`s1`/`s2` — equals the old `rb(scales_off + b)`.
@@ -144,6 +157,83 @@ fn q5k_block_dot(
     return scale * qsum - minv * xsum;
 }
 
+#ifdef SUBGROUP
+@compute @workgroup_size(32, 1, 1)
+fn gemv_q5_k(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
+) {
+    let m = params.x;
+    let k = params.y;
+    let first_row = get_wid(wid) * NR;
+    if first_row >= m {
+        return;
+    }
+
+    let nb = k / QK_K;
+    let row_bytes = nb * Q5K_BYTES;
+    let t = lid.x;
+
+    let e0 = t * 8u;
+    let j = e0 / 64u;
+    let o = e0 % 64u;
+    let hi = o / 32u;
+    let sub = 2u * j + hi;
+    let qbase = 32u * j + (o % 32u);
+    let qhbase = o % 32u;
+    let hbit = 1u << sub;
+    let nsh = hi * 4u;
+
+    let row0 = first_row * row_bytes;
+    let row1 = min(first_row + 1u, m - 1u) * row_bytes;
+
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+
+    for (var ib = 0u; ib < nb; ib += 1u) {
+        let xb = ib * QK_K + e0;
+        let xl = vec4<f32>(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+        let xh = vec4<f32>(x[xb + 4u], x[xb + 5u], x[xb + 6u], x[xb + 7u]);
+        let xsum = dot(xl, vec4<f32>(1.0)) + dot(xh, vec4<f32>(1.0));
+
+        let off = ib * Q5K_BYTES;
+        acc0 += q5k_block_dot(row0 + off, sub, qbase, qhbase, nsh, hbit, xl, xh, xsum);
+        acc1 += q5k_block_dot(row1 + off, sub, qbase, qhbase, nsh, hbit, xl, xh, xsum);
+    }
+
+    let s0 = subgroupAdd(acc0);
+    let s1 = subgroupAdd(acc1);
+
+    let nsg = (WG_SIZE + sg_size - 1u) / sg_size;
+    if nsg == 1u {
+        if t == 0u {
+            y[first_row] = s0;
+            if first_row + 1u < m { y[first_row + 1u] = s1; }
+        }
+        return;
+    }
+
+    let sgid = t / sg_size;
+    if sg_lane == 0u {
+        sg_sums[0u * MAX_SUBGROUPS + sgid] = s0;
+        sg_sums[1u * MAX_SUBGROUPS + sgid] = s1;
+    }
+    workgroupBarrier();
+
+    if t == 0u {
+        var t0: f32 = 0.0;
+        var t1: f32 = 0.0;
+        for (var sg = 0u; sg < nsg; sg += 1u) {
+            t0 += sg_sums[0u * MAX_SUBGROUPS + sg];
+            t1 += sg_sums[1u * MAX_SUBGROUPS + sg];
+        }
+        y[first_row] = t0;
+        if first_row + 1u < m { y[first_row + 1u] = t1; }
+    }
+}
+#else
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q5_k(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -228,3 +318,4 @@ fn gemv_q5_k(
         if first_row + 1u < m { y[first_row + 1u] = partials[WG_SIZE]; }
     }
 }
+#endif

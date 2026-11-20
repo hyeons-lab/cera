@@ -640,6 +640,7 @@ impl WgpuAudioDecoder {
             || WgpuDepthformer::try_from_gguf(&ctx, &pipes, df_src),
         )?;
 
+        ctx.save_pipeline_cache();
         Ok(Self {
             ctx,
             cfg,
