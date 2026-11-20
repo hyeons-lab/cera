@@ -6146,14 +6146,14 @@ mod tests {
         assert!(!restored);
         assert!(!drained);
 
-        let mut order = Vec::new();
+        let order = std::cell::RefCell::new(Vec::new());
         super::webgpu::import_checkpoint_with(
             || Ok(()),
-            || order.push("restore"),
-            || order.push("drain"),
+            || order.borrow_mut().push("restore"),
+            || order.borrow_mut().push("drain"),
         )
         .unwrap();
-        assert_eq!(order, vec!["restore", "drain"]);
+        assert_eq!(*order.borrow(), vec!["restore", "drain"]);
 
         // 6. generateTokens rejects a lost device even when `ids` is empty (TWIN-COR-2).
         let empty_lost = super::webgpu::check_generate_entry_with(
