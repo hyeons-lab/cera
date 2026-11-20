@@ -12739,14 +12739,9 @@ impl Model for GpuLfmModel {
             return crate::sampler::argmax(&logits);
         }
         let mut padded = [u32::MAX; 4];
-        padded[..ban_ids.len()].copy_from_slice(ban_ids);
-        let key = [
-            ban_ids.len() as u32,
-            padded[0],
-            padded[1],
-            padded[2],
-            padded[3],
-        ];
+        let len = ban_ids.len().min(4);
+        padded[..len].copy_from_slice(&ban_ids[..len]);
+        let key = [len as u32, padded[0], padded[1], padded[2], padded[3]];
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         {
             let mut cached = self

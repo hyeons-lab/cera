@@ -381,6 +381,41 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+std::thread_local! {
+    static GEMV_MAX_ACTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the scoped worker cap for `gemv_dispatch_active` fallbacks (`0` = unbounded).
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[inline]
+fn current_gemv_max_active() -> usize {
+    GEMV_MAX_ACTIVE.with(std::cell::Cell::get)
+}
+
+/// Runs `f` while capping pool fan-out for GEMV dispatchers via TLS.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn with_gemv_max_active<R>(max_active: usize, f: impl FnOnce() -> R) -> R {
+    if max_active == 0 {
+        return f();
+    }
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GEMV_MAX_ACTIVE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = GEMV_MAX_ACTIVE.with(|c| c.replace(max_active));
+    let _guard = Restore(prev);
+    f()
+}
+
+/// Runs `f` directly when no persistent row pool is active (`wasm32` or serial builds).
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn with_gemv_max_active<R>(_max_active: usize, f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Row-parallel `for_each`: applies `f` to each element of `y`. Under
 /// `parallel` this dispatches through the persistent
 /// [`super::threadpool::RowPool`] (see that module for why not rayon), where
@@ -389,9 +424,22 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 /// are smaller. Otherwise it runs serially.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
-    super::threadpool::RowPool::decode().dispatch_rows(y, 1, min_rows, |row, slice| {
-        f((row, &mut slice[0]));
-    });
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        super::threadpool::RowPool::prefill().dispatch_rows_active(
+            y,
+            1,
+            min_rows,
+            cap,
+            |row, slice| {
+                f((row, &mut slice[0]));
+            },
+        );
+    } else {
+        super::threadpool::RowPool::decode().dispatch_rows(y, 1, min_rows, |row, slice| {
+            f((row, &mut slice[0]));
+        });
+    }
 }
 
 /// Dispatch mutable 4-row chunks across `pool` (optionally capped at `max_active` workers).
@@ -438,7 +486,12 @@ pub fn par_rows_slice(
     min_rows: usize,
     f: impl Fn((usize, &mut [f32])) + Sync + Send,
 ) {
-    par_rows_slice_in(&super::threadpool::RowPool::decode(), 0, y, min_rows, f);
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        par_rows_slice_active(cap, y, min_rows, f);
+    } else {
+        par_rows_slice_in(&super::threadpool::RowPool::decode(), 0, y, min_rows, f);
+    }
 }
 
 /// Row-parallel slice dispatch capped to `max_active` workers on the active-barrier pool.
@@ -465,7 +518,12 @@ pub fn par_range(total_rows: usize, min_rows: usize, f: impl Fn(usize, usize) + 
     if total_rows == 0 {
         return;
     }
-    super::threadpool::RowPool::decode().dispatch_range(total_rows, min_rows, f);
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        super::threadpool::RowPool::prefill().dispatch_range_active(total_rows, min_rows, cap, f);
+    } else {
+        super::threadpool::RowPool::decode().dispatch_range(total_rows, min_rows, f);
+    }
 }
 
 /// Wasm32 fallback for `par_range`: runs serially on the calling thread.
@@ -919,14 +977,19 @@ pub fn par_rows_n_chunked_decode(
     min_chunk_rows: usize,
     f: impl Fn((usize, &mut [f32])) + Sync + Send,
 ) {
-    par_rows_n_chunked_on(
-        super::threadpool::RowPool::decode(),
-        y,
-        n,
-        min_rows,
-        min_chunk_rows,
-        f,
-    );
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        par_rows_n_chunked_active(y, n, min_rows, min_chunk_rows, cap, f);
+    } else {
+        par_rows_n_chunked_on(
+            super::threadpool::RowPool::decode(),
+            y,
+            n,
+            min_rows,
+            min_chunk_rows,
+            f,
+        );
+    }
 }
 
 /// See the `wasm32` note on [`par_rows`]; rayon has no decode/prefill pool split
@@ -5566,8 +5629,9 @@ pub fn gemv_dispatch_active(
         });
         return;
     }
-    let _ = max_active;
-    gemv_dispatch(dtype, data, x, y, m, k, q8_scratch);
+    with_gemv_max_active(max_active, || {
+        gemv_dispatch(dtype, data, x, y, m, k, q8_scratch)
+    });
 }
 
 /// Dispatch quantized/float GEMV `y = W * x` across the host's optimal SIMD tier.
@@ -17152,18 +17216,43 @@ mod tests {
         }
     }
 
+    /// Verifies `f` panics with `expected` when tiled range attention is supported at runtime.
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
+    fn assert_flash_range_panics<F: FnOnce()>(expected: &str, f: F) {
+        if !flash_attention_range_supported(64) {
+            return;
+        }
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("expected flash_attention_gqa_cpu_opt_range to panic");
+        let msg = if let Some(s) = err.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = err.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            msg.contains(expected),
+            "panic message {msg:?} did not contain {expected:?}"
+        );
+    }
+
     #[cfg(any(
         target_arch = "aarch64",
         all(target_arch = "x86_64", feature = "avx512")
     ))]
     #[test]
-    #[should_panic(expected = "bad query range")]
     fn flash_range_panics_on_inverted_range() {
         let mut out = [0.0f32; 64];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 1, 0,
-        );
+        assert_flash_range_panics("bad query range", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 1, 0,
+            );
+        });
     }
 
     #[cfg(any(
@@ -17171,13 +17260,14 @@ mod tests {
         all(target_arch = "x86_64", feature = "avx512")
     ))]
     #[test]
-    #[should_panic(expected = "bad query range")]
     fn flash_range_panics_on_q_hi_out_of_bounds() {
         let mut out = [0.0f32; 64];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 2,
-        );
+        assert_flash_range_panics("bad query range", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 2,
+            );
+        });
     }
 
     #[cfg(any(
@@ -17185,13 +17275,14 @@ mod tests {
         all(target_arch = "x86_64", feature = "avx512")
     ))]
     #[test]
-    #[should_panic(expected = "out buffer too small")]
     fn flash_range_panics_on_undersized_output() {
         let mut out = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("out buffer too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
     #[cfg(any(
@@ -17199,14 +17290,15 @@ mod tests {
         all(target_arch = "x86_64", feature = "avx512")
     ))]
     #[test]
-    #[should_panic(expected = "q_mat too small")]
     fn flash_range_panics_on_undersized_q_mat() {
         let mut out = [0.0f32; 64];
         let short_q = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &short_q, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("q_mat too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &short_q, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
     #[cfg(any(
@@ -17214,14 +17306,15 @@ mod tests {
         all(target_arch = "x86_64", feature = "avx512")
     ))]
     #[test]
-    #[should_panic(expected = "k_cache too small")]
     fn flash_range_panics_on_undersized_k_cache() {
         let mut out = [0.0f32; 64];
         let short_k = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &short_k, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("k_cache too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &short_k, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
     #[cfg(any(
@@ -17229,14 +17322,15 @@ mod tests {
         all(target_arch = "x86_64", feature = "avx512")
     ))]
     #[test]
-    #[should_panic(expected = "v_cache too small")]
     fn flash_range_panics_on_undersized_v_cache() {
         let mut out = [0.0f32; 64];
         let short_v = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &short_v, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("v_cache too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &short_v, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
     /// `flash_attention_prefill_items` must match `flash_attention_gqa_cpu_opt_range` bit for bit,
@@ -18718,6 +18812,80 @@ mod q8_activation_quantizer_tests {
                     "rollback state mismatch at pos={rollback_pos}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemv_active_tests {
+    use super::*;
+    use crate::quant::{BlockQ4_0, BlockQ6K};
+    use crate::tensor::DType;
+
+    #[test]
+    fn gemv_dispatch_active_honors_cap_and_matches_unbounded() {
+        let m = gemv_par_threshold().max(512);
+        let k = 256;
+        let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.125).collect();
+        let f32_weights: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.0625)
+            .collect();
+        let f32_bytes: Vec<u8> = f32_weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let q4_bytes = vec![0x23u8; m * (k / 32) * size_of::<BlockQ4_0>()];
+        let q6_bytes = vec![0x11u8; m * (k / 256) * size_of::<BlockQ6K>()];
+
+        for (dtype, weights) in [
+            (DType::F32, f32_bytes.as_slice()),
+            (DType::Q4_0, q4_bytes.as_slice()),
+            (DType::Q6K, q6_bytes.as_slice()),
+        ] {
+            let mut expected = vec![0.0f32; m];
+            let mut capped1 = vec![0.0f32; m];
+            let mut capped2 = vec![0.0f32; m];
+            gemv_dispatch(dtype, weights, &x, &mut expected, m, k, None);
+            gemv_dispatch_active(1, dtype, weights, &x, &mut capped1, m, k, None);
+            gemv_dispatch_active(2, dtype, weights, &x, &mut capped2, m, k, None);
+            for (i, (&a, &b)) in capped1.iter().zip(&expected).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4,
+                    "{dtype:?} max_active=1[{i}]: {a} vs {b}"
+                );
+            }
+            for (i, (&a, &b)) in capped2.iter().zip(&expected).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4,
+                    "{dtype:?} max_active=2[{i}]: {a} vs {b}"
+                );
+            }
+        }
+
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use std::collections::HashSet;
+            use std::sync::Mutex;
+            let caller = std::thread::current().id();
+            let mut y = vec![0.0f32; m];
+            with_gemv_max_active(1, || {
+                let seen = Mutex::new(HashSet::new());
+                par_rows(&mut y, 1, |_| {
+                    seen.lock().unwrap().insert(std::thread::current().id());
+                });
+                let s = seen.into_inner().unwrap();
+                assert_eq!(s.len(), 1);
+                assert!(s.contains(&caller));
+
+                let seen_chunk = Mutex::new(HashSet::new());
+                par_rows_n_chunked_decode(&mut y, 4, 1, 1, |_| {
+                    seen_chunk
+                        .lock()
+                        .unwrap()
+                        .insert(std::thread::current().id());
+                });
+                let sc = seen_chunk.into_inner().unwrap();
+                assert_eq!(sc.len(), 1);
+                assert!(sc.contains(&caller));
+            });
+            assert_eq!(current_gemv_max_active(), 0);
         }
     }
 }
