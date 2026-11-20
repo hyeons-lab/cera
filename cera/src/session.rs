@@ -4194,9 +4194,9 @@ impl Session {
                     Self::resize_pools_for_cpuset();
                     let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
-                        // A vocoder sampling fault aborts the turn outright:
-                        // synchronize the verified frontier and token history
-                        // before returning the backend error.
+                        // A vocoder frame fault (sampling fault or mid-utterance/lost-device
+                        // detokenize fault) aborts the turn outright: synchronize the verified
+                        // frontier and token history before returning the backend error.
                         crate::audio_engine::FrameOutcome::Fault(detail) => {
                             return Err(Self::sync_frontier_on_err(
                                 &mut self.current_pos,
@@ -4406,10 +4406,23 @@ impl Session {
 
         if let Some(mut dec) = decoder
             && dec.audio_frames() > 0
-        {
-            dec.finish(|pcm, rate| {
+            && let Err(err) = dec.try_finish(|pcm, rate| {
                 sink.on_audio_frames(pcm, rate);
-            });
+            })
+        {
+            let cera_err = match err.downcast::<CeraError>() {
+                Ok(ce) => ce,
+                Err(other) => CeraError::Backend(format!("{other:#}")),
+            };
+            let finished_history_len = self.token_history.len();
+            return Err(Self::sync_frontier_on_err(
+                &mut self.current_pos,
+                &self.position_atomic,
+                &mut self.token_history,
+                pos,
+                finished_history_len,
+                cera_err,
+            ));
         }
 
         self.current_pos = pos;

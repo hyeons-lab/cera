@@ -1160,6 +1160,37 @@ struct PendingPasses {
 #[cfg(feature = "gpu")]
 const VIT_PASSES_PER_SUBMIT: u32 = 24;
 
+/// Orchestration seam behind [`WgpuVitOps::new`] so core rejection, panic payload
+/// preservation, stream/flash degradation, and lost-device aborts are testable on
+/// host without a GPU.
+#[cfg(feature = "gpu")]
+fn init_vit_pipelines_with<Core, Stream, Flash>(
+    stream_enabled: bool,
+    flash_enabled: bool,
+    mut device_lost_detail: impl FnMut() -> Option<String>,
+    build_core: impl FnOnce() -> Result<Core>,
+    build_stream: impl FnOnce() -> Result<Option<Stream>>,
+    build_flash: impl FnOnce() -> Result<Option<Flash>>,
+) -> Result<(Core, Option<Stream>, Option<Flash>)> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        if let Some(detail) = device_lost_detail() {
+            anyhow::bail!("vit pipelines: GPU device lost ({detail})");
+        }
+        let core = build_core()?;
+        let stream = if stream_enabled {
+            build_stream()?
+        } else {
+            None
+        };
+        let flash = if flash_enabled { build_flash()? } else { None };
+        Ok((core, stream, flash))
+    }))
+    .map_err(|payload| {
+        let detail = crate::backend::wgpu::panic_payload_message(payload);
+        anyhow::anyhow!("wgpu ViT pipeline creation failed (shader compile/validation): {detail}")
+    })?
+}
+
 #[cfg(feature = "gpu")]
 impl WgpuVitOps {
     /// The head-dim ceiling of the query-tiled attention kernel.
@@ -1178,35 +1209,11 @@ impl WgpuVitOps {
 
     pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Result<Self> {
         use crate::backend::wgpu::shaders;
-        // `create_pipeline*` return the pipeline directly and panic only on host-side
-        // shader preprocessing failure (pinned wgpu 30 reports adapter-side
-        // validation/compile failure to the error sink and hands back an invalid
-        // pipeline instead of panicking). Catch the host panic here and surface an `Err`
-        // so the caller's `?` degrades to the CPU encoder, mirroring
-        // `MetalVitOps::new`'s `.ok()?`, instead of aborting `CeraEngine`
-        // construction. The flash build below checks its error scope explicitly because
-        // it is the one kernel that can exceed an adapter's workgroup limit.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || -> Result<Self> {
-            let (wg_m, wg_n) = (format!("{VIT_MM_WG_M}u"), format!("{VIT_MM_WG_N}u"));
-            let (tile_m, tile_n) = (format!("{VIT_MM_TILE_M}u"), format!("{VIT_MM_TILE_N}u"));
-            let tile_k = format!("{VIT_MM_TILE_K}u");
-            let mk_mul_mat = |label: &str, src0_ty: &str, init_src0: &str| {
-                ctx.create_pipeline_with_defines(
-                    shaders::MUL_MAT_REG_TILE,
-                    "main",
-                    label,
-                    &[
-                        ("SRC0_INNER_TYPE", src0_ty),
-                        (init_src0, ""),
-                        ("WORKGROUP_SIZE_M", &wg_m),
-                        ("WORKGROUP_SIZE_N", &wg_n),
-                        ("TILE_M", &tile_m),
-                        ("TILE_N", &tile_n),
-                        ("TILE_K", &tile_k),
-                    ],
-                )
-            };
-            let (
+        let stream = ctx.supports_spirv_passthrough()
+            && !crate::backend::cpu_features::env_disabled("CERA_VIT_STREAM");
+        let flash = ctx.uses_flash_attention(64);
+        let (
+            (
                 p_linear,
                 p_mul_mat_q8_0,
                 p_mul_mat_q4_0,
@@ -1217,116 +1224,126 @@ impl WgpuVitOps {
                 p_attn,
                 p_attn_tiled,
                 p_add,
-            ) = ctx.check_pipelines("vit core pipelines", || {
-                // f32 batched matmul: the dequantized-weight fallback path.
-                let p_linear = mk_mul_mat("vit_linear", "f32", "INIT_SRC0_SHMEM_FLOAT");
-                // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
-                // shared memory in-kernel and reuse them across the token tile.
-                let mk_quant = |label: &str, init_src0: &str| mk_mul_mat(label, "u32", init_src0);
-                let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
-                let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
-                (
-                    p_linear,
-                    p_mul_mat_q8_0,
-                    p_mul_mat_q4_0,
-                    ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
-                    ctx.create_pipeline(
-                        shaders::LAYERNORM_BATCH,
-                        "layernorm_batch",
-                        "vit_layernorm",
-                    ),
-                    ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
-                    ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace", "vit_relu"),
-                    ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention", "vit_attention"),
-                    ctx.create_pipeline(
-                        shaders::VIT_ATTENTION_TILED,
-                        "vit_attention_tiled",
-                        "vit_attention_tiled",
-                    ),
-                    ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
-                )
-            })?;
-            let stream = ctx.supports_spirv_passthrough()
-                && !crate::backend::cpu_features::env_disabled("CERA_VIT_STREAM");
-            let (
-                p_gemm_q8_stream,
-                p_transpose_f16,
-                p_attn_scores,
-                p_attn_softmax,
-                p_attn_pv,
-                p_cast_f16,
-            ) = if stream {
-                match ctx.check_pipelines("vit stream pipelines", || {
-                    (
-                        ctx.gemm_stream_q8_0_k64_passthrough(),
-                        ctx.transpose_cast_f16_passthrough(),
-                        ctx.vit_attn_scores_f16_passthrough(),
-                        ctx.vit_attn_softmax_t_passthrough(),
-                        ctx.vit_attn_pv_f16_passthrough(),
-                        ctx.cast_f32_f16_passthrough(),
+            ),
+            stream_pipes,
+            p_attn_flash,
+        ) = init_vit_pipelines_with(
+            stream,
+            flash,
+            || ctx.device_lost_detail(),
+            || {
+                let (wg_m, wg_n) = (format!("{VIT_MM_WG_M}u"), format!("{VIT_MM_WG_N}u"));
+                let (tile_m, tile_n) = (format!("{VIT_MM_TILE_M}u"), format!("{VIT_MM_TILE_N}u"));
+                let tile_k = format!("{VIT_MM_TILE_K}u");
+                let mk_mul_mat = |label: &str, src0_ty: &str, init_src0: &str| {
+                    ctx.create_pipeline_with_defines(
+                        shaders::MUL_MAT_REG_TILE,
+                        "main",
+                        label,
+                        &[
+                            ("SRC0_INNER_TYPE", src0_ty),
+                            (init_src0, ""),
+                            ("WORKGROUP_SIZE_M", &wg_m),
+                            ("WORKGROUP_SIZE_N", &wg_n),
+                            ("TILE_M", &tile_m),
+                            ("TILE_N", &tile_n),
+                            ("TILE_K", &tile_k),
+                        ],
                     )
-                }) {
-                    Ok((a, b, c, d, e, f)) => {
-                        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "ViT streaming SPIR-V pipelines failed validation ({e}); \
-                             falling back to WGSL kernels"
-                        );
-                        eprintln!(
-                            "[cera::wgpu] ViT streaming SPIR-V pipelines failed validation ({e}); \
-                             falling back to WGSL kernels"
-                        );
-                        (None, None, None, None, None, None)
-                    }
-                }
-            } else {
-                (None, None, None, None, None, None)
-            };
-            // Built only where the flash gate passes (the kernel needs
-            // `FLASH_ATTENTION_WORKGROUP_BYTES`, past some adapters' limit,
-            // and the checked build cannot run on wasm32, so the gate keeps
-            // flash off there); a flash-only failure falls back, far slower,
-            // instead of failing the encoder (shared tail in
-            // `build_flash_pipeline_or_log`). Built outside `check_pipelines`
-            // above so its own error scope is not nested.
-            let p_attn_flash = if ctx.uses_flash_attention(64) {
+                };
+                ctx.check_pipelines("vit core pipelines", || {
+                    // f32 batched matmul: the dequantized-weight fallback path.
+                    let p_linear = mk_mul_mat("vit_linear", "f32", "INIT_SRC0_SHMEM_FLOAT");
+                    // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
+                    // shared memory in-kernel and reuse them across the token tile.
+                    let mk_quant =
+                        |label: &str, init_src0: &str| mk_mul_mat(label, "u32", init_src0);
+                    let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
+                    let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
+                    (
+                        p_linear,
+                        p_mul_mat_q8_0,
+                        p_mul_mat_q4_0,
+                        ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
+                        ctx.create_pipeline(
+                            shaders::LAYERNORM_BATCH,
+                            "layernorm_batch",
+                            "vit_layernorm",
+                        ),
+                        ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
+                        ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace", "vit_relu"),
+                        ctx.create_pipeline(
+                            shaders::VIT_ATTENTION,
+                            "vit_attention",
+                            "vit_attention",
+                        ),
+                        ctx.create_pipeline(
+                            shaders::VIT_ATTENTION_TILED,
+                            "vit_attention_tiled",
+                            "vit_attention_tiled",
+                        ),
+                        ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
+                    )
+                })
+            },
+            || {
+                ctx.degrade_pipeline_err(
+                    "ViT streaming SPIR-V pipelines",
+                    "falling back to WGSL kernels",
+                    ctx.check_pipelines("vit stream pipelines", || {
+                        (
+                            ctx.gemm_stream_q8_0_k64_passthrough(),
+                            ctx.transpose_cast_f16_passthrough(),
+                            ctx.vit_attn_scores_f16_passthrough(),
+                            ctx.vit_attn_softmax_t_passthrough(),
+                            ctx.vit_attn_pv_f16_passthrough(),
+                            ctx.cast_f32_f16_passthrough(),
+                        )
+                    }),
+                )
+            },
+            || {
                 ctx.build_flash_pipeline_or_log(
                     "ViT attention falls back to the tiled/scalar kernels",
                 )
-            } else {
-                None
-            };
-            Ok(Self {
-                pending: Default::default(),
-                param_cache: Default::default(),
-                pool: Default::default(),
-                p_gemm_q8_stream,
-                p_transpose_f16,
-                p_attn_scores,
-                p_attn_softmax,
-                p_attn_pv,
-                p_cast_f16,
-                p_bias,
-                p_layernorm,
-                p_gelu,
-                p_relu,
-                p_attn,
-                p_attn_tiled,
-                p_attn_flash,
-                p_add,
-                p_mul_mat_q8_0,
-                p_mul_mat_q4_0,
-                p_linear,
-                ctx,
-                #[cfg(test)]
-                flash_dispatches: std::sync::atomic::AtomicU32::new(0),
-            })
-        }))
-        .map_err(|_| {
-            anyhow::anyhow!("wgpu ViT pipeline creation failed (shader compile/validation)")
-        })?
+            },
+        )?;
+        let (
+            p_gemm_q8_stream,
+            p_transpose_f16,
+            p_attn_scores,
+            p_attn_softmax,
+            p_attn_pv,
+            p_cast_f16,
+        ) = match stream_pipes {
+            Some((a, b, c, d, e, f)) => (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)),
+            None => (None, None, None, None, None, None),
+        };
+        Ok(Self {
+            pending: Default::default(),
+            param_cache: Default::default(),
+            pool: Default::default(),
+            p_gemm_q8_stream,
+            p_transpose_f16,
+            p_attn_scores,
+            p_attn_softmax,
+            p_attn_pv,
+            p_cast_f16,
+            p_bias,
+            p_layernorm,
+            p_gelu,
+            p_relu,
+            p_attn,
+            p_attn_tiled,
+            p_attn_flash,
+            p_add,
+            p_mul_mat_q8_0,
+            p_mul_mat_q4_0,
+            p_linear,
+            ctx,
+            #[cfg(test)]
+            flash_dispatches: std::sync::atomic::AtomicU32::new(0),
+        })
     }
 
     /// Whether `attention` with `head_dim` runs on the register-tiled flash kernel: head_dim 64
@@ -2371,6 +2388,23 @@ struct WgpuVisionEncoder {
 }
 
 #[cfg(feature = "gpu")]
+async fn encode_image_async_with<F, Fut>(
+    ensure_alive: F,
+    run: impl FnOnce() -> Fut,
+) -> Result<Vec<f32>>
+where
+    F: Fn(&str) -> Result<()>,
+    Fut: std::future::Future<Output = Result<Vec<f32>>>,
+{
+    // Non-consuming device-loss check avoids draining shared `readback_fault` owned
+    // by `GpuLfmModel` when vision and LLM share one `GpuContext`.
+    ensure_alive("vision encode async")?;
+    let res = run().await;
+    ensure_alive("vision encode async")?;
+    res
+}
+
+#[cfg(feature = "gpu")]
 impl VisionGpuEncode for WgpuVisionEncoder {
     fn backend_label(&self) -> &'static str {
         "wgpu"
@@ -2397,15 +2431,10 @@ impl VisionGpuEncode for WgpuVisionEncoder {
         grid_w: usize,
         grid_h: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
-        Box::pin(async move {
-            let _ = self.ops.ctx.take_readback_fault();
-            let res =
-                encode_image_gpu_wgpu_async(&self.ops, &self.weights, pixels, grid_w, grid_h).await;
-            if let Some(e) = self.ops.ctx.take_readback_fault() {
-                return Err(e.into());
-            }
-            res
-        })
+        Box::pin(encode_image_async_with(
+            |stage| self.ops.ctx.ensure_alive(stage),
+            move || encode_image_gpu_wgpu_async(&self.ops, &self.weights, pixels, grid_w, grid_h),
+        ))
     }
 }
 
@@ -2903,6 +2932,27 @@ fn try_metal_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>>
     None
 }
 
+#[cfg(feature = "gpu")]
+fn finish_wgpu_stack_with<Ops, Stack>(
+    build_stack: impl FnOnce(Ops) -> Result<Stack>,
+    ops: Ops,
+    ensure_alive: impl FnOnce(&Stack, &str) -> Result<()>,
+) -> Option<std::sync::Arc<Stack>> {
+    let stack = match build_stack(ops) {
+        Ok(stack) => stack,
+        Err(e) => {
+            warn_stack_unavailable("wgpu stack spec", e);
+            return None;
+        }
+    };
+    if let Err(e) = ensure_alive(&stack, "vit stack weight upload") {
+        warn_stack_unavailable("wgpu", e);
+        return None;
+    }
+    tracing::info!("vit stack: using wgpu GPU backend");
+    Some(std::sync::Arc::new(stack))
+}
+
 /// A wgpu stack; with `need_flash`, only on an adapter that attends with the flash kernel.
 #[cfg(feature = "gpu")]
 fn try_wgpu_stack(spec: &VitStackSpec, need_flash: bool) -> Option<std::sync::Arc<dyn VitStack>> {
@@ -2934,16 +2984,12 @@ fn try_wgpu_stack(spec: &VitStackSpec, need_flash: bool) -> Option<std::sync::Ar
     // A VitStack evaluates layers in f32 (the decision head scores are compared to host
     // layers to 2e-3); the fp16 streaming pipeline is for WgpuVisionEncoder image encoding.
     let ops = ops.with_f32_attention();
-    match GpuStack::build(ops, spec) {
-        Ok(stack) => {
-            tracing::info!("vit stack: using wgpu GPU backend");
-            Some(std::sync::Arc::new(stack))
-        }
-        Err(e) => {
-            warn_stack_unavailable("wgpu stack spec", e);
-            None
-        }
-    }
+    finish_wgpu_stack_with(
+        |o| GpuStack::build(o, spec),
+        ops,
+        |stack, stage| stack.ops.ctx.ensure_alive(stage),
+    )
+    .map(|s| s as std::sync::Arc<dyn VitStack>)
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -3020,6 +3066,29 @@ pub fn build_gpu_vision_encoder(
 }
 
 #[cfg(feature = "gpu")]
+fn finish_wgpu_vision_encoder_with<E>(
+    encoder: E,
+    run_warm_up: impl FnOnce(&E) -> bool,
+    mut ensure_alive: impl FnMut(&E, &str) -> Result<()>,
+) -> Option<std::sync::Arc<E>> {
+    if let Err(e) = ensure_alive(&encoder, "vision encoder weight upload") {
+        tracing::warn!("vision encoder: wgpu unavailable after upload: {e:#}");
+        eprintln!("[cera::wgpu] vision encoder: wgpu unavailable after upload: {e:#}");
+        return None;
+    }
+    if !run_warm_up(&encoder) {
+        return None;
+    }
+    if let Err(e) = ensure_alive(&encoder, "vision encoder post-warmup") {
+        tracing::warn!("vision encoder: wgpu unavailable after warm-up: {e:#}");
+        eprintln!("[cera::wgpu] vision encoder: wgpu unavailable after warm-up: {e:#}");
+        return None;
+    }
+    tracing::info!("vision encoder: using wgpu GPU backend");
+    Some(std::sync::Arc::new(encoder))
+}
+
+#[cfg(feature = "gpu")]
 pub fn build_wgpu_vision_encoder_with_context(
     ctx: crate::backend::wgpu::GpuContext,
     weights: &VisionEncoderWeights,
@@ -3027,7 +3096,14 @@ pub fn build_wgpu_vision_encoder_with_context(
     if weights.config.projector_type.is_lfm3() {
         return None;
     }
-    let ops = WgpuVitOps::new(ctx).ok()?;
+    let ops = match WgpuVitOps::new(ctx) {
+        Ok(ops) => ops,
+        Err(e) => {
+            tracing::warn!("vision encoder: wgpu pipelines unavailable: {e:#}");
+            eprintln!("[cera::wgpu] vision encoder: wgpu pipelines unavailable: {e:#}");
+            return None;
+        }
+    };
     let gpu_w = GpuVitWeights::build(&ops, weights);
     let encoder = WgpuVisionEncoder {
         ops,
@@ -3036,12 +3112,22 @@ pub fn build_wgpu_vision_encoder_with_context(
     };
     // Not on wasm32: the warm-up encode ends in a blocking `download_f32`, which waits on a map
     // callback that only the JS event loop can run, so it would hang the worker at load.
-    #[cfg(not(target_arch = "wasm32"))]
-    if !warm_up(&encoder, &weights.config) {
-        return None;
-    }
-    tracing::info!("vision encoder: using wgpu GPU backend");
-    Some(std::sync::Arc::new(encoder))
+    finish_wgpu_vision_encoder_with(
+        encoder,
+        |enc| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                warm_up(enc, &weights.config)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = enc;
+                true
+            }
+        },
+        |enc, stage| enc.ops.ctx.ensure_alive(stage),
+    )
+    .map(|e| e as std::sync::Arc<dyn VisionGpuEncode>)
 }
 
 /// Encode a blank 512x384 image once, so the first real image does not pay for one-time setup: driver
@@ -3085,6 +3171,9 @@ fn warm_up_with(
         }
         Err(e) => {
             tracing::warn!("vision encoder warm-up failed, using the CPU vision encoder: {e:#}");
+            eprintln!(
+                "[cera::wgpu] vision encoder warm-up failed, using the CPU vision encoder: {e:#}"
+            );
             false
         }
     }
@@ -3110,7 +3199,14 @@ fn try_metal_vision_encoder(
     weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     let ctx = crate::backend::metal::MetalContext::new().ok()?;
-    let ops = MetalVitOps::new(ctx).ok()?;
+    let ops = match MetalVitOps::new(ctx) {
+        Ok(ops) => ops,
+        Err(e) => {
+            tracing::warn!("vision encoder: Metal pipelines unavailable: {e:#}");
+            eprintln!("vision encoder: Metal pipelines unavailable: {e:#}");
+            return None;
+        }
+    };
     let gpu_w = GpuVitWeights::build(&ops, weights);
     tracing::info!("vision encoder: using native Metal backend");
     Some(std::sync::Arc::new(MetalVisionEncoder {
@@ -3269,6 +3365,212 @@ mod tests {
         calls.set(0);
         assert!(warm_up_with(&cfg, ok));
         assert_eq!(calls.get(), 0);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn init_vit_pipelines_with_degrades_stream_and_flash_but_aborts_on_core_or_lost_device() {
+        // 1. Pre-existing device loss aborts before building anything.
+        let mut core_calls = 0usize;
+        let err_pre = init_vit_pipelines_with(
+            true,
+            true,
+            || Some("pre-lost".to_string()),
+            || {
+                core_calls += 1;
+                Ok(1u32)
+            },
+            || Ok(Some(2u32)),
+            || Ok(Some(3u32)),
+        )
+        .unwrap_err();
+        assert_eq!(core_calls, 0);
+        assert!(err_pre.to_string().contains("pre-lost"));
+
+        // 2. Core pipeline error aborts without invoking stream or flash.
+        let (mut stream_calls, mut flash_calls) = (0usize, 0usize);
+        let err_core = init_vit_pipelines_with::<u32, u32, u32>(
+            true,
+            true,
+            || None,
+            || anyhow::bail!("bad core wgsl"),
+            || {
+                stream_calls += 1;
+                Ok(Some(2))
+            },
+            || {
+                flash_calls += 1;
+                Ok(Some(3))
+            },
+        )
+        .unwrap_err();
+        assert_eq!((stream_calls, flash_calls), (0, 0));
+        assert!(err_core.to_string().contains("bad core wgsl"));
+
+        // 3. Panic inside core pipeline creation preserves payload (&str and String).
+        let err_panic_str = init_vit_pipelines_with::<u32, u32, u32>(
+            false,
+            false,
+            || None,
+            || -> Result<u32> { panic!("boom static") },
+            || Ok(None),
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert!(err_panic_str.to_string().contains("boom static"));
+
+        let err_panic_string = init_vit_pipelines_with::<u32, u32, u32>(
+            false,
+            false,
+            || None,
+            || -> Result<u32> { panic!("{}", String::from("boom owned")) },
+            || Ok(None),
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert!(err_panic_string.to_string().contains("boom owned"));
+
+        // 4. Stream degradation + flash degradation still succeed with None.
+        let (c, s, f) = init_vit_pipelines_with(
+            true,
+            true,
+            || None,
+            || Ok(10u32),
+            || Ok(None::<u32>),
+            || Ok(None::<u32>),
+        )
+        .unwrap();
+        assert_eq!((c, s, f), (10, None, None));
+
+        // 5. Device loss in stream aborts before flash.
+        let mut flash_calls = 0usize;
+        let err_stream_lost = init_vit_pipelines_with::<u32, u32, u32>(
+            true,
+            true,
+            || None,
+            || Ok(10),
+            || anyhow::bail!("stream device lost"),
+            || {
+                flash_calls += 1;
+                Ok(Some(3))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(flash_calls, 0);
+        assert!(err_stream_lost.to_string().contains("stream device lost"));
+
+        // 6. Device loss in flash aborts instead of returning Ok.
+        let err_flash_lost = init_vit_pipelines_with::<u32, u32, u32>(
+            true,
+            true,
+            || None,
+            || Ok(10),
+            || Ok(Some(20)),
+            || anyhow::bail!("flash device lost"),
+        )
+        .unwrap_err();
+        assert!(err_flash_lost.to_string().contains("flash device lost"));
+    }
+
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn wgpu_vit_ops_aborts_on_lost_device() {
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        ctx.simulate_device_lost("test: vit lost");
+        let err = match WgpuVitOps::new(ctx) {
+            Ok(_) => panic!("WgpuVitOps::new must fail on a lost device"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("test: vit lost"), "{err:#}");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn finish_wgpu_vision_encoder_and_stack_abort_on_post_upload_device_loss() {
+        // Stack: spec error returns None without checking ensure_alive.
+        let mut alive_calls = 0usize;
+        assert!(
+            finish_wgpu_stack_with::<u32, u32>(
+                |_| anyhow::bail!("bad spec"),
+                1,
+                |_, _| {
+                    alive_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(alive_calls, 0);
+
+        // Stack: post-upload lost device returns None instead of Some(dead stack).
+        assert!(
+            finish_wgpu_stack_with::<u32, u32>(
+                |o| Ok(o + 1),
+                10,
+                |_, stage| anyhow::bail!("{stage}: GPU device lost (stack lost)"),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            finish_wgpu_stack_with::<u32, u32>(|o| Ok(o + 1), 10, |_, _| Ok(())).as_deref(),
+            Some(&11)
+        );
+
+        // Vision encoder: upload-time device loss aborts BEFORE running warm-up (even when warm-up
+        // would be skipped, e.g. CERA_VIT_WARMUP=0 or wasm32).
+        let mut warm_up_calls = 0usize;
+        assert!(
+            finish_wgpu_vision_encoder_with(
+                7u32,
+                |_| {
+                    warm_up_calls += 1;
+                    true
+                },
+                |_, stage| anyhow::bail!("{stage}: GPU device lost (vit upload lost)"),
+            )
+            .is_none()
+        );
+        assert_eq!(warm_up_calls, 0);
+
+        // Vision encoder: warm-up skipped/passes, but post-warmup device loss aborts with None.
+        let mut stage_idx = 0usize;
+        assert!(
+            finish_wgpu_vision_encoder_with(
+                7u32,
+                |_| true,
+                |_, stage| {
+                    stage_idx += 1;
+                    if stage_idx == 1 {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("{stage}: GPU device lost (post-warmup lost)")
+                    }
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(stage_idx, 2);
+
+        // Vision encoder: failed warm-up drops the encoder immediately without second check.
+        let mut stage_idx = 0usize;
+        assert!(
+            finish_wgpu_vision_encoder_with(
+                7u32,
+                |_| false,
+                |_, _| {
+                    stage_idx += 1;
+                    Ok(())
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(stage_idx, 1);
+
+        // Vision encoder: alive before and after warm-up -> Some.
+        let ok = finish_wgpu_vision_encoder_with(7u32, |_| true, |_, _| Ok(())).unwrap();
+        assert_eq!(*ok, 7);
     }
 
     fn synth_encoder_quant(quant: Option<DType>) -> VisionEncoderWeights {
@@ -4035,6 +4337,73 @@ mod tests {
             covered += n;
         }
         assert_eq!(covered, 20_000_000);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn encode_image_async_with_aborts_on_lost_device_without_clearing_readback_fault() {
+        let wgpu_mod = crate::backend::wgpu::gpu_or_skip();
+        // Pure host seam test (runs even on no-GPU hosts): device loss aborts before
+        // and after the encode future without touching any external fault slot.
+        let mut readback_slot = Some(crate::CeraError::Backend("llm readback fault".into()));
+        let out = pollster::block_on(super::encode_image_async_with(
+            |_| Ok(()),
+            || async { Ok(vec![1.0, 2.0]) },
+        ))
+        .unwrap();
+        assert_eq!(out, vec![1.0, 2.0]);
+        assert!(
+            readback_slot.is_some(),
+            "shared readback fault must not be drained"
+        );
+
+        let mut ran = false;
+        let err_pre = pollster::block_on(super::encode_image_async_with(
+            |stage| anyhow::bail!("{stage}: GPU device lost (pre)"),
+            || {
+                ran = true;
+                async { Ok(vec![]) }
+            },
+        ))
+        .unwrap_err();
+        assert!(!ran);
+        assert!(format!("{err_pre:#}").contains("GPU device lost"));
+        assert!(readback_slot.take().is_some());
+
+        let check_calls = std::sync::atomic::AtomicUsize::new(0);
+        let err_post = pollster::block_on(super::encode_image_async_with(
+            |stage| {
+                if check_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                    anyhow::bail!("{stage}: GPU device lost (post)");
+                }
+                Ok(())
+            },
+            || async { Ok(vec![1.0]) },
+        ))
+        .unwrap_err();
+        assert!(format!("{err_post:#}").contains("post"));
+
+        // Live GpuContext verification when an adapter is available: record a fault on the
+        // shared context (via a lost-device readback) and ensure non-consuming `ensure_alive`
+        // + `encode_image_async_with` leaves `take_readback_fault()` intact unless a real
+        // loss occurs, where it fails closed instead of falling back.
+        if let Some(ctx) = wgpu_mod {
+            ctx.simulate_device_lost("test: shared loss");
+            let buf = ctx.create_storage_rw(4, "fault_probe");
+            let zeros = ctx.download_u32(&buf, 1);
+            assert_eq!(zeros, vec![0]);
+            assert!(ctx.has_readback_fault());
+            let err = pollster::block_on(super::encode_image_async_with(
+                |stage| ctx.ensure_alive(stage),
+                || async { Ok(vec![42.0]) },
+            ))
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("test: shared loss"));
+            assert!(
+                ctx.take_readback_fault().is_some(),
+                "encode_image_async path must not consume pre-existing readback_fault"
+            );
+        }
     }
 }
 

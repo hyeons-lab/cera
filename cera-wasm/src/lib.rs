@@ -2949,6 +2949,98 @@ mod webgpu {
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
 
+    fn check_shared_sync_step(
+        ctx: &cera::backend::wgpu::GpuContext,
+        model: &cera::model::gpu_lfm2::GpuLfmModel,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        check_shared_sync_step_with(|| ctx.ensure_alive(context), || model.take_decode_error())
+    }
+
+    pub(super) fn check_shared_sync_step_with(
+        ensure_alive: impl FnOnce() -> anyhow::Result<()>,
+        take_decode_error: impl FnOnce() -> Option<cera::CeraError>,
+    ) -> anyhow::Result<()> {
+        ensure_alive()?;
+        if let Some(err) = take_decode_error() {
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_sync_step_or_rollback_with(
+        check: impl FnOnce() -> anyhow::Result<()>,
+        rollback: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        if let Err(err) = check() {
+            rollback();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn check_shared_sync_step_or_rollback(
+        model: &cera::model::gpu_lfm2::GpuLfmModel,
+        state: &mut cera::kv_cache::InferenceState,
+        rollback_pos: usize,
+        stage: &str,
+    ) -> Result<(), JsError> {
+        check_sync_step_or_rollback_with(
+            || check_shared_sync_step(model.ctx(), model, stage),
+            || {
+                state.seq_len = rollback_pos;
+                model.truncate_kv_direct(state, rollback_pos);
+            },
+        )
+        .map_err(map_err)
+    }
+
+    pub(super) fn commit_generate_exit_with(
+        ensure_alive: impl FnOnce() -> anyhow::Result<()>,
+        commit_seq_len: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        ensure_alive()?;
+        commit_seq_len();
+        Ok(())
+    }
+
+    pub(super) fn import_checkpoint_with(
+        ensure_alive: impl FnOnce() -> anyhow::Result<()>,
+        apply_restore: impl FnOnce(),
+        drain_decode_error: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        ensure_alive()?;
+        apply_restore();
+        drain_decode_error();
+        Ok(())
+    }
+
+    pub(super) fn check_generate_entry_with(
+        ensure_alive: impl FnOnce() -> anyhow::Result<()>,
+        ids_empty: bool,
+    ) -> anyhow::Result<bool> {
+        ensure_alive()?;
+        Ok(!ids_empty)
+    }
+
+    pub(super) fn gate_sidecar_fallback<T, E: std::fmt::Display>(
+        res: Result<T, E>,
+        ensure_alive: impl FnOnce(&str) -> anyhow::Result<()>,
+        stage: &str,
+        mut on_fallback: impl FnMut(&str),
+    ) -> anyhow::Result<Option<T>> {
+        match res {
+            Ok(v) => Ok(Some(v)),
+            Err(err) => {
+                ensure_alive(stage)?;
+                on_fallback(&format!(
+                    "[cera-wasm] {stage} failed ({err:#}); falling back to CPU"
+                ));
+                Ok(None)
+            }
+        }
+    }
+
     /// Stream one decoded piece to the JS callback. Any exception it throws is
     /// fatal and re-thrown across the wasm boundary (mirroring
     /// `JsTextSink::on_text_tokens`); `throw_val` preserves the original error
@@ -3068,6 +3160,10 @@ mod webgpu {
         /// from the session default, or fresh entropy when unset).
         #[wasm_bindgen]
         pub fn reset(&mut self) -> Result<(), JsError> {
+            self.model
+                .ctx()
+                .ensure_alive("WebGpuSession::reset")
+                .map_err(map_err)?;
             let mut fresh = cera::kv_cache::InferenceState::from_config_with_compression(
                 self.model.config(),
                 &self.compression,
@@ -3075,6 +3171,9 @@ mod webgpu {
             .map_err(crate::map_cera_err)?;
             fresh.lora = self.state.lora.clone();
             self.model.reset_session_state();
+            // Clear any transient non-lost decode error from the prior sequence; a true
+            // device loss already aborted above via `ensure_alive`.
+            let _ = self.model.take_decode_error();
             if let Some(gad) = self.gpu_audio_decoder.as_ref() {
                 gad.reset();
             }
@@ -3590,23 +3689,30 @@ mod webgpu {
                     && !cera::model::audio_decoder::is_lfm3a_gen_gguf(detok_g)
                 {
                     let ctx = self.model.ctx().clone();
+                    ctx.ensure_alive("attach_audio_sidecars").map_err(map_err)?;
                     let depthformer_g = voc_arc.as_ref();
-                    match cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_ggufs_with_context(
-                        ctx,
-                        detok_g,
-                        depthformer_g,
-                    ) {
-                        Ok(gad) => {
+                    let res =
+                        cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_ggufs_with_context(
+                            ctx.clone(),
+                            detok_g,
+                            depthformer_g,
+                        );
+                    match gate_sidecar_fallback(
+                        res,
+                        |stage| ctx.ensure_alive(stage),
+                        "WgpuAudioDecoder load",
+                        console_warn,
+                    )
+                    .map_err(map_err)?
+                    {
+                        Some(gad) => {
                             console_info(&format!(
                                 "[cera-wasm] WgpuAudioDecoder loaded: supports_depthformer={}",
                                 gad.supports_depthformer()
                             ));
                             self.gpu_audio_decoder = Some(Arc::new(gad));
                         }
-                        Err(e) => {
-                            console_info(&format!(
-                                "[cera-wasm] WgpuAudioDecoder load failed ({e:#}), using CPU decoder"
-                            ));
+                        None => {
                             self.gpu_audio_decoder = None;
                         }
                     }
@@ -3688,11 +3794,20 @@ mod webgpu {
                     )));
                 }
                 let weights = Arc::new(weights);
-                self.gpu_vision_encoder =
+                let ctx = self.model.ctx().clone();
+                ctx.ensure_alive("attach_projector").map_err(map_err)?;
+                let gpu_enc =
                     cera::model::vision_encoder_gpu::build_wgpu_vision_encoder_with_context(
-                        self.model.ctx().clone(),
+                        ctx.clone(),
                         &weights,
                     );
+                ctx.ensure_alive("attach_projector").map_err(map_err)?;
+                if gpu_enc.is_none() && !weights.config.projector_type.is_lfm3() {
+                    console_warn(
+                        "[cera-wasm] WgpuVisionEncoder unavailable; falling back to WASM CPU encoder",
+                    );
+                }
+                self.gpu_vision_encoder = gpu_enc;
                 self.vision_encoder = Some(weights);
             }
             Ok(())
@@ -3751,11 +3866,16 @@ mod webgpu {
         /// Feed `ids` into the KV cache without running any token generation.
         #[wasm_bindgen(js_name = appendTokens)]
         pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError> {
+            self.model
+                .ctx()
+                .ensure_alive("appendTokens")
+                .map_err(map_err)?;
             if ids.is_empty() {
                 return Ok(());
             }
             let max_seq_len = self.model.config().max_seq_len;
-            let mut pos = self.state.seq_len;
+            let start = self.state.seq_len;
+            let mut pos = start;
             if pos.saturating_add(ids.len()) > max_seq_len {
                 return Err(JsError::new(&format!(
                     "tokens of len {} plus {pos} already in context exceeds max sequence length {max_seq_len}",
@@ -3766,6 +3886,12 @@ mod webgpu {
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
                 pos += 1;
             }
+            check_shared_sync_step_or_rollback(
+                &self.model,
+                &mut self.state,
+                start,
+                "appendTokens",
+            )?;
             self.state.seq_len = pos;
             Ok(())
         }
@@ -3872,6 +3998,10 @@ mod webgpu {
             // token capacity, and fall back rather than fail on a runtime GPU
             // error: the CPU encoder is always attached and numerically
             // equivalent. Same policy as `Session::append_image_with_opts`.
+            self.model
+                .ctx()
+                .ensure_alive("appendImage")
+                .map_err(map_err)?;
             let gpu = self
                 .gpu_vision_encoder
                 .as_ref()
@@ -3884,22 +4014,26 @@ mod webgpu {
                         "[cera:worker] appendImage: 2/3 Running WebGPU Vision Tower ({grid_tokens} patches, projection_dim={})...",
                         encoder.config.projection_dim
                     ));
-                    match g
+                    let ctx = self.model.ctx().clone();
+                    let res = g
                         .encode_image_async(&pre.pixels, pre.grid_w, pre.grid_h)
-                        .await
+                        .await;
+                    if let Some(tokens) = gate_sidecar_fallback(
+                        res,
+                        |stage| ctx.ensure_alive(stage),
+                        "appendImage WebGPU vision encode",
+                        console_warn,
+                    )
+                    .map_err(map_err)?
                     {
-                        Ok(t) => (t, "WebGPU"),
-                        Err(e) => {
-                            console_warn(&format!(
-                                "[cera:worker] appendImage: 2/3 WebGPU vision encode failed ({e:#}); falling back to WASM CPU encoder"
-                            ));
-                            (
-                                encoder
-                                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-                                    .map_err(map_err)?,
-                                "WASM-CPU (fallback)",
-                            )
-                        }
+                        (tokens, "WebGPU")
+                    } else {
+                        (
+                            encoder
+                                .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                                .map_err(map_err)?,
+                            "WASM-CPU (fallback)",
+                        )
                     }
                 }
                 None => {
@@ -3964,9 +4098,20 @@ mod webgpu {
             console_info(&format!(
                 "[cera:worker] appendImage: 3/3 Seeding {n_tokens} embeddings into WebGPU LLM KV cache (pos {start} -> {end})..."
             ));
+            self.model
+                .ctx()
+                .ensure_alive("appendImage kv seed")
+                .map_err(map_err)?;
             let t_seed_start = Instant::now();
             self.model
                 .seed_embeddings(&img_tokens, n_tokens, start, &mut self.state);
+            if let Err(err) =
+                check_shared_sync_step(self.model.ctx(), &self.model, "appendImage kv seed")
+            {
+                self.state.seq_len = start;
+                self.model.truncate_kv_direct(&mut self.state, start);
+                return Err(map_err(err));
+            }
             let t_seed = t_seed_start.elapsed();
 
             debug_assert_eq!(
@@ -4014,20 +4159,33 @@ mod webgpu {
             if resampled.is_empty() {
                 return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
             }
+            self.model
+                .ctx()
+                .ensure_alive("appendAudio")
+                .map_err(map_err)?;
             let effective_samples = resampled.as_ref();
             let (embeddings, n_tokens) = match self.gpu_audio_encoder.as_ref() {
-                Some(gpu) => match gpu.encode_pcm(effective_samples) {
-                    Ok(out) => out,
-                    Err(e) => {
-                        tracing::warn!(
-                            "gpu audio encode failed ({e:#}); falling back to CPU encoder"
-                        );
+                Some(gpu) => {
+                    let ctx = self.model.ctx().clone();
+                    if let Some(out) = gate_sidecar_fallback(
+                        gpu.encode_pcm(effective_samples),
+                        |stage| ctx.ensure_alive(stage),
+                        "appendAudio GPU encode",
+                        |msg| {
+                            tracing::warn!("{msg}");
+                            console_warn(msg);
+                        },
+                    )
+                    .map_err(map_err)?
+                    {
+                        out
+                    } else {
                         cera::model::audio_encoder::encode_audio_pcm(
                             effective_samples,
                             encoder.as_ref(),
                         )
                     }
-                },
+                }
                 None => cera::model::audio_encoder::encode_audio_pcm(
                     effective_samples,
                     encoder.as_ref(),
@@ -4053,7 +4211,18 @@ mod webgpu {
             }
 
             self.model
+                .ctx()
+                .ensure_alive("appendAudio kv seed")
+                .map_err(map_err)?;
+            self.model
                 .seed_embeddings(&embeddings, n_tokens, start, &mut self.state);
+            if let Err(err) =
+                check_shared_sync_step(self.model.ctx(), &self.model, "appendAudio kv seed")
+            {
+                self.state.seq_len = start;
+                self.model.truncate_kv_direct(&mut self.state, start);
+                return Err(map_err(err));
+            }
             debug_assert_eq!(
                 self.state.seq_len, end,
                 "seed_embeddings must advance seq_len by n_tokens"
@@ -4242,7 +4411,12 @@ mod webgpu {
             on_token: &js_sys::Function,
             on_audio: Option<&js_sys::Function>,
         ) -> Result<String, JsError> {
-            if ids.is_empty() {
+            if !check_generate_entry_with(
+                || self.model.ctx().ensure_alive("generateTokens"),
+                ids.is_empty(),
+            )
+            .map_err(map_err)?
+            {
                 return Ok(String::new());
             }
 
@@ -4270,14 +4444,27 @@ mod webgpu {
                 Some(pair) => pair,
                 None => return Ok(String::new()),
             };
+            let start = self.state.seq_len;
             for &tok in prefix {
                 if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    check_shared_sync_step_or_rollback(
+                        &self.model,
+                        &mut self.state,
+                        start,
+                        "generateTokens cancel",
+                    )?;
                     self.state.seq_len = pos;
                     return Ok(String::new());
                 }
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
                 pos += 1;
             }
+            check_shared_sync_step_or_rollback(
+                &self.model,
+                &mut self.state,
+                start,
+                "generateTokens prefill",
+            )?;
 
             let (def_top_p, def_top_k, def_min_p, def_rep_pen, audio_temp, audio_top_k) =
                 match &self.generation_defaults {
@@ -4447,6 +4634,10 @@ mod webgpu {
 
             for _ in 0..max_tokens {
                 if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.model
+                        .ctx()
+                        .ensure_alive("generateTokens cancel")
+                        .map_err(map_err)?;
                     break;
                 }
                 if Some(next) == self.eos || (self.eos.is_none() && (next == 7 || next == 2)) {
@@ -4488,6 +4679,10 @@ mod webgpu {
                         let mut use_gpu_buf = false;
                         loop {
                             if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.model
+                                    .ctx()
+                                    .ensure_alive("generateTokens")
+                                    .map_err(map_err)?;
                                 break;
                             }
                             if pos >= max_seq_len || dec.is_safety_limit_reached() {
@@ -4566,6 +4761,12 @@ mod webgpu {
                                         &mut self.state,
                                     )
                                     .map_err(map_err)?;
+                                check_shared_sync_step_or_rollback(
+                                    &self.model,
+                                    &mut self.state,
+                                    pos,
+                                    "forward_hidden_from_embedding_gpu",
+                                )?;
                                 use_gpu_buf = true;
                             } else {
                                 emb = self
@@ -4633,10 +4834,14 @@ mod webgpu {
                     let can_use_gpu_buf = dec.supports_gpu_depthformer();
                     let mut use_gpu_buf = false;
                     loop {
-                        if self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-                            || pos >= max_seq_len
-                            || dec.is_safety_limit_reached()
-                        {
+                        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            self.model
+                                .ctx()
+                                .ensure_alive("generateTokens")
+                                .map_err(map_err)?;
+                            break;
+                        }
+                        if pos >= max_seq_len || dec.is_safety_limit_reached() {
                             break;
                         }
                         let t_df0 = js_sys::Date::now();
@@ -4781,6 +4986,12 @@ mod webgpu {
                             self.model
                                 .forward_hidden_from_embedding_gpu(&audio_emb, pos, &mut self.state)
                                 .map_err(map_err)?;
+                            check_shared_sync_step_or_rollback(
+                                &self.model,
+                                &mut self.state,
+                                pos,
+                                "forward_hidden_from_embedding_gpu",
+                            )?;
                             use_gpu_buf = true;
                         } else {
                             emb = self
@@ -4832,6 +5043,10 @@ mod webgpu {
                             let mut early_stop = false;
                             for &d_tok in &drafted {
                                 if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    self.model
+                                        .ctx()
+                                        .ensure_alive("generateTokens")
+                                        .map_err(map_err)?;
                                     early_stop = true;
                                     break;
                                 }
@@ -4919,6 +5134,11 @@ mod webgpu {
                 pos += 1;
             }
 
+            self.model
+                .ctx()
+                .ensure_alive("generateTokens")
+                .map_err(map_err)?;
+
             let mut total_samples = 0;
             if let Some(ref mut dec) = decoder
                 && dec.audio_frames() > 0
@@ -4998,7 +5218,13 @@ mod webgpu {
                 out.push_str(&piece);
                 emit(on_token, &piece);
             }
-            self.state.seq_len = pos;
+            commit_generate_exit_with(
+                || self.model.ctx().ensure_alive("generateTokens"),
+                || {
+                    self.state.seq_len = pos;
+                },
+            )
+            .map_err(map_err)?;
             Ok(out)
         }
 
@@ -5043,6 +5269,10 @@ mod webgpu {
         /// Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
         #[wasm_bindgen(js_name = importCheckpoint)]
         pub fn import_checkpoint(&mut self, data: &[u8]) -> Result<(), JsError> {
+            self.model
+                .ctx()
+                .ensure_alive("WebGpuSession::importCheckpoint")
+                .map_err(map_err)?;
             let cp =
                 cera::session::SessionCheckpoint::from_bytes(data).map_err(crate::map_cera_err)?;
             validate_webgpu_checkpoint(
@@ -5053,16 +5283,29 @@ mod webgpu {
                 &self.compression,
             )?;
 
-            self.state.restore(&cp.kv_state);
-            self.model.restore_session_state(&cp.kv_state);
-            if let Some(gad) = self.gpu_audio_decoder.as_ref() {
-                gad.reset();
-            }
-            if let Some(drafter) = self.drafter.as_mut() {
-                drafter.reset();
-            }
-            self.cancel
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            import_checkpoint_with(
+                || {
+                    self.model
+                        .ctx()
+                        .ensure_alive("WebGpuSession::importCheckpoint")
+                },
+                || {
+                    self.state.restore(&cp.kv_state);
+                    self.model.restore_session_state(&cp.kv_state);
+                    if let Some(gad) = self.gpu_audio_decoder.as_ref() {
+                        gad.reset();
+                    }
+                    if let Some(drafter) = self.drafter.as_mut() {
+                        drafter.reset();
+                    }
+                    self.cancel
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                },
+                || {
+                    let _ = self.model.take_decode_error();
+                },
+            )
+            .map_err(map_err)?;
             Ok(())
         }
     }
@@ -5803,5 +6046,123 @@ mod tests {
         cp.position = 1;
         cp.kv_state.seq_len = 1;
         assert!(validate_webgpu_checkpoint(&cp, &config, &state, true, &compression).is_err());
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn webgpu_shared_context_helpers_abort_on_loss_and_preserve_fallbacks() {
+        // 1. Device loss aborts instead of falling back onto CPU sidecars, while non-lost
+        //    sidecar failures warn and fall back cleanly.
+        let mut warned = Vec::new();
+        let non_lost: Option<u32> = super::webgpu::gate_sidecar_fallback(
+            Err(anyhow::anyhow!("shader rejected")),
+            |_| Ok(()),
+            "WgpuAudioDecoder load",
+            |msg| warned.push(msg.to_string()),
+        )
+        .unwrap();
+        assert!(non_lost.is_none());
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("falling back to CPU"));
+
+        let mut warned_on_loss = false;
+        let lost_res: Result<u32, anyhow::Error> =
+            Err(anyhow::anyhow!("WgpuAudioDecoder unavailable"));
+        let lost_err = super::webgpu::gate_sidecar_fallback(
+            lost_res,
+            |stage| anyhow::bail!("{stage}: GPU device lost (vk lost)"),
+            "WgpuAudioDecoder load",
+            |_| warned_on_loss = true,
+        )
+        .unwrap_err();
+        assert!(!warned_on_loss);
+        assert!(format!("{lost_err:#}").contains("vk lost"));
+
+        // 2. Shared synchronous steps abort cleanly on either device loss or drained decode error.
+        assert!(super::webgpu::check_shared_sync_step_with(|| Ok(()), || None).is_ok());
+        let err_lost = super::webgpu::check_shared_sync_step_with(
+            || anyhow::bail!("appendTokens: GPU device lost"),
+            || None,
+        )
+        .unwrap_err();
+        assert!(format!("{err_lost:#}").contains("GPU device lost"));
+
+        let err_fault = super::webgpu::check_shared_sync_step_with(
+            || Ok(()),
+            || Some(cera::CeraError::Backend("readback map failed".into())),
+        )
+        .unwrap_err();
+        assert!(format!("{err_fault:#}").contains("readback map failed"));
+
+        // 3. Sync prefill and GPU-hidden steps roll back seq_len/KV on error (R7-G6).
+        let mut host_seq = 5usize;
+        let mut gpu_seq = 8usize;
+        let err_rb = super::webgpu::check_sync_step_or_rollback_with(
+            || anyhow::bail!("appendTokens: GPU device lost"),
+            || {
+                host_seq = 2;
+                gpu_seq = 2;
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err_rb:#}").contains("GPU device lost"));
+        assert_eq!(host_seq, 2);
+        assert_eq!(gpu_seq, 2);
+        super::webgpu::check_sync_step_or_rollback_with(
+            || Ok(()),
+            || {
+                host_seq = 0;
+                gpu_seq = 0;
+            },
+        )
+        .unwrap();
+        assert_eq!(host_seq, 2);
+        assert_eq!(gpu_seq, 2);
+
+        // 4. Loop/cancel exits refuse to commit seq_len when device is lost (R7-G7).
+        let mut session_seq = 3usize;
+        let err_exit = super::webgpu::commit_generate_exit_with(
+            || anyhow::bail!("generateTokens: GPU device lost"),
+            || session_seq = 7,
+        )
+        .unwrap_err();
+        assert!(format!("{err_exit:#}").contains("GPU device lost"));
+        assert_eq!(session_seq, 3);
+        super::webgpu::commit_generate_exit_with(|| Ok(()), || session_seq = 7).unwrap();
+        assert_eq!(session_seq, 7);
+
+        // 5. importCheckpoint / restore aborts before mutating state on loss and drains fault
+        //    after restoring on a healthy device (R7-G2).
+        let mut restored = false;
+        let mut drained = false;
+        let err_imp = super::webgpu::import_checkpoint_with(
+            || anyhow::bail!("WebGpuSession::importCheckpoint: GPU device lost"),
+            || restored = true,
+            || drained = true,
+        )
+        .unwrap_err();
+        assert!(format!("{err_imp:#}").contains("importCheckpoint"));
+        assert!(!restored);
+        assert!(!drained);
+
+        let mut order = Vec::new();
+        super::webgpu::import_checkpoint_with(
+            || Ok(()),
+            || order.push("restore"),
+            || order.push("drain"),
+        )
+        .unwrap();
+        assert_eq!(order, vec!["restore", "drain"]);
+
+        // 6. generateTokens rejects a lost device even when `ids` is empty (TWIN-COR-2).
+        let empty_lost = super::webgpu::check_generate_entry_with(
+            || anyhow::bail!("generateTokens: GPU device lost"),
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{empty_lost:#}").contains("GPU device lost"));
+        assert!(!super::webgpu::check_generate_entry_with(|| Ok(()), true).unwrap());
+        assert!(super::webgpu::check_generate_entry_with(|| Ok(()), false).unwrap());
     }
 }

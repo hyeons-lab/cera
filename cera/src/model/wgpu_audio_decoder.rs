@@ -32,8 +32,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anyhow::{Context, Result};
 use wgpu::Buffer;
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::backend::wgpu::DevicePollExt;
 use crate::backend::wgpu::{GpuContext, shaders};
 use crate::gguf::GgufFile;
 use crate::model::audio_decoder::{
@@ -89,10 +87,20 @@ struct DetokLayerGpu {
 }
 
 #[derive(Clone)]
-pub(crate) struct Pipelines {
-    gemm_f32: wgpu::ComputePipeline,
+pub(crate) struct DepthformerPipelines {
     gemv_f32: wgpu::ComputePipeline,
     gemv_f32_accum: wgpu::ComputePipeline,
+    argmax_f32: wgpu::ComputePipeline,
+    df_embed_add: wgpu::ComputePipeline,
+    df_kv_copy: wgpu::ComputePipeline,
+    df_sample_logits: wgpu::ComputePipeline,
+    df_ffn_gate_up: wgpu::ComputePipeline,
+    df_qkv_gemv: wgpu::ComputePipeline,
+}
+
+#[derive(Clone)]
+pub(crate) struct Pipelines {
+    gemm_f32: wgpu::ComputePipeline,
     rmsnorm_batch: wgpu::ComputePipeline,
     add_rmsnorm_batch: wgpu::ComputePipeline,
     qk_norm_rope_batch: wgpu::ComputePipeline,
@@ -103,12 +111,195 @@ pub(crate) struct Pipelines {
     bias_add: wgpu::ComputePipeline,
     exp_polar: wgpu::ComputePipeline,
     overlap_add: wgpu::ComputePipeline,
-    argmax_f32: wgpu::ComputePipeline,
-    df_embed_add: wgpu::ComputePipeline,
-    df_kv_copy: wgpu::ComputePipeline,
-    df_sample_logits: wgpu::ComputePipeline,
-    df_ffn_gate_up: wgpu::ComputePipeline,
-    df_qkv_gemv: wgpu::ComputePipeline,
+    df: Option<DepthformerPipelines>,
+}
+
+/// Orchestration seam behind [`WgpuAudioDecoder::from_ggufs_with_context`] pipeline
+/// validation so pre-weight validation, optional depthformer pipeline alignment, and
+/// lost-device aborts are testable on host without a GPU.
+fn init_audio_decoder_pipelines_with<Core, Df>(
+    try_df: bool,
+    mut device_lost_detail: impl FnMut() -> Option<String>,
+    build_core: impl FnOnce() -> Result<Core>,
+    build_df: impl FnOnce() -> Result<Option<Df>>,
+) -> Result<(Core, Option<Df>)> {
+    if let Some(detail) = device_lost_detail() {
+        anyhow::bail!("audio_decoder pipelines: GPU device lost ({detail})");
+    }
+    let core = build_core()?;
+    let df = if try_df { build_df()? } else { None };
+    Ok((core, df))
+}
+
+/// Orchestration seam behind the post-upload tail of [`WgpuAudioDecoder::from_ggufs_with_context`]
+/// so device-loss checks before depthformer upload, on depthformer error, and after all uploads
+/// stay unit-testable on host without a GPU.
+fn finish_audio_decoder_load_with<Df>(
+    has_df_pipes: bool,
+    mut ensure_alive: impl FnMut(&str) -> Result<()>,
+    mut is_device_lost: impl FnMut() -> bool,
+    load_df: impl FnOnce() -> Result<Df>,
+) -> Result<Option<Df>> {
+    ensure_alive("audio_decoder weight upload")?;
+    let depthformer = if has_df_pipes {
+        match load_df() {
+            Ok(df) => {
+                tracing::info!("[cera:wgpu_audio_decoder] WebGPU depthformer loaded successfully");
+                Some(df)
+            }
+            Err(e) => {
+                if is_device_lost() {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    "[cera:wgpu_audio_decoder] WebGPU depthformer unavailable ({e:#}), using CPU depthformer"
+                );
+                eprintln!(
+                    "[cera:wgpu_audio_decoder] WebGPU depthformer unavailable ({e:#}), using CPU depthformer"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    ensure_alive("audio_decoder post-upload")?;
+    Ok(depthformer)
+}
+
+impl Pipelines {
+    /// Compile and validate the mandatory audio detokenizer/ISTFT pipelines, plus
+    /// optional depthformer pipelines when `try_df` is true (degrading only the
+    /// depthformer pipelines on non-device-loss validation failure).
+    pub(crate) fn build_validated(ctx: &GpuContext, try_df: bool) -> Result<Self> {
+        let (mut pipes, df_pipes) = init_audio_decoder_pipelines_with(
+            try_df,
+            || ctx.device_lost_detail(),
+            || {
+                ctx.check_pipelines("audio_decoder pipelines", || {
+                    // f32 reg-tile GEMM matches the LFM2 prefill's dense fallback kernel.
+                    let gemm_f32 = ctx.create_pipeline_with_defines(
+                        shaders::MUL_MAT_REG_TILE,
+                        "main",
+                        "audio_detok_gemm_f32",
+                        &[
+                            ("SRC0_INNER_TYPE", "f32"),
+                            ("INIT_SRC0_SHMEM_FLOAT", ""),
+                            ("WORKGROUP_SIZE_M", &format!("{MUL_MAT_TILE_WG_M}u")),
+                            ("WORKGROUP_SIZE_N", &format!("{MUL_MAT_TILE_WG_N}u")),
+                            ("TILE_M", &format!("{MUL_MAT_TILE_M}u")),
+                            ("TILE_N", &format!("{MUL_MAT_TILE_N}u")),
+                            ("TILE_K", &format!("{MUL_MAT_TILE_K}u")),
+                        ],
+                    );
+                    Pipelines {
+                        gemm_f32,
+                        rmsnorm_batch: ctx.create_pipeline(
+                            shaders::RMSNORM_BATCH,
+                            "rmsnorm_batch",
+                            "audio_detok_rmsnorm_batch",
+                        ),
+                        add_rmsnorm_batch: ctx.create_pipeline(
+                            shaders::RMSNORM_BATCH,
+                            "add_rmsnorm_batch",
+                            "audio_detok_add_rmsnorm_batch",
+                        ),
+                        qk_norm_rope_batch: ctx.create_pipeline(
+                            shaders::QK_NORM_ROPE_BATCH,
+                            "qk_norm_rope_batch",
+                            "audio_detok_qk_norm_rope_batch",
+                        ),
+                        conv1d_fused_batch: ctx.create_pipeline(
+                            shaders::CONV1D_FUSED_BATCH,
+                            "conv1d_fused_batch",
+                            "audio_detok_conv1d_fused_batch",
+                        ),
+                        flash_attention: ctx.create_pipeline(
+                            shaders::FLASH_ATTENTION_F32,
+                            "flash_attention",
+                            "audio_detok_flash_attention",
+                        ),
+                        silu_mul: ctx.create_pipeline(
+                            shaders::ELEMENTWISE,
+                            "silu_mul_inplace",
+                            "audio_detok_silu_mul",
+                        ),
+                        add_inplace: ctx.create_pipeline(
+                            shaders::ELEMENTWISE,
+                            "add_inplace",
+                            "audio_detok_add_inplace",
+                        ),
+                        bias_add: ctx.create_pipeline(
+                            shaders::BIAS_ADD,
+                            "bias_add",
+                            "audio_detok_bias_add",
+                        ),
+                        exp_polar: ctx.create_pipeline(
+                            shaders::EXP_POLAR,
+                            "exp_polar",
+                            "audio_istft_exp_polar",
+                        ),
+                        overlap_add: ctx.create_pipeline(
+                            shaders::OVERLAP_ADD,
+                            "overlap_add",
+                            "audio_istft_overlap_add",
+                        ),
+                        df: None,
+                    }
+                })
+            },
+            || {
+                ctx.degrade_pipeline_err(
+                    "audio_depthformer",
+                    "using CPU depthformer",
+                    ctx.check_pipelines("audio_depthformer pipelines", || DepthformerPipelines {
+                        gemv_f32: ctx.create_pipeline(
+                            shaders::GEMV_F32,
+                            "gemv_f32",
+                            "audio_df_gemv_f32",
+                        ),
+                        gemv_f32_accum: ctx.create_pipeline(
+                            shaders::GEMV_F32,
+                            "gemv_f32_accum",
+                            "audio_df_gemv_f32_accum",
+                        ),
+                        argmax_f32: ctx.create_pipeline(
+                            shaders::ARGMAX_F32,
+                            "argmax_f32",
+                            "audio_df_argmax_f32",
+                        ),
+                        df_embed_add: ctx.create_pipeline(
+                            include_str!("../backend/shaders/df_embed_add.wgsl"),
+                            "df_embed_add",
+                            "audio_df_embed_add",
+                        ),
+                        df_kv_copy: ctx.create_pipeline(
+                            include_str!("../backend/shaders/df_kv_cache_copy.wgsl"),
+                            "df_kv_cache_copy",
+                            "audio_df_kv_copy",
+                        ),
+                        df_sample_logits: ctx.create_pipeline(
+                            include_str!("../backend/shaders/df_sample_logits.wgsl"),
+                            "df_sample_logits",
+                            "audio_df_sample_logits",
+                        ),
+                        df_ffn_gate_up: ctx.create_pipeline(
+                            include_str!("../backend/shaders/df_ffn_gate_up.wgsl"),
+                            "df_ffn_gate_up",
+                            "audio_df_ffn_gate_up",
+                        ),
+                        df_qkv_gemv: ctx.create_pipeline(
+                            include_str!("../backend/shaders/df_qkv_gemv.wgsl"),
+                            "df_qkv_gemv",
+                            "audio_df_qkv_gemv",
+                        ),
+                    }),
+                )
+            },
+        )?;
+        pipes.df = df_pipes;
+        Ok(pipes)
+    }
 }
 
 pub struct WgpuAudioDecoder {
@@ -128,16 +319,15 @@ pub struct WgpuAudioDecoder {
     hann: Buffer,
 
     // Scratch (all sized for N_FRAMES tokens).
-    hidden_buf: Buffer,           // residual stream [N x hs]
-    normed_buf: Buffer,           // rmsnorm out / attn out [N x max(hs, q_dim)]
-    proj_buf: Buffer,             // conv in_proj [N x 3hs] / attn Q [N x q_dim]
-    gate_buf: Buffer,             // attn K / op residual / ffn gate [N x max(hs, kv_dim, ffn)]
-    up_buf: Buffer,               // attn V / ffn up / ffn down [N x max(hs, kv_dim, ffn)]
-    q_single: Buffer,             // one token's Q [q_dim]
-    attn_single: Buffer,          // one token's attn out [q_dim]
-    spectrum_buf: Buffer,         // [N x (n_fft_bins*2)]
-    spectrum_staging_buf: Buffer, // pre-allocated staging buffer for zero-alloc spectrum readback
-    rope_freqs_dummy: Buffer,     // 1-element buffer bound at qk_norm_rope binding 5
+    hidden_buf: Buffer,       // residual stream [N x hs]
+    normed_buf: Buffer,       // rmsnorm out / attn out [N x max(hs, q_dim)]
+    proj_buf: Buffer,         // conv in_proj [N x 3hs] / attn Q [N x q_dim]
+    gate_buf: Buffer,         // attn K / op residual / ffn gate [N x max(hs, kv_dim, ffn)]
+    up_buf: Buffer,           // attn V / ffn up / ffn down [N x max(hs, kv_dim, ffn)]
+    q_single: Buffer,         // one token's Q [q_dim]
+    attn_single: Buffer,      // one token's attn out [q_dim]
+    spectrum_buf: Buffer,     // [N x (n_fft_bins*2)]
+    rope_freqs_dummy: Buffer, // 1-element buffer bound at qk_norm_rope binding 5
 
     // Persistent state.
     conv_bufs: Vec<Option<Buffer>>, // [d_conv x hs] per conv layer
@@ -153,98 +343,75 @@ pub struct WgpuAudioDecoder {
 }
 
 fn get_detok_tensor(gguf: &GgufFile, name1: &str, name2: &str) -> Result<crate::tensor::Tensor> {
-    gguf.get_tensor(name1)
-        .or_else(|_| gguf.get_tensor(name2))
-        .with_context(|| format!("tensor not found: neither `{name1}` nor `{name2}`"))
-}
-
-fn get_detok_mmap_weight(
-    gguf: &Arc<GgufFile>,
-    name1: &str,
-    name2: &str,
-) -> Result<crate::model::weights::MmapWeight> {
-    crate::model::weights::MmapWeight::from_gguf(gguf, name1)
-        .or_else(|_| crate::model::weights::MmapWeight::from_gguf(gguf, name2))
-        .with_context(|| format!("tensor weight not found: neither `{name1}` nor `{name2}`"))
+    if gguf.tensors.contains_key(name1) {
+        gguf.get_tensor(name1)
+            .with_context(|| format!("failed to load tensor `{name1}`"))
+    } else if gguf.tensors.contains_key(name2) {
+        gguf.get_tensor(name2)
+            .with_context(|| format!("failed to load tensor `{name2}`"))
+    } else {
+        anyhow::bail!("tensor not found: neither `{name1}` nor `{name2}`")
+    }
 }
 
 impl WgpuAudioDecoder {
-    pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
-        let ctx = GpuContext::new()?;
-        Self::from_gguf_with_context(ctx, gguf)
-    }
+    /// Pure-host metadata, probe-dtype, geometry, and tensor validation ahead of opening a WebGPU
+    /// adapter (`GpuContext::new()`) or building compute pipelines.
+    pub(crate) fn prevalidate_detokenizer_gguf(gguf: &GgufFile) -> Result<DetokenizerConfig> {
+        let lookup_probe = |name1: &'static str,
+                            name2: &'static str|
+         -> Result<(&'static str, &crate::gguf::TensorInfo)> {
+            let (label, info) = if let Some(info) = gguf.tensors.get(name1) {
+                (name1, info)
+            } else if let Some(info) = gguf.tensors.get(name2) {
+                (name2, info)
+            } else {
+                anyhow::bail!("tensor not found: neither `{name1}` nor `{name2}`");
+            };
+            crate::model::audio_decoder::check_gguf_tensor_decodable_to_f32(info, label)?;
+            Ok((label, info))
+        };
 
-    pub fn from_gguf_with_context(ctx: GpuContext, gguf: &Arc<GgufFile>) -> Result<Self> {
-        Self::from_ggufs_with_context(ctx, gguf, None)
-    }
-
-    pub fn from_ggufs_with_context(
-        ctx: GpuContext,
-        detok_gguf: &Arc<GgufFile>,
-        depthformer_gguf: Option<&Arc<GgufFile>>,
-    ) -> Result<Self> {
-        let gguf = detok_gguf;
-        // Config from tensor shapes (same derivation as DetokenizerWeights).
-        let conv_in = get_detok_mmap_weight(
-            gguf,
+        let (conv_lbl, conv_info) = lookup_probe(
             "lfm.layers.0.conv.in_proj.weight",
             "blk.0.shortconv.in_proj.weight",
         )?;
-        let n_embd = conv_in.cols;
-        let q_norm_t = get_detok_tensor(
-            gguf,
+        let (n_embd, _) =
+            crate::model::audio_decoder::tensor_2d_cols_rows(&conv_info.shape, conv_lbl)?;
+        let (_qn_lbl, qn_info) = lookup_probe(
             "lfm.layers.2.self_attn.q_layernorm.weight",
             "blk.2.attn_q_norm.weight",
         )?;
-        // an empty shape is the corrupt case the guard below names; indexing it would panic first
-        let head_dim = q_norm_t.shape().first().copied().unwrap_or(0);
-        // `n_head` and `n_kv` below both divide by this, so a corrupt vocoder
-        // GGUF reporting an empty q_layernorm shape would be a div-by-zero
-        // panic. Same wording as the CPU loader's check in `audio_decoder.rs`,
-        // since the two read the same tensor and fail for the same reason.
-        anyhow::ensure!(
-            head_dim > 0,
-            "detokenizer n_embd_head must be > 0 (q_layernorm shape was empty)"
-        );
-        let q_w = get_detok_mmap_weight(
-            gguf,
+        // An empty shape is rejected cleanly below by validate_detokenizer_dims.
+        let head_dim = qn_info.shape.first().copied().unwrap_or(0);
+        let (q_lbl, q_info) = lookup_probe(
             "lfm.layers.2.self_attn.q_proj.weight",
             "blk.2.attn_q.weight",
         )?;
-        let n_head = q_w.rows / head_dim;
-        let k_w = get_detok_mmap_weight(
-            gguf,
+        let (_, q_rows) = crate::model::audio_decoder::tensor_2d_cols_rows(&q_info.shape, q_lbl)?;
+        let (k_lbl, k_info) = lookup_probe(
             "lfm.layers.2.self_attn.k_proj.weight",
             "blk.2.attn_k.weight",
         )?;
-        let n_kv = k_w.rows / head_dim;
-        let ffn_w1_0 = get_detok_mmap_weight(
-            gguf,
+        let (_, k_rows) = crate::model::audio_decoder::tensor_2d_cols_rows(&k_info.shape, k_lbl)?;
+        let (w1_lbl, w1_info) = lookup_probe(
             "lfm.layers.0.feed_forward.w1.weight",
             "blk.0.ffn_gate.weight",
         )?;
-        let ffn_dim = ffn_w1_0.rows;
+        let (_, ffn_dim) =
+            crate::model::audio_decoder::tensor_2d_cols_rows(&w1_info.shape, w1_lbl)?;
+
+        let (n_head, n_kv) = crate::model::audio_decoder::validate_detokenizer_dims(
+            n_embd,
+            head_dim,
+            q_rows,
+            k_rows,
+            ffn_dim,
+            crate::model::audio_decoder::HeadDimBounds::WGPU,
+        )?;
 
         let layer_is_conv = vec![true, true, false, true, false, true, false, true];
         let n_layer = layer_is_conv.len();
-        let kv_dim = n_kv * head_dim;
-        let q_dim = n_head * head_dim;
-
-        // Kernel contracts, checked once at construction so a future model or
-        // config drift fails loudly here instead of silently corrupting output:
-        //   - `flash_attention` sizes `q_shared`/`acc` at MAX_HEAD_DIM (128).
-        //   - GQA: the kernel derives `group_size = n_head / n_kv`.
-        //   - the single-chunk ring write below assumes `swa % N_FRAMES == 0`
-        //     (so 6 consecutive positions never straddle the ring wrap).
-        anyhow::ensure!(
-            head_dim <= 128,
-            "detokenizer head_dim {head_dim} > 128; wgpu flash_attention cannot size q_shared/acc"
-        );
-        anyhow::ensure!(
-            n_kv > 0 && n_head.is_multiple_of(n_kv),
-            "detokenizer GQA requires n_kv > 0 and n_head divisible by n_kv (n_head={n_head}, n_kv={n_kv})"
-        );
-
         let cfg = DetokenizerConfig {
             n_layer,
             n_embd,
@@ -267,112 +434,44 @@ impl WgpuAudioDecoder {
             "detokenizer swa_window_size {} must be a multiple of {N_FRAMES} for the single-chunk KV ring write",
             cfg.swa_window_size
         );
+        crate::model::audio_decoder::validate_detokenizer_gguf_tensors(gguf, &cfg, true)?;
+        Ok(cfg)
+    }
 
-        // f32 reg-tile GEMM matches the LFM2 prefill's dense fallback kernel.
-        let gemm_f32 = ctx.create_pipeline_with_defines(
-            shaders::MUL_MAT_REG_TILE,
-            "main",
-            "audio_detok_gemm_f32",
-            &[
-                ("SRC0_INNER_TYPE", "f32"),
-                ("INIT_SRC0_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", &format!("{MUL_MAT_TILE_WG_M}u")),
-                ("WORKGROUP_SIZE_N", &format!("{MUL_MAT_TILE_WG_N}u")),
-                ("TILE_M", &format!("{MUL_MAT_TILE_M}u")),
-                ("TILE_N", &format!("{MUL_MAT_TILE_N}u")),
-                ("TILE_K", &format!("{MUL_MAT_TILE_K}u")),
-            ],
-        );
-        let pipes = Pipelines {
-            gemm_f32,
-            gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "audio_df_gemv_f32"),
-            gemv_f32_accum: ctx.create_pipeline(
-                shaders::GEMV_F32,
-                "gemv_f32_accum",
-                "audio_df_gemv_f32_accum",
-            ),
-            rmsnorm_batch: ctx.create_pipeline(
-                shaders::RMSNORM_BATCH,
-                "rmsnorm_batch",
-                "audio_detok_rmsnorm_batch",
-            ),
-            add_rmsnorm_batch: ctx.create_pipeline(
-                shaders::RMSNORM_BATCH,
-                "add_rmsnorm_batch",
-                "audio_detok_add_rmsnorm_batch",
-            ),
-            qk_norm_rope_batch: ctx.create_pipeline(
-                shaders::QK_NORM_ROPE_BATCH,
-                "qk_norm_rope_batch",
-                "audio_detok_qk_norm_rope_batch",
-            ),
-            conv1d_fused_batch: ctx.create_pipeline(
-                shaders::CONV1D_FUSED_BATCH,
-                "conv1d_fused_batch",
-                "audio_detok_conv1d_fused_batch",
-            ),
-            flash_attention: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION_F32,
-                "flash_attention",
-                "audio_detok_flash_attention",
-            ),
-            silu_mul: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "silu_mul_inplace",
-                "audio_detok_silu_mul",
-            ),
-            add_inplace: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "add_inplace",
-                "audio_detok_add_inplace",
-            ),
-            bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "audio_detok_bias_add"),
-            exp_polar: ctx.create_pipeline(
-                shaders::EXP_POLAR,
-                "exp_polar",
-                "audio_istft_exp_polar",
-            ),
-            overlap_add: ctx.create_pipeline(
-                shaders::OVERLAP_ADD,
-                "overlap_add",
-                "audio_istft_overlap_add",
-            ),
-            argmax_f32: ctx.create_pipeline(
-                shaders::ARGMAX_F32,
-                "argmax_f32",
-                "audio_df_argmax_f32",
-            ),
-            df_embed_add: ctx.create_pipeline(
-                include_str!("../backend/shaders/df_embed_add.wgsl"),
-                "df_embed_add",
-                "audio_df_embed_add",
-            ),
-            df_kv_copy: ctx.create_pipeline(
-                include_str!("../backend/shaders/df_kv_cache_copy.wgsl"),
-                "df_kv_cache_copy",
-                "audio_df_kv_copy",
-            ),
-            df_sample_logits: ctx.create_pipeline(
-                include_str!("../backend/shaders/df_sample_logits.wgsl"),
-                "df_sample_logits",
-                "audio_df_sample_logits",
-            ),
-            df_ffn_gate_up: ctx.create_pipeline(
-                include_str!("../backend/shaders/df_ffn_gate_up.wgsl"),
-                "df_ffn_gate_up",
-                "audio_df_ffn_gate_up",
-            ),
-            df_qkv_gemv: ctx.create_pipeline(
-                include_str!("../backend/shaders/df_qkv_gemv.wgsl"),
-                "df_qkv_gemv",
-                "audio_df_qkv_gemv",
-            ),
-        };
+    pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
+        let _ = Self::prevalidate_detokenizer_gguf(gguf)?;
+        let ctx = GpuContext::new()?;
+        Self::from_gguf_with_context(ctx, gguf)
+    }
+
+    pub fn from_gguf_with_context(ctx: GpuContext, gguf: &Arc<GgufFile>) -> Result<Self> {
+        Self::from_ggufs_with_context(ctx, gguf, None)
+    }
+
+    pub fn from_ggufs_with_context(
+        ctx: GpuContext,
+        detok_gguf: &Arc<GgufFile>,
+        depthformer_gguf: Option<&Arc<GgufFile>>,
+    ) -> Result<Self> {
+        let gguf = detok_gguf;
+        let cfg = Self::prevalidate_detokenizer_gguf(gguf)?;
+        let n_layer = cfg.n_layer;
+        let n_embd = cfg.n_embd;
+        let n_head = cfg.n_head;
+        let n_kv = cfg.n_head_kv;
+        let head_dim = cfg.n_embd_head;
+        let ffn_dim = cfg.ffn_dim;
+        let kv_dim = n_kv * head_dim;
+        let q_dim = n_head * head_dim;
+
+        let df_src = depthformer_gguf.unwrap_or(detok_gguf);
+        let try_df = depthformer_gguf.is_some() || df_src.get_u32("depthformer_n_layer").is_some();
+        let pipes = Pipelines::build_validated(&ctx, try_df)?;
 
         // Dequantize each weight to f32 (CPU-matching precision) and upload.
         let make_weight = |name1: &str, name2: &str| -> Result<GpuWeight> {
             let t = get_detok_tensor(gguf, name1, name2)?;
-            let f32_data = t.to_f32_vec();
+            let f32_data = t.try_to_f32_vec()?;
             let shape = t.shape();
             let (rows, cols) = match shape.len() {
                 1 => (1, shape[0]),
@@ -387,7 +486,10 @@ impl WgpuAudioDecoder {
             })
         };
         let upload_vec = |name1: &str, name2: &str| -> Result<Buffer> {
-            Ok(ctx.upload_f32(&get_detok_tensor(gguf, name1, name2)?.to_f32_vec(), name1))
+            Ok(ctx.upload_f32(
+                &get_detok_tensor(gguf, name1, name2)?.try_to_f32_vec()?,
+                name1,
+            ))
         };
 
         let mut layers = Vec::with_capacity(n_layer);
@@ -517,12 +619,6 @@ impl WgpuAudioDecoder {
         let attn_single = alloc(q_dim, "audio_detok_attn_single");
         let spec_len = N_FRAMES * (n_embd_bins(&cfg));
         let spectrum_buf = alloc(spec_len, "audio_detok_spectrum");
-        let spectrum_staging_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("audio_spectrum_staging"),
-            size: (spec_len * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let rope_freqs_dummy = ctx.upload_f32(&[1.0f32], "audio_detok_rope_dummy");
 
         let mut conv_bufs = vec![None; n_layer];
@@ -537,19 +633,12 @@ impl WgpuAudioDecoder {
             }
         }
 
-        let df_src = depthformer_gguf.unwrap_or(detok_gguf);
-        let depthformer = match WgpuDepthformer::try_from_gguf(&ctx, &pipes, df_src) {
-            Ok(df) => {
-                tracing::info!("[cera:wgpu_audio_decoder] WebGPU depthformer loaded successfully");
-                Some(df)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[cera:wgpu_audio_decoder] WebGPU depthformer unavailable ({e:#}), using CPU depthformer"
-                );
-                None
-            }
-        };
+        let depthformer = finish_audio_decoder_load_with(
+            pipes.df.is_some(),
+            |stage| ctx.ensure_alive(stage),
+            || ctx.is_device_lost(),
+            || WgpuDepthformer::try_from_gguf(&ctx, &pipes, df_src),
+        )?;
 
         Ok(Self {
             ctx,
@@ -570,7 +659,6 @@ impl WgpuAudioDecoder {
             q_single,
             attn_single,
             spectrum_buf,
-            spectrum_staging_buf,
             rope_freqs_dummy,
             conv_bufs,
             kv_k,
@@ -750,7 +838,7 @@ impl WgpuAudioDecoder {
         enc: &mut wgpu::CommandEncoder,
         cpu_weights: &DetokenizerWeights,
         codes: &[i32],
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize) {
         let hs = self.cfg.n_embd;
         let hd = self.cfg.n_embd_head;
         let n_head = self.cfg.n_head as u32;
@@ -1008,8 +1096,7 @@ impl WgpuAudioDecoder {
             "audio_detok_bias",
         );
 
-        self.n_past.store(n_past + N_FRAMES, Ordering::Relaxed);
-        (N_FRAMES, spec_per_frame)
+        (N_FRAMES, spec_per_frame, n_past + N_FRAMES)
     }
 
     pub fn detokenize_to_spectrum(
@@ -1018,11 +1105,16 @@ impl WgpuAudioDecoder {
         codes: &[i32],
     ) -> Vec<f32> {
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        let (n_frames, spec_per_frame) =
+        let (n_frames, spec_per_frame, next_n_past) =
             self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
         self.ctx.submit_encoder(enc);
-        self.ctx
-            .download_f32(&self.spectrum_buf, n_frames * spec_per_frame)
+        let out = self
+            .ctx
+            .download_f32(&self.spectrum_buf, n_frames * spec_per_frame);
+        if !self.ctx.has_readback_fault() {
+            self.n_past.store(next_n_past, Ordering::Relaxed);
+        }
+        out
     }
 
     pub async fn detokenize_to_spectrum_async(
@@ -1030,53 +1122,22 @@ impl WgpuAudioDecoder {
         cpu_weights: &DetokenizerWeights,
         codes: &[i32],
     ) -> Result<Vec<f32>> {
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        let (n_frames, spec_per_frame) =
-            self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
-        let size = (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64;
-        enc.copy_buffer_to_buffer(&self.spectrum_buf, 0, &self.spectrum_staging_buf, 0, size);
-        self.ctx.submit_encoder(enc);
-
-        let (tx, rx) = futures_channel::oneshot::channel();
-        self.spectrum_staging_buf
-            .slice(0..size)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        self.ctx.device.poll_wait();
-
-        let res = rx.await;
-        let mut result = vec![0f32; n_frames * spec_per_frame];
-        match res {
-            Ok(Ok(())) => {
-                let parse_res: Result<Vec<f32>> = {
-                    let slice = self.spectrum_staging_buf.slice(0..size);
-                    match slice.get_mapped_range() {
-                        Ok(data) => {
-                            let expected_bytes =
-                                n_frames * spec_per_frame * std::mem::size_of::<f32>();
-                            if data.len() < expected_bytes {
-                                Err(anyhow::anyhow!(
-                                    "GPU spectrum staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                                    data.len()
-                                ))
-                            } else {
-                                bytemuck::cast_slice_mut(&mut result)
-                                    .copy_from_slice(&data[..expected_bytes]);
-                                Ok(result)
-                            }
-                        }
-                        Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
-                    }
-                };
-                self.spectrum_staging_buf.unmap();
-                parse_res
-            }
-            Ok(Err(e)) => anyhow::bail!("GPU readback failed: {e:?}"),
-            Err(_) => anyhow::bail!("GPU readback channel closed"),
-        }
+        detokenize_to_spectrum_with(
+            &self.n_past,
+            |stage| self.ctx.ensure_alive(stage),
+            || {
+                let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+                let (n_frames, spec_per_frame, next_n_past) =
+                    self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
+                let expected_floats = n_frames * spec_per_frame;
+                let size = (expected_floats * std::mem::size_of::<f32>()) as u64;
+                let pending = self
+                    .ctx
+                    .begin_download_with_encoder(enc, &self.spectrum_buf, size);
+                (expected_floats, next_n_past, pending.recv())
+            },
+        )
+        .await
     }
 
     fn encode_istft_to_pcm(
@@ -1388,6 +1449,51 @@ impl crate::model::audio_decoder::AudioAccelerator for WgpuAudioDecoder {
     }
 }
 
+async fn detokenize_to_spectrum_with<Fut>(
+    n_past: &AtomicUsize,
+    ensure_alive: impl FnOnce(&str) -> Result<()>,
+    prepare: impl FnOnce() -> (usize, usize, Fut),
+) -> Result<Vec<f32>>
+where
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    ensure_alive("detokenize_to_spectrum_async")?;
+    let (expected_floats, next_n_past, readback) = prepare();
+    let bytes = readback.await?;
+    let expected_bytes = expected_floats * std::mem::size_of::<f32>();
+    anyhow::ensure!(
+        bytes.len() >= expected_bytes,
+        "GPU spectrum staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
+        bytes.len()
+    );
+    let mut result = vec![0f32; expected_floats];
+    bytemuck::cast_slice_mut(&mut result).copy_from_slice(&bytes[..expected_bytes]);
+    n_past.store(next_n_past, Ordering::Relaxed);
+    Ok(result)
+}
+
+async fn finish_depthformer_sample_with<Fut>(
+    ensure_alive: impl FnOnce(&str) -> Result<()>,
+    dispatch_and_readback: impl FnOnce() -> Fut,
+) -> Result<[i32; 8]>
+where
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    ensure_alive("sample_frame_internal_async")?;
+    let bytes = dispatch_and_readback().await?;
+    let expected_bytes = 8 * std::mem::size_of::<u32>();
+    anyhow::ensure!(
+        bytes.len() >= expected_bytes,
+        "GPU staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
+        bytes.len()
+    );
+    let mut codes = [0i32; 8];
+    for i in 0..8 {
+        codes[i] = bytemuck::pod_read_unaligned::<u32>(&bytes[i * 4..(i + 1) * 4]) as i32;
+    }
+    Ok(codes)
+}
+
 // ── WgpuDepthformer ────────────────────────────────────────────────────────
 //
 // F32 dequantized weights + F32 KV cache. Runs all 8 codebook steps of an audio
@@ -1399,6 +1505,7 @@ pub struct WgpuDepthformer {
     df_cfg: DepthformerConfig,
     dec_cfg: DecoderConfig,
     pipes: Arc<Pipelines>,
+    df_pipes: DepthformerPipelines,
     layers: Vec<DfLayerGpu>,
     // Pre-baked bind groups:
     depth_linear_bgs: Vec<wgpu::BindGroup>,   // 8 entries
@@ -1426,11 +1533,147 @@ pub struct WgpuDepthformer {
     attn_out_buf: Buffer,
     ffn_act_buf: Buffer,
     sampled_codes_buf: Buffer,
-    staging_readback_buf: Buffer,
     logits_buf: Buffer,
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
     rng_state: std::sync::atomic::AtomicU64,
+}
+
+struct PreparedDepthformerGguf {
+    df_cfg: DepthformerConfig,
+    dec_cfg: DecoderConfig,
+    n_embd_d: usize,
+    dl_cols: usize,
+    dl_f32: Vec<f32>,
+    depth_linear_b: Vec<f32>,
+}
+
+/// Validate all depthformer GGUF metadata, dimensions, and per-layer/codebook shapes upfront
+/// before dequantizing (`try_to_f32_vec()`) or allocating GPU buffers, so malformed files
+/// fail with `Result::Err` cleanly on both host and GPU.
+fn prepare_depthformer_gguf(
+    gguf: &GgufFile,
+    head_dim_bounds: crate::model::audio_decoder::HeadDimBounds,
+) -> Result<PreparedDepthformerGguf> {
+    use crate::model::audio_decoder::{
+        checked_tensor_numel, tensor_2d_cols_rows, validate_depthformer_config_geometry,
+        validate_depthformer_dims, validate_depthformer_gguf_tensors,
+    };
+
+    let n_layer = gguf
+        .get_u32("depthformer_n_layer")
+        .context("missing depthformer_n_layer")? as usize;
+    anyhow::ensure!(
+        (1..=256).contains(&n_layer),
+        "depthformer_n_layer ({n_layer}) must be in 1..=256"
+    );
+    let n_embd = gguf
+        .get_u32("depthformer_n_embd")
+        .context("missing depthformer_n_embd")? as usize;
+
+    let qkv_info = gguf
+        .tensors
+        .get("depthformer.layers.0.operator.qkv_proj.weight")
+        .context("tensor not found: depthformer.layers.0.operator.qkv_proj.weight")?;
+    let (qkv_cols, qkv_out) = tensor_2d_cols_rows(
+        &qkv_info.shape,
+        "depthformer.layers.0.operator.qkv_proj.weight",
+    )?;
+    anyhow::ensure!(
+        n_embd > 0 && qkv_cols == n_embd,
+        "depthformer_n_embd ({n_embd}) disagrees with qkv_proj ({qkv_cols} columns)"
+    );
+    let q_norm_info = gguf
+        .tensors
+        .get("depthformer.layers.0.operator.attention.q_layernorm.weight")
+        .context("tensor not found: depthformer.layers.0.operator.attention.q_layernorm.weight")?;
+    let n_embd_head = q_norm_info
+        .shape
+        .first()
+        .copied()
+        .filter(|&d| d > 0)
+        .context("depthformer q_layernorm has no usable shape")?;
+    let n_head = 32usize;
+    let n_head_kv = 8usize;
+    let expected_qkv_out = (n_head + 2 * n_head_kv)
+        .checked_mul(n_embd_head)
+        .context("qkv_proj expected rows overflow")?;
+    anyhow::ensure!(qkv_out == expected_qkv_out, "qkv_proj shape mismatch");
+
+    let w1_info = gguf
+        .tensors
+        .get("depthformer.layers.0.feed_forward.w1.weight")
+        .context("tensor not found: depthformer.layers.0.feed_forward.w1.weight")?;
+    let (w1_cols, ffn_dim) = tensor_2d_cols_rows(
+        &w1_info.shape,
+        "depthformer.layers.0.feed_forward.w1.weight",
+    )?;
+    anyhow::ensure!(
+        ffn_dim > 0 && w1_cols == n_embd,
+        "depthformer ffn_dim ({ffn_dim}) / w1 cols ({w1_cols}) invalid for depthformer_n_embd ({n_embd})"
+    );
+
+    let df_cfg = DepthformerConfig {
+        n_layer,
+        n_embd,
+        n_head,
+        n_head_kv,
+        n_embd_head,
+        ffn_dim,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 1_000_000.0,
+        max_seq_len: 8,
+    };
+
+    let n_codebook = 8;
+    let dl_info = gguf
+        .tensors
+        .get("depth_linear.weight")
+        .context("tensor not found: depth_linear.weight")?;
+    let dl_bias_info = gguf
+        .tensors
+        .get("depth_linear.bias")
+        .context("tensor not found: depth_linear.bias")?;
+    let to_logits_0_info = gguf
+        .tensors
+        .get("depth_embeddings.0.to_logits.weight")
+        .context("tensor not found: depth_embeddings.0.to_logits.weight")?;
+    let (_, n_vocab) = tensor_2d_cols_rows(
+        &to_logits_0_info.shape,
+        "depth_embeddings.0.to_logits.weight",
+    )?;
+
+    let (n_embd_d, dl_cols, _) = validate_depthformer_dims(
+        n_embd,
+        n_embd_head,
+        ffn_dim,
+        n_codebook,
+        n_vocab,
+        &dl_info.shape,
+        checked_tensor_numel(&dl_info.shape, "depth_linear.weight")?,
+        checked_tensor_numel(&dl_bias_info.shape, "depth_linear.bias")?,
+        head_dim_bounds,
+    )?;
+
+    let dec_cfg = DecoderConfig {
+        n_codebook,
+        n_vocab,
+        n_embd: dl_cols,
+        rms_norm_eps: 1e-5,
+    };
+    validate_depthformer_config_geometry(&df_cfg, &dec_cfg, head_dim_bounds)?;
+    validate_depthformer_gguf_tensors(gguf, &df_cfg, &dec_cfg, false)?;
+
+    let dl_f32 = gguf.get_tensor("depth_linear.weight")?.try_to_f32_vec()?;
+    let depth_linear_b = gguf.get_tensor("depth_linear.bias")?.try_to_f32_vec()?;
+    Ok(PreparedDepthformerGguf {
+        df_cfg,
+        dec_cfg,
+        n_embd_d,
+        dl_cols,
+        dl_f32,
+        depth_linear_b,
+    })
 }
 
 impl WgpuDepthformer {
@@ -1439,97 +1682,35 @@ impl WgpuDepthformer {
         pipes: &Arc<Pipelines>,
         gguf: &Arc<GgufFile>,
     ) -> Result<Self> {
-        // Hyperparameters from GGUF metadata.
-        let n_layer = gguf
-            .get_u32("depthformer_n_layer")
-            .context("missing depthformer_n_layer")? as usize;
-        // sizes per-layer allocations below: bound it like the CPU loader does
-        anyhow::ensure!(
-            (1..=256).contains(&n_layer),
-            "depthformer_n_layer ({n_layer}) must be in 1..=256"
-        );
-        let n_embd = gguf
-            .get_u32("depthformer_n_embd")
-            .context("missing depthformer_n_embd")? as usize;
-
-        // Derive head config from qkv_proj shape.
-        let qkv = crate::model::weights::MmapWeight::from_gguf(
-            gguf,
-            "depthformer.layers.0.operator.qkv_proj.weight",
-        )?;
-        anyhow::ensure!(
-            n_embd > 0 && qkv.cols == n_embd,
-            "depthformer_n_embd ({n_embd}) disagrees with qkv_proj ({} columns)",
-            qkv.cols
-        );
-        let q_norm_w =
-            gguf.get_tensor("depthformer.layers.0.operator.attention.q_layernorm.weight")?;
-        let n_embd_head = q_norm_w
-            .shape()
-            .first()
-            .copied()
-            .filter(|&d| d > 0)
-            .context("depthformer q_layernorm has no usable shape")?;
-        let qkv_out = qkv.rows;
-        let n_head = 32;
-        let n_head_kv = 8;
-        anyhow::ensure!(
-            qkv_out == (n_head + 2 * n_head_kv) * n_embd_head,
-            "qkv_proj shape mismatch"
-        );
-
-        let w1_0 = crate::model::weights::MmapWeight::from_gguf(
-            gguf,
-            "depthformer.layers.0.feed_forward.w1.weight",
-        )?;
-        let ffn_dim = w1_0.rows;
-        anyhow::ensure!(
-            w1_0.cols == n_embd,
-            "depthformer_n_embd ({n_embd}) disagrees with w1 ({} columns)",
-            w1_0.cols
-        );
-
-        let df_cfg = DepthformerConfig {
-            n_layer,
-            n_embd,
-            n_head,
-            n_head_kv,
-            n_embd_head,
-            ffn_dim,
-            rms_norm_eps: 1e-5,
-            rope_freq_base: 1_000_000.0,
-            max_seq_len: 8,
-        };
-
-        let depth_linear_w =
-            crate::model::weights::MmapWeight::from_gguf(gguf, "depth_linear.weight")?;
-        let depth_linear_b = gguf.get_tensor("depth_linear.bias")?.to_f32_vec();
-        let n_codebook = 8;
-        let to_logits_0 = crate::model::weights::MmapWeight::from_gguf(
-            gguf,
-            "depth_embeddings.0.to_logits.weight",
-        )?;
-        let n_vocab = to_logits_0.rows;
-        let n_embd_llm = depth_linear_w.cols;
-
-        let dec_cfg = DecoderConfig {
-            n_codebook,
-            n_vocab,
-            n_embd: n_embd_llm,
-            rms_norm_eps: 1e-5,
-        };
-
-        Self::from_configs(ctx, pipes, gguf, &df_cfg, &dec_cfg, depth_linear_b)
+        let prepared =
+            prepare_depthformer_gguf(gguf, crate::model::audio_decoder::HeadDimBounds::WGPU)?;
+        Self::from_configs(ctx, pipes, gguf, prepared)
     }
 
     fn from_configs(
         ctx: &GpuContext,
         pipes: &Arc<Pipelines>,
         gguf: &Arc<GgufFile>,
-        df_cfg: &DepthformerConfig,
-        dec_cfg: &DecoderConfig,
-        depth_linear_b: Vec<f32>,
+        prepared: PreparedDepthformerGguf,
     ) -> Result<Self> {
+        let df_pipes = pipes
+            .df
+            .as_ref()
+            .context("audio_depthformer pipelines unavailable")?
+            .clone();
+        let PreparedDepthformerGguf {
+            df_cfg,
+            dec_cfg,
+            n_embd_d,
+            dl_cols,
+            dl_f32,
+            depth_linear_b,
+        } = prepared;
+        crate::model::audio_decoder::validate_depthformer_config_geometry(
+            &df_cfg,
+            &dec_cfg,
+            crate::model::audio_decoder::HeadDimBounds::WGPU,
+        )?;
         let n_embd = df_cfg.n_embd;
         let hd = df_cfg.n_embd_head;
         let n_head = df_cfg.n_head;
@@ -1539,7 +1720,7 @@ impl WgpuDepthformer {
         let ffn_dim = df_cfg.ffn_dim;
 
         let upload_vec = |name: &str| -> Result<Buffer> {
-            Ok(ctx.upload_f32(&gguf.get_tensor(name)?.to_f32_vec(), name))
+            Ok(ctx.upload_f32(&gguf.get_tensor(name)?.try_to_f32_vec()?, name))
         };
 
         let alloc = |n: usize, label: &str| ctx.create_storage_rw((n * 4) as u64, label);
@@ -1550,23 +1731,10 @@ impl WgpuDepthformer {
         let v_buf = alloc(kv_dim, "df_v");
         let attn_out_buf = alloc(q_dim, "df_attn_out");
         let ffn_act_buf = alloc(ffn_dim, "df_ffn_act");
-        let dl_t = gguf.get_tensor("depth_linear.weight")?;
-        let dl_f32 = dl_t.to_f32_vec();
-        // e.g. 2048 (n_embd_llm) columns by 8 * 1024 rows
-        let &[dl_cols, dl_rows] = dl_t.shape() else {
-            anyhow::bail!("depth_linear.weight must be 2-D, got {:?}", dl_t.shape());
-        };
-        let n_embd_d = dl_rows / dec_cfg.n_codebook;
 
         let embedding_in_buf = alloc(dl_cols, "df_embedding_in");
         let logits_buf = alloc(dec_cfg.n_vocab, "df_logits");
         let sampled_codes_buf = alloc(dec_cfg.n_codebook, "df_sampled_codes");
-        let staging_readback_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("df_staging_readback"),
-            size: (dec_cfg.n_codebook * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let rope_freqs_dummy = ctx.upload_f32(&[1.0f32], "df_rope_dummy");
 
         let mut kv_k = Vec::with_capacity(df_cfg.n_layer);
@@ -1667,7 +1835,7 @@ impl WgpuDepthformer {
         for i in 0..df_cfg.n_layer {
             let pfx = format!("depthformer.layers.{i}");
             let qkv_t = gguf.get_tensor(&format!("{pfx}.operator.qkv_proj.weight"))?;
-            let qkv_f32 = qkv_t.to_f32_vec();
+            let qkv_f32 = qkv_t.try_to_f32_vec()?;
             let qkv_buf = ctx.upload_f32(&qkv_f32, &format!("{pfx}.qkv"));
 
             let op_norm = upload_vec(&format!("{pfx}.operator_norm.weight"))?;
@@ -1676,17 +1844,17 @@ impl WgpuDepthformer {
             let wo_buf = ctx.upload_f32(
                 &gguf
                     .get_tensor(&format!("{pfx}.operator.out_proj.weight"))?
-                    .to_f32_vec(),
+                    .try_to_f32_vec()?,
                 &format!("{pfx}.wo"),
             );
             let ffn_norm = upload_vec(&format!("{pfx}.ffn_norm.weight"))?;
 
             let w1_vec = gguf
                 .get_tensor(&format!("{pfx}.feed_forward.w1.weight"))?
-                .to_f32_vec();
+                .try_to_f32_vec()?;
             let w3_vec = gguf
                 .get_tensor(&format!("{pfx}.feed_forward.w3.weight"))?
-                .to_f32_vec();
+                .try_to_f32_vec()?;
             let mut w13_vec = Vec::with_capacity(w1_vec.len() + w3_vec.len());
             w13_vec.extend_from_slice(&w1_vec);
             w13_vec.extend_from_slice(&w3_vec);
@@ -1694,7 +1862,7 @@ impl WgpuDepthformer {
             let w2_buf = ctx.upload_f32(
                 &gguf
                     .get_tensor(&format!("{pfx}.feed_forward.w2.weight"))?
-                    .to_f32_vec(),
+                    .try_to_f32_vec()?,
                 &format!("{pfx}.w2"),
             );
 
@@ -1704,7 +1872,7 @@ impl WgpuDepthformer {
                 &format!("df_op_norm_bg_{i}"),
             );
             let gemm_qkv_bg = make_bg(
-                &pipes.df_qkv_gemv,
+                &df_pipes.df_qkv_gemv,
                 &[&qkv_buf, &normed_buf, &q_buf, &k_buf, &v_buf, &qkv_params],
                 &format!("df_qkv_bg_{i}"),
             );
@@ -1726,7 +1894,7 @@ impl WgpuDepthformer {
                     &format!("df_rope_bg_{i}_{pos}"),
                 ));
                 kv_copy_bgs.push(make_bg(
-                    &pipes.df_kv_copy,
+                    &df_pipes.df_kv_copy,
                     &[&k_buf, &v_buf, &kv_k[i], &kv_v[i], &kv_copy_params[pos]],
                     &format!("df_kv_copy_bg_{i}_{pos}"),
                 ));
@@ -1738,7 +1906,7 @@ impl WgpuDepthformer {
             }
 
             let gemm_wo_accum_bg = make_bg(
-                &pipes.gemv_f32_accum,
+                &df_pipes.gemv_f32_accum,
                 &[&wo_buf, &attn_out_buf, &hidden_buf, &wo_params],
                 &format!("df_wo_accum_bg_{i}"),
             );
@@ -1748,12 +1916,12 @@ impl WgpuDepthformer {
                 &format!("df_ffn_norm_bg_{i}"),
             );
             let ffn_gate_up_bg = make_bg(
-                &pipes.df_ffn_gate_up,
+                &df_pipes.df_ffn_gate_up,
                 &[&w13_buf, &normed_buf, &ffn_act_buf, &w13_params],
                 &format!("df_ffn_gate_up_bg_{i}"),
             );
             let gemm_w2_accum_bg = make_bg(
-                &pipes.gemv_f32_accum,
+                &df_pipes.gemv_f32_accum,
                 &[&w2_buf, &ffn_act_buf, &hidden_buf, &w2_params],
                 &format!("df_w2_accum_bg_{i}"),
             );
@@ -1785,7 +1953,7 @@ impl WgpuDepthformer {
             let slice_data = &dl_f32[start..end];
             let buf = ctx.upload_f32(slice_data, &format!("depth_linear_slice_{j}"));
             depth_linear_bgs.push(make_bg(
-                &pipes.gemv_f32,
+                &df_pipes.gemv_f32,
                 &[&buf, &embedding_in_buf, &hidden_buf, &dl_params],
                 &format!("df_dl_bg_{j}"),
             ));
@@ -1820,10 +1988,10 @@ impl WgpuDepthformer {
             ));
 
             let tl_t = gguf.get_tensor(&format!("{pfx}.to_logits.weight"))?;
-            let tl_f32 = tl_t.to_f32_vec();
+            let tl_f32 = tl_t.try_to_f32_vec()?;
             let tl_buf = ctx.upload_f32(&tl_f32, &format!("{pfx}.to_logits"));
             to_logits_gemm_bgs.push(make_bg(
-                &pipes.gemv_f32,
+                &df_pipes.gemv_f32,
                 &[&tl_buf, &normed_buf, &logits_buf, &tl_params],
                 &format!("df_tl_bg_{j}"),
             ));
@@ -1833,20 +2001,20 @@ impl WgpuDepthformer {
                 &format!("df_argmax_params_{j}"),
             );
             argmax_bgs.push(make_bg(
-                &pipes.argmax_f32,
+                &df_pipes.argmax_f32,
                 &[&logits_buf, &sampled_codes_buf, &am_params],
                 &format!("df_argmax_bg_{j}"),
             ));
 
             if j < dec_cfg.n_codebook - 1 {
                 let emb_t = gguf.get_tensor(&format!("{pfx}.embedding.weight"))?;
-                let emb_buf = ctx.upload_f32(&emb_t.to_f32_vec(), &format!("{pfx}.emb"));
+                let emb_buf = ctx.upload_f32(&emb_t.try_to_f32_vec()?, &format!("{pfx}.emb"));
                 let em_params = ctx.upload_storage(
                     bytemuck::cast_slice(&[n_embd as u32, j as u32]),
                     &format!("df_embed_params_{j}"),
                 );
                 embed_add_bgs.push(make_bg(
-                    &pipes.df_embed_add,
+                    &df_pipes.df_embed_add,
                     &[&emb_buf, &sampled_codes_buf, &hidden_buf, &em_params],
                     &format!("df_embed_add_bg_{j}"),
                 ));
@@ -1858,7 +2026,7 @@ impl WgpuDepthformer {
         for j in 0..dec_cfg.n_codebook {
             let sm_params = alloc(4, &format!("df_sample_params_{j}"));
             sample_bgs.push(make_bg(
-                &pipes.df_sample_logits,
+                &df_pipes.df_sample_logits,
                 &[&logits_buf, &sampled_codes_buf, &sm_params],
                 &format!("df_sample_bg_{j}"),
             ));
@@ -1876,6 +2044,7 @@ impl WgpuDepthformer {
             df_cfg: df_cfg.clone(),
             dec_cfg: dec_cfg.clone(),
             pipes: pipes.clone(),
+            df_pipes,
             layers,
             depth_linear_bgs,
             bias_add_bgs,
@@ -1900,7 +2069,6 @@ impl WgpuDepthformer {
             attn_out_buf,
             ffn_act_buf,
             sampled_codes_buf,
-            staging_readback_buf,
             logits_buf,
             kv_k,
             kv_v,
@@ -1925,6 +2093,7 @@ impl WgpuDepthformer {
         temperature: f32,
         top_k: usize,
     ) -> Result<[i32; 8]> {
+        self.ctx.ensure_alive("sample_frame_async")?;
         let mut padded = vec![0.0f32; self.dl_cols];
         let copy_len = embedding.len().min(self.dl_cols);
         padded[..copy_len].copy_from_slice(&embedding[..copy_len]);
@@ -1951,254 +2120,841 @@ impl WgpuDepthformer {
         top_k: usize,
         gpu_hidden_src: Option<&wgpu::Buffer>,
     ) -> Result<[i32; 8]> {
-        let n_embd = self.df_cfg.n_embd;
-        let hd = self.df_cfg.n_embd_head;
-        let n_head = self.df_cfg.n_head as u32;
-        let n_kv = self.df_cfg.n_head_kv as u32;
-        let kv_dim = n_kv * hd as u32;
+        finish_depthformer_sample_with(
+            |stage| self.ctx.ensure_alive(stage),
+            || {
+                let n_embd = self.df_cfg.n_embd;
+                let hd = self.df_cfg.n_embd_head;
+                let n_head = self.df_cfg.n_head as u32;
+                let n_kv = self.df_cfg.n_head_kv as u32;
+                let kv_dim = n_kv * hd as u32;
 
-        let use_sampling = temperature > 0.0 && temperature.is_finite() && top_k > 1;
-        let inv_temp = if use_sampling { 1.0 / temperature } else { 1.0 };
+                let use_sampling = temperature > 0.0 && temperature.is_finite() && top_k > 1;
+                let inv_temp = if use_sampling { 1.0 / temperature } else { 1.0 };
 
-        if use_sampling {
-            for j in 0..self.dec_cfg.n_codebook {
-                let rand_val =
-                    crate::model::audio_decoder::next_atomic_xorshift64_f32_01(&self.rng_state);
-                let params = [self.dec_cfg.n_vocab as f32, j as f32, inv_temp, rand_val];
-                self.ctx.queue.write_buffer(
-                    &self.sample_params_bufs[j],
-                    0,
-                    bytemuck::cast_slice(&params),
-                );
-            }
-        }
+                if use_sampling {
+                    for j in 0..self.dec_cfg.n_codebook {
+                        let rand_val = crate::model::audio_decoder::next_atomic_xorshift64_f32_01(
+                            &self.rng_state,
+                        );
+                        let params = [self.dec_cfg.n_vocab as f32, j as f32, inv_temp, rand_val];
+                        self.ctx.queue.write_buffer(
+                            &self.sample_params_bufs[j],
+                            0,
+                            bytemuck::cast_slice(&params),
+                        );
+                    }
+                }
 
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wgpu_depthformer_all_codebooks"),
-            });
+                let mut enc =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("wgpu_depthformer_all_codebooks"),
+                        });
 
-        if let Some(src) = gpu_hidden_src {
-            let size = (self.dl_cols * 4) as u64;
-            enc.copy_buffer_to_buffer(src, 0, &self.embedding_in_buf, 0, size);
-        }
+                if let Some(src) = gpu_hidden_src {
+                    let size = (self.dl_cols * 4) as u64;
+                    enc.copy_buffer_to_buffer(src, 0, &self.embedding_in_buf, 0, size);
+                }
 
-        let dispatch_pass = |enc: &mut wgpu::CommandEncoder,
-                             pipeline: &wgpu::ComputePipeline,
-                             bg: &wgpu::BindGroup,
-                             workgroups: (u32, u32, u32),
-                             label: &str| {
-            let mut pass = self.ctx.begin_pass(enc, label);
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+                let dispatch_pass = |enc: &mut wgpu::CommandEncoder,
+                                     pipeline: &wgpu::ComputePipeline,
+                                     bg: &wgpu::BindGroup,
+                                     workgroups: (u32, u32, u32),
+                                     label: &str| {
+                    let mut pass = self.ctx.begin_pass(enc, label);
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+                };
+
+                for j in 0..self.dec_cfg.n_codebook {
+                    let pos = j;
+
+                    // Initial projections for this codebook
+                    dispatch_pass(
+                        &mut enc,
+                        &self.df_pipes.gemv_f32,
+                        &self.depth_linear_bgs[j],
+                        (self.depth_linear_wg_m, 1, 1),
+                        "df_depth_linear",
+                    );
+
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipes.add_inplace,
+                        &self.bias_add_bgs[j],
+                        ((n_embd as u32).div_ceil(256), 1, 1),
+                        "df_bias_add",
+                    );
+
+                    if j > 0 {
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.df_embed_add,
+                            &self.embed_add_bgs[j - 1],
+                            ((n_embd as u32).div_ceil(256), 1, 1),
+                            "df_embed_add",
+                        );
+                    }
+
+                    // Transformer layers with fused QKV, fused FFN gate+up with inline SiLU, and direct residual accumulators
+                    for lw in &self.layers {
+                        // RMSnorm -> normed_buf
+                        dispatch_pass(
+                            &mut enc,
+                            &self.pipes.rmsnorm_batch,
+                            &lw.operator_norm_bg,
+                            (1, 1, 1),
+                            "df_op_norm",
+                        );
+
+                        // Fused QKV GEMV -> q_buf, k_buf, v_buf
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.df_qkv_gemv,
+                            &lw.gemm_qkv_bg,
+                            (self.qkv_wg_m, 1, 1),
+                            "df_qkv_gemv",
+                        );
+
+                        // QK norm + RoPE (interleaved / NORM)
+                        dispatch_pass(
+                            &mut enc,
+                            &self.pipes.qk_norm_rope_batch,
+                            &lw.rope_bgs[pos],
+                            (n_head + n_kv, 1, 1),
+                            "df_qk_norm_rope",
+                        );
+
+                        // GPU-side KV cache slot copy inside the compute pass
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.df_kv_copy,
+                            &lw.kv_copy_bgs[pos],
+                            (kv_dim.div_ceil(256), 1, 1),
+                            "df_kv_copy",
+                        );
+
+                        // Flash Attention -> attn_out_buf
+                        dispatch_pass(
+                            &mut enc,
+                            &self.pipes.flash_attention,
+                            &lw.attn_bgs[pos],
+                            (n_head, 1, 1),
+                            "df_flash_attention",
+                        );
+
+                        // Out projection directly accumulated into hidden_buf (hidden_buf += Wo · attn_out)
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.gemv_f32_accum,
+                            &lw.gemm_wo_accum_bg,
+                            (self.n_embd_wg_m, 1, 1),
+                            "df_wo_accum",
+                        );
+
+                        // FFN: RMSnorm -> normed_buf
+                        dispatch_pass(
+                            &mut enc,
+                            &self.pipes.rmsnorm_batch,
+                            &lw.ffn_norm_bg,
+                            (1, 1, 1),
+                            "df_ffn_norm",
+                        );
+
+                        // FFN Fused Gate + Up with inline SiLU -> ffn_act_buf
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.df_ffn_gate_up,
+                            &lw.ffn_gate_up_bg,
+                            (self.ffn_dim_wg_m, 1, 1),
+                            "df_ffn_gate_up",
+                        );
+
+                        // FFN W2 Down projection directly accumulated into hidden_buf (hidden_buf += W2 · ffn_act)
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.gemv_f32_accum,
+                            &lw.gemm_w2_accum_bg,
+                            (self.n_embd_wg_m, 1, 1),
+                            "df_w2_accum",
+                        );
+                    }
+
+                    // to_logits: RMSnorm -> GEMV -> logits_buf
+                    dispatch_pass(
+                        &mut enc,
+                        &self.pipes.rmsnorm_batch,
+                        &self.to_logits_norm_bgs[j],
+                        (1, 1, 1),
+                        "df_to_logits_norm",
+                    );
+
+                    dispatch_pass(
+                        &mut enc,
+                        &self.df_pipes.gemv_f32,
+                        &self.to_logits_gemm_bgs[j],
+                        (self.n_vocab_wg_m, 1, 1),
+                        "df_to_logits_gemm",
+                    );
+
+                    // Sample on GPU (with temperature) or Argmax on GPU -> sampled_codes_buf[j]
+                    if use_sampling {
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.df_sample_logits,
+                            &self.sample_bgs[j],
+                            (1, 1, 1),
+                            "df_sample_logits",
+                        );
+                    } else {
+                        dispatch_pass(
+                            &mut enc,
+                            &self.df_pipes.argmax_f32,
+                            &self.argmax_bgs[j],
+                            (1, 1, 1),
+                            "df_argmax",
+                        );
+                    }
+                }
+
+                // Single 32-byte download of all 8 codes through `PendingReadback`
+                let size = (self.dec_cfg.n_codebook * 4) as u64;
+                self.ctx
+                    .begin_download_with_encoder(enc, &self.sampled_codes_buf, size)
+                    .recv()
+            },
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        detokenize_to_spectrum_with, finish_audio_decoder_load_with,
+        finish_depthformer_sample_with, init_audio_decoder_pipelines_with,
+    };
+
+    #[test]
+    fn init_audio_decoder_pipelines_with_validates_core_and_aligns_df_optionality() {
+        // 1. Pre-existing device loss aborts before building core or df pipelines.
+        let mut core_calls = 0usize;
+        let err_pre = init_audio_decoder_pipelines_with(
+            true,
+            || Some("pre-lost".to_string()),
+            || {
+                core_calls += 1;
+                Ok(1u32)
+            },
+            || Ok(Some(2u32)),
+        )
+        .unwrap_err();
+        assert_eq!(core_calls, 0);
+        assert!(err_pre.to_string().contains("pre-lost"));
+
+        // 2. Core pipeline error aborts before df validation.
+        let mut df_calls = 0usize;
+        let err_core = init_audio_decoder_pipelines_with::<u32, u32>(
+            true,
+            || None,
+            || anyhow::bail!("core detok failed"),
+            || {
+                df_calls += 1;
+                Ok(Some(2))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(df_calls, 0);
+        assert!(err_core.to_string().contains("core detok failed"));
+
+        // 3. When try_df is false, df builder is never invoked and returns None.
+        let mut df_calls = 0usize;
+        let (core, df) = init_audio_decoder_pipelines_with(
+            false,
+            || None,
+            || Ok(11u32),
+            || {
+                df_calls += 1;
+                Ok(Some(22u32))
+            },
+        )
+        .unwrap();
+        assert_eq!((core, df, df_calls), (11, None, 0));
+
+        // 4. When try_df is true and df degrades non-fatally to None, detokenizer succeeds.
+        let (core, df) =
+            init_audio_decoder_pipelines_with(true, || None, || Ok(11u32), || Ok(None::<u32>))
+                .unwrap();
+        assert_eq!((core, df), (11, None));
+
+        // 5. When try_df is true and df aborts with device-loss Err, whole load aborts.
+        let err_df = init_audio_decoder_pipelines_with::<u32, u32>(
+            true,
+            || None,
+            || Ok(11),
+            || anyhow::bail!("df device lost"),
+        )
+        .unwrap_err();
+        assert!(err_df.to_string().contains("df device lost"));
+    }
+
+    #[test]
+    fn finish_audio_decoder_load_with_aborts_on_post_upload_device_loss() {
+        // 1. Device lost after detokenizer upload with has_df_pipes=true skips depthformer upload.
+        let mut df_calls = 0usize;
+        let err_detok_with_df = finish_audio_decoder_load_with(
+            true,
+            |_| anyhow::bail!("audio_decoder weight upload: GPU device lost (detok lost)"),
+            || true,
+            || {
+                df_calls += 1;
+                Ok(1u32)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(df_calls, 0);
+        assert!(format!("{err_detok_with_df:#}").contains("detok lost"));
+
+        // 2. Device lost after detokenizer upload with has_df_pipes=false aborts instead of Ok(None).
+        let err_detok_no_df = finish_audio_decoder_load_with(
+            false,
+            |_| anyhow::bail!("audio_decoder weight upload: GPU device lost (detok no-df lost)"),
+            || true,
+            || Ok(1u32),
+        )
+        .unwrap_err();
+        assert!(format!("{err_detok_no_df:#}").contains("detok no-df lost"));
+
+        // 3. Depthformer upload returns Ok(df), but device died silently mid-upload -> post-upload abort.
+        let mut stage_idx = 0usize;
+        let err_df_silent = finish_audio_decoder_load_with(
+            true,
+            |stage| {
+                stage_idx += 1;
+                if stage_idx == 1 {
+                    Ok(())
+                } else {
+                    anyhow::bail!("{stage}: GPU device lost (df silent loss)")
+                }
+            },
+            || true,
+            || Ok(99u32),
+        )
+        .unwrap_err();
+        assert_eq!(stage_idx, 2);
+        assert!(format!("{err_df_silent:#}").contains("df silent loss"));
+
+        // 4. Depthformer load returns Err and device is lost -> aborts with Err instead of CPU fallback.
+        let err_df_lost = finish_audio_decoder_load_with::<u32>(
+            true,
+            |_| Ok(()),
+            || true,
+            || anyhow::bail!("df load error on dead device"),
+        )
+        .unwrap_err();
+        assert!(format!("{err_df_lost:#}").contains("df load error on dead device"));
+
+        // 5. Depthformer load returns Err while device is alive -> falls back to CPU (Ok(None)).
+        let fallback = finish_audio_decoder_load_with::<u32>(
+            true,
+            |_| Ok(()),
+            || false,
+            || anyhow::bail!("non-fatal df GGUF mismatch"),
+        )
+        .unwrap();
+        assert_eq!(fallback, None);
+
+        // 6. Both uploads succeed on live device -> Ok(Some(df)).
+        let ok = finish_audio_decoder_load_with(true, |_| Ok(()), || false, || Ok(42u32)).unwrap();
+        assert_eq!(ok, Some(42));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pipelines_build_validated_succeeds_and_aborts_on_lost_device() {
+        use super::Pipelines;
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
         };
+        let core_only = Pipelines::build_validated(&ctx, false)
+            .expect("core audio_decoder pipelines must build on a live device");
+        assert!(core_only.df.is_none());
 
-        for j in 0..self.dec_cfg.n_codebook {
-            let pos = j;
+        let with_df = Pipelines::build_validated(&ctx, true)
+            .expect("audio_decoder pipelines with depthformer must build on a live device");
+        assert!(with_df.df.is_some());
 
-            // Initial projections for this codebook
-            dispatch_pass(
-                &mut enc,
-                &self.pipes.gemv_f32,
-                &self.depth_linear_bgs[j],
-                (self.depth_linear_wg_m, 1, 1),
-                "df_depth_linear",
-            );
+        ctx.simulate_device_lost("test: audio decoder lost");
+        let err = match Pipelines::build_validated(&ctx, true) {
+            Ok(_) => panic!("Pipelines::build_validated must abort on a lost device"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("audio_decoder pipelines"), "{msg}");
+        assert!(msg.contains("test: audio decoder lost"), "{msg}");
+    }
 
-            dispatch_pass(
-                &mut enc,
-                &self.pipes.add_inplace,
-                &self.bias_add_bgs[j],
-                ((n_embd as u32).div_ceil(256), 1, 1),
-                "df_bias_add",
-            );
-
-            if j > 0 {
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.df_embed_add,
-                    &self.embed_add_bgs[j - 1],
-                    ((n_embd as u32).div_ceil(256), 1, 1),
-                    "df_embed_add",
-                );
-            }
-
-            // Transformer layers with fused QKV, fused FFN gate+up with inline SiLU, and direct residual accumulators
-            for lw in &self.layers {
-                // RMSnorm -> normed_buf
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.rmsnorm_batch,
-                    &lw.operator_norm_bg,
-                    (1, 1, 1),
-                    "df_op_norm",
-                );
-
-                // Fused QKV GEMV -> q_buf, k_buf, v_buf
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.df_qkv_gemv,
-                    &lw.gemm_qkv_bg,
-                    (self.qkv_wg_m, 1, 1),
-                    "df_qkv_gemv",
-                );
-
-                // QK norm + RoPE (interleaved / NORM)
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.qk_norm_rope_batch,
-                    &lw.rope_bgs[pos],
-                    (n_head + n_kv, 1, 1),
-                    "df_qk_norm_rope",
-                );
-
-                // GPU-side KV cache slot copy inside the compute pass
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.df_kv_copy,
-                    &lw.kv_copy_bgs[pos],
-                    (kv_dim.div_ceil(256), 1, 1),
-                    "df_kv_copy",
-                );
-
-                // Flash Attention -> attn_out_buf
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.flash_attention,
-                    &lw.attn_bgs[pos],
-                    (n_head, 1, 1),
-                    "df_flash_attention",
-                );
-
-                // Out projection directly accumulated into hidden_buf (hidden_buf += Wo · attn_out)
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.gemv_f32_accum,
-                    &lw.gemm_wo_accum_bg,
-                    (self.n_embd_wg_m, 1, 1),
-                    "df_wo_accum",
-                );
-
-                // FFN: RMSnorm -> normed_buf
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.rmsnorm_batch,
-                    &lw.ffn_norm_bg,
-                    (1, 1, 1),
-                    "df_ffn_norm",
-                );
-
-                // FFN Fused Gate + Up with inline SiLU -> ffn_act_buf
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.df_ffn_gate_up,
-                    &lw.ffn_gate_up_bg,
-                    (self.ffn_dim_wg_m, 1, 1),
-                    "df_ffn_gate_up",
-                );
-
-                // FFN W2 Down projection directly accumulated into hidden_buf (hidden_buf += W2 · ffn_act)
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.gemv_f32_accum,
-                    &lw.gemm_w2_accum_bg,
-                    (self.n_embd_wg_m, 1, 1),
-                    "df_w2_accum",
-                );
-            }
-
-            // to_logits: RMSnorm -> GEMV -> logits_buf
-            dispatch_pass(
-                &mut enc,
-                &self.pipes.rmsnorm_batch,
-                &self.to_logits_norm_bgs[j],
-                (1, 1, 1),
-                "df_to_logits_norm",
-            );
-
-            dispatch_pass(
-                &mut enc,
-                &self.pipes.gemv_f32,
-                &self.to_logits_gemm_bgs[j],
-                (self.n_vocab_wg_m, 1, 1),
-                "df_to_logits_gemm",
-            );
-
-            // Sample on GPU (with temperature) or Argmax on GPU -> sampled_codes_buf[j]
-            if use_sampling {
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.df_sample_logits,
-                    &self.sample_bgs[j],
-                    (1, 1, 1),
-                    "df_sample_logits",
-                );
-            } else {
-                dispatch_pass(
-                    &mut enc,
-                    &self.pipes.argmax_f32,
-                    &self.argmax_bgs[j],
-                    (1, 1, 1),
-                    "df_argmax",
-                );
-            }
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
         }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
 
-        // Single 32-byte download of all 8 codes via pre-allocated staging buffer
-        let size = (self.dec_cfg.n_codebook * 4) as u64;
-        enc.copy_buffer_to_buffer(
-            &self.sampled_codes_buf,
-            0,
-            &self.staging_readback_buf,
-            0,
-            size,
-        );
-        self.ctx.submit_encoder(enc);
+    fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        fut.poll(&mut cx)
+    }
 
-        let (tx, rx) = futures_channel::oneshot::channel();
-        self.staging_readback_buf
-            .slice(0..size)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
+    #[test]
+    fn detokenize_and_depthformer_async_readbacks_defer_commit_and_abort_on_loss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        #[cfg(not(target_arch = "wasm32"))]
-        self.ctx.device.poll_wait();
+        // 1. Pre-flight device loss skips encoding and keeps n_past unchanged.
+        let n_past = AtomicUsize::new(0);
+        let mut prepared = false;
+        let err_pre = {
+            let mut fut = std::pin::pin!(detokenize_to_spectrum_with(
+                &n_past,
+                |stage| anyhow::bail!("{stage}: GPU device lost (pre-lost)"),
+                || {
+                    prepared = true;
+                    (2, 6, async { Ok(vec![0u8; 8]) })
+                },
+            ));
+            match poll_once(fut.as_mut()) {
+                std::task::Poll::Ready(Err(e)) => e,
+                other => panic!("expected Ready(Err), got {other:?}"),
+            }
+        };
+        assert!(!prepared);
+        assert_eq!(n_past.load(Ordering::Relaxed), 0);
+        assert!(format!("{err_pre:#}").contains("pre-lost"));
 
-        let res = rx.await;
-        let mut codes = [0i32; 8];
-        match res {
-            Ok(Ok(())) => {
-                let parse_res: Result<[i32; 8]> = {
-                    let slice = self.staging_readback_buf.slice(0..size);
-                    match slice.get_mapped_range() {
-                        Ok(data) => {
-                            let expected_bytes = 8 * std::mem::size_of::<u32>();
-                            if data.len() < expected_bytes {
-                                Err(anyhow::anyhow!(
-                                    "GPU staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
-                                    data.len()
-                                ))
-                            } else {
-                                for i in 0..8 {
-                                    codes[i] = bytemuck::pod_read_unaligned::<u32>(
-                                        &data[i * 4..(i + 1) * 4],
-                                    ) as i32;
-                                }
-                                Ok(codes)
-                            }
-                        }
-                        Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
+        // 2. Mid-flight readback failure propagates Err and does NOT advance n_past.
+        let mut fut = std::pin::pin!(detokenize_to_spectrum_with(
+            &n_past,
+            |_| Ok(()),
+            || (2, 6, async {
+                anyhow::bail!("GPU device lost (mid-flight); readback discarded")
+            }),
+        ));
+        let err_mid = match poll_once(fut.as_mut()) {
+            std::task::Poll::Ready(Err(e)) => e,
+            other => panic!("expected Ready(Err), got {other:?}"),
+        };
+        assert_eq!(n_past.load(Ordering::Relaxed), 0);
+        assert!(format!("{err_mid:#}").contains("mid-flight"));
+
+        // 3. Dropping/cancelling a pending readback future does NOT advance n_past.
+        {
+            let (_tx, rx) = futures_channel::oneshot::channel::<anyhow::Result<Vec<u8>>>();
+            let mut fut = std::pin::pin!(detokenize_to_spectrum_with(
+                &n_past,
+                |_| Ok(()),
+                || (2, 6, async move {
+                    rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("closed")))
+                }),
+            ));
+            assert!(matches!(poll_once(fut.as_mut()), std::task::Poll::Pending));
+        }
+        assert_eq!(n_past.load(Ordering::Relaxed), 0);
+
+        // 4. Truncated spectrum buffer fails without advancing n_past.
+        let mut fut = std::pin::pin!(detokenize_to_spectrum_with(
+            &n_past,
+            |_| Ok(()),
+            || (2, 6, async { Ok(vec![0u8; 4]) }),
+        ));
+        assert!(matches!(
+            poll_once(fut.as_mut()),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(n_past.load(Ordering::Relaxed), 0);
+
+        // 5. Valid spectrum readback decodes floats and commits n_past.
+        let expected = [1.5f32, -2.25f32];
+        let valid_bytes = bytemuck::cast_slice(&expected).to_vec();
+        let mut fut = std::pin::pin!(detokenize_to_spectrum_with(
+            &n_past,
+            |_| Ok(()),
+            || (2, 6, async move { Ok(valid_bytes) }),
+        ));
+        let got = match poll_once(fut.as_mut()) {
+            std::task::Poll::Ready(Ok(v)) => v,
+            other => panic!("expected Ready(Ok), got {other:?}"),
+        };
+        assert_eq!(got, expected);
+        assert_eq!(n_past.load(Ordering::Relaxed), 6);
+
+        // 6. Depthformer sample helper: pre-flight loss skips dispatch; mid-flight loss &
+        //    truncated bytes abort; valid 32-byte readback decodes all 8 codes.
+        let mut dispatched = false;
+        {
+            let mut fut = std::pin::pin!(finish_depthformer_sample_with(
+                |stage| anyhow::bail!("{stage}: GPU device lost (df pre-lost)"),
+                || {
+                    dispatched = true;
+                    async { Ok(vec![0u8; 32]) }
+                },
+            ));
+            assert!(matches!(
+                poll_once(fut.as_mut()),
+                std::task::Poll::Ready(Err(_))
+            ));
+        }
+        assert!(!dispatched);
+
+        let mut fut = std::pin::pin!(finish_depthformer_sample_with(
+            |_| Ok(()),
+            || async { anyhow::bail!("GPU device lost (df mid-flight); readback discarded") },
+        ));
+        let df_mid = match poll_once(fut.as_mut()) {
+            std::task::Poll::Ready(Err(e)) => e,
+            other => panic!("expected Ready(Err), got {other:?}"),
+        };
+        assert!(format!("{df_mid:#}").contains("df mid-flight"));
+
+        let mut fut = std::pin::pin!(finish_depthformer_sample_with(
+            |_| Ok(()),
+            || async { Ok(vec![0u8; 16]) },
+        ));
+        assert!(matches!(
+            poll_once(fut.as_mut()),
+            std::task::Poll::Ready(Err(_))
+        ));
+
+        let codes_u32 = [11u32, 22, 33, 44, 55, 66, 77, 88];
+        let code_bytes = bytemuck::cast_slice(&codes_u32).to_vec();
+        let mut fut = std::pin::pin!(finish_depthformer_sample_with(
+            |_| Ok(()),
+            || async move { Ok(code_bytes) },
+        ));
+        let got_codes = match poll_once(fut.as_mut()) {
+            std::task::Poll::Ready(Ok(c)) => c,
+            other => panic!("expected Ready(Ok), got {other:?}"),
+        };
+        assert_eq!(got_codes, [11, 22, 33, 44, 55, 66, 77, 88]);
+    }
+
+    #[test]
+    fn prepare_depthformer_gguf_rejects_bad_dtypes_and_shapes_upfront() {
+        fn build(
+            n_embd: usize,
+            head_dim: usize,
+            ffn_dim: usize,
+            dl_cols: usize,
+            n_vocab: usize,
+            mut overrides: impl FnMut(&str, &mut Vec<usize>, &mut u32),
+        ) -> crate::gguf::GgufFile {
+            let mut b = Some(
+                crate::gguf::GgufBuilder::new()
+                    .kv_u32("depthformer_n_layer", 1)
+                    .kv_u32("depthformer_n_embd", n_embd as u32),
+            );
+            {
+                let mut add = |name: &str, mut dims: Vec<usize>| {
+                    let mut ty = 0u32; // F32
+                    overrides(name, &mut dims, &mut ty);
+                    let numel: usize = dims.iter().product();
+                    if let Some(builder) = b.take() {
+                        b = Some(builder.tensor(name, &dims, ty, vec![0u8; numel * 4]));
                     }
                 };
-                self.staging_readback_buf.unmap();
-                parse_res
+                let qkv_out = (32 + 2 * 8) * head_dim;
+                add("depthformer.layers.0.operator_norm.weight", vec![n_embd]);
+                add(
+                    "depthformer.layers.0.operator.qkv_proj.weight",
+                    vec![n_embd, qkv_out],
+                );
+                add(
+                    "depthformer.layers.0.operator.attention.q_layernorm.weight",
+                    vec![head_dim],
+                );
+                add(
+                    "depthformer.layers.0.operator.attention.k_layernorm.weight",
+                    vec![head_dim],
+                );
+                add(
+                    "depthformer.layers.0.operator.out_proj.weight",
+                    vec![32 * head_dim, n_embd],
+                );
+                add("depthformer.layers.0.ffn_norm.weight", vec![n_embd]);
+                add(
+                    "depthformer.layers.0.feed_forward.w1.weight",
+                    vec![n_embd, ffn_dim],
+                );
+                add(
+                    "depthformer.layers.0.feed_forward.w2.weight",
+                    vec![ffn_dim, n_embd],
+                );
+                add(
+                    "depthformer.layers.0.feed_forward.w3.weight",
+                    vec![n_embd, ffn_dim],
+                );
+                add("depth_linear.weight", vec![dl_cols, 8 * n_embd]);
+                add("depth_linear.bias", vec![8 * n_embd]);
+                for j in 0..8 {
+                    add(
+                        &format!("depth_embeddings.{j}.embedding_norm.weight"),
+                        vec![n_embd],
+                    );
+                    add(
+                        &format!("depth_embeddings.{j}.to_logits.weight"),
+                        vec![n_embd, n_vocab],
+                    );
+                    if j < 7 {
+                        add(
+                            &format!("depth_embeddings.{j}.embedding.weight"),
+                            vec![n_embd, n_vocab],
+                        );
+                    }
+                }
             }
-            Ok(Err(e)) => anyhow::bail!("GPU readback failed: {e:?}"),
-            Err(_) => anyhow::bail!("GPU readback channel closed"),
+            b.unwrap().build()
         }
+
+        use crate::model::audio_decoder::HeadDimBounds;
+        // Valid baseline passes cleanly (head_dim=4 and head_dim=6 both valid on WGPU).
+        let valid = build(8, 4, 16, 6, 12, |_, _, _| {});
+        let prep = super::prepare_depthformer_gguf(&valid, HeadDimBounds::WGPU).unwrap();
+        assert_eq!(prep.n_embd_d, 8);
+        assert_eq!(prep.dl_cols, 6);
+        let valid_hd6 = build(8, 6, 16, 6, 12, |_, _, _| {});
+        assert!(super::prepare_depthformer_gguf(&valid_hd6, HeadDimBounds::WGPU).is_ok());
+
+        // GGML_TYPE_I32 (26) fails cleanly via try_to_f32_vec() instead of panicking.
+        let i32_dl_w = build(8, 4, 16, 6, 12, |name, _, ty| {
+            if name == "depth_linear.weight" {
+                *ty = 26;
+            }
+        });
+        assert!(super::prepare_depthformer_gguf(&i32_dl_w, HeadDimBounds::WGPU).is_err());
+
+        let i32_dl_b = build(8, 4, 16, 6, 12, |name, _, ty| {
+            if name == "depth_linear.bias" {
+                *ty = 26;
+            }
+        });
+        assert!(super::prepare_depthformer_gguf(&i32_dl_b, HeadDimBounds::WGPU).is_err());
+
+        // Invalid dl_shape (1D) and dl_cols == 0 fail upfront.
+        let bad_dl_rank = build(8, 4, 16, 6, 12, |name, dims, _| {
+            if name == "depth_linear.weight" {
+                *dims = vec![6 * 8 * 8];
+            }
+        });
+        assert!(super::prepare_depthformer_gguf(&bad_dl_rank, HeadDimBounds::WGPU).is_err());
+
+        let bad_dl_cols = build(8, 4, 16, 0, 12, |_, _, _| {});
+        assert!(super::prepare_depthformer_gguf(&bad_dl_cols, HeadDimBounds::WGPU).is_err());
+
+        // head_dim > 128 and odd head_dim rejected on WGPU.
+        let bad_hd = build(8, 130, 16, 6, 12, |_, _, _| {});
+        assert!(super::prepare_depthformer_gguf(&bad_hd, HeadDimBounds::WGPU).is_err());
+        let odd_hd = build(8, 3, 16, 6, 12, |_, _, _| {});
+        assert!(super::prepare_depthformer_gguf(&odd_hd, HeadDimBounds::WGPU).is_err());
+
+        // ffn_dim == 0 and n_vocab == 0 rejected upfront.
+        let bad_ffn = build(8, 4, 0, 6, 12, |_, _, _| {});
+        assert!(super::prepare_depthformer_gguf(&bad_ffn, HeadDimBounds::WGPU).is_err());
+        let bad_vocab = build(8, 4, 16, 6, 0, |_, _, _| {});
+        assert!(super::prepare_depthformer_gguf(&bad_vocab, HeadDimBounds::WGPU).is_err());
+
+        // Bad layer matrix dims rejected before weight dequantization.
+        let bad_w3 = build(8, 4, 16, 6, 12, |name, dims, _| {
+            if name == "depthformer.layers.0.feed_forward.w3.weight" {
+                *dims = vec![8, 4];
+            }
+        });
+        assert!(super::prepare_depthformer_gguf(&bad_w3, HeadDimBounds::WGPU).is_err());
+
+        // Unsupported GGML placeholder type Q2_K (10 -> size_bytes=0) rejected upfront.
+        let q2k_w1 = build(8, 4, 16, 6, 12, |name, _, ty| {
+            if name == "depthformer.layers.0.feed_forward.w1.weight" {
+                *ty = 10;
+            }
+        });
+        let q2k_err = format!(
+            "{:#}",
+            super::prepare_depthformer_gguf(&q2k_w1, HeadDimBounds::WGPU)
+                .err()
+                .expect("Q2_K must fail upfront")
+        );
+        assert!(q2k_err.contains("unsupported GGML type 10"), "{q2k_err}");
+    }
+
+    #[test]
+    fn prevalidate_detokenizer_gguf_and_probe_helpers_reject_bad_dtypes_and_geometry_before_gpu() {
+        use crate::model::audio_decoder::tests::build_minimal_detokenizer_gguf;
+
+        // 1. Valid lfm.* and blk.* detokenizer GGUFs (including head_dim=6 on WGPU) pass pure-host
+        //    prevalidation without touching GpuContext.
+        let valid_lfm = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, false, |_, _, _| {});
+        let cfg = super::WgpuAudioDecoder::prevalidate_detokenizer_gguf(&valid_lfm).unwrap();
+        assert_eq!(
+            (cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_embd_head),
+            (8, 2, 1, 4)
+        );
+
+        let valid_blk = build_minimal_detokenizer_gguf(8, 4, 2, 1, 16, true, |_, _, _| {});
+        let cfg_blk = super::WgpuAudioDecoder::prevalidate_detokenizer_gguf(&valid_blk).unwrap();
+        assert_eq!(cfg_blk.ffn_dim, 16);
+
+        let valid_hd6 = build_minimal_detokenizer_gguf(12, 6, 2, 1, 16, false, |_, _, _| {});
+        assert!(super::WgpuAudioDecoder::prevalidate_detokenizer_gguf(&valid_hd6).is_ok());
+
+        let assert_fails_before_gpu =
+            |gguf: std::sync::Arc<crate::gguf::GgufFile>, needle: &str, label: &str| {
+                let helper_err = format!(
+                    "{:#}",
+                    super::WgpuAudioDecoder::prevalidate_detokenizer_gguf(&gguf).unwrap_err()
+                );
+                assert!(
+                    helper_err.contains(needle),
+                    "{label} helper: expected {needle:?}, got {helper_err:?}"
+                );
+                let msg = format!(
+                    "{:#}",
+                    super::WgpuAudioDecoder::from_gguf(&gguf, std::path::Path::new(""))
+                        .err()
+                        .unwrap_or_else(|| panic!("{label}: expected Err"))
+                );
+                assert!(
+                    !msg.contains("No suitable GPU adapter"),
+                    "{label}: skipped prevalidation and reached GpuContext::new(): {msg}"
+                );
+                assert!(
+                    msg.contains(needle),
+                    "{label} from_gguf: expected {needle:?}, got {msg:?}"
+                );
+            };
+
+        // 2. Q2_K (10 -> size_bytes=0) on an lfm.* probe tensor must surface unsupported type 10
+        //    instead of falling back to absent blk.* and reporting "not found" (R8-G2).
+        let q2k_probe_conv = std::sync::Arc::new(build_minimal_detokenizer_gguf(
+            8,
+            4,
+            2,
+            1,
+            16,
+            false,
+            |name, _, ty| {
+                if name == "lfm.layers.0.conv.in_proj.weight" {
+                    *ty = 10;
+                }
+            },
+        ));
+        let direct_conv_err = format!(
+            "{:#}",
+            super::get_detok_tensor(
+                &q2k_probe_conv,
+                "lfm.layers.0.conv.in_proj.weight",
+                "blk.0.shortconv.in_proj.weight",
+            )
+            .err()
+            .expect("get_detok_tensor must fail on Q2_K conv probe")
+        );
+        assert!(
+            direct_conv_err.contains("unsupported GGML type 10")
+                && !direct_conv_err.contains("not found"),
+            "get_detok_tensor masked conv error: {direct_conv_err}"
+        );
+        assert_fails_before_gpu(q2k_probe_conv, "unsupported GGML type 10", "q2k probe conv");
+
+        let q2k_probe_tensor = std::sync::Arc::new(build_minimal_detokenizer_gguf(
+            8,
+            4,
+            2,
+            1,
+            16,
+            false,
+            |name, _, ty| {
+                if name == "lfm.layers.2.self_attn.q_layernorm.weight" {
+                    *ty = 10;
+                }
+            },
+        ));
+        let direct_tensor_err = format!(
+            "{:#}",
+            super::get_detok_tensor(
+                &q2k_probe_tensor,
+                "lfm.layers.2.self_attn.q_layernorm.weight",
+                "blk.2.attn_q_norm.weight",
+            )
+            .err()
+            .expect("get_detok_tensor must fail on Q2_K probe tensor")
+        );
+        assert!(
+            direct_tensor_err.contains("unsupported GGML type 10")
+                && !direct_tensor_err.contains("not found"),
+            "get_detok_tensor masked error: {direct_tensor_err}"
+        );
+        assert_fails_before_gpu(
+            q2k_probe_tensor,
+            "unsupported GGML type 10",
+            "q2k probe tensor",
+        );
+
+        // 3. Q2_K and I32 on non-probe detokenizer layer weights also fail upfront before GPU init.
+        let i32_layer = std::sync::Arc::new(build_minimal_detokenizer_gguf(
+            8,
+            4,
+            2,
+            1,
+            16,
+            false,
+            |name, _, ty| {
+                if name == "lin.weight" {
+                    *ty = 26;
+                }
+            },
+        ));
+        assert_fails_before_gpu(i32_layer, "I32", "i32 lin.weight");
+
+        let q2k_layer = std::sync::Arc::new(build_minimal_detokenizer_gguf(
+            8,
+            4,
+            2,
+            1,
+            16,
+            true,
+            |name, _, ty| {
+                if name == "blk.1.shortconv.conv.weight" {
+                    *ty = 10;
+                }
+            },
+        ));
+        assert_fails_before_gpu(q2k_layer, "unsupported GGML type 10", "q2k blk layer");
+
+        // 4. HeadDimBounds::WGPU (odd head_dim=3 and oversized head_dim=130) rejected upfront.
+        let odd_hd = std::sync::Arc::new(build_minimal_detokenizer_gguf(
+            6,
+            3,
+            2,
+            1,
+            16,
+            false,
+            |_, _, _| {},
+        ));
+        assert_fails_before_gpu(odd_hd, "multiple of 2", "head_dim=3 WGPU");
+
+        let big_hd = std::sync::Arc::new(build_minimal_detokenizer_gguf(
+            260,
+            130,
+            2,
+            1,
+            16,
+            false,
+            |_, _, _| {},
+        ));
+        assert_fails_before_gpu(big_hd, "head_dim 130 > 128", "head_dim=130 WGPU");
     }
 }

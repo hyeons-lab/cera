@@ -295,13 +295,13 @@ pub enum FrameOutcome {
     /// to the text modality per its mode's exit convention.
     End,
     /// The accelerator backend faulted mid-frame (see
-    /// `AudioAccelerator::take_audio_error`) and the stage has no CPU fallback
-    /// with coherent state, so the frame produced nothing usable.
-    /// Callers must abort generation with the error, not continue over
-    /// the hole: detokenize/ISTFT faults already fall back to CPU
-    /// inside `decode_frame`/`finish`, so only sampling faults arrive
-    /// here. Carries the fault detail string (`CeraError` is neither
-    /// `Clone` nor `PartialEq`, which this enum derives); callers
+    /// `AudioAccelerator::take_audio_error`) and the stage cannot continue on
+    /// CPU fallback with coherent state, so the frame produced nothing usable.
+    /// Callers must abort generation with the error, not continue over the hole:
+    /// both sampling faults and mid-utterance or lost-device detokenize faults
+    /// arrive here (while batch-mode detokenize/lost-device ISTFT faults
+    /// propagate from `try_finish`). Carries the fault detail string (`CeraError`
+    /// is neither `Clone` nor `PartialEq`, which this enum derives); callers
     /// re-wrap with `CeraError::Backend`.
     Fault(String),
 }
@@ -326,6 +326,8 @@ pub struct AudioOutputDecoder<'a> {
     audio_top_k: usize,
     /// Precomputed: hardware depthformer acceleration is active.
     use_accelerated_df: bool,
+    /// Latched on frame-0 non-device-loss detokenizer CPU fallback so all later frames stay on CPU `detok_state`.
+    detok_fallback_cpu: bool,
     /// Whether to detokenize and stream audio incrementally per frame,
     /// or buffer sampled codes and perform a single fused detokenization + iSTFT pass at finish.
     streaming: bool,
@@ -342,6 +344,17 @@ impl<'a> Drop for AudioOutputDecoder<'a> {
         if let Some(acc) = self.accelerator {
             acc.release_session();
         }
+    }
+}
+
+fn is_device_loss_cera_err(err: &crate::CeraError) -> bool {
+    err.to_string().to_ascii_lowercase().contains("device lost")
+}
+
+fn format_cera_err_detail(err: crate::CeraError) -> String {
+    match err {
+        crate::CeraError::Backend(detail) => detail,
+        other => other.to_string(),
     }
 }
 
@@ -495,6 +508,7 @@ impl<'a> AudioOutputDecoder<'a> {
                         gpu_depthformer,
                     )
                 }),
+            detok_fallback_cpu: false,
             streaming: true,
             all_codes: Vec::new(),
             last_codes: Vec::new(),
@@ -558,26 +572,9 @@ impl<'a> AudioOutputDecoder<'a> {
             }
 
             let t1 = Instant::now();
-            let spectrum = if let Some(a) = self.accelerator {
-                let _ = a.take_audio_error();
-                let spectrum = a.detokenize_to_spectrum(self.detok_weights, &codes_vec);
-                if a.take_audio_error().is_some() {
-                    detokenize_to_spectrum(
-                        self.detok_weights,
-                        self.weights,
-                        &mut self.detok_state,
-                        &codes_vec,
-                    )
-                } else {
-                    spectrum
-                }
-            } else {
-                detokenize_to_spectrum(
-                    self.detok_weights,
-                    self.weights,
-                    &mut self.detok_state,
-                    &codes_vec,
-                )
+            let spectrum = match self.detokenize_frame_sync(&codes_vec) {
+                Ok(s) => s,
+                Err(detail) => return FrameOutcome::Fault(detail),
             };
             self.time_detokenizer += t1.elapsed();
 
@@ -640,28 +637,9 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         let t1 = Instant::now();
-        let spectrum = if let Some(a) = self.accelerator {
-            // Drain around the bare call; on a fault recompute on CPU,
-            // mirroring the async path's `Err(_) =>` arm below.
-            let _ = a.take_audio_error();
-            let spectrum = a.detokenize_to_spectrum(self.detok_weights, &codes);
-            if a.take_audio_error().is_some() {
-                detokenize_to_spectrum(
-                    self.detok_weights,
-                    self.weights,
-                    &mut self.detok_state,
-                    &codes,
-                )
-            } else {
-                spectrum
-            }
-        } else {
-            detokenize_to_spectrum(
-                self.detok_weights,
-                self.weights,
-                &mut self.detok_state,
-                &codes,
-            )
+        let spectrum = match self.detokenize_frame_sync(&codes) {
+            Ok(s) => s,
+            Err(detail) => return FrameOutcome::Fault(detail),
         };
         self.time_detokenizer += t1.elapsed();
 
@@ -715,19 +693,11 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         let t1 = Instant::now();
-        let spectrum = if let Some(a) = self.accelerator {
-            match a
-                .detokenize_to_spectrum_async(self.detok_weights, &codes)
-                .await
-            {
-                Ok(spec) => spec,
-                Err(_) => detokenize_to_spectrum(
-                    self.detok_weights,
-                    self.weights,
-                    &mut self.detok_state,
-                    &codes,
-                ),
-            }
+        let spectrum = if !self.detok_fallback_cpu
+            && let Some(a) = self.accelerator
+        {
+            a.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await?
         } else {
             detokenize_to_spectrum(
                 self.detok_weights,
@@ -786,19 +756,11 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         let t1 = Instant::now();
-        let spectrum = if let Some(a) = self.accelerator {
-            match a
-                .detokenize_to_spectrum_async(self.detok_weights, &codes)
-                .await
-            {
-                Ok(spec) => spec,
-                Err(_) => detokenize_to_spectrum(
-                    self.detok_weights,
-                    self.weights,
-                    &mut self.detok_state,
-                    &codes,
-                ),
-            }
+        let spectrum = if !self.detok_fallback_cpu
+            && let Some(a) = self.accelerator
+        {
+            a.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await?
         } else {
             detokenize_to_spectrum(
                 self.detok_weights,
@@ -819,18 +781,19 @@ impl<'a> AudioOutputDecoder<'a> {
         })
     }
 
-    /// Drain any remaining audio through the ISTFT pass.
+    /// Drain any remaining audio through the ISTFT pass, returning an error if
+    /// batch detokenization or iSTFT aborts due to a mid-utterance or lost-device fault.
     /// Flushes any buffered streaming samples to the caller and returns the
     /// accumulated streamed sample count.
     #[allow(clippy::chunks_exact_to_as_chunks)]
-    pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
+    pub fn try_finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> anyhow::Result<usize> {
         if self.streaming {
             let remaining = self.streamer.flush();
             if !remaining.is_empty() {
                 sink(&remaining, self.detok_weights.config.sample_rate as u32);
                 self.streamed_samples += remaining.len();
             }
-            return self.streamed_samples;
+            return Ok(self.streamed_samples);
         }
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
@@ -842,13 +805,31 @@ impl<'a> AudioOutputDecoder<'a> {
             };
             let chunks = self.all_codes.chunks_exact(frame_codebooks);
             let remainder = chunks.remainder();
-            for codes in chunks {
-                let spectrum = if let Some(a) = self.accelerator {
-                    // Drain around the bare call; on a fault recompute
-                    // on CPU rather than extending zeros.
+            let mut fallback_cpu = self.detok_fallback_cpu;
+            for (chunk_idx, codes) in chunks.enumerate() {
+                let spectrum = if !fallback_cpu && let Some(a) = self.accelerator {
                     let _ = a.take_audio_error();
                     let spectrum = a.detokenize_to_spectrum(self.detok_weights, codes);
-                    if a.take_audio_error().is_some() {
+                    if let Some(err) = a.take_audio_error() {
+                        if chunk_idx > 0 || is_device_loss_cera_err(&err) {
+                            tracing::warn!(
+                                "GPU batch detokenize aborted at chunk {chunk_idx}: {err}"
+                            );
+                            eprintln!(
+                                "[cera::audio] GPU batch detokenize aborted at chunk {chunk_idx}: {err}"
+                            );
+                            self.all_spectrum.clear();
+                            self.all_codes.clear();
+                            return Err(err.into());
+                        }
+                        tracing::warn!(
+                            "GPU batch detokenize fault on chunk 0 ({err}); falling back to CPU"
+                        );
+                        eprintln!(
+                            "[cera::audio] GPU batch detokenize fault on chunk 0 ({err}); falling back to CPU"
+                        );
+                        fallback_cpu = true;
+                        self.detok_fallback_cpu = true;
                         detokenize_to_spectrum(
                             self.detok_weights,
                             self.weights,
@@ -879,17 +860,22 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         if self.all_spectrum.is_empty() {
-            return self.streamed_samples;
+            return Ok(self.streamed_samples);
         }
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
         let pcm = match self.accelerator {
             Some(a) => {
-                // ISTFT is stateless, so a faulted accelerator run recomputes
-                // on CPU with identical output instead of failing.
+                // ISTFT is stateless, so a non-lost transient accelerator fault
+                // recomputes on CPU cleanly; device loss aborts via `try_finish`.
                 let _ = a.take_audio_error();
                 let pcm = a.istft_to_pcm(&self.all_spectrum, n_fft, hop);
-                if a.take_audio_error().is_some() {
+                if let Some(err) = a.take_audio_error() {
+                    if is_device_loss_cera_err(&err) {
+                        self.all_spectrum.clear();
+                        self.all_codes.clear();
+                        return Err(err.into());
+                    }
                     istft_to_pcm(&self.all_spectrum, n_fft, hop)
                 } else {
                     pcm
@@ -900,15 +886,57 @@ impl<'a> AudioOutputDecoder<'a> {
         self.all_spectrum.clear();
         self.all_codes.clear();
         if pcm.is_empty() {
-            return self.streamed_samples;
+            return Ok(self.streamed_samples);
         }
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
         self.streamed_samples += n;
-        self.streamed_samples
+        Ok(self.streamed_samples)
     }
 
-    /// Async version of [`Self::finish`] for WebGPU / browser wasm.
+    /// Infallible compatibility wrapper around [`Self::try_finish`]; returns the
+    /// accumulated streamed sample count even if batch detokenization aborted.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    pub fn finish(&mut self, sink: impl FnMut(&[f32], u32)) -> usize {
+        self.try_finish(sink).unwrap_or(self.streamed_samples)
+    }
+
+    fn detokenize_frame_sync(&mut self, codes: &[i32]) -> Result<Vec<f32>, String> {
+        if !self.detok_fallback_cpu
+            && let Some(a) = self.accelerator
+        {
+            // Drain around the bare call; mid-utterance or lost-device faults
+            // abort instead of running cold CPU `detok_state`, while frame-0
+            // transient faults warn, latch CPU fallback, and stay on CPU.
+            let _ = a.take_audio_error();
+            let spectrum = a.detokenize_to_spectrum(self.detok_weights, codes);
+            if let Some(err) = a.take_audio_error() {
+                if self.audio_frames > 1 || is_device_loss_cera_err(&err) {
+                    return Err(format_cera_err_detail(err));
+                }
+                self.detok_fallback_cpu = true;
+                tracing::warn!("GPU detokenize fault on frame 0 ({err}); falling back to CPU");
+                eprintln!(
+                    "[cera::audio] GPU detokenize fault on frame 0 ({err}); falling back to CPU"
+                );
+                return Ok(detokenize_to_spectrum(
+                    self.detok_weights,
+                    self.weights,
+                    &mut self.detok_state,
+                    codes,
+                ));
+            }
+            return Ok(spectrum);
+        }
+        Ok(detokenize_to_spectrum(
+            self.detok_weights,
+            self.weights,
+            &mut self.detok_state,
+            codes,
+        ))
+    }
+
+    /// Async version of [`Self::try_finish`] for WebGPU / browser wasm.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub async fn finish_async(
         &mut self,
@@ -933,9 +961,20 @@ impl<'a> AudioOutputDecoder<'a> {
             let chunks = self.all_codes.chunks_exact(frame_codebooks);
             let remainder = chunks.remainder();
             for codes in chunks {
-                let spectrum = if let Some(a) = self.accelerator {
-                    a.detokenize_to_spectrum_async(self.detok_weights, codes)
-                        .await?
+                let spectrum = if !self.detok_fallback_cpu
+                    && let Some(a) = self.accelerator
+                {
+                    match a
+                        .detokenize_to_spectrum_async(self.detok_weights, codes)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(err) => {
+                            self.all_spectrum.clear();
+                            self.all_codes.clear();
+                            return Err(err);
+                        }
+                    }
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
@@ -962,7 +1001,14 @@ impl<'a> AudioOutputDecoder<'a> {
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
         let pcm = match self.accelerator {
-            Some(a) => a.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await?,
+            Some(a) => match a.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await {
+                Ok(pcm) => pcm,
+                Err(err) => {
+                    self.all_spectrum.clear();
+                    self.all_codes.clear();
+                    return Err(err);
+                }
+            },
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
         self.all_spectrum.clear();
@@ -1151,8 +1197,8 @@ pub fn generate_audio(
                     }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
-                        // A sampling fault aborts generation: no codes, no
-                        // feedback embedding, nothing to continue with.
+                        // Sampling faults and mid-utterance/lost-device detokenize faults
+                        // abort generation cleanly instead of continuing on cold CPU state.
                         FrameOutcome::Fault(detail) => {
                             return Err(crate::CeraError::Backend(detail).into());
                         }
@@ -1242,8 +1288,8 @@ pub fn generate_audio(
                 }
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
-                    // A sampling fault aborts generation: no codes, no
-                    // feedback embedding, nothing to continue with.
+                    // Sampling faults and mid-utterance/lost-device detokenize faults
+                    // abort generation cleanly instead of continuing on cold CPU state.
                     FrameOutcome::Fault(detail) => {
                         return Err(crate::CeraError::Backend(detail).into());
                     }
@@ -1315,8 +1361,8 @@ pub fn generate_audio(
         }
     }
 
-    // Drain any remaining buffered samples or execute batch ISTFT.
-    let audio_samples = decoder.finish(&mut audio_callback);
+    // Drain any remaining buffered samples or execute batch ISTFT, returning batch/device-loss errors.
+    let audio_samples = decoder.try_finish(&mut audio_callback)?;
 
     Ok(AudioGenerateResult {
         text_tokens,
@@ -1974,5 +2020,347 @@ pub(crate) mod tests {
         assert_eq!(ctrl.audio_end, 129);
         assert_eq!(ctrl.text_end, 130);
         assert_eq!(ctrl.mixed_start, 131);
+    }
+
+    #[test]
+    fn async_and_mid_utterance_detok_faults_abort_instead_of_running_cold_cpu_state() {
+        let (dec, mut detok) = empty_vocoder_weights();
+        detok.output_norm = vec![1.0; 4];
+        detok.emb_weight = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 4], 1, 4);
+        detok.lin_w = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 40], 10, 4);
+        detok.lin_b = vec![0.0; 10];
+
+        // 1. Async decode_frame_async must propagate detok Err via `?` (not fall back to CPU).
+        let gpu_async = ScriptedFaultGpu::with_script(vec![
+            None,
+            None,
+            None,
+            Some(crate::CeraError::Backend(
+                "GPU device lost (async detok)".into(),
+            )),
+        ]);
+        let mut dec_async = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_async), 1.0, 1, true);
+        let async_err = block_on_ready(dec_async.decode_frame_async(&[0.0; 4])).unwrap_err();
+        assert!(format!("{async_err:#}").contains("async detok"));
+
+        // 2. Sync decode_frame must abort (FrameOutcome::Fault) on frame-0 device loss.
+        let gpu_sync_lost = ScriptedFaultGpu::with_script(vec![
+            None,
+            None,
+            None,
+            Some(crate::CeraError::Backend(
+                "GPU device lost (sync detok)".into(),
+            )),
+        ]);
+        let mut dec_lost =
+            AudioOutputDecoder::new(&dec, &detok, Some(&gpu_sync_lost), 1.0, 1, true);
+        assert_eq!(
+            dec_lost.decode_frame(&[0.0; 4]),
+            FrameOutcome::Fault("GPU device lost (sync detok)".into())
+        );
+
+        // 3. Sync decode_frame mid-utterance (frame 2) must abort rather than running cold CPU
+        //    `detok_state` after frame 1 executed on GPU.
+        let gpu_mid = ScriptedFaultGpu::with_script(vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::CeraError::Backend(
+                "mid-utterance detok fault".into(),
+            )),
+        ]);
+        let mut dec_mid = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_mid), 1.0, 1, true);
+        let _first = dec_mid.decode_frame(&[0.0; 4]);
+        assert_eq!(
+            dec_mid.decode_frame(&[0.0; 4]),
+            FrameOutcome::Fault("mid-utterance detok fault".into())
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn decode_frame_from_gpu_hidden_async_propagates_detok_error() {
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        let hidden_buf = ctx.create_storage_rw(16, "test_audio_hidden");
+        let (dec, mut detok) = empty_vocoder_weights();
+        detok.output_norm = vec![1.0; 4];
+        detok.emb_weight = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 4], 1, 4);
+        detok.lin_w = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 40], 10, 4);
+        detok.lin_b = vec![0.0; 10];
+
+        struct HiddenSampleFaultDetokGpu {
+            takes: std::sync::Mutex<std::collections::VecDeque<Option<crate::CeraError>>>,
+        }
+        impl crate::model::audio_decoder::AudioAccelerator for HiddenSampleFaultDetokGpu {
+            fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+                [1; 8]
+            }
+            fn sample_audio_frame_from_gpu_hidden_async<'a>(
+                &'a self,
+                _: &'a wgpu::Buffer,
+                _: f32,
+                _: usize,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<[i32; 8]>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok([1; 8]) })
+            }
+            fn detokenize_to_spectrum(
+                &self,
+                _: &crate::model::audio_decoder::DetokenizerWeights,
+                _: &[i32],
+            ) -> Vec<f32> {
+                vec![7.0; 3]
+            }
+            fn istft_to_pcm(&self, _: &[f32], _: usize, _: usize) -> Vec<f32> {
+                Vec::new()
+            }
+            fn reset_depthformer(&self) {}
+            fn reset_detokenizer(&self) {}
+            fn supports_depthformer(&self) -> bool {
+                true
+            }
+            fn take_audio_error(&self) -> Option<crate::CeraError> {
+                self.takes.lock().unwrap().pop_front().flatten()
+            }
+        }
+        let gpu = HiddenSampleFaultDetokGpu {
+            takes: std::sync::Mutex::new(std::collections::VecDeque::from([
+                None,
+                Some(crate::CeraError::Backend(
+                    "hidden async detok failed".into(),
+                )),
+            ])),
+        };
+        let mut dec_hidden = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
+        let err =
+            block_on_ready(dec_hidden.decode_frame_from_gpu_hidden_async(&hidden_buf)).unwrap_err();
+        assert!(format!("{err:#}").contains("hidden async detok failed"));
+    }
+
+    #[test]
+    fn frame0_detok_fallback_latches_cpu_and_skips_accelerator_on_later_frames() {
+        let (dec, mut detok) = empty_vocoder_weights();
+        detok.output_norm = vec![1.0; 4];
+        detok.emb_weight = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 4], 1, 4);
+        detok.lin_w = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 40], 10, 4);
+        detok.lin_b = vec![0.0; 10];
+
+        struct CountingDetokGpu {
+            takes: std::sync::Mutex<std::collections::VecDeque<Option<crate::CeraError>>>,
+            detok_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::model::audio_decoder::AudioAccelerator for CountingDetokGpu {
+            fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+                [1; 8]
+            }
+            fn detokenize_to_spectrum(
+                &self,
+                _: &crate::model::audio_decoder::DetokenizerWeights,
+                _: &[i32],
+            ) -> Vec<f32> {
+                self.detok_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![7.0; 3]
+            }
+            fn istft_to_pcm(&self, _: &[f32], _: usize, _: usize) -> Vec<f32> {
+                Vec::new()
+            }
+            fn reset_depthformer(&self) {}
+            fn reset_detokenizer(&self) {}
+            fn supports_depthformer(&self) -> bool {
+                true
+            }
+            fn take_audio_error(&self) -> Option<crate::CeraError> {
+                self.takes.lock().unwrap().pop_front().flatten()
+            }
+        }
+
+        let gpu = CountingDetokGpu {
+            takes: std::sync::Mutex::new(std::collections::VecDeque::from([
+                None,
+                None,
+                None,
+                Some(crate::CeraError::Backend(
+                    "transient frame 0 shader fault".into(),
+                )),
+                // Frame 1 and frame 2 keep sampling clean while skipping accelerator detokenization.
+                None,
+                None,
+                None,
+                None,
+            ])),
+            detok_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
+        let f0 = decoder.decode_frame(&[0.0; 4]);
+        assert!(matches!(f0, FrameOutcome::Codes { .. }));
+        assert_eq!(
+            gpu.detok_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let f1 = decoder.decode_frame(&[0.0; 4]);
+        assert!(matches!(f1, FrameOutcome::Codes { .. }));
+        assert_eq!(
+            gpu.detok_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "frame 1 must stay on CPU detok_state once frame 0 fell back"
+        );
+
+        let f2 = block_on_ready(decoder.decode_frame_async(&[0.0; 4])).unwrap();
+        assert!(matches!(f2, FrameOutcome::Codes { .. }));
+        assert_eq!(
+            gpu.detok_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "async decode_frame_async must also stay on CPU detok_state once latched"
+        );
+    }
+
+    #[test]
+    fn try_finish_batch_mode_aborts_on_mid_utterance_chunk_or_device_loss() {
+        let (dec, mut detok) = empty_vocoder_weights();
+        detok.output_norm = vec![1.0; 4];
+        detok.emb_weight = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 4], 1, 4);
+        detok.lin_w = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 40], 10, 4);
+        detok.lin_b = vec![0.0; 10];
+
+        // 1. Mid-utterance batch chunk 1 transient fault returns Err and clears buffers.
+        let gpu_chunk1 = ScriptedFaultGpu::with_script(vec![
+            None,
+            None, // sample frame 0
+            None,
+            None, // sample frame 1
+            None,
+            None, // batch detok chunk 0 ok
+            None,
+            Some(crate::CeraError::Backend("chunk 1 detok failed".into())),
+        ]);
+        let mut dec1 = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_chunk1), 1.0, 1, true)
+            .with_streaming(false);
+        assert!(matches!(
+            dec1.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        assert!(matches!(
+            dec1.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        let err1 = dec1.try_finish(|_, _| {}).unwrap_err();
+        assert!(format!("{err1:#}").contains("chunk 1 detok failed"));
+        assert!(dec1.all_codes.is_empty());
+        assert!(dec1.all_spectrum.is_empty());
+
+        // 2. Chunk 0 device-loss fault returns Err (never falls back onto dead device).
+        let gpu_chunk0_lost = ScriptedFaultGpu::with_script(vec![
+            None,
+            None, // sample frame 0
+            None,
+            Some(crate::CeraError::Backend(
+                "GPU device lost during chunk 0 detok".into(),
+            )),
+        ]);
+        let mut dec2 = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_chunk0_lost), 1.0, 1, true)
+            .with_streaming(false);
+        assert!(matches!(
+            dec2.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        let err2 = dec2.try_finish(|_, _| {}).unwrap_err();
+        assert!(format!("{err2:#}").contains("device lost"));
+        assert!(dec2.all_codes.is_empty());
+
+        // 3. Batch iSTFT device-loss returns Err; transient non-lost iSTFT fault recomputes on CPU.
+        let gpu_istft_lost = ScriptedFaultGpu::with_script(vec![
+            None,
+            None, // sample frame 0
+            None,
+            None, // chunk 0 detok ok
+            None,
+            Some(crate::CeraError::Backend(
+                "GPU device lost during istft".into(),
+            )),
+        ]);
+        let mut dec3 = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_istft_lost), 1.0, 1, true)
+            .with_streaming(false);
+        assert!(matches!(
+            dec3.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        let err3 = dec3.try_finish(|_, _| {}).unwrap_err();
+        assert!(format!("{err3:#}").contains("istft"));
+
+        let gpu_istft_transient = ScriptedFaultGpu::fault_once();
+        let mut dec4 =
+            AudioOutputDecoder::new(&dec, &detok, Some(&gpu_istft_transient), 1.0, 1, true)
+                .with_streaming(false);
+        dec4.all_spectrum = vec![0.5; 40];
+        let mut got_pcm = Vec::new();
+        let ok_samples = dec4
+            .try_finish(|pcm, _| got_pcm.extend_from_slice(pcm))
+            .unwrap();
+        assert!(ok_samples > 0);
+        assert_eq!(got_pcm.len(), ok_samples);
+    }
+
+    #[test]
+    fn finish_async_batch_mode_clears_buffers_on_detok_and_istft_error() {
+        let (dec, detok) = empty_vocoder_weights();
+
+        // 1. Mid-loop async batch detokenize failure clears partial `all_spectrum` and `all_codes`.
+        let gpu_detok_err = ScriptedFaultGpu::with_script(vec![
+            None,
+            None, // sample frame 0
+            None,
+            None, // sample frame 1
+            None,
+            None, // async detok chunk 0 ok (pushes partial spectrum)
+            None,
+            Some(crate::CeraError::Backend(
+                "async batch chunk 1 detok failed".into(),
+            )),
+        ]);
+        let mut dec1 = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_detok_err), 1.0, 1, true)
+            .with_streaming(false);
+        assert!(matches!(
+            dec1.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        assert!(matches!(
+            dec1.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        let err1 = block_on_ready(dec1.finish_async(|_, _| {})).unwrap_err();
+        assert!(format!("{err1:#}").contains("chunk 1 detok failed"));
+        assert!(dec1.all_spectrum.is_empty());
+        assert!(dec1.all_codes.is_empty());
+        assert_eq!(dec1.try_finish(|_, _| {}).unwrap(), 0);
+
+        // 2. Async batch iSTFT failure clears `all_spectrum` and `all_codes`.
+        let gpu_istft_err = ScriptedFaultGpu::with_script(vec![
+            None,
+            None, // sample frame 0
+            None,
+            None, // async detok chunk 0 ok
+            None,
+            Some(crate::CeraError::Backend("async batch istft failed".into())),
+        ]);
+        let mut dec2 = AudioOutputDecoder::new(&dec, &detok, Some(&gpu_istft_err), 1.0, 1, true)
+            .with_streaming(false);
+        assert!(matches!(
+            dec2.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        let err2 = block_on_ready(dec2.finish_async(|_, _| {})).unwrap_err();
+        assert!(format!("{err2:#}").contains("async batch istft failed"));
+        assert!(dec2.all_spectrum.is_empty());
+        assert!(dec2.all_codes.is_empty());
+        assert_eq!(dec2.finish(|_, _| {}), 0);
     }
 }

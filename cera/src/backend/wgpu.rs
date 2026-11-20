@@ -419,7 +419,65 @@ fn flash_attention_supported_for(
         && flash_attention_supported(workgroup_storage, adapter_name, is_android)
 }
 
+/// Extract a human-readable message from a `std::panic::catch_unwind` payload.
+pub(crate) fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+fn ensure_alive_from_detail(detail: Option<&str>, context: &str) -> Result<()> {
+    if let Some(detail) = detail {
+        anyhow::bail!("{context}: GPU device lost ({detail})");
+    }
+    Ok(())
+}
+
+/// Pure degradation decision behind [`GpuContext::degrade_pipeline_err`]: when `res`
+/// fails and `device_lost` is true, return `Err` immediately instead of degrading to
+/// `None` so callers never retry fallbacks or upload weights onto a dead device.
+fn degrade_or_abort<T>(
+    device_lost: bool,
+    label: &str,
+    fallback_note: &str,
+    res: Result<T>,
+) -> Result<Option<T>> {
+    match res {
+        Ok(val) => Ok(Some(val)),
+        Err(e) => {
+            if device_lost {
+                return Err(e);
+            }
+            tracing::warn!("{label} pipeline validation failed ({e}); {fallback_note}");
+            eprintln!("[cera::wgpu] {label} pipeline validation failed ({e}); {fallback_note}");
+            Ok(None)
+        }
+    }
+}
+
 impl GpuContext {
+    /// Non-consuming peek at the recorded device-loss detail, if any. Does not
+    /// touch [`Self::readback_fault`].
+    pub(crate) fn device_lost_detail(&self) -> Option<String> {
+        self.device_lost
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Non-consuming check for whether this context's device has been lost.
+    pub fn is_device_lost(&self) -> bool {
+        self.device_lost_detail().is_some()
+    }
+
+    /// Abort with an error naming `context` and the device-loss detail if the GPU
+    /// device has been lost (non-consuming; does not touch `Self::readback_fault`).
+    pub fn ensure_alive(&self, context: &str) -> Result<()> {
+        ensure_alive_from_detail(self.device_lost_detail().as_deref(), context)
+    }
+
     /// Report (and record) device loss. A lost device drops all work
     /// silently, so submitting/reading back anyway would produce
     /// fake-instant timings and zero/empty readbacks. Instead of panicking
@@ -430,11 +488,8 @@ impl GpuContext {
     /// its work and returns an empty/zero value. Loss stays unrecoverable
     /// without recreating the whole context.
     fn device_is_lost(&self) -> bool {
-        let guard = self.device_lost.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
+        match self.device_lost_detail() {
             Some(detail) => {
-                let detail = detail.clone();
-                drop(guard);
                 self.record_readback_fault(format!("GPU device lost ({detail})"));
                 true
             }
@@ -669,11 +724,12 @@ impl GpuContext {
         // then panicked indexing an empty argmax readback. Record the
         // reason so the submit/download choke points can fail fast with it.
         let device_lost = Arc::new(std::sync::Mutex::new(None));
-        #[cfg(not(target_arch = "wasm32"))]
         {
             let device_lost_cb = Arc::clone(&device_lost);
             device.set_device_lost_callback(move |reason, msg| {
                 let detail = format!("{reason:?}: {msg}");
+                tracing::error!(target: "cera::wgpu", detail = %detail, "wgpu device lost");
+                #[cfg(not(target_arch = "wasm32"))]
                 eprintln!("[cera::wgpu] device lost: {detail}");
                 *device_lost_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail);
             });
@@ -1610,8 +1666,9 @@ impl GpuContext {
             })
     }
 
-    /// Run `build` inside `Validation` and `Internal` error scopes on native targets,
-    /// returning `Err` if either scope reports a driver error.
+    /// Run `build` inside `Validation`, `Internal`, and `OutOfMemory` error scopes on
+    /// native targets, checking device loss before pushing and after popping scopes, and
+    /// returning `Err` if any scope reports a driver error or the device is lost.
     ///
     /// Pinned `wgpu` 30 reports shader/pipeline compile errors to the device error
     /// sink instead of failing pipeline creation synchronously and hands back invalid
@@ -1619,37 +1676,52 @@ impl GpuContext {
     /// builds with `check_pipelines` surfaces driver rejections programmatically so
     /// model loaders can degrade passthrough/streaming paths or fall back to CPU.
     /// On `wasm32`, popping error scopes needs a blocking executor which `wasm32`
-    /// lacks, so `build` runs unchecked there.
+    /// lacks, so `build` runs unchecked there (still guarding against pre-existing
+    /// device loss).
     pub(crate) fn check_pipelines<T, F>(&self, label: &str, build: F) -> anyhow::Result<T>
     where
         F: FnOnce() -> T,
     {
+        if let Some(detail) = self.device_lost_detail() {
+            anyhow::bail!("{label}: GPU device lost ({detail})");
+        }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = label;
             Ok(build())
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let val_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let int_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let oom_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
             let out = build();
             // Pop error scopes in strict LIFO order before combining.
+            let oom_err = pollster::block_on(oom_scope.pop());
             let int_err = pollster::block_on(int_scope.pop());
             let val_err = pollster::block_on(val_scope.pop());
-            match int_err.or(val_err) {
+            let scope_err = oom_err.or(int_err).or(val_err);
+            if let Some(detail) = self.device_lost_detail() {
+                return match scope_err {
+                    Some(e) => Err(anyhow::anyhow!(
+                        "{label}: pipeline validation failed ({e}); GPU device lost ({detail})"
+                    )),
+                    None => Err(anyhow::anyhow!("{label}: GPU device lost ({detail})")),
+                };
+            }
+            match scope_err {
                 Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
                 None => Ok(out),
             }
         }
     }
 
-    /// Create a compute pipeline, returning `Err` when the driver rejects it instead of an
-    /// invalid pipeline: pinned wgpu 30 never panics on validation or compile failure, it
-    /// reports to the error sink and hands back a pipeline whose dispatches are silently
-    /// dropped, so without this check a failed build zeroes output with nothing programmatic
-    /// surfacing. On wasm32 this always returns `Ok`: popping the error scope needs a
-    /// blocking executor, which wasm32 lacks.
+    /// Create a compute pipeline, returning `Err` when the driver rejects it or the device is
+    /// lost, instead of handing back an invalid pipeline: pinned wgpu 30 never panics on
+    /// validation or compile failure, it reports to the error sink and hands back a pipeline
+    /// whose dispatches are silently dropped, so without this check a failed build zeroes
+    /// output with nothing programmatic surfacing. On wasm32, error-scope validation is
+    /// skipped because popping scopes requires a blocking executor, while pre-existing device
+    /// loss still returns `Err`.
     pub fn try_create_pipeline_checked(
         &self,
         shader_source: &str,
@@ -1661,7 +1733,20 @@ impl GpuContext {
         })
     }
 
-    /// Build the flash pipeline, degrading to `None` with a loud log when validation fails.
+    /// Degrade an optional checked-pipeline error to `Ok(None)` with dual-channel
+    /// (`tracing::warn!` + `eprintln!`) logging, or abort immediately with `Err` if
+    /// the device has been lost.
+    pub(crate) fn degrade_pipeline_err<T>(
+        &self,
+        label: &str,
+        fallback_note: &str,
+        res: anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        degrade_or_abort(self.is_device_lost(), label, fallback_note, res)
+    }
+
+    /// Build the flash pipeline, degrading to `None` with a loud log when validation fails
+    /// on a live device, or returning `Err` if the device is lost.
     /// Both flash callers share this tail so the degrade-instead-of-fail policy cannot drift;
     /// `fallback_note` names what the caller falls back to. Gates stay at the call sites
     /// (the trunk gates on head_dim too, ViT on the adapter only). Both channels carry the
@@ -1669,24 +1754,16 @@ impl GpuContext {
     pub(crate) fn build_flash_pipeline_or_log(
         &self,
         fallback_note: &str,
-    ) -> Option<wgpu::ComputePipeline> {
-        match self.try_create_pipeline_checked(
-            shaders::ATTENTION_FLASH_HD64,
-            "main",
+    ) -> anyhow::Result<Option<wgpu::ComputePipeline>> {
+        self.degrade_pipeline_err(
             "attention_flash_hd64",
-        ) {
-            Ok(pipe) => Some(pipe),
-            Err(e) => {
-                tracing::warn!(
-                    "attention_flash_hd64 pipeline validation failed ({e}); {fallback_note}"
-                );
-                eprintln!(
-                    "[cera::wgpu] attention_flash_hd64 pipeline validation failed ({e}); \
-                     {fallback_note}"
-                );
-                None
-            }
-        }
+            fallback_note,
+            self.try_create_pipeline_checked(
+                shaders::ATTENTION_FLASH_HD64,
+                "main",
+                "attention_flash_hd64",
+            ),
+        )
     }
 
     /// True if the device can take a SPIR-V passthrough module. Only the Vulkan
@@ -8511,12 +8588,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn degrade_or_abort_stops_on_lost_device() {
+        assert_eq!(
+            degrade_or_abort(false, "opt", "falling back", Ok(42)).unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            degrade_or_abort::<u32>(false, "opt", "falling back", Err(anyhow::anyhow!("bad")))
+                .unwrap(),
+            None
+        );
+        let err =
+            degrade_or_abort::<u32>(true, "opt", "falling back", Err(anyhow::anyhow!("lost")))
+                .unwrap_err();
+        assert!(err.to_string().contains("lost"), "{err}");
+    }
+
+    #[test]
+    fn ensure_alive_from_detail_aborts_on_lost_device() {
+        assert!(ensure_alive_from_detail(None, "post-upload").is_ok());
+        let err = ensure_alive_from_detail(Some("vk lost"), "audio weight upload").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("audio weight upload"), "{msg}");
+        assert!(msg.contains("vk lost"), "{msg}");
+    }
+
     /// `try_create_pipeline_checked` fails loudly where `create_pipeline` hands back an
     /// invalid pipeline: pinned wgpu 30 reports validation failures to the error sink
     /// instead of panicking, so an unchecked bad build would drop every dispatch and
     /// read back zeros. Both probes are backend-independent (naga-level), so they fail
-    /// identically on Metal and lavapipe. Not wasm32: the checked build is unchecked
-    /// there by construction (see `checked_pipeline_creation_is_unchecked_on_wasm32`).
+    /// identically on Metal and lavapipe. Not wasm32: error-scope popping needs a blocking
+    /// executor which wasm32 lacks; browser WebGPU coverage lives in
+    /// `cera-wasm/tests/webgpu_smoke.rs` via `GpuContext::new_async`.
     /// Needs a GPU.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -8548,29 +8652,104 @@ mod tests {
             ctx.try_create_pipeline_checked(trivial, "main", "trivial_probe")
                 .is_ok()
         );
+
+        // Mixed valid+invalid batch: one bad pipeline fails the whole batch, and outer
+        // scopes stay clean because all three inner scopes pop in strict LIFO order.
+        let outer_val = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let outer_oom = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let mixed_err = ctx
+            .check_pipelines("mixed_batch_probe", || {
+                let valid = ctx.create_pipeline(trivial, "main", "mixed_valid");
+                let invalid = ctx.create_pipeline(trivial, "main_missing", "mixed_invalid");
+                (valid, invalid)
+            })
+            .unwrap_err();
+        assert!(
+            mixed_err.to_string().contains("mixed_batch_probe"),
+            "{mixed_err}"
+        );
+        assert!(pollster::block_on(outer_oom.pop()).is_none());
+        assert!(pollster::block_on(outer_val.pop()).is_none());
+        // Subsequent valid batch on the same context still succeeds cleanly.
+        assert!(
+            ctx.check_pipelines("post_mixed_valid", || {
+                ctx.create_pipeline(trivial, "main", "after_mixed")
+            })
+            .is_ok()
+        );
+
+        // Passthrough-gated probe for the checked prefill fp16 SPIR-V pipeline.
+        let can_f16_prefill = ctx.supports_spirv_passthrough()
+            && ctx.max_compute_workgroup_storage_size >= FLASH_ATTENTION_F16_WORKGROUP_BYTES;
+        require_passthrough_or_skip(
+            &ctx,
+            ctx.supports_spirv_passthrough(),
+            "attention_prefill_hd64_f16",
+        );
+        if can_f16_prefill {
+            assert!(
+                ctx.try_attention_prefill_hd64_f16_passthrough_checked()
+                    .is_ok(),
+                "checked prefill f16 passthrough build must succeed when adapter supports it"
+            );
+        }
     }
 
-    /// The wasm32 exception to `try_create_pipeline_checked`: popping the error scope
-    /// needs a blocking executor, which wasm32 lacks, so the build is unchecked there
-    /// and always returns `Ok` (callers rely on the capability gate, which keeps flash
-    /// off). Pins the documented behavior so the non-wasm test above can stay strict.
+    /// `check_pipelines` and optional degradation helpers must fail fast with an error
+    /// naming the label and loss detail when the device is already lost or becomes lost
+    /// during pipeline compilation, without touching `readback_fault`.
     /// Needs a GPU.
     #[test]
-    #[cfg(target_arch = "wasm32")]
-    fn checked_pipeline_creation_is_unchecked_on_wasm32() {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn checked_pipeline_creation_rejects_lost_device() {
         let Some(ctx) = gpu_or_skip() else { return };
         let trivial = "@compute @workgroup_size(1) fn main() {}";
-        assert!(
-            ctx.try_create_pipeline_checked(trivial, "main_missing", "bad_entry_probe")
-                .is_ok()
+
+        // Mid-build device loss is caught after scopes pop.
+        let mid_err = ctx
+            .check_pipelines("mid_build_loss_probe", || {
+                ctx.simulate_device_lost("test: mid-build loss");
+                ctx.create_pipeline(trivial, "main", "mid_build_valid")
+            })
+            .unwrap_err();
+        let mid_msg = format!("{mid_err:#}");
+        assert!(mid_msg.contains("mid_build_loss_probe"), "{mid_msg}");
+        assert!(mid_msg.contains("test: mid-build loss"), "{mid_msg}");
+
+        // Non-consuming lost-device inspection must report the detail without polluting readback_fault.
+        assert!(ctx.is_device_lost());
+        assert_eq!(
+            ctx.device_lost_detail().as_deref(),
+            Some("test: mid-build loss")
         );
+        let alive_err = ctx.ensure_alive("post-upload probe").unwrap_err();
+        let alive_msg = format!("{alive_err:#}");
+        assert!(alive_msg.contains("post-upload probe"), "{alive_msg}");
+        assert!(alive_msg.contains("test: mid-build loss"), "{alive_msg}");
+        assert!(ctx.take_readback_fault().is_none());
+
+        // Pre-existing device loss short-circuits before running `build`.
+        let mut built = false;
+        let pre_err = ctx
+            .check_pipelines("pre_lost_probe", || {
+                built = true;
+                ctx.create_pipeline(trivial, "main", "never_built")
+            })
+            .unwrap_err();
+        assert!(!built, "lost device must abort before running build()");
+        let pre_msg = format!("{pre_err:#}");
+        assert!(pre_msg.contains("pre_lost_probe"), "{pre_msg}");
+        assert!(pre_msg.contains("test: mid-build loss"), "{pre_msg}");
+
+        // Optional degradation paths must abort on lost device rather than returning Ok(None).
+        assert!(ctx.build_flash_pipeline_or_log("fallback").is_err());
         assert!(
-            ctx.try_create_pipeline_checked(
-                "@compute @workgroup_size(1) fn main() { let x: u32 = ; }",
-                "main",
-                "bad_module_probe",
+            ctx.degrade_pipeline_err(
+                "opt_probe",
+                "fallback",
+                Err::<(), _>(anyhow::anyhow!("driver error"))
             )
-            .is_ok()
+            .is_err()
         );
     }
 

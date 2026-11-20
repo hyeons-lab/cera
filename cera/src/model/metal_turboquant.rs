@@ -92,6 +92,184 @@ pub struct TqMetalCache {
     max_seq_len: usize,
 }
 
+struct TqMetalCachePlan {
+    layout: TqLayout,
+    sign_elems: usize,
+    layer_specs: Vec<Option<(usize, u64, u64)>>,
+    qrot_bytes: u64,
+}
+
+fn validate_metal_tq_buffer_limit(
+    bytes: u64,
+    label: &str,
+    max_buffer_length: u64,
+) -> Result<(), CeraError> {
+    if bytes == 0 {
+        return Err(CeraError::Backend(format!(
+            "turboquant {label} buffer size must be > 0"
+        )));
+    }
+    if bytes > max_buffer_length {
+        return Err(CeraError::Backend(format!(
+            "turboquant {label} buffer ({bytes} bytes) exceeds Metal max_buffer_length ({max_buffer_length} bytes)"
+        )));
+    }
+    Ok(())
+}
+
+fn tq_checked_elems<T>(a: usize, b: usize, label: &str) -> Result<usize, CeraError> {
+    checked_elems::<T>(a, b).map_err(|_| {
+        CeraError::Backend(format!(
+            "turboquant {label} element count overflow ({a} * {b})"
+        ))
+    })
+}
+
+fn checked_words_to_bytes(words: usize, label: &str) -> Result<u64, CeraError> {
+    u64::try_from(words)
+        .ok()
+        .and_then(|w| w.checked_mul(4))
+        .ok_or_else(|| CeraError::Backend(format!("turboquant {label} byte count overflow")))
+}
+
+/// Pre-validate geometry, u32 shader parameter ranges, overflow bounds, GQA divisibility,
+/// and Metal buffer limits before generating signs, compiling pipelines, or allocating buffers.
+fn prevalidate_metal_tq_cache_specs(
+    config: &ModelConfig,
+    max_seq_len: usize,
+    q_cap: usize,
+    max_buffer_length: u64,
+) -> Result<TqMetalCachePlan, CeraError> {
+    let head_dim = config.head_dim;
+    // The in-crate caller gates on `TqMode::from_compression`, but this type is
+    // `pub` (the oracle tests construct it directly), so surface a typed error
+    // rather than aborting the caller's process.
+    if !head_dim_supported(head_dim) {
+        return Err(crate::turboquant::unsupported_head_dim(head_dim));
+    }
+    let n_layers = config.block_types.len();
+    if n_layers == 0 {
+        return Err(CeraError::Backend(
+            "turboquant requires n_layers > 0".into(),
+        ));
+    }
+    if max_seq_len == 0 {
+        return Err(CeraError::Backend(
+            "turboquant requires max_seq_len > 0".into(),
+        ));
+    }
+    u32::try_from(max_seq_len).map_err(|_| {
+        CeraError::Backend(format!("turboquant max_seq_len {max_seq_len} exceeds u32"))
+    })?;
+    if q_cap == 0 {
+        return Err(CeraError::Backend("turboquant requires q_cap > 0".into()));
+    }
+    u32::try_from(q_cap)
+        .map_err(|_| CeraError::Backend(format!("turboquant q_cap {q_cap} exceeds u32")))?;
+    if config.n_heads == 0 {
+        return Err(CeraError::Backend("turboquant requires n_heads > 0".into()));
+    }
+    let q_dim = config
+        .n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| CeraError::Backend("turboquant q_dim overflow".into()))?;
+    u32::try_from(q_dim)
+        .map_err(|_| CeraError::Backend(format!("turboquant q_dim {q_dim} exceeds u32")))?;
+
+    let signs_per_layer = head_dim
+        .checked_mul(2)
+        .ok_or_else(|| CeraError::Backend("turboquant signs_per_layer overflow".into()))?;
+    let sign_elems = n_layers
+        .checked_mul(signs_per_layer)
+        .ok_or_else(|| CeraError::Backend("turboquant sign element count overflow".into()))?;
+    u32::try_from(sign_elems).map_err(|_| {
+        CeraError::Backend(format!(
+            "turboquant sign element count {sign_elems} exceeds u32"
+        ))
+    })?;
+    let signs_bytes = checked_words_to_bytes(sign_elems, "signs")?;
+    validate_metal_tq_buffer_limit(signs_bytes, "tq_signs", max_buffer_length)?;
+
+    let layout = TqLayout::new(head_dim);
+    let mut layer_specs = Vec::with_capacity(n_layers);
+    for (i, bt) in config.block_types.iter().enumerate() {
+        match bt {
+            BlockType::Attention | BlockType::ParallelAttentionMamba2 => {
+                let n_kv_heads = *config.kv_heads_per_layer.get(i).ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "turboquant layer {i} missing kv_heads_per_layer entry (len={})",
+                        config.kv_heads_per_layer.len()
+                    ))
+                })?;
+                if n_kv_heads == 0 {
+                    return Err(CeraError::Backend(format!(
+                        "turboquant layer {i} n_kv_heads must be > 0"
+                    )));
+                }
+                if !config.n_heads.is_multiple_of(n_kv_heads) {
+                    return Err(CeraError::Backend(format!(
+                        "turboquant layer {i} n_heads ({}) must be a multiple of n_kv_heads ({n_kv_heads})",
+                        config.n_heads
+                    )));
+                }
+                let kv_stride = n_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "turboquant layer {i} kv_stride overflow ({n_kv_heads} * {head_dim})"
+                    ))
+                })?;
+                u32::try_from(kv_stride).map_err(|_| {
+                    CeraError::Backend(format!(
+                        "turboquant layer {i} kv_stride {kv_stride} exceeds u32"
+                    ))
+                })?;
+                // `TqLayout` owns the region formula and guards its own
+                // multiplies, so production and the oracle tests can't drift
+                // apart on the sizing.
+                let vecs =
+                    tq_checked_elems::<u32>(n_kv_heads, max_seq_len, &format!("layer {i} vecs"))?;
+                let k_words = layout.key_words(vecs).map_err(|_| {
+                    CeraError::Backend(format!("turboquant layer {i} key word count overflow"))
+                })?;
+                let v_words = layout.value_words(vecs).map_err(|_| {
+                    CeraError::Backend(format!("turboquant layer {i} value word count overflow"))
+                })?;
+                let k_bytes = checked_words_to_bytes(k_words, &format!("layer {i} keys"))?;
+                let v_bytes = checked_words_to_bytes(v_words, &format!("layer {i} values"))?;
+                validate_metal_tq_buffer_limit(
+                    k_bytes,
+                    &format!("l{i}.tq_keys"),
+                    max_buffer_length,
+                )?;
+                validate_metal_tq_buffer_limit(
+                    v_bytes,
+                    &format!("l{i}.tq_values"),
+                    max_buffer_length,
+                )?;
+                layer_specs.push(Some((n_kv_heads, k_bytes, v_bytes)));
+            }
+            BlockType::GatedConv | BlockType::Mamba2 | BlockType::DeltaNet => {
+                layer_specs.push(None);
+            }
+        }
+    }
+
+    let q_rows = tq_checked_elems::<f32>(q_cap, config.n_heads, "qrot rows")?;
+    let qrot_stride = head_dim
+        .checked_mul(2)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| CeraError::Backend("turboquant qrot stride overflow".into()))?;
+    let qrot_floats = tq_checked_elems::<f32>(q_rows, qrot_stride, "qrot")?;
+    let qrot_bytes = checked_words_to_bytes(qrot_floats, "qrot")?;
+    validate_metal_tq_buffer_limit(qrot_bytes, "tq_qrot", max_buffer_length)?;
+
+    Ok(TqMetalCachePlan {
+        layout,
+        sign_elems,
+        layer_specs,
+        qrot_bytes,
+    })
+}
+
 impl TqMetalCache {
     /// Allocate the compressed caches and compile the pipelines.
     ///
@@ -111,47 +289,13 @@ impl TqMetalCache {
         mode: TqMode,
     ) -> Result<Self, CeraError> {
         let head_dim = config.head_dim;
-        // The in-crate caller gates on `TqMode::from_compression`, but this type
-        // is `pub` (the oracle tests construct it directly), so surface a typed
-        // error rather than aborting the caller's process.
-        if !head_dim_supported(head_dim) {
-            return Err(crate::turboquant::unsupported_head_dim(head_dim));
-        }
-        let layout = TqLayout::new(head_dim);
-        let n_layers = config.block_types.len();
-
-        // Per-layer sign flips, laid out [polar | jl] so one binding serves both.
-        let mut signs = Vec::with_capacity(n_layers * 2 * head_dim);
-        for layer_idx in 0..n_layers {
-            let rot = RotationState::try_from_seed(mode.seed ^ layer_idx as u64, head_dim)?;
-            signs.extend_from_slice(&rot.polar_signs);
-            signs.extend_from_slice(&rot.jl_signs);
-        }
-
-        let mut layers = Vec::with_capacity(n_layers);
-        for (i, bt) in config.block_types.iter().enumerate() {
-            match bt {
-                BlockType::Attention | BlockType::ParallelAttentionMamba2 => {
-                    let n_kv_heads = config.kv_heads_per_layer[i];
-                    // `TqLayout` owns the region formula and guards its own
-                    // multiplies, so production and the oracle tests can't drift
-                    // apart on the sizing.
-                    let vecs = checked_elems::<u32>(n_kv_heads, max_seq_len)?;
-                    let k_bytes = TqLayout::words_to_bytes(layout.key_words(vecs)?);
-                    let v_bytes = TqLayout::words_to_bytes(layout.value_words(vecs)?);
-                    layers.push(Some(TqLayerCache {
-                        keys: ctx.create_buffer(k_bytes),
-                        values: ctx.create_buffer(v_bytes),
-                        n_kv_heads,
-                    }));
-                }
-                BlockType::GatedConv | BlockType::Mamba2 | BlockType::DeltaNet => layers.push(None),
-            }
-        }
-
-        // Rotated-query scratch: two head-wide regions plus one sum per (row, head).
-        let q_rows = checked_elems::<f32>(q_cap, config.n_heads)?;
-        let qrot_floats = checked_elems::<f32>(q_rows, 2 * head_dim + 1)?;
+        let plan = prevalidate_metal_tq_cache_specs(
+            config,
+            max_seq_len,
+            q_cap,
+            ctx.device.max_buffer_length(),
+        )?;
+        let n_layers = plan.layer_specs.len();
 
         let pipelines = TqPipelines {
             encode_keys: pipeline(ctx, shaders::TURBOQUANT, "tq_encode_keys")?,
@@ -160,12 +304,29 @@ impl TqMetalCache {
             attention: pipeline(ctx, shaders::FLASH_ATTENTION_TQ, "flash_attention_tq")?,
         };
 
+        // Per-layer sign flips, laid out [polar | jl] so one binding serves both.
+        let mut signs = Vec::with_capacity(plan.sign_elems);
+        for layer_idx in 0..n_layers {
+            let rot = RotationState::try_from_seed(mode.seed ^ layer_idx as u64, head_dim)?;
+            signs.extend_from_slice(&rot.polar_signs);
+            signs.extend_from_slice(&rot.jl_signs);
+        }
+
+        let mut layers = Vec::with_capacity(n_layers);
+        for spec in plan.layer_specs {
+            layers.push(spec.map(|(n_kv_heads, k_bytes, v_bytes)| TqLayerCache {
+                keys: ctx.create_buffer(k_bytes),
+                values: ctx.create_buffer(v_bytes),
+                n_kv_heads,
+            }));
+        }
+
         Ok(Self {
             mode,
-            layout,
+            layout: plan.layout,
             layers,
             signs: ctx.upload_f32(&signs),
-            qrot: ctx.create_buffer(TqLayout::words_to_bytes(qrot_floats)),
+            qrot: ctx.create_buffer(plan.qrot_bytes),
             q_cap,
             config: TurboQuantConfig::for_head_dim(head_dim),
             pipelines,
@@ -568,5 +729,138 @@ fn write_words(buf: &Buffer, word_off: usize, bytes: &[u8]) {
             (buf.contents() as *mut u8).add(word_off * 4),
             bytes.len(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prevalidate_metal_tq_cache_specs;
+    use crate::CeraError;
+    use crate::model::{BlockType, ModelConfig};
+
+    #[test]
+    fn prevalidate_metal_tq_cache_specs_rejects_degenerate_gqa_and_oversized_configs() {
+        fn base_cfg() -> ModelConfig {
+            ModelConfig {
+                architecture: "lfm2".to_string(),
+                n_layers: 1,
+                hidden_size: 64,
+                intermediate_size: 128,
+                n_heads: 4,
+                n_kv_heads: 2,
+                head_dim: 32,
+                vocab_size: 32,
+                max_seq_len: 16,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-5,
+                block_types: vec![BlockType::Attention],
+                conv_kernel_size: None,
+                ssm: None,
+                kv_heads_per_layer: vec![2],
+                scalars: Default::default(),
+                moe: None,
+                is_causal: true,
+                class_labels: vec![],
+            }
+        }
+
+        const LIMIT: u64 = 1024 * 1024;
+        assert!(prevalidate_metal_tq_cache_specs(&base_cfg(), 16, 4, LIMIT).is_ok());
+
+        // Unsupported head_dim
+        let mut cfg = base_cfg();
+        cfg.head_dim = 16;
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(_))
+        ));
+
+        // n_layers == 0
+        let mut cfg = base_cfg();
+        cfg.block_types.clear();
+        cfg.kv_heads_per_layer.clear();
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("n_layers > 0")
+        ));
+
+        // max_seq_len == 0 and q_cap == 0 and n_heads == 0
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&base_cfg(), 0, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("max_seq_len > 0")
+        ));
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&base_cfg(), 16, 0, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("q_cap > 0")
+        ));
+        let mut cfg = base_cfg();
+        cfg.n_heads = 0;
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("n_heads > 0")
+        ));
+
+        // Missing or zero kv_heads_per_layer
+        let mut cfg = base_cfg();
+        cfg.kv_heads_per_layer.clear();
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("kv_heads_per_layer")
+        ));
+        let mut cfg = base_cfg();
+        cfg.kv_heads_per_layer = vec![0];
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("n_kv_heads must be > 0")
+        ));
+
+        // GQA divisibility: n_kv_heads > n_heads and non-divisible n_heads / n_kv_heads
+        let mut cfg = base_cfg();
+        cfg.n_heads = 2;
+        cfg.kv_heads_per_layer = vec![4];
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("multiple of n_kv_heads")
+        ));
+        let mut cfg = base_cfg();
+        cfg.n_heads = 10;
+        cfg.kv_heads_per_layer = vec![4];
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&cfg, 16, 4, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("multiple of n_kv_heads")
+        ));
+
+        // Overflow & buffer limits against Metal max_buffer_length (including qrot_floats * 4 > u64::MAX
+        // where unguarded multiplication wraps below 1 GiB limit).
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&base_cfg(), usize::MAX, 4, LIMIT),
+            Err(CeraError::Backend(_))
+        ));
+        let mut qrot_u64_wrap_cfg = base_cfg();
+        qrot_u64_wrap_cfg.head_dim = 32;
+        qrot_u64_wrap_cfg.n_heads = 67_108_872;
+        qrot_u64_wrap_cfg.kv_heads_per_layer = vec![1];
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&qrot_u64_wrap_cfg, 1, 1_057_222_593, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("byte count overflow")
+        ));
+        #[cfg(not(target_pointer_width = "64"))]
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&qrot_u64_wrap_cfg, 1, 1_057_222_593, LIMIT),
+            Err(CeraError::Backend(_))
+        ));
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&base_cfg(), 16, 4, 128),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_signs")
+        ));
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&base_cfg(), 1_000_000, 1, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_keys") || msg.contains("tq_values")
+        ));
+        assert!(matches!(
+            prevalidate_metal_tq_cache_specs(&base_cfg(), 1, 1024, 16 * 1024),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_qrot")
+        ));
     }
 }

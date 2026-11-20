@@ -1791,6 +1791,63 @@ pub struct WgpuAudioOps {
     p_mel_norm: wgpu::ComputePipeline,
 }
 
+/// Seam behind [`WgpuAudioOps::new`] that wraps audio pipeline validation inside
+/// `catch_unwind` while preserving panic payloads and `check_pipelines` errors.
+#[cfg(feature = "gpu")]
+fn init_audio_pipelines_with<T>(build_audio: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_audio)).map_err(|payload| {
+        let detail = crate::backend::wgpu::panic_payload_message(payload);
+        anyhow::anyhow!("wgpu audio pipeline creation failed (shader compile/validation): {detail}")
+    })?
+}
+
+/// Compile and validate the 12 audio-specific WGSL pipelines via `check_pipelines`.
+///
+/// `create_pipeline` panics only on host-side preprocessing failure; pinned `wgpu` 30
+/// reports shader/pipeline validation errors through error scopes instead of panicking,
+/// so wrap the 12 audio pipelines in `check_pipelines` inside `catch_unwind` and surface
+/// an `Err` so the caller degrades to the CPU encoder instead of aborting.
+#[cfg(feature = "gpu")]
+fn build_audio_pipelines(
+    ctx: &crate::backend::wgpu::GpuContext,
+) -> Result<[wgpu::ComputePipeline; 12]> {
+    use crate::backend::wgpu::shaders;
+    init_audio_pipelines_with(|| {
+        ctx.check_pipelines("audio pipelines", || {
+            [
+                ctx.create_pipeline(shaders::ACTIVATIONS, "silu_inplace", "audio_silu"),
+                ctx.create_pipeline(shaders::ACTIVATIONS, "gelu_erf_inplace", "audio_gelu_erf"),
+                ctx.create_pipeline(
+                    shaders::ELEMENTWISE,
+                    "scaled_add_inplace",
+                    "audio_scaled_add",
+                ),
+                ctx.create_pipeline(shaders::CONV2D_DIRECT, "conv2d_direct", "audio_conv2d"),
+                ctx.create_pipeline(
+                    shaders::TRANSPOSE_BLOCKED,
+                    "transpose_blocked",
+                    "audio_transpose",
+                ),
+                ctx.create_pipeline(shaders::GLU_SPLIT, "glu_split", "audio_glu"),
+                ctx.create_pipeline(
+                    shaders::CHAN_AFFINE_SILU,
+                    "chan_affine_silu",
+                    "audio_chan_affine",
+                ),
+                ctx.create_pipeline(
+                    shaders::AUDIO_XL_ATTENTION,
+                    "audio_xl_attention",
+                    "audio_xl_attn",
+                ),
+                ctx.create_pipeline(shaders::STFT_FRAME, "stft_frame", "audio_stft"),
+                ctx.create_pipeline(shaders::POWER_SPEC, "power_spec", "audio_power"),
+                ctx.create_pipeline(shaders::MEL_PROJECT, "mel_project", "audio_mel_project"),
+                ctx.create_pipeline(shaders::MEL_NORM, "mel_norm", "audio_mel_norm"),
+            ]
+        })
+    })
+}
+
 #[cfg(feature = "gpu")]
 impl WgpuAudioOps {
     /// Most elements one elementwise dispatch covers (65535 workgroups of 256).
@@ -1818,53 +1875,8 @@ impl WgpuAudioOps {
     }
 
     pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Result<Self> {
-        use crate::backend::wgpu::shaders;
         let vit = WgpuVitOps::new(ctx)?;
-        // `create_pipeline` panics on a shader that fails to compile or validate; surface an `Err`
-        // so the caller degrades to the CPU encoder instead of aborting.
-        let pipelines = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let c = &vit.ctx;
-            [
-                c.create_pipeline(shaders::ACTIVATIONS, "silu_inplace", "audio_silu"),
-                c.create_pipeline(shaders::ACTIVATIONS, "gelu_erf_inplace", "audio_gelu_erf"),
-                c.create_pipeline(
-                    shaders::ELEMENTWISE,
-                    "scaled_add_inplace",
-                    "audio_scaled_add",
-                ),
-                c.create_pipeline(shaders::CONV2D_DIRECT, "conv2d_direct", "audio_conv2d"),
-                c.create_pipeline(
-                    shaders::TRANSPOSE_BLOCKED,
-                    "transpose_blocked",
-                    "audio_transpose",
-                ),
-                c.create_pipeline(shaders::GLU_SPLIT, "glu_split", "audio_glu"),
-                c.create_pipeline(
-                    shaders::CHAN_AFFINE_SILU,
-                    "chan_affine_silu",
-                    "audio_chan_affine",
-                ),
-                c.create_pipeline(
-                    shaders::AUDIO_XL_ATTENTION,
-                    "audio_xl_attention",
-                    "audio_xl_attn",
-                ),
-                c.create_pipeline(shaders::STFT_FRAME, "stft_frame", "audio_stft"),
-                c.create_pipeline(shaders::POWER_SPEC, "power_spec", "audio_power"),
-                c.create_pipeline(shaders::MEL_PROJECT, "mel_project", "audio_mel_project"),
-                c.create_pipeline(shaders::MEL_NORM, "mel_norm", "audio_mel_norm"),
-            ]
-        }))
-        .map_err(|payload| {
-            let detail = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown panic".to_string());
-            anyhow::anyhow!(
-                "wgpu audio pipeline creation failed (shader compile/validation): {detail}"
-            )
-        })?;
+        let pipelines = build_audio_pipelines(&vit.ctx)?;
         let [
             p_silu,
             p_gelu_erf,
@@ -2402,6 +2414,35 @@ fn warn_audio_unavailable(backend: &str, e: impl std::fmt::Display) {
 }
 
 #[cfg(feature = "gpu")]
+fn try_wgpu_audio_encoder_with<Ops, Weights, Out>(
+    open_ops: impl FnOnce() -> Result<Ops>,
+    build_weights: impl FnOnce(&Ops) -> Result<Weights>,
+    ensure_alive: impl FnOnce(&Ops, &str) -> Result<()>,
+    finish: impl FnOnce(Ops, Weights) -> Out,
+) -> Option<Out> {
+    let ops = match open_ops() {
+        Ok(ops) => ops,
+        Err(e) => {
+            warn_audio_unavailable("wgpu pipelines", e);
+            return None;
+        }
+    };
+    let gpu_w = match build_weights(&ops) {
+        Ok(w) => w,
+        Err(e) => {
+            warn_audio_unavailable("wgpu", e);
+            return None;
+        }
+    };
+    if let Err(e) = ensure_alive(&ops, "audio encoder weight upload") {
+        warn_audio_unavailable("wgpu", e);
+        return None;
+    }
+    tracing::info!("audio encoder: using wgpu GPU backend");
+    Some(finish(ops, gpu_w))
+}
+
+#[cfg(feature = "gpu")]
 fn try_wgpu_audio_encoder(
     weights: &AudioEncoderWeights,
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
@@ -2414,26 +2455,18 @@ fn try_wgpu_audio_encoder(
             return None;
         }
     };
-    let ops = match WgpuAudioOps::new(ctx) {
-        Ok(ops) => ops,
-        Err(e) => {
-            warn_audio_unavailable("wgpu pipelines", e);
-            return None;
-        }
-    };
-    let gpu_w = match GpuAudioWeights::build(&ops, weights) {
-        Ok(w) => w,
-        Err(e) => {
-            warn_audio_unavailable("wgpu", e);
-            return None;
-        }
-    };
-    tracing::info!("audio encoder: using wgpu GPU backend");
-    Some(std::sync::Arc::new(WgpuAudioEncoder {
-        ops,
-        weights: gpu_w,
-        encode_lock: std::sync::Mutex::new(()),
-    }))
+    try_wgpu_audio_encoder_with(
+        || WgpuAudioOps::new(ctx),
+        |ops| GpuAudioWeights::build(ops, weights),
+        |ops, stage| ops.vit.ctx.ensure_alive(stage),
+        |ops, gpu_w| {
+            std::sync::Arc::new(WgpuAudioEncoder {
+                ops,
+                weights: gpu_w,
+                encode_lock: std::sync::Mutex::new(()),
+            }) as std::sync::Arc<dyn AudioGpuEncode>
+        },
+    )
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -2613,6 +2646,108 @@ mod tests {
         let grouped =
             Conv2dSpec::padded(2, 96, 2, 90_000, (3, 3), (1, 1), (1, 1), (1, 1), 2).unwrap();
         assert!(!WgpuAudioOps::conv_spec_runnable(&grouped));
+    }
+
+    #[test]
+    fn init_audio_pipelines_with_propagates_errors_and_panic_payloads() {
+        assert_eq!(init_audio_pipelines_with(|| Ok(7u32)).unwrap(), 7);
+
+        let err = init_audio_pipelines_with::<u32>(|| anyhow::bail!("audio validation failed"))
+            .unwrap_err();
+        assert!(err.to_string().contains("audio validation failed"));
+
+        let panic_str =
+            init_audio_pipelines_with::<u32>(|| panic!("audio static panic")).unwrap_err();
+        assert!(panic_str.to_string().contains("audio static panic"));
+
+        let panic_owned =
+            init_audio_pipelines_with::<u32>(|| panic!("{}", String::from("audio owned panic")))
+                .unwrap_err();
+        assert!(panic_owned.to_string().contains("audio owned panic"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn wgpu_audio_ops_aborts_on_lost_device() {
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        ctx.simulate_device_lost("test: audio lost");
+        let err = match WgpuAudioOps::new(ctx) {
+            Ok(_) => panic!("WgpuAudioOps::new must fail on a lost device"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("test: audio lost"), "{err:#}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn build_audio_pipelines_validates_on_live_device_and_aborts_on_lost_device() {
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        assert!(
+            build_audio_pipelines(&ctx).is_ok(),
+            "all 12 audio pipelines must compile and validate on a live device"
+        );
+        ctx.simulate_device_lost("test: audio lost");
+        let err = build_audio_pipelines(&ctx)
+            .expect_err("build_audio_pipelines must abort on a lost device");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("audio pipelines"), "{msg}");
+        assert!(msg.contains("test: audio lost"), "{msg}");
+    }
+
+    #[test]
+    fn try_wgpu_audio_encoder_with_aborts_after_weight_upload_if_device_is_lost() {
+        let mut weights_calls = 0usize;
+        let mut alive_calls = 0usize;
+        let err_ops = try_wgpu_audio_encoder_with::<u32, u32, u32>(
+            || anyhow::bail!("ops failed"),
+            |_| {
+                weights_calls += 1;
+                Ok(1)
+            },
+            |_, _| {
+                alive_calls += 1;
+                Ok(())
+            },
+            |_, _| 1,
+        );
+        assert!(err_ops.is_none());
+        assert_eq!((weights_calls, alive_calls), (0, 0));
+
+        let mut alive_calls = 0usize;
+        let err_weights = try_wgpu_audio_encoder_with::<u32, u32, u32>(
+            || Ok(1),
+            |_| anyhow::bail!("weights failed"),
+            |_, _| {
+                alive_calls += 1;
+                Ok(())
+            },
+            |_, _| 1,
+        );
+        assert!(err_weights.is_none());
+        assert_eq!(alive_calls, 0);
+
+        let err_lost = try_wgpu_audio_encoder_with::<u32, u32, u32>(
+            || Ok(10),
+            |ops| Ok(*ops + 1),
+            |_, stage| anyhow::bail!("{stage}: GPU device lost (upload lost)"),
+            |ops, w| ops + w,
+        );
+        assert!(
+            err_lost.is_none(),
+            "post-upload device loss must abort instead of returning a dead encoder"
+        );
+
+        let ok = try_wgpu_audio_encoder_with(
+            || Ok(10u32),
+            |ops| Ok(*ops + 1),
+            |_, _| Ok(()),
+            |ops, w| ops + w,
+        );
+        assert_eq!(ok, Some(21));
     }
 
     /// Device-free ops for pinning the planner's refusal consultations: every compute op

@@ -188,6 +188,238 @@ pub struct TqGpuCache {
     max_seq_len: usize,
 }
 
+/// Orchestration seam behind [`TqGpuCache::new`] so host tests can verify pipeline
+/// validation runs before VRAM allocations, post-allocation lost-device checks abort, and
+/// errors map cleanly to [`CeraError::Backend`].
+fn init_tq_cache_with<P, B>(
+    build_pipelines: impl FnOnce() -> anyhow::Result<P>,
+    alloc_buffers: impl FnOnce(P) -> Result<B, CeraError>,
+    ensure_alive: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> Result<B, CeraError> {
+    let pipelines = build_pipelines().map_err(|e| CeraError::Backend(format!("{e:#}")))?;
+    let cache = alloc_buffers(pipelines)?;
+    ensure_alive("tq allocation").map_err(|e| CeraError::Backend(format!("{e:#}")))?;
+    Ok(cache)
+}
+
+struct TqCachePlan {
+    layout: TqLayout,
+    sign_elems: usize,
+    layer_specs: Vec<Option<(usize, u64, u64)>>,
+    qrot_bytes: u64,
+    slot_stride: usize,
+    params_bytes: u64,
+}
+
+fn validate_tq_buffer_limit(
+    bytes: u64,
+    label: &str,
+    max_buffer_size: u64,
+    max_storage_binding_size: u64,
+) -> Result<(), CeraError> {
+    if bytes == 0 {
+        return Err(CeraError::Backend(format!(
+            "turboquant {label} buffer size must be > 0"
+        )));
+    }
+    let effective_limit = max_buffer_size.min(max_storage_binding_size);
+    if bytes > effective_limit {
+        return Err(CeraError::Backend(format!(
+            "turboquant {label} buffer ({bytes} bytes) exceeds GPU limit ({effective_limit} bytes; max_buffer_size={max_buffer_size}, max_storage_buffer_binding_size={max_storage_binding_size})"
+        )));
+    }
+    Ok(())
+}
+
+fn tq_checked_elems<T>(a: usize, b: usize, label: &str) -> Result<usize, CeraError> {
+    checked_elems::<T>(a, b).map_err(|_| {
+        CeraError::Backend(format!(
+            "turboquant {label} element count overflow ({a} * {b})"
+        ))
+    })
+}
+
+fn checked_words_to_bytes(words: usize, label: &str) -> Result<u64, CeraError> {
+    u64::try_from(words)
+        .ok()
+        .and_then(|w| w.checked_mul(4))
+        .ok_or_else(|| CeraError::Backend(format!("turboquant {label} byte count overflow")))
+}
+
+/// Pre-validate geometry, u32 shader parameter ranges, overflow bounds, and GPU buffer
+/// limits before compiling pipelines, generating signs, or allocating VRAM.
+fn prevalidate_tq_cache_specs(
+    config: &ModelConfig,
+    max_seq_len: usize,
+    q_cap: usize,
+    min_storage_align: u64,
+    max_buffer_size: u64,
+    max_storage_binding_size: u64,
+) -> Result<TqCachePlan, CeraError> {
+    let head_dim = config.head_dim;
+    // The in-crate caller gates on `TqMode::from_compression`, but this type is
+    // `pub` (the oracle tests construct it directly), so surface a typed error
+    // rather than aborting the caller's process.
+    if !head_dim_supported(head_dim) {
+        return Err(crate::turboquant::unsupported_head_dim(head_dim));
+    }
+    let n_layers = config.block_types.len();
+    if n_layers == 0 {
+        return Err(CeraError::Backend(
+            "turboquant requires n_layers > 0".into(),
+        ));
+    }
+    if max_seq_len == 0 {
+        return Err(CeraError::Backend(
+            "turboquant requires max_seq_len > 0".into(),
+        ));
+    }
+    u32::try_from(max_seq_len).map_err(|_| {
+        CeraError::Backend(format!("turboquant max_seq_len {max_seq_len} exceeds u32"))
+    })?;
+    if q_cap == 0 {
+        return Err(CeraError::Backend("turboquant requires q_cap > 0".into()));
+    }
+    u32::try_from(q_cap)
+        .map_err(|_| CeraError::Backend(format!("turboquant q_cap {q_cap} exceeds u32")))?;
+    if config.n_heads == 0 {
+        return Err(CeraError::Backend("turboquant requires n_heads > 0".into()));
+    }
+    let q_dim = config
+        .n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| CeraError::Backend("turboquant q_dim overflow".into()))?;
+    u32::try_from(q_dim)
+        .map_err(|_| CeraError::Backend(format!("turboquant q_dim {q_dim} exceeds u32")))?;
+
+    let signs_per_layer = head_dim
+        .checked_mul(2)
+        .ok_or_else(|| CeraError::Backend("turboquant signs_per_layer overflow".into()))?;
+    let sign_elems = n_layers
+        .checked_mul(signs_per_layer)
+        .ok_or_else(|| CeraError::Backend("turboquant sign element count overflow".into()))?;
+    u32::try_from(sign_elems).map_err(|_| {
+        CeraError::Backend(format!(
+            "turboquant sign element count {sign_elems} exceeds u32"
+        ))
+    })?;
+    let signs_bytes = checked_words_to_bytes(sign_elems, "signs")?;
+    validate_tq_buffer_limit(
+        signs_bytes,
+        "tq_signs",
+        max_buffer_size,
+        max_storage_binding_size,
+    )?;
+
+    let layout = TqLayout::new(head_dim);
+    let mut layer_specs = Vec::with_capacity(n_layers);
+    for (i, bt) in config.block_types.iter().enumerate() {
+        match bt {
+            BlockType::Attention | BlockType::ParallelAttentionMamba2 => {
+                let n_kv_heads = *config.kv_heads_per_layer.get(i).ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "turboquant layer {i} missing kv_heads_per_layer entry (len={})",
+                        config.kv_heads_per_layer.len()
+                    ))
+                })?;
+                if n_kv_heads == 0 {
+                    return Err(CeraError::Backend(format!(
+                        "turboquant layer {i} n_kv_heads must be > 0"
+                    )));
+                }
+                if !config.n_heads.is_multiple_of(n_kv_heads) {
+                    return Err(CeraError::Backend(format!(
+                        "turboquant layer {i} n_heads ({}) must be a multiple of n_kv_heads ({n_kv_heads})",
+                        config.n_heads
+                    )));
+                }
+                let kv_stride = n_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "turboquant layer {i} kv_stride overflow ({n_kv_heads} * {head_dim})"
+                    ))
+                })?;
+                u32::try_from(kv_stride).map_err(|_| {
+                    CeraError::Backend(format!(
+                        "turboquant layer {i} kv_stride {kv_stride} exceeds u32"
+                    ))
+                })?;
+                // `TqLayout` owns the region formula and guards its own
+                // multiplies, so production and the oracle tests can't drift
+                // apart on the sizing.
+                let vecs =
+                    tq_checked_elems::<u32>(n_kv_heads, max_seq_len, &format!("layer {i} vecs"))?;
+                let k_words = layout.key_words(vecs).map_err(|_| {
+                    CeraError::Backend(format!("turboquant layer {i} key word count overflow"))
+                })?;
+                let v_words = layout.value_words(vecs).map_err(|_| {
+                    CeraError::Backend(format!("turboquant layer {i} value word count overflow"))
+                })?;
+                let k_bytes = checked_words_to_bytes(k_words, &format!("layer {i} keys"))?;
+                let v_bytes = checked_words_to_bytes(v_words, &format!("layer {i} values"))?;
+                validate_tq_buffer_limit(
+                    k_bytes,
+                    &format!("l{i}.tq_keys"),
+                    max_buffer_size,
+                    max_storage_binding_size,
+                )?;
+                validate_tq_buffer_limit(
+                    v_bytes,
+                    &format!("l{i}.tq_values"),
+                    max_buffer_size,
+                    max_storage_binding_size,
+                )?;
+                layer_specs.push(Some((n_kv_heads, k_bytes, v_bytes)));
+            }
+            BlockType::GatedConv | BlockType::Mamba2 | BlockType::DeltaNet => {
+                layer_specs.push(None);
+            }
+        }
+    }
+
+    let q_rows = tq_checked_elems::<f32>(q_cap, config.n_heads, "qrot rows")?;
+    let qrot_stride = head_dim
+        .checked_mul(2)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| CeraError::Backend("turboquant qrot stride overflow".into()))?;
+    let qrot_floats = tq_checked_elems::<f32>(q_rows, qrot_stride, "qrot")?;
+    let qrot_bytes = checked_words_to_bytes(qrot_floats, "qrot")?;
+    validate_tq_buffer_limit(
+        qrot_bytes,
+        "tq_qrot",
+        max_buffer_size,
+        max_storage_binding_size,
+    )?;
+
+    let align = usize::try_from(min_storage_align.max(4))
+        .map_err(|_| CeraError::Backend("turboquant storage alignment exceeds usize".into()))?;
+    let slot_stride = PARAMS_BYTES
+        .checked_next_multiple_of(align)
+        .ok_or_else(|| CeraError::Backend("turboquant slot_stride alignment overflow".into()))?;
+    let total_slots = n_layers
+        .checked_mul(SLOTS_PER_LAYER)
+        .ok_or_else(|| CeraError::Backend("turboquant params slot count overflow".into()))?;
+    let params_bytes_usize = total_slots
+        .checked_mul(slot_stride)
+        .ok_or_else(|| CeraError::Backend("turboquant params byte count overflow".into()))?;
+    let params_bytes = u64::try_from(params_bytes_usize)
+        .map_err(|_| CeraError::Backend("turboquant params byte count overflow u64".into()))?;
+    validate_tq_buffer_limit(
+        params_bytes,
+        "tq_params",
+        max_buffer_size,
+        max_storage_binding_size,
+    )?;
+
+    Ok(TqCachePlan {
+        layout,
+        sign_elems,
+        layer_specs,
+        qrot_bytes,
+        slot_stride,
+        params_bytes,
+    })
+}
+
 impl TqGpuCache {
     /// Allocate the compressed caches and compile the pipelines.
     ///
@@ -206,94 +438,93 @@ impl TqGpuCache {
         mode: TqMode,
     ) -> Result<Self, CeraError> {
         let head_dim = config.head_dim;
-        // The in-crate caller gates on `TqMode::from_compression`, but this type is
-        // `pub` (the oracle tests construct it directly), so surface a typed error
-        // rather than aborting the caller's process.
-        if !head_dim_supported(head_dim) {
-            return Err(crate::turboquant::unsupported_head_dim(head_dim));
-        }
-        let layout = TqLayout::new(head_dim);
-        let n_layers = config.block_types.len();
+        // Pre-validate all geometry, overflows, and GPU buffer limits before compiling
+        // pipelines or generating sign tables.
+        let plan = prevalidate_tq_cache_specs(
+            config,
+            max_seq_len,
+            q_cap,
+            ctx.min_storage_buffer_offset_alignment,
+            ctx.max_buffer_size,
+            ctx.max_storage_buffer_binding_size,
+        )?;
+        let n_layers = plan.layer_specs.len();
 
         // Per-layer sign flips, laid out [polar | jl] so one binding serves both.
-        let mut signs = Vec::with_capacity(n_layers * 2 * head_dim);
+        let mut signs = Vec::with_capacity(plan.sign_elems);
         for layer_idx in 0..n_layers {
             let rot = RotationState::try_from_seed(mode.seed ^ layer_idx as u64, head_dim)?;
             signs.extend_from_slice(&rot.polar_signs);
             signs.extend_from_slice(&rot.jl_signs);
         }
 
-        let mut layers = Vec::with_capacity(n_layers);
-        for (i, bt) in config.block_types.iter().enumerate() {
-            match bt {
-                BlockType::Attention | BlockType::ParallelAttentionMamba2 => {
-                    let n_kv_heads = config.kv_heads_per_layer[i];
-                    // `TqLayout` owns the region formula and guards its own
-                    // multiplies, so production and the oracle tests can't drift
-                    // apart on the sizing.
-                    let vecs = checked_elems::<u32>(n_kv_heads, max_seq_len)?;
-                    let k_bytes = TqLayout::words_to_bytes(layout.key_words(vecs)?);
-                    let v_bytes = TqLayout::words_to_bytes(layout.value_words(vecs)?);
-                    layers.push(Some(TqLayerCache {
+        let TqCachePlan {
+            layout,
+            sign_elems: _,
+            layer_specs,
+            qrot_bytes,
+            slot_stride,
+            params_bytes,
+        } = plan;
+
+        init_tq_cache_with(
+            || {
+                ctx.check_pipelines("tq pipelines", || TqPipelines {
+                    encode_keys: ctx.create_pipeline(
+                        crate::backend::wgpu::shaders::TURBOQUANT,
+                        "tq_encode_keys",
+                        "tq_encode_keys",
+                    ),
+                    encode_values: ctx.create_pipeline(
+                        crate::backend::wgpu::shaders::TURBOQUANT,
+                        "tq_encode_values",
+                        "tq_encode_values",
+                    ),
+                    rotate_q: ctx.create_pipeline(
+                        crate::backend::wgpu::shaders::TURBOQUANT,
+                        "tq_rotate_q",
+                        "tq_rotate_q",
+                    ),
+                    attention: ctx.create_pipeline(
+                        crate::backend::wgpu::shaders::FLASH_ATTENTION_TQ,
+                        "flash_attention_tq",
+                        "flash_attention_tq",
+                    ),
+                })
+            },
+            |pipelines| {
+                let mut layers = Vec::with_capacity(n_layers);
+                for (i, spec) in layer_specs.into_iter().enumerate() {
+                    layers.push(spec.map(|(n_kv_heads, k_bytes, v_bytes)| TqLayerCache {
                         keys: ctx.create_storage_rw(k_bytes, &format!("l{i}.tq_keys")),
                         values: ctx.create_storage_rw(v_bytes, &format!("l{i}.tq_values")),
                         n_kv_heads,
                     }));
                 }
-                BlockType::GatedConv | BlockType::Mamba2 | BlockType::DeltaNet => layers.push(None),
-            }
-        }
 
-        // Rotated-query scratch: two head-wide regions plus one sum per (row, head).
-        let q_rows = checked_elems::<f32>(q_cap, config.n_heads)?;
-        let qrot_floats = checked_elems::<f32>(q_rows, 2 * head_dim + 1)?;
-        let qrot = ctx.create_storage_rw(TqLayout::words_to_bytes(qrot_floats), "tq_qrot");
+                // Rotated-query scratch: two head-wide regions plus one sum per (row, head).
+                let qrot = ctx.create_storage_rw(qrot_bytes, "tq_qrot");
 
-        // One params slot per (layer, purpose), each padded out to the device's
-        // storage-binding offset alignment so a bind group can address it.
-        let align = ctx.min_storage_buffer_offset_alignment.max(4) as usize;
-        let slot_stride = PARAMS_BYTES.next_multiple_of(align);
-        let params = ctx.create_storage_rw(
-            (n_layers * SLOTS_PER_LAYER * slot_stride) as u64,
-            "tq_params",
-        );
+                // One params slot per (layer, purpose), each padded out to the device's
+                // storage-binding offset alignment so a bind group can address it.
+                let params = ctx.create_storage_rw(params_bytes, "tq_params");
 
-        let pipelines = TqPipelines {
-            encode_keys: ctx.create_pipeline(
-                crate::backend::wgpu::shaders::TURBOQUANT,
-                "tq_encode_keys",
-                "tq_encode_keys",
-            ),
-            encode_values: ctx.create_pipeline(
-                crate::backend::wgpu::shaders::TURBOQUANT,
-                "tq_encode_values",
-                "tq_encode_values",
-            ),
-            rotate_q: ctx.create_pipeline(
-                crate::backend::wgpu::shaders::TURBOQUANT,
-                "tq_rotate_q",
-                "tq_rotate_q",
-            ),
-            attention: ctx.create_pipeline(
-                crate::backend::wgpu::shaders::FLASH_ATTENTION_TQ,
-                "flash_attention_tq",
-                "flash_attention_tq",
-            ),
-        };
-
-        Ok(Self {
-            mode,
-            layout,
-            layers,
-            signs: ctx.upload_f32(&signs, "tq_signs"),
-            qrot,
-            q_cap,
-            params,
-            slot_stride,
-            config: TurboQuantConfig::for_head_dim(head_dim),
-            pipelines,
-            max_seq_len,
-        })
+                Ok(Self {
+                    mode,
+                    layout,
+                    layers,
+                    signs: ctx.upload_f32(&signs, "tq_signs"),
+                    qrot,
+                    q_cap,
+                    params,
+                    slot_stride,
+                    config: TurboQuantConfig::for_head_dim(head_dim),
+                    pipelines,
+                    max_seq_len,
+                })
+            },
+            |stage| ctx.ensure_alive(stage),
+        )
     }
 
     /// This layer's cache, or `None` for a conv layer.
@@ -781,5 +1012,297 @@ impl TqGpuCache {
             );
         }
         Some(seq_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init_tq_cache_with;
+    use crate::CeraError;
+    use crate::model::{BlockType, ModelConfig};
+
+    #[test]
+    fn init_tq_cache_with_validates_pipelines_before_allocating_buffers() {
+        let mut allocated = false;
+        let mut checked_alive = false;
+        let err = init_tq_cache_with(
+            || -> anyhow::Result<u32> { anyhow::bail!("tq validation failed") },
+            |_| -> Result<u32, CeraError> {
+                allocated = true;
+                Ok(1)
+            },
+            |_| {
+                checked_alive = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            !allocated && !checked_alive,
+            "buffer allocation and post-upload check must not run after pipeline failure"
+        );
+        match err {
+            CeraError::Backend(msg) => assert!(msg.contains("tq validation failed"), "{msg}"),
+            other => panic!("expected CeraError::Backend, got {other:?}"),
+        }
+
+        // Allocation error aborts without running post-upload alive check.
+        let mut checked_alive = false;
+        let err_alloc = init_tq_cache_with(
+            || Ok(42u32),
+            |_| -> Result<u32, CeraError> { Err(CeraError::Backend("oom".into())) },
+            |_| {
+                checked_alive = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!checked_alive);
+        match err_alloc {
+            CeraError::Backend(msg) => assert_eq!(msg, "oom"),
+            other => panic!("expected CeraError::Backend, got {other:?}"),
+        }
+
+        // Post-allocation device loss aborts with CeraError::Backend instead of returning Ok.
+        let err_lost = init_tq_cache_with(
+            || Ok(42u32),
+            |p| Ok(p + 1),
+            |stage| anyhow::bail!("{stage}: GPU device lost (signs upload lost)"),
+        )
+        .unwrap_err();
+        match err_lost {
+            CeraError::Backend(msg) => {
+                assert!(msg.contains("tq allocation"), "{msg}");
+                assert!(msg.contains("signs upload lost"), "{msg}");
+            }
+            other => panic!("expected CeraError::Backend, got {other:?}"),
+        }
+
+        let ok = init_tq_cache_with(|| Ok(42u32), |p| Ok(p + 1), |_| Ok(())).unwrap();
+        assert_eq!(ok, 43);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tq_gpu_cache_aborts_on_lost_device() {
+        use super::{TqGpuCache, TqMode};
+        let Some(ctx) = crate::backend::wgpu::gpu_or_skip() else {
+            return;
+        };
+        ctx.simulate_device_lost("test: tq lost");
+        let cfg = ModelConfig {
+            architecture: "lfm2".to_string(),
+            n_layers: 1,
+            hidden_size: 64,
+            intermediate_size: 128,
+            n_heads: 2,
+            n_kv_heads: 2,
+            head_dim: 32,
+            vocab_size: 32,
+            max_seq_len: 16,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            block_types: vec![BlockType::Attention],
+            conv_kernel_size: None,
+            ssm: None,
+            kv_heads_per_layer: vec![2],
+            scalars: Default::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: vec![],
+        };
+        let err = match TqGpuCache::new(&ctx, &cfg, 16, 4, TqMode { seed: 1 }) {
+            Ok(_) => panic!("TqGpuCache::new must fail on a lost device"),
+            Err(e) => e,
+        };
+        match err {
+            CeraError::Backend(msg) => assert!(msg.contains("test: tq lost"), "{msg}"),
+            other => panic!("expected CeraError::Backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prevalidate_tq_cache_specs_rejects_degenerate_and_oversized_configs() {
+        use super::prevalidate_tq_cache_specs;
+        fn base_cfg() -> ModelConfig {
+            ModelConfig {
+                architecture: "lfm2".to_string(),
+                n_layers: 1,
+                hidden_size: 64,
+                intermediate_size: 128,
+                n_heads: 2,
+                n_kv_heads: 2,
+                head_dim: 32,
+                vocab_size: 32,
+                max_seq_len: 16,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-5,
+                block_types: vec![BlockType::Attention],
+                conv_kernel_size: None,
+                ssm: None,
+                kv_heads_per_layer: vec![2],
+                scalars: Default::default(),
+                moe: None,
+                is_causal: true,
+                class_labels: vec![],
+            }
+        }
+
+        const LIMIT: u64 = 1024 * 1024;
+        // Valid baseline passes cleanly.
+        assert!(prevalidate_tq_cache_specs(&base_cfg(), 16, 4, 256, LIMIT, LIMIT).is_ok());
+
+        // n_layers == 0
+        let mut cfg = base_cfg();
+        cfg.block_types.clear();
+        cfg.kv_heads_per_layer.clear();
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&cfg, 16, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("n_layers > 0")
+        ));
+
+        // max_seq_len == 0
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), 0, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("max_seq_len > 0")
+        ));
+
+        // q_cap == 0
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), 16, 0, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("q_cap > 0")
+        ));
+
+        // n_heads == 0
+        let mut cfg = base_cfg();
+        cfg.n_heads = 0;
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&cfg, 16, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("n_heads > 0")
+        ));
+
+        // Short kv_heads_per_layer
+        let mut cfg = base_cfg();
+        cfg.kv_heads_per_layer.clear();
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&cfg, 16, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("kv_heads_per_layer")
+        ));
+
+        // Zero n_kv_heads on attention layer
+        let mut cfg = base_cfg();
+        cfg.kv_heads_per_layer = vec![0];
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&cfg, 16, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("n_kv_heads must be > 0")
+        ));
+
+        // n_kv_heads > n_heads (shader divides n_heads / n_kv_heads -> 0) and non-divisible
+        // GQA head counts must return CeraError::Backend upfront.
+        let mut cfg = base_cfg();
+        cfg.n_heads = 2;
+        cfg.kv_heads_per_layer = vec![4];
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&cfg, 16, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("multiple of n_kv_heads")
+        ));
+        let mut cfg = base_cfg();
+        cfg.n_heads = 10;
+        cfg.kv_heads_per_layer = vec![4];
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&cfg, 16, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("multiple of n_kv_heads")
+        ));
+
+        // Integer overflow in signs / qrot / params / vecs (both 32-bit and 64-bit targets return
+        // CeraError::Backend, never OutOfMemory or wrapped u64 byte counts).
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), usize::MAX, 4, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(_))
+        ));
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), 16, usize::MAX, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(_))
+        ));
+        let mut portable_u32_overflow = base_cfg();
+        portable_u32_overflow.head_dim = 32;
+        portable_u32_overflow.n_heads = 67_108_872;
+        portable_u32_overflow.kv_heads_per_layer = vec![1];
+        assert!(matches!(
+            prevalidate_tq_cache_specs(
+                &portable_u32_overflow,
+                1,
+                u32::MAX as usize,
+                256,
+                u64::MAX,
+                u64::MAX
+            ),
+            Err(CeraError::Backend(_))
+        ));
+        // Exact u64 byte-scaling overflow on 64-bit (`qrot_floats = 4.61e18 <= usize::MAX` while
+        // `qrot_floats * 4 > u64::MAX`, wrapping mod 2^64 to ~256 MiB < LIMIT if unguarded).
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&portable_u32_overflow, 1, 1_057_222_593, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("byte count overflow")
+        ));
+        #[cfg(not(target_pointer_width = "64"))]
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&portable_u32_overflow, 1, 1_057_222_593, 256, LIMIT, LIMIT),
+            Err(CeraError::Backend(_))
+        ));
+        let mut huge_layers_cfg = base_cfg();
+        huge_layers_cfg.block_types = vec![BlockType::GatedConv; 128];
+        huge_layers_cfg.kv_heads_per_layer = vec![0; 128];
+        // Tiny storage alignment or huge alignment overflowing params
+        assert!(matches!(
+            prevalidate_tq_cache_specs(
+                &huge_layers_cfg,
+                16,
+                4,
+                usize::MAX as u64 / 2,
+                LIMIT,
+                LIMIT
+            ),
+            Err(CeraError::Backend(_))
+        ));
+
+        // Each of the 5 buffers exceeding max_buffer_size or max_storage_buffer_binding_size
+        // returns CeraError::Backend naming the offending buffer.
+        // Baseline buffer sizes for head_dim=32, n_layers=1, kv_heads=2, max_seq_len=16, q_cap=4,
+        // n_heads=2, align=256:
+        // tq_signs = 256 B, tq_params = 1024 B, l0.tq_keys = 512 B, l0.tq_values = 384 B,
+        // tq_qrot = 2080 B.
+        let plan = prevalidate_tq_cache_specs(&base_cfg(), 16, 4, 256, LIMIT, LIMIT).unwrap();
+        let (n_kv, k_bytes, v_bytes) = plan.layer_specs[0].unwrap();
+        assert_eq!(n_kv, 2);
+
+        // Fail specifically on tq_signs via tiny limit < 256 B
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), 16, 4, 256, 128, LIMIT),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_signs")
+        ));
+        // Fail on max_storage_buffer_binding_size for k_bytes/v_bytes using large max_seq_len
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), 1_000_000, 1, 256, u64::MAX, 1024 * 1024),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_keys") || msg.contains("tq_values")
+        ));
+        // Fail specifically on tq_qrot via q_cap making qrot > limit while k/v stay <= limit
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&base_cfg(), 1, 1024, 256, 1024 * 1024, 16 * 1024),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_qrot")
+        ));
+        // Fail specifically on tq_params when params_bytes > limit and all other buffers fit
+        let many_conv_cfg = ModelConfig {
+            block_types: vec![BlockType::GatedConv; 8],
+            kv_heads_per_layer: vec![0; 8],
+            ..base_cfg()
+        };
+        assert!(matches!(
+            prevalidate_tq_cache_specs(&many_conv_cfg, 1, 1, 256, 4096, 4096),
+            Err(CeraError::Backend(msg)) if msg.contains("tq_params")
+        ));
+        // Sanity check our baseline v_bytes < k_bytes
+        assert!(v_bytes < k_bytes);
     }
 }
