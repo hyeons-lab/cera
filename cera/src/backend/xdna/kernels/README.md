@@ -33,12 +33,16 @@ LFM2/LFM2.5-1.2B, and LFM3-1.7B / d1-2B prefill and decode:
   ShortConv Mode 0 (`insts_lfm3_dec_conv.bin`), causal/SWA Mode 1
   (`insts_lfm3_dec_attn_c0..c255.bin`), and >8K paged Modes 2–4
   (`insts_lfm3_dec_phase_a.bin`, `insts_lfm3_dec_fa_part_c256.bin`,
-  `insts_lfm3_dec_fa_fin_c0..c255.bin`) sharing `q4layer_lfm3.xclbin`.
+  `insts_lfm3_dec_fa_fin_c0..c255.bin`) sharing `q4layer_lfm3.xclbin`
+  (single `SLOT_NORM_0` parameter+RoPE packet, merged `Q+K+V+ATTN_GATE`
+  broadcasts, packed 4-chunk `FFN_DOWN` activations, and overlaid `DecState`).
 - `q4prefill_lfm2` / `q4layer_lfm2`: unified LFM2/LFM2.5 prefill (`B=64`) and
   decode (`B=1`) kernels covering ShortConv, SWA/causal attention, and >8K
   paged online-softmax modes (`q4prefill_lfm2.xclbin` + `insts_lfm2_pre_*.bin`,
-  `q4layer_lfm2.xclbin` + `insts_lfm2_dec_*.bin`; legacy `B=32` sources remain
-  in `iron/`).
+  `q4layer_lfm2.xclbin` + `insts_lfm2_dec_*.bin` with merged `SLOT_NORM_0`
+  parameter+RoPE packet, merged `Q+K+V` broadcasts, packed 4-chunk `FFN_DOWN`
+  inputs, and inline `y_op==11` residual accumulation; legacy `B=32` sources
+  remain in `iron/`).
 - `gemm_bf16`: standalone BF16 GEMM (`gemm_bf16.xclbin`, `insts_gemm_bf16_k*.bin`).
 
 Sources in `iron/` are cera's own code (Apache-2.0 OR MIT, developed in

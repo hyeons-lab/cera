@@ -1865,7 +1865,13 @@ impl XdnaLfm3Model {
                 .map_err(|e| format!("decode kvh {kvh} kv bo_kv sync failed: {e}"))?;
         }
         if let Some(pending) = pending_cpu_kv {
-            pending.push_attn_bf16(layer_idx, kvo_bytes, LFM3_N_KV_HEADS, LFM3_HEAD_DIM);
+            pending.push_attn_bf16(
+                layer_idx,
+                kvo_bytes,
+                LFM3_N_KV_HEADS,
+                LFM3_HEAD_DIM,
+                512 * 4,
+            );
         }
         Ok(())
     }

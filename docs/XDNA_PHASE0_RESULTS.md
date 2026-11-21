@@ -1,6 +1,6 @@
 # AMD XDNA NPU: Phase 0 and 0b results
 
-Results for the checklist in [XDNA_NPU_PHASE0.md](XDNA_NPU_PHASE0.md). Status: **Phase 0b decided and Phase 1 backend validated (section 8).** The deciding question is answered (yes, 3c step 2), 3d evaluates the go/no-go bar against the section 2 baselines, 3e records the follow-up Q4 kernel spike and the decision taken on it, and section 8 records the end-to-end `--device npu` backend results. The remaining Phase 0 items (the 2 Windows unit-test portability fixes, CPU SIMD tier, `target-cpu=native`, and `WGPU_BACKEND=dx12` vs `vulkan`) are also closed in sections 1 and 2.
+Results for the checklist in [XDNA_NPU_PHASE0.md](XDNA_NPU_PHASE0.md). Status: **Phase 0b decided and Phase 1 backend validated (section 8; LFM2/LFM3 decode in section 9).** The deciding question is answered (yes, 3c step 2), 3d evaluates the go/no-go bar against the section 2 baselines, 3e records the follow-up Q4 kernel spike and the decision taken on it, section 8 records the end-to-end `--device npu` backend results on Llama-3.2-1B, and section 9 records LFM2/LFM3 NPU decode host and IRON kernel optimizations. The remaining Phase 0 items (the 2 Windows unit-test portability fixes, CPU SIMD tier, `target-cpu=native`, and `WGPU_BACKEND=dx12` vs `vulkan`) are also closed in sections 1 and 2.
 
 Sizes of buffers and transfers are binary (KiB, MiB); bandwidth is decimal GB/s (10^9 bytes per second); model file sizes (773 MB) are decimal. All measurements ran natively on Windows (the IRON kernels were built in WSL2; see 3c step 2). They were launched from a WSL2 shell through Windows interop, which starts the Windows executable as a normal Windows process. No measurement here ran inside the Linux VM.
 
@@ -550,3 +550,27 @@ The production backend (`cera/src/backend/xdna/`, `cera/src/model/xdna_llama.rs`
 | CPU (`--device cpu`, section 2, machine in use) | 60.3 | 65.60 | 0.92 | 43.90 (vs 21.70 W floor) | 1.37 |
 
 **Gate verdict: PASS.** The XDNA backend clears both legs of the section 4 numeric bar (**51.3 tok/s p50 >= 35 tok/s** and **>= 2.08 gross tok/J >= 1.5 gross tok/J**, ~2.57 gross tok/J at ~20 W), matching Qualcomm Hexagon NPU decode throughput (50–53 tok/s on Llama-3.2-1B) while drawing ~20 W whole-package power (~5 to 11 W above idle, vs ~67 W on the GPU and ~66 W on the CPU). `cargo test --release -p cera --lib --features xdna` passes all **1,747** unit tests (**0 failed**, 16 ignored).
+
+## 9. LFM2 / LFM3 NPU decode optimization (2026-11-21)
+
+Follow-up host and IRON kernel work extending `--device npu` to **LFM2/LFM2.5-1.2B** (`cera/src/model/xdna_lfm2.rs`, `q4layer_lfm2`) and **LFM3-1.7B / d1-2B** (`cera/src/model/xdna_lfm3.rs`, `q4layer_lfm3`):
+
+### Host runtime changes
+- **Windows hybrid warm-spin lease (`PrefillWarmGuard` in `cera/src/backend/threadpool.rs`).** Replaced the fixed worker-local `spin_limit` with `Shared::spin_limit: AtomicU32` and a refcounted RAII guard (`acquire_prefill_warm_spin`) that raises `RowPool::prefill` spin iterations from `PREFILL_SPIN_BEFORE_PARK` (`100_000`) to `XDNA_PREFILL_SPIN_BEFORE_PARK` (`24_000_000`) while `XdnaLfm2Model` or a causal `XdnaLfm3Model` is live (honoring explicit `CERA_SPIN` overrides and restoring `100_000` on drop), preventing ~1 ms Windows scheduler park/wake stalls across Q6_K LM-head dispatches.
+- **CPU Q6_K LM-head thread sizing (`LfmModel::xdna_project_logits_into` in `cera/src/model/lfm2.rs`).** Switched default worker count from `0` (SMT decode-pool fallback) to `(cores * 3 / 4).clamp(4, 12)` when `cores > 8` (`cores.max(1)` otherwise; overridable via `CERA_NPU_HEAD_THREADS`).
+- **Overlapped KV mirroring, coalesced BO syncs, and zero-alloc `forward_greedy`.** Added `HybridPendingSlot` (`cera/src/model/xdna_llama.rs`) so `LayerState::Conv` history pushes and `BF16`->`F16`/`F32` KV conversions (`flush_into`) overlap behind the next token's NPU `runlist.execute()`; trimmed Conv KVO readbacks to `CONV_SYNC_BYTES`; coalesced per-head `K`+`V` `sync_range_to_device` calls (`XdnaLfm2Model`, `XdnaLfm3Model`, and `XdnaLlamaModel`); merged `step_params` and `rope` syncs; and added zero-allocation `forward_greedy` (`logits_into` into `state.scratch.logits`).
+
+### IRON decode kernel changes (`q4layer_lfm2`, `q4layer_lfm3`)
+- Merged `SLOT_ROPE_PKT` into `SLOT_NORM_0` (removing a separate per-layer host→device sync and packet wait).
+- Removed the separate `X` packet FIFOs and `q4_lfm{2,3}_dec_x_op.cc`, folding `Q+K+V` (and `ATTN_GATE` in `q4layer_lfm3`) broadcasts and packed 4-chunk `FFN_DOWN` Q8 inputs + `[4,2,72,256]` weight TAP onto the `W0`/`W1` streams.
+- Added inline `y_op == 11` residual accumulation in `q4layer_lfm2` (removing `tg_res1`/`tg_res2` barriers) and overlaid `xq_buf[4 * X_ELEMS]` in `DecState` (`q4_lfm3_dec_state.h`) for `q4layer_lfm3`.
+- Rebuilt all 68 decode artifacts (`q4layer_lfm2.xclbin` + 33 `insts_lfm2_dec_*.bin`, `q4layer_lfm3.xclbin` + 33 `insts_lfm3_dec_*.bin`; core ELF `.text <= 15,940 B <= 16,384 B`) and updated the SHA-256 table in `cera/src/backend/xdna/kernels/README.md`.
+
+### Throughput results (Windows Strix Halo, `--release`, default environment)
+
+| Model | Baseline decode | Optimized decode | Notes |
+|---|---|---|---|
+| `LFM2.5-1.2B-Instruct-Q4_0` (`--device npu`) | ~41.2–41.5 tok/s | **62.5 tok/s p50** (cool, `pp=16`) / **63.2 tok/s p50** (`pp=128`, p90 `66.4`) | `54.3 tok/s` post-stress at `pp=16` |
+| `LFM3-1.7B-QAD-Q4_0` (`--device npu`) | ~31.1–32.7 tok/s | **41.0 tok/s p50** (`pp=16`, p90 `41.5`) | Hybrid SWA + Conv + gated attention |
+
+All six XDNA2 hardware verification gates (`hw_verify_q4layer_lfm3`, `hw_gate_lfm2_causal_parity_and_throughput`, `hw_gate_lfm2_long_context_parity`, `hw_gate3a_lfm3_causal_parity_and_throughput`, `hw_gate3b_d1_2b_bidirectional_parity_and_decide`, `hw_gate3c_lfm3_long_context_parity`) pass.
