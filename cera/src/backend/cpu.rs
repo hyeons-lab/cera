@@ -2141,6 +2141,158 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_gate_up_silu_dispatch(
     false
 }
 
+/// Dispatch fused quantize+pack row-major `out[n, m]` GEMM from `f32` activations `x[n, k]`
+/// over lin16-repacked Q4_0 weights when supported.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_f32_repacked_q4_0_lin16_rowmajor_dispatch(
+    packed: &[u8],
+    scales_f16: &[u16],
+    x: &[f32],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, scales_f16, x, &out, n, m, k);
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if avx512_vnni_lin16_available() && m.is_multiple_of(16) && k.is_multiple_of(32) {
+        let nb = k / 32;
+        assert!(
+            packed.len() >= (m / 16) * nb * 256
+                && scales_f16.len() >= (m / 16) * nb * 16
+                && x.len() >= n * k
+                && out.len() == m * n
+        );
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_f32_lin16_rowmajor_zmm(
+                packed, scales_f16, x, out, n, m, k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
+/// Dispatch a pair of row-major lin16 Q4_0 GEMMs sharing one quantized+packed `f32` activation `[n, k]`.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_f32_repacked_q4_0_lin16_pair_rowmajor_dispatch(
+    packed_a: &[u8],
+    scales_f16_a: &[u16],
+    out_a: &mut [f32],
+    m_a: usize,
+    packed_b: &[u8],
+    scales_f16_b: &[u16],
+    out_b: &mut [f32],
+    m_b: usize,
+    x: &[f32],
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (
+        packed_a,
+        scales_f16_a,
+        &out_a,
+        m_a,
+        packed_b,
+        scales_f16_b,
+        &out_b,
+        m_b,
+        x,
+        n,
+        k,
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if avx512_vnni_lin16_available()
+        && m_a.is_multiple_of(16)
+        && m_b.is_multiple_of(16)
+        && k.is_multiple_of(32)
+    {
+        let nb = k / 32;
+        assert!(
+            packed_a.len() >= (m_a / 16) * nb * 256
+                && scales_f16_a.len() >= (m_a / 16) * nb * 16
+                && packed_b.len() >= (m_b / 16) * nb * 256
+                && scales_f16_b.len() >= (m_b / 16) * nb * 16
+                && x.len() >= n * k
+                && out_a.len() == m_a * n
+                && out_b.len() == m_b * n
+        );
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_f32_lin16_pair_rowmajor_zmm(
+                packed_a,
+                scales_f16_a,
+                out_a,
+                m_a,
+                packed_b,
+                scales_f16_b,
+                out_b,
+                m_b,
+                x,
+                n,
+                k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
+/// Dispatch fused quantize+pack `f32` gate/up + SiLU (`silu(gate @ x) * (up @ x)`) over lin16 weights.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_f32_repacked_q4_0_lin16_gate_up_silu_dispatch(
+    gate_packed: &[u8],
+    gate_scales_f16: &[u16],
+    up_packed: &[u8],
+    up_scales_f16: &[u16],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (
+        gate_packed,
+        gate_scales_f16,
+        up_packed,
+        up_scales_f16,
+        x,
+        &out,
+        m,
+        n,
+        k,
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if avx512_vnni_lin16_available() && m.is_multiple_of(16) && k.is_multiple_of(32) {
+        let nb = k / 32;
+        assert!(
+            gate_packed.len() >= (m / 16) * nb * 256
+                && up_packed.len() >= (m / 16) * nb * 256
+                && gate_scales_f16.len() >= (m / 16) * nb * 16
+                && up_scales_f16.len() >= (m / 16) * nb * 16
+                && x.len() >= n * k
+                && out.len() == m * n
+        );
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_f32_lin16_gate_up_silu_rowmajor_zmm(
+                gate_packed,
+                gate_scales_f16,
+                up_packed,
+                up_scales_f16,
+                x,
+                out,
+                n,
+                m,
+                k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
 /// Run the repacked-Q4_0 prefill GEMM for `m x n` output floats from `m x k`
 /// repacked weights against pre-quantized `k x n` activation columns. Returns
 /// `false` if no kernel is available for this host architecture.
@@ -8540,6 +8692,33 @@ pub fn flash_attention_prefill_token_major(
     is_causal: bool,
     max_active: usize,
 ) -> bool {
+    flash_attention_prefill_token_major_windowed(
+        q_mat, k_cache, v_cache, out, n_heads, group_size, n, kv_dim, head_dim, scale, start_pos,
+        is_causal, None, max_active,
+    )
+}
+
+/// Token-major AVX-512 GQA prefill flash attention with optional sliding window.
+///
+/// When `sliding_window` is `Some(w)`, query token `j` attends only to keys in
+/// `[max(0, mkv - w) .. mkv)`. Returns `false` if this CPU/shape is unsupported.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_prefill_token_major_windowed(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    group_size: usize,
+    n: usize,
+    kv_dim: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    sliding_window: Option<usize>,
+    max_active: usize,
+) -> bool {
     #[cfg(all(
         feature = "parallel",
         not(target_arch = "wasm32"),
@@ -8555,6 +8734,7 @@ pub fn flash_attention_prefill_token_major(
             || group_size == 0
             || n_heads == 0
             || !n_heads.is_multiple_of(group_size)
+            || sliding_window == Some(0)
         {
             return false;
         }
@@ -8617,6 +8797,7 @@ pub fn flash_attention_prefill_token_major(
                         scale,
                         start_pos,
                         is_causal,
+                        sliding_window,
                     );
                 }
             });
@@ -8636,6 +8817,22 @@ pub fn flash_attention_prefill_token_major(
         feature = "avx512"
     )))]
     {
+        let _ = (
+            q_mat,
+            k_cache,
+            v_cache,
+            out,
+            n_heads,
+            group_size,
+            n,
+            kv_dim,
+            head_dim,
+            scale,
+            start_pos,
+            is_causal,
+            sliding_window,
+            max_active,
+        );
         false
     }
 }
@@ -9620,6 +9817,7 @@ unsafe fn flash_attention_gqa_avx512_token_major_tile(
     scale: f32,
     start_pos: usize,
     is_causal: bool,
+    sliding_window: Option<usize>,
 ) {
     use std::arch::x86_64::*;
     unsafe {
@@ -9663,27 +9861,35 @@ unsafe fn flash_attention_gqa_avx512_token_major_tile(
             }
         }
 
+        let has_window = sliding_window.is_some();
         let mut block_kv = 0usize;
+        let mut block_kv_start = usize::MAX;
+        let mut min_kv_arr = [0i32; Q_LANE];
         let mut max_kv_arr = [0i32; Q_LANE];
-        for (jq, mkv_slot) in max_kv_arr[..jb].iter_mut().enumerate() {
+        for jq in 0..jb {
             let j = j0 + jq;
             let mkv = if is_causal {
                 start_pos + j + 1
             } else {
                 start_pos + n_queries
             };
-            *mkv_slot = mkv as i32;
+            let min_k = sliding_window.map_or(0, |w| mkv.saturating_sub(w));
+            min_kv_arr[jq] = min_k as i32;
+            max_kv_arr[jq] = mkv as i32;
+            block_kv_start = block_kv_start.min(min_k);
             block_kv = block_kv.max(mkv);
         }
+        let block_kv_start = block_kv_start.min(block_kv);
+        let min_kv_v = _mm512_loadu_si512(min_kv_arr.as_ptr().cast());
         let max_kv_v = _mm512_loadu_si512(max_kv_arr.as_ptr().cast());
 
         let mut running_max = [neg_inf_v; MAX_G];
         let mut rsum_lo = [_mm512_setzero_pd(); MAX_G];
         let mut rsum_hi = [_mm512_setzero_pd(); MAX_G];
 
-        for kv_start in (0..block_kv).step_by(FLASH_TILE_KV) {
+        for kv_start in (block_kv_start..block_kv).step_by(FLASH_TILE_KV) {
             let tile_keys = (block_kv - kv_start).min(FLASH_TILE_KV);
-            let need_rescale = kv_start > 0;
+            let need_rescale = kv_start > block_kv_start;
 
             // Stage contiguous `[tile_keys, head_dim]` K and V slices into L1D once per GQA group.
             for ti in 0..tile_keys {
@@ -9739,7 +9945,12 @@ unsafe fn flash_attention_gqa_avx512_token_major_tile(
                     macro_rules! finish_k {
                         ($s:expr, $offset:expr) => {{
                             let kv_idx = _mm512_set1_epi32((kv_start + tk + $offset) as i32);
-                            let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                            let above_max = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx);
+                            let vm = if has_window {
+                                above_max & !_mm512_cmpgt_epi32_mask(min_kv_v, kv_idx) & valid_q
+                            } else {
+                                above_max & valid_q
+                            };
                             let sc =
                                 _mm512_mask_blend_ps(vm, neg_inf_v, _mm512_mul_ps($s, scale_v));
                             tile_max_v = _mm512_max_ps(tile_max_v, sc);
@@ -9767,7 +9978,12 @@ unsafe fn flash_attention_gqa_avx512_token_major_tile(
                         s0 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k0.add(d)), s0);
                     }
                     let kv_idx = _mm512_set1_epi32((kv_start + tk) as i32);
-                    let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                    let above_max = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx);
+                    let vm = if has_window {
+                        above_max & !_mm512_cmpgt_epi32_mask(min_kv_v, kv_idx) & valid_q
+                    } else {
+                        above_max & valid_q
+                    };
                     let sc = _mm512_mask_blend_ps(vm, neg_inf_v, _mm512_mul_ps(s0, scale_v));
                     tile_max_v = _mm512_max_ps(tile_max_v, sc);
                     _mm512_store_ps(scores_blk.0.as_mut_ptr().add(tk * Q_LANE), sc);
@@ -9792,7 +10008,12 @@ unsafe fn flash_attention_gqa_avx512_token_major_tile(
                 let mut tile_sum_v = zero_v;
                 for ti in 0..tile_keys {
                     let kv_idx = _mm512_set1_epi32((kv_start + ti) as i32);
-                    let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                    let above_max = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx);
+                    let vm = if has_window {
+                        above_max & !_mm512_cmpgt_epi32_mask(min_kv_v, kv_idx) & valid_q
+                    } else {
+                        above_max & valid_q
+                    };
                     let sv = _mm512_load_ps(scores_blk.0.as_ptr().add(ti * Q_LANE));
                     let ev = ggml_expf_avx512(_mm512_sub_ps(sv, new_max_v), &exp_c);
                     let pv = _mm512_maskz_mov_ps(vm, ev);
@@ -17522,6 +17743,113 @@ mod tests {
                                 got.to_bits(),
                                 want.to_bits(),
                                 "hd={head_dim} n={n} pos={start_pos} causal={is_causal} ({j},{h},{d}): got {got} want {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sliding-window `flash_attention_prefill_token_major_windowed` must match
+    /// the scalar windowed attention reference across causal/non-causal shapes and shifted KV slices.
+    #[test]
+    fn flash_attention_prefill_token_major_windowed_matches_scalar_reference() {
+        let mut seed = 0x1357_2468u64;
+        let mut next = || -> f32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as i32 as f32 / 16777216.0) - 0.5
+        };
+
+        for &(head_dim, n_heads, group_size) in &[(64usize, 16usize, 4usize), (128, 16, 4)] {
+            let hs = n_heads * head_dim;
+            let kv_dim = (n_heads / group_size) * head_dim;
+            for &(n, start_pos, window, is_causal) in &[
+                (19usize, 0usize, 10usize, true),
+                (41, 32, 20, true),
+                (70, 300, 256, true),
+                (35, 64, 40, false),
+            ] {
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let q_tok: Vec<f32> = (0..n * hs).map(|_| next()).collect();
+                let k_full: Vec<f32> = (0..(start_pos + n) * kv_dim).map(|_| next()).collect();
+                let v_full: Vec<f32> = (0..(start_pos + n) * kv_dim).map(|_| next()).collect();
+
+                let min_seq = if is_causal {
+                    start_pos + 1
+                } else {
+                    start_pos + n
+                };
+                let kv_floor = min_seq.saturating_sub(window).min(start_pos);
+                let eff_start_pos = start_pos - kv_floor;
+                let k_slice = &k_full[kv_floor * kv_dim..];
+                let v_slice = &v_full[kv_floor * kv_dim..];
+
+                let mut out_tok = vec![0.0f32; n * hs];
+                if !flash_attention_prefill_token_major_windowed(
+                    &q_tok,
+                    k_slice,
+                    v_slice,
+                    &mut out_tok,
+                    n_heads,
+                    group_size,
+                    n,
+                    kv_dim,
+                    head_dim,
+                    scale,
+                    eff_start_pos,
+                    is_causal,
+                    Some(window),
+                    4,
+                ) {
+                    continue;
+                }
+
+                let mut scores = Vec::new();
+                for j in 0..n {
+                    let seq_len = if is_causal {
+                        start_pos + j + 1
+                    } else {
+                        start_pos + n
+                    };
+                    let win_start = seq_len.saturating_sub(window);
+                    let win_len = seq_len - win_start;
+                    let k_win = &k_full[win_start * kv_dim..seq_len * kv_dim];
+                    let v_win = &v_full[win_start * kv_dim..seq_len * kv_dim];
+                    scores.resize(win_len, 0.0);
+                    for h in 0..n_heads {
+                        let kv_h = h / group_size;
+                        let q_head = &q_tok[j * hs + h * head_dim..j * hs + (h + 1) * head_dim];
+                        attn_scores(
+                            q_head,
+                            k_win,
+                            &mut scores,
+                            kv_dim,
+                            kv_h * head_dim,
+                            head_dim,
+                            scale,
+                            win_len,
+                        );
+                        softmax_inplace(&mut scores);
+                        let mut want_head = vec![0.0f32; head_dim];
+                        attn_values(
+                            &scores,
+                            v_win,
+                            &mut want_head,
+                            kv_dim,
+                            kv_h * head_dim,
+                            head_dim,
+                            win_len,
+                        );
+                        for d in 0..head_dim {
+                            let got = out_tok[j * hs + h * head_dim + d];
+                            let diff = (got - want_head[d]).abs();
+                            assert!(
+                                diff < 2e-5,
+                                "hd={head_dim} n={n} pos={start_pos} w={window} causal={is_causal} ({j},{h},{d}): got {got} want {} (diff {diff})",
+                                want_head[d]
                             );
                         }
                     }

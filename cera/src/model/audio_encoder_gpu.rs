@@ -2510,12 +2510,24 @@ fn audio_encoder_candidates(
     }
 }
 
+/// Whether `Auto` backend selection should try XDNA for a Conformer encoder with
+/// `(n_layers, n_embd)`.
+///
+/// Short/narrow Conformer stacks spend more time in per-linear XRT synchronization
+/// than CPU/wgpu take to run the whole encoder, whereas explicit `BackendPreference::Npu`
+/// still routes to XDNA.
+#[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+fn xdna_worthwhile_for_auto(n_layers: usize, n_embd: usize) -> bool {
+    !(n_layers <= 4 && n_embd <= 512)
+}
+
 /// Build a cached GPU audio encoder for `weights`, honoring `backend`.
 ///
 /// Returns `None` for `Cpu`, for the LFM3A encoder (CPU only, see
 /// `audio_encoder_candidates`), when the chosen backend's feature isn't compiled,
 /// or when the device/context can't be created. The caller then uses the CPU
-/// encoder. `Auto` prefers Metal, then Hexagon, then XDNA, then wgpu.
+/// encoder. `Auto` prefers Metal, then Hexagon, then XDNA (when stack size
+/// justifies NPU dispatch overhead), then wgpu.
 pub fn build_gpu_audio_encoder(
     weights: &std::sync::Arc<AudioEncoderWeights>,
     backend: crate::engine::BackendPreference,
@@ -2524,10 +2536,13 @@ pub fn build_gpu_audio_encoder(
     if weights.is_lfm3a() && !matches!(backend, crate::engine::BackendPreference::Cpu) {
         tracing::debug!("audio encoder: lfm3a has no accelerated encoder; using the CPU encoder");
     }
+    let allow_auto_xdna = backend != crate::engine::BackendPreference::Auto
+        || xdna_worthwhile_for_auto(weights.layers.len(), weights.config.n_embd);
     candidates.iter().find_map(|accel| match accel {
         AudioEncoderAccel::Wgpu => try_wgpu_audio_encoder(weights),
         AudioEncoderAccel::Hexagon => try_hexagon_audio_encoder(weights),
-        AudioEncoderAccel::Xdna => try_xdna_audio_encoder(weights),
+        AudioEncoderAccel::Xdna if allow_auto_xdna => try_xdna_audio_encoder(weights),
+        AudioEncoderAccel::Xdna => None,
         AudioEncoderAccel::Metal => try_metal_audio_encoder(weights),
     })
 }
@@ -2637,6 +2652,14 @@ mod tests {
             &[AudioEncoderAccel::Hexagon, AudioEncoderAccel::Xdna]
         );
         assert!(audio_encoder_candidates(false, BP::Cpu).is_empty());
+    }
+
+    #[test]
+    fn xdna_auto_skips_short_conformer_stacks_only() {
+        assert!(!super::xdna_worthwhile_for_auto(4, 512));
+        assert!(super::xdna_worthwhile_for_auto(8, 512));
+        assert!(super::xdna_worthwhile_for_auto(17, 512));
+        assert!(super::xdna_worthwhile_for_auto(4, 768));
     }
 
     /// `conv_spec_runnable` admits what fits one dispatch and what the channel splitter can

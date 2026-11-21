@@ -1385,6 +1385,80 @@ pub(crate) fn try_repacked_gemm_rowmajor(
 
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn try_repacked_f32_gemm_rowmajor(
+    wref: &WeightRef,
+    x: &[f32],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    debug_assert_eq!(
+        wref.m, m,
+        "try_repacked_f32_gemm_rowmajor: weight m mismatch"
+    );
+    debug_assert_eq!(
+        wref.k, k,
+        "try_repacked_f32_gemm_rowmajor: weight k mismatch"
+    );
+    if let Some(rp) = &wref.repacked
+        && let Repacked::Q40Lin16 { packed, scales_f16 } = &rp.kind
+    {
+        return cpu::gemm_f32_repacked_q4_0_lin16_rowmajor_dispatch(
+            packed, scales_f16, x, out, n, m, k,
+        );
+    }
+    false
+}
+
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_repacked_f32_gate_up_silu_rowmajor(
+    gate: &WeightRef,
+    up: &WeightRef,
+    x: &[f32],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    debug_assert_eq!(
+        gate.m, m,
+        "try_repacked_f32_gate_up_silu_rowmajor: gate m mismatch"
+    );
+    debug_assert_eq!(
+        gate.k, k,
+        "try_repacked_f32_gate_up_silu_rowmajor: gate k mismatch"
+    );
+    debug_assert_eq!(
+        up.m, m,
+        "try_repacked_f32_gate_up_silu_rowmajor: up m mismatch"
+    );
+    debug_assert_eq!(
+        up.k, k,
+        "try_repacked_f32_gate_up_silu_rowmajor: up k mismatch"
+    );
+    if let (Some(g_rp), Some(u_rp)) = (&gate.repacked, &up.repacked)
+        && let (
+            Repacked::Q40Lin16 {
+                packed: gp,
+                scales_f16: gs,
+            },
+            Repacked::Q40Lin16 {
+                packed: up,
+                scales_f16: us,
+            },
+        ) = (&g_rp.kind, &u_rp.kind)
+    {
+        return cpu::gemm_f32_repacked_q4_0_lin16_gate_up_silu_dispatch(
+            gp, gs, up, us, x, out, m, n, k,
+        );
+    }
+    false
+}
+
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_preq_rowmajor(
     gguf: &GgufFile,
     wref: &WeightRef,

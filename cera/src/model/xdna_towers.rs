@@ -433,6 +433,29 @@ fn pack_activation_tile(
     k_len: usize,
     k_pad: usize,
 ) {
+    if let Ok(dst_words) = bytemuck::try_cast_slice_mut::<u8, u16>(dst_bytes) {
+        let total_rows = GEMM_BF16_M_TILE;
+        for r in 0..r_count {
+            let src_row =
+                &x[(r_start + r) * stride_k + k_start..(r_start + r) * stride_k + k_start + k_len];
+            let dst_row = &mut dst_words[r * k_pad..(r + 1) * k_pad];
+            for (d, &v) in dst_row[..k_len].iter_mut().zip(src_row.iter()) {
+                *d = f32_to_bf16(v);
+            }
+            if k_len < k_pad {
+                dst_row[k_len..].fill(0);
+            }
+        }
+        if r_count < total_rows {
+            let tail_start = r_count * k_pad;
+            let tail_end = dst_words.len().min(total_rows * k_pad);
+            if tail_start < tail_end {
+                dst_words[tail_start..tail_end].fill(0);
+            }
+        }
+        return;
+    }
+
     dst_bytes.fill(0);
     for r in 0..r_count {
         let src_row =
@@ -458,6 +481,23 @@ fn unpack_output_tile(
     c_count: usize,
     accumulate: bool,
 ) {
+    if let Ok(src_f32) = bytemuck::try_cast_slice::<u8, f32>(src_bytes) {
+        for r in 0..r_count {
+            let src_off = r * GEMM_BF16_N_TILE;
+            let src_row = &src_f32[src_off..src_off + c_count];
+            let dst_row = &mut out
+                [(r_start + r) * out_dim + c_start..(r_start + r) * out_dim + c_start + c_count];
+            if accumulate {
+                for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
+                    *d += s;
+                }
+            } else {
+                dst_row.copy_from_slice(src_row);
+            }
+        }
+        return;
+    }
+
     for r in 0..r_count {
         let src_row_off = r * GEMM_BF16_N_TILE * 4;
         let dst_row = &mut out

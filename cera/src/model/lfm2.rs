@@ -3900,24 +3900,38 @@ impl LfmModel {
                     if blas_ok {
                         #[cfg(not(has_blas))]
                         {
-                            let t_q = Instant::now();
-                            transformer::quantize_rows(normed, hs, n, bq_scales, bq_quants);
-                            if profile_prefill {
-                                t_quant += t_q.elapsed();
-                            }
                             let t = Instant::now();
-                            transformer::gemm_preq_rowmajor(
-                                &self.gguf,
+                            if transformer::try_repacked_f32_gemm_rowmajor(
                                 in_proj,
-                                bq_scales,
-                                bq_quants,
+                                normed,
                                 &mut proj_mat[..3 * hs * n],
                                 n,
                                 3 * hs,
                                 hs,
-                            );
-                            if profile_prefill {
-                                t_conv_in += t.elapsed();
+                            ) {
+                                if profile_prefill {
+                                    t_conv_in += t.elapsed();
+                                }
+                            } else {
+                                let t_q = Instant::now();
+                                transformer::quantize_rows(normed, hs, n, bq_scales, bq_quants);
+                                if profile_prefill {
+                                    t_quant += t_q.elapsed();
+                                }
+                                let t = Instant::now();
+                                transformer::gemm_preq_rowmajor(
+                                    &self.gguf,
+                                    in_proj,
+                                    bq_scales,
+                                    bq_quants,
+                                    &mut proj_mat[..3 * hs * n],
+                                    n,
+                                    3 * hs,
+                                    hs,
+                                );
+                                if profile_prefill {
+                                    t_conv_in += t.elapsed();
+                                }
                             }
                         }
                         #[cfg(has_blas)]
@@ -4147,24 +4161,44 @@ impl LfmModel {
                         // Phase 3: Batch out_proj GEMM
                         #[cfg(not(has_blas))]
                         {
-                            let t_q = Instant::now();
-                            transformer::quantize_rows(out_proj_input, hs, n, bq_scales, bq_quants);
-                            if profile_prefill {
-                                t_quant += t_q.elapsed();
-                            }
                             let t_o = Instant::now();
-                            transformer::gemm_preq_rowmajor(
-                                &self.gguf,
+                            if transformer::try_repacked_f32_gemm_rowmajor(
                                 out_proj,
-                                bq_scales,
-                                bq_quants,
+                                out_proj_input,
                                 &mut block_out[..hs * n],
                                 n,
                                 hs,
                                 hs,
-                            );
-                            if profile_prefill {
-                                t_conv_out += t_o.elapsed();
+                            ) {
+                                if profile_prefill {
+                                    t_conv_out += t_o.elapsed();
+                                }
+                            } else {
+                                let t_q = Instant::now();
+                                transformer::quantize_rows(
+                                    out_proj_input,
+                                    hs,
+                                    n,
+                                    bq_scales,
+                                    bq_quants,
+                                );
+                                if profile_prefill {
+                                    t_quant += t_q.elapsed();
+                                }
+                                let t_o = Instant::now();
+                                transformer::gemm_preq_rowmajor(
+                                    &self.gguf,
+                                    out_proj,
+                                    bq_scales,
+                                    bq_quants,
+                                    &mut block_out[..hs * n],
+                                    n,
+                                    hs,
+                                    hs,
+                                );
+                                if profile_prefill {
+                                    t_conv_out += t_o.elapsed();
+                                }
                             }
                         }
                         #[cfg(has_blas)]
@@ -4308,13 +4342,6 @@ impl LfmModel {
                         }
                         #[cfg(not(has_blas))]
                         {
-                            let t_q = Instant::now();
-                            transformer::quantize_rows(normed, hs, n, bq_scales, bq_quants);
-                            if profile_prefill {
-                                t_quant += t_q.elapsed();
-                            }
-                            let t_qkv = Instant::now();
-
                             let qkv_dim = hs + 2 * kv_dim;
                             // (concatenated packed, concatenated scales, smmla layout?).
                             // Concatenation is layout-agnostic (per-super-row blocks
@@ -4770,23 +4797,88 @@ impl LfmModel {
                                 None
                             });
 
+                            let t_qkv = Instant::now();
                             let mut ran_fused = false;
+                            let mut gate_done = false;
+                            let mut normed_quantized = false;
+                            macro_rules! ensure_normed_quantized {
+                                () => {
+                                    if !normed_quantized {
+                                        let t_q = Instant::now();
+                                        transformer::quantize_rows(
+                                            normed, hs, n, bq_scales, bq_quants,
+                                        );
+                                        if profile_prefill {
+                                            t_quant += t_q.elapsed();
+                                        }
+                                        normed_quantized = true;
+                                    }
+                                };
+                            }
                             if let Some(fused) = qkv_repacked.as_ref() {
                                 match fused {
-                                    FusedAttnProjections::Q40Lin16All {
-                                        packed,
-                                        scales_f16,
-                                    } => {
-                                        if crate::backend::cpu::gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
-                                            packed,
-                                            scales_f16,
-                                            bq_scales,
-                                            bq_quants,
-                                            &mut proj_mat[..qkv_dim * n],
-                                            n,
-                                            qkv_dim,
-                                            hs,
-                                        ) {
+                                    FusedAttnProjections::Q40Lin16All { packed, scales_f16 } => {
+                                        let gate_lin16 = lfm3_attn.and_then(|a| {
+                                            a.gate.repacked.as_ref().and_then(|rp| match &rp.kind {
+                                                transformer::Repacked::Q40Lin16 {
+                                                    packed,
+                                                    scales_f16,
+                                                } => {
+                                                    Some((packed.as_slice(), scales_f16.as_slice()))
+                                                }
+                                                _ => None,
+                                            })
+                                        });
+                                        let ok = if let Some((gp, gs)) = gate_lin16 {
+                                            let gate_buf = &mut ffn_input[..n * cfg.n_heads];
+                                            if crate::backend::cpu::gemm_f32_repacked_q4_0_lin16_pair_rowmajor_dispatch(
+                                                packed,
+                                                scales_f16,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                qkv_dim,
+                                                gp,
+                                                gs,
+                                                gate_buf,
+                                                cfg.n_heads,
+                                                normed,
+                                                n,
+                                                hs,
+                                            ) {
+                                                cpu::sigmoid_inplace(gate_buf);
+                                                gate_done = true;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else if lfm3_attn.is_none() {
+                                            crate::backend::cpu::gemm_f32_repacked_q4_0_lin16_rowmajor_dispatch(
+                                                packed,
+                                                scales_f16,
+                                                normed,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            false
+                                        };
+                                        let ok = if ok {
+                                            true
+                                        } else {
+                                            ensure_normed_quantized!();
+                                            crate::backend::cpu::gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
+                                                packed,
+                                                scales_f16,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
                                             ran_fused = true;
                                             for j in 0..n {
                                                 let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
@@ -4804,6 +4896,7 @@ impl LfmModel {
                                         scales,
                                         smmla,
                                     } => {
+                                        ensure_normed_quantized!();
                                         let ok = if *smmla {
                                             crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
                                                 packed,
@@ -4846,6 +4939,7 @@ impl LfmModel {
                                         dmn,
                                         smmla,
                                     } => {
+                                        ensure_normed_quantized!();
                                         let ok = if *smmla {
                                             crate::backend::cpu::gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
                                                 packed,
@@ -4889,6 +4983,7 @@ impl LfmModel {
                                         scales,
                                         smmla,
                                     } => {
+                                        ensure_normed_quantized!();
                                         let ok = if *smmla {
                                             crate::backend::cpu::gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
                                                 packed,
@@ -4931,6 +5026,7 @@ impl LfmModel {
                                         dmn,
                                         smmla,
                                     } => {
+                                        ensure_normed_quantized!();
                                         let qk_dim = hs + kv_dim;
                                         let ok = if *smmla {
                                             crate::backend::cpu::gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
@@ -4978,10 +5074,8 @@ impl LfmModel {
                                             );
                                         }
                                     }
-                                    FusedAttnProjections::Q40Lin16QkOnly {
-                                        packed,
-                                        scales_f16,
-                                    } => {
+                                    FusedAttnProjections::Q40Lin16QkOnly { packed, scales_f16 } => {
+                                        ensure_normed_quantized!();
                                         let qk_dim = hs + kv_dim;
                                         if crate::backend::cpu::gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
                                             packed,
@@ -5018,6 +5112,7 @@ impl LfmModel {
                                         scales,
                                         smmla,
                                     } => {
+                                        ensure_normed_quantized!();
                                         let qk_dim = hs + kv_dim;
                                         let ok = if *smmla {
                                             crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
@@ -5068,6 +5163,7 @@ impl LfmModel {
                                         scales,
                                         smmla,
                                     } => {
+                                        ensure_normed_quantized!();
                                         let qk_dim = hs + kv_dim;
                                         let ok = if *smmla {
                                             crate::backend::cpu::gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
@@ -5117,6 +5213,7 @@ impl LfmModel {
                             }
 
                             if !ran_fused {
+                                ensure_normed_quantized!();
                                 transformer::gemm_preq_rowmajor(
                                     &self.gguf,
                                     attn_q_ref,
@@ -5148,7 +5245,16 @@ impl LfmModel {
                                     hs,
                                 );
                             }
-                            if let Some(a) = lfm3_attn {
+                            if let Some(a) = lfm3_attn
+                                && !gate_done
+                            {
+                                if !normed_quantized {
+                                    let t_q = Instant::now();
+                                    transformer::quantize_rows(normed, hs, n, bq_scales, bq_quants);
+                                    if profile_prefill {
+                                        t_quant += t_q.elapsed();
+                                    }
+                                }
                                 let gate_buf = &mut ffn_input[..n * cfg.n_heads];
                                 transformer::gemm_preq_rowmajor(
                                     &self.gguf,
@@ -5491,22 +5597,42 @@ impl LfmModel {
 
                         let sliding_window = lfm3_attn.and_then(|a| a.window);
                         const FLASH_ATTN_THRESHOLD: usize = 16;
-                        let use_flash = !use_tq
-                            && n >= FLASH_ATTN_THRESHOLD
-                            && sliding_window.is_none_or(|w| start_pos + n <= w);
+                        let is_causal =
+                            self.is_causal_for(state) && !self.layer_is_non_causal(layer);
+                        let min_seq_len = if is_causal {
+                            start_pos + 1
+                        } else {
+                            start_pos + n
+                        };
+                        let kv_floor = if use_tq {
+                            0
+                        } else {
+                            sliding_window
+                                .map_or(0, |w| min_seq_len.saturating_sub(w).min(start_pos))
+                        };
+                        let elem_off = kv_floor * kv_dim;
+                        let eff_start_pos = start_pos - kv_floor;
 
-                        if use_f16
+                        if !use_tq
+                            && use_f16
                             && let LayerState::Attention {
                                 key_cache_f16,
                                 value_cache_f16,
                                 ..
                             } = &state.layers[layer]
                         {
-                            cpu::par_f16_slice_to_f32_into(key_cache_f16, kv_widen_k);
-                            cpu::par_f16_slice_to_f32_into(value_cache_f16, kv_widen_v);
+                            let t_widen = Instant::now();
+                            cpu::par_f16_slice_to_f32_into(&key_cache_f16[elem_off..], kv_widen_k);
+                            cpu::par_f16_slice_to_f32_into(
+                                &value_cache_f16[elem_off..],
+                                kv_widen_v,
+                            );
+                            if profile_prefill {
+                                t_attn_scores += t_widen.elapsed();
+                            }
                         }
 
-                        if use_flash {
+                        if !use_tq && n >= FLASH_ATTN_THRESHOLD {
                             let (k_cache, v_cache) = if use_f16 {
                                 (kv_widen_k.as_slice(), kv_widen_v.as_slice())
                             } else {
@@ -5515,16 +5641,14 @@ impl LfmModel {
                                         key_cache,
                                         value_cache,
                                         ..
-                                    } => (key_cache.as_slice(), value_cache.as_slice()),
+                                    } => (&key_cache[elem_off..], &value_cache[elem_off..]),
                                     _ => unreachable!(),
                                 }
                             };
                             let n_heads = cfg.n_heads;
                             let t_scores = Instant::now();
                             let max_active = cpu::prefill_threads_for_tokens(n);
-                            let is_causal =
-                                self.is_causal_for(state) && !self.layer_is_non_causal(layer);
-                            if !cpu::flash_attention_prefill_token_major(
+                            if cpu::flash_attention_prefill_token_major_windowed(
                                 &q_mat[..n * hs],
                                 k_cache,
                                 v_cache,
@@ -5535,10 +5659,15 @@ impl LfmModel {
                                 kv_dim,
                                 head_dim,
                                 scale,
-                                start_pos,
+                                eff_start_pos,
                                 is_causal,
+                                sliding_window,
                                 max_active,
                             ) {
+                                if profile_prefill {
+                                    t_attn_scores += t_scores.elapsed();
+                                }
+                            } else if sliding_window.is_none_or(|w| start_pos + n <= w) {
                                 let head_chunk = n * head_dim;
                                 let flash_buf = &mut flash_out[..n_heads * head_chunk];
                                 // Q transpose to head-major columns, row-parallel using 4x4 vector tiles.
@@ -5552,8 +5681,19 @@ impl LfmModel {
                                 let q_ref = &q_col[..hs * n];
 
                                 if !cpu::flash_attention_prefill_items(
-                                    q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n,
-                                    kv_dim, head_dim, scale, start_pos, is_causal, max_active,
+                                    q_ref,
+                                    k_cache,
+                                    v_cache,
+                                    flash_buf,
+                                    n_heads,
+                                    group_size,
+                                    n,
+                                    kv_dim,
+                                    head_dim,
+                                    scale,
+                                    eff_start_pos,
+                                    is_causal,
+                                    max_active,
                                 ) {
                                     cpu::par_rows_n_chunked_active(
                                         flash_buf,
@@ -5576,7 +5716,7 @@ impl LfmModel {
                                                 kv_h * head_dim,
                                                 head_dim,
                                                 scale,
-                                                start_pos,
+                                                eff_start_pos,
                                                 is_causal,
                                             );
                                         },
@@ -5605,9 +5745,60 @@ impl LfmModel {
                                         }
                                     },
                                 );
-                            }
-                            if profile_prefill {
-                                t_attn_scores += t_scores.elapsed();
+                                if profile_prefill {
+                                    t_attn_scores += t_scores.elapsed();
+                                }
+                            } else {
+                                let t_scalar = Instant::now();
+                                state.scratch.scores.clear();
+                                state
+                                    .scratch
+                                    .scores
+                                    .reserve((eff_start_pos + n) * group_size);
+                                for j in 0..n {
+                                    let seq_len = if is_causal {
+                                        (eff_start_pos + j + 1).min(k_cache.len() / kv_dim)
+                                    } else {
+                                        (eff_start_pos + n).min(k_cache.len() / kv_dim)
+                                    };
+                                    let win_start =
+                                        sliding_window.map_or(0, |w| seq_len.saturating_sub(w));
+                                    let win_len = seq_len - win_start;
+                                    let k_win = &k_cache[win_start * kv_dim..seq_len * kv_dim];
+                                    let v_win = &v_cache[win_start * kv_dim..seq_len * kv_dim];
+                                    let q = &q_mat[j * hs..(j + 1) * hs];
+                                    let attn_out = &mut out_proj_input[j * hs..(j + 1) * hs];
+                                    let scores = &mut state.scratch.scores;
+                                    scores.resize(win_len, 0.0);
+                                    for h in 0..cfg.n_heads {
+                                        let kv_h = h / group_size;
+                                        let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                                        let kv_h_offset = kv_h * head_dim;
+                                        cpu::attn_scores(
+                                            q_head,
+                                            k_win,
+                                            scores,
+                                            kv_dim,
+                                            kv_h_offset,
+                                            head_dim,
+                                            scale,
+                                            win_len,
+                                        );
+                                        cpu::softmax_inplace(scores);
+                                        cpu::attn_values(
+                                            scores,
+                                            v_win,
+                                            &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                                            kv_dim,
+                                            kv_h_offset,
+                                            head_dim,
+                                            win_len,
+                                        );
+                                    }
+                                }
+                                if profile_prefill {
+                                    t_attn_scores += t_scalar.elapsed();
+                                }
                             }
                         } else if use_tq {
                             state.scratch.scores.clear();
@@ -5730,6 +5921,7 @@ impl LfmModel {
                                 }
                             }
                         } else {
+                            let t_scalar = Instant::now();
                             let (k_cache, v_cache) = if use_f16 {
                                 (kv_widen_k.as_slice(), kv_widen_v.as_slice())
                             } else {
@@ -5738,19 +5930,20 @@ impl LfmModel {
                                         key_cache,
                                         value_cache,
                                         ..
-                                    } => (key_cache.as_slice(), value_cache.as_slice()),
+                                    } => (&key_cache[elem_off..], &value_cache[elem_off..]),
                                     _ => unreachable!(),
                                 }
                             };
                             state.scratch.scores.clear();
-                            state.scratch.scores.reserve((start_pos + n) * group_size);
+                            state
+                                .scratch
+                                .scores
+                                .reserve((eff_start_pos + n) * group_size);
                             for j in 0..n {
-                                let is_causal =
-                                    self.is_causal_for(state) && !self.layer_is_non_causal(layer);
                                 let seq_len = if is_causal {
-                                    (start_pos + j + 1).min(k_cache.len() / kv_dim)
+                                    (eff_start_pos + j + 1).min(k_cache.len() / kv_dim)
                                 } else {
-                                    (start_pos + n).min(k_cache.len() / kv_dim)
+                                    (eff_start_pos + n).min(k_cache.len() / kv_dim)
                                 };
                                 let win_start =
                                     sliding_window.map_or(0, |w| seq_len.saturating_sub(w));
@@ -5787,6 +5980,9 @@ impl LfmModel {
                                     );
                                 }
                             }
+                            if profile_prefill {
+                                t_attn_scores += t_scalar.elapsed();
+                            }
                         }
 
                         // `lfm3`: scale each head's output by its sigmoid gate before output projection.
@@ -5806,24 +6002,44 @@ impl LfmModel {
                         // Phase 3: Batch output projection GEMM
                         #[cfg(not(has_blas))]
                         {
-                            let t_q = Instant::now();
-                            transformer::quantize_rows(out_proj_input, hs, n, bq_scales, bq_quants);
-                            if profile_prefill {
-                                t_quant += t_q.elapsed();
-                            }
                             let t_ao = Instant::now();
-                            transformer::gemm_preq_rowmajor(
-                                &self.gguf,
+                            if transformer::try_repacked_f32_gemm_rowmajor(
                                 attn_output_ref,
-                                bq_scales,
-                                bq_quants,
+                                out_proj_input,
                                 &mut block_out[..hs * n],
                                 n,
                                 hs,
                                 hs,
-                            );
-                            if profile_prefill {
-                                t_attn_out += t_ao.elapsed();
+                            ) {
+                                if profile_prefill {
+                                    t_attn_out += t_ao.elapsed();
+                                }
+                            } else {
+                                let t_q = Instant::now();
+                                transformer::quantize_rows(
+                                    out_proj_input,
+                                    hs,
+                                    n,
+                                    bq_scales,
+                                    bq_quants,
+                                );
+                                if profile_prefill {
+                                    t_quant += t_q.elapsed();
+                                }
+                                let t_ao = Instant::now();
+                                transformer::gemm_preq_rowmajor(
+                                    &self.gguf,
+                                    attn_output_ref,
+                                    bq_scales,
+                                    bq_quants,
+                                    &mut block_out[..hs * n],
+                                    n,
+                                    hs,
+                                    hs,
+                                );
+                                if profile_prefill {
+                                    t_attn_out += t_ao.elapsed();
+                                }
                             }
                         }
                         #[cfg(has_blas)]
@@ -6032,16 +6248,6 @@ impl LfmModel {
                         false
                     }
                 }) {
-                    // Pre-quantize all n columns to Q8_0: only needed for the NEON fallback.
-                    #[cfg(not(has_blas))]
-                    {
-                        let t_q = Instant::now();
-                        transformer::quantize_rows(ffn_input, hs, n, bq_scales, bq_quants);
-                        if profile_prefill {
-                            t_quant += t_q.elapsed();
-                        }
-                    }
-
                     // Gate + Up via Single-Dispatch Fused AMX GEMM (AMX Gate + Up)
                     #[cfg(has_blas)]
                     {
@@ -6103,74 +6309,87 @@ impl LfmModel {
                     #[cfg(not(has_blas))]
                     {
                         let t_gu = Instant::now();
-                        let fused_ok = lora.is_none()
-                            && transformer::try_repacked_gate_up_silu_rowmajor(
+                        let fused_f32_ok = lora.is_none()
+                            && transformer::try_repacked_f32_gate_up_silu_rowmajor(
                                 &dense.gate,
                                 &dense.up,
-                                bq_scales,
-                                bq_quants,
+                                ffn_input,
                                 &mut gate_mat[..is * n],
                                 n,
                                 is,
                                 hs,
                             );
-                        if !fused_ok {
-                            transformer::gemm_preq_rowmajor(
-                                &self.gguf,
-                                &dense.gate,
-                                bq_scales,
-                                bq_quants,
-                                &mut gate_mat[..is * n],
-                                n,
-                                is,
-                                hs,
-                            );
-                            transformer::gemm_preq_rowmajor(
-                                &self.gguf,
-                                &dense.up,
-                                bq_scales,
-                                bq_quants,
-                                &mut up_mat[..is * n],
-                                n,
-                                is,
-                                hs,
-                            );
-                            if let Some(lora) = &lora {
-                                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
-                                    crate::lora::apply_prefill_rowmajor(
-                                        t,
-                                        ffn_input,
-                                        &mut gate_mat[..is * n],
-                                        n,
-                                        &mut state.scratch.lora_tmp,
-                                    );
-                                }
-                                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
-                                    crate::lora::apply_prefill_rowmajor(
-                                        t,
-                                        ffn_input,
-                                        &mut up_mat[..is * n],
-                                        n,
-                                        &mut state.scratch.lora_tmp,
-                                    );
-                                }
+                        if !fused_f32_ok {
+                            let t_q = Instant::now();
+                            transformer::quantize_rows(ffn_input, hs, n, bq_scales, bq_quants);
+                            if profile_prefill {
+                                t_quant += t_q.elapsed();
                             }
-                            // Elementwise over the whole `[n x is]` block: one pool dispatch, not
-                            // one 9-row dispatch per token (which ran on a single worker).
-                            cpu::silu_mul_inplace(&mut gate_mat[..n * is], &up_mat[..n * is]);
-                        }
-                        if profile_prefill {
+                            let t_gu_inner = Instant::now();
+                            let fused_ok = lora.is_none()
+                                && transformer::try_repacked_gate_up_silu_rowmajor(
+                                    &dense.gate,
+                                    &dense.up,
+                                    bq_scales,
+                                    bq_quants,
+                                    &mut gate_mat[..is * n],
+                                    n,
+                                    is,
+                                    hs,
+                                );
+                            if !fused_ok {
+                                transformer::gemm_preq_rowmajor(
+                                    &self.gguf,
+                                    &dense.gate,
+                                    bq_scales,
+                                    bq_quants,
+                                    &mut gate_mat[..is * n],
+                                    n,
+                                    is,
+                                    hs,
+                                );
+                                transformer::gemm_preq_rowmajor(
+                                    &self.gguf,
+                                    &dense.up,
+                                    bq_scales,
+                                    bq_quants,
+                                    &mut up_mat[..is * n],
+                                    n,
+                                    is,
+                                    hs,
+                                );
+                                if let Some(lora) = &lora {
+                                    if let Some(t) =
+                                        lora.get(layer, crate::lora::LoraTarget::FfnGate)
+                                    {
+                                        crate::lora::apply_prefill_rowmajor(
+                                            t,
+                                            ffn_input,
+                                            &mut gate_mat[..is * n],
+                                            n,
+                                            &mut state.scratch.lora_tmp,
+                                        );
+                                    }
+                                    if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp)
+                                    {
+                                        crate::lora::apply_prefill_rowmajor(
+                                            t,
+                                            ffn_input,
+                                            &mut up_mat[..is * n],
+                                            n,
+                                            &mut state.scratch.lora_tmp,
+                                        );
+                                    }
+                                }
+                                // Elementwise over the whole `[n x is]` block: one pool dispatch, not
+                                // one 9-row dispatch per token (which ran on a single worker).
+                                cpu::silu_mul_inplace(&mut gate_mat[..n * is], &up_mat[..n * is]);
+                            }
+                            if profile_prefill {
+                                t_ffn_gate_up += t_gu_inner.elapsed();
+                            }
+                        } else if profile_prefill {
                             t_ffn_gate_up += t_gu.elapsed();
-                        }
-                    }
-
-                    // Re-quantize gate_mat columns for down projection: only needed for NEON fallback.
-                    #[cfg(not(has_blas))]
-                    {
-                        let t_q = Instant::now();
-                        transformer::quantize_rows(gate_mat, is, n, dq_scales, dq_quants);
-                        if profile_prefill {
-                            t_quant += t_q.elapsed();
                         }
                     }
 
@@ -6204,18 +6423,37 @@ impl LfmModel {
                     #[cfg(not(has_blas))]
                     {
                         let t_d = Instant::now();
-                        transformer::gemm_preq_rowmajor(
-                            &self.gguf,
+                        if transformer::try_repacked_f32_gemm_rowmajor(
                             &dense.down,
-                            dq_scales,
-                            dq_quants,
+                            gate_mat,
                             &mut ffn_out[..hs * n],
                             n,
                             hs,
                             is,
-                        );
-                        if profile_prefill {
-                            t_ffn_down += t_d.elapsed();
+                        ) {
+                            if profile_prefill {
+                                t_ffn_down += t_d.elapsed();
+                            }
+                        } else {
+                            let t_q = Instant::now();
+                            transformer::quantize_rows(gate_mat, is, n, dq_scales, dq_quants);
+                            if profile_prefill {
+                                t_quant += t_q.elapsed();
+                            }
+                            let t_d = Instant::now();
+                            transformer::gemm_preq_rowmajor(
+                                &self.gguf,
+                                &dense.down,
+                                dq_scales,
+                                dq_quants,
+                                &mut ffn_out[..hs * n],
+                                n,
+                                hs,
+                                is,
+                            );
+                            if profile_prefill {
+                                t_ffn_down += t_d.elapsed();
+                            }
                         }
                     }
 
