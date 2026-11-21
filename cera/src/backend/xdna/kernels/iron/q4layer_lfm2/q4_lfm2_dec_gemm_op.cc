@@ -1,13 +1,12 @@
 #include "q4_lfm2_dec_state.h"
 
 extern "C" void q4_lfm2_dec_gemm_op(
-    const uint8_t *__restrict x_slot,
     const uint8_t *__restrict w_tile,
     int32_t out_idx,
     int32_t flags) {
   aie::tile::current().set_rounding(aie::rounding_mode::conv_even);
   const int32_t add_prev = flags & 1;
-  const int32_t dst_gate = (flags >> 1) & 1;
+  const int32_t dst_sel = (flags >> 1) & 3;
 
   aie::accum<accfloat, 16> facc = aie::zeros<accfloat, 16>();
   using mmul_t = aie::mmul<4, 16, 16, int8, int4>;
@@ -16,7 +15,8 @@ extern "C" void q4_lfm2_dec_gemm_op(
   aie::vector<int8, 64> a2 = aie::zeros<int8, 64>();
   aie::vector<int8, 64> a3 = aie::zeros<int8, 64>();
 
-  const uint8_t *__restrict x_blk = x_slot;
+  const int32_t x_slot = (flags >> 3) & 3;
+  const uint8_t *__restrict x_blk = (const uint8_t *)(g_dec.xq_buf + x_slot * X_ELEMS);
   const uint8_t *__restrict bp = w_tile;
 #pragma clang loop unroll(disable)
   for (int kh = 0; kh < 2; ++kh) {
@@ -58,7 +58,10 @@ extern "C" void q4_lfm2_dec_gemm_op(
   }
 
   aie::vector<float, 16> fv = facc.template to_vector<float>();
-  float *__restrict dst = dst_gate ? &g_dec.ffn_gate[out_idx][0] : &g_dec.y_gemm[out_idx][0];
+  float *__restrict dst =
+      (dst_sel == 0) ? &g_dec.y_gemm[out_idx][0] :
+      (dst_sel == 1) ? &g_dec.ffn_gate[out_idx][0] :
+                       (g_dec.conv_c + out_idx * 16);
   if (add_prev) {
     fv = aie::add(fv, aie::load_v<16>(dst));
   }

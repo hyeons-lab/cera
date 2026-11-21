@@ -27,19 +27,25 @@ struct DecState {
   alignas(64) uint8_t xq_out[64];
   alignas(64) bfloat16 xd_out[8];
   float sum_sq;
-  alignas(64) float conv_wt[7][64];
-  alignas(64) float conv_state[6][64];
-  alignas(64) float conv_bx[64];
-  alignas(64) float conv_c[64];
-  alignas(64) bfloat16 q_bf16[HEAD_DIM];
-  alignas(64) float rope_cs[HEAD_DIM];
-  alignas(64) float q_norm_w[HEAD_DIM];
-  alignas(64) float k_norm_w[HEAD_DIM];
-  alignas(64) float scores[KV_CHUNK_T];
-  alignas(64) float o_acc[HEAD_DIM];
-  float row_m;
-  float row_l;
-  float gate_sig;
+  union {
+    alignas(64) float xq_buf[4 * X_ELEMS];
+    struct {
+      alignas(64) float _xq0[X_ELEMS];
+      alignas(64) float conv_wt[7][64];
+      alignas(64) float conv_state[6][64];
+      alignas(64) float conv_bx[64];
+      alignas(64) float conv_c[64];
+      alignas(64) bfloat16 q_bf16[HEAD_DIM];
+      alignas(64) float rope_cs[HEAD_DIM];
+      alignas(64) float q_norm_w[HEAD_DIM];
+      alignas(64) float k_norm_w[HEAD_DIM];
+      alignas(64) float scores[KV_CHUNK_T];
+      alignas(64) float o_acc[HEAD_DIM];
+      float row_m;
+      float row_l;
+      float gate_sig;
+    };
+  };
 };
 
 extern "C" {

@@ -230,6 +230,339 @@ pub(crate) fn validate_xdna_kv_compression(
     Ok(())
 }
 
+/// Deferred host-side CPU `InferenceState` mirror work for hybrid XDNA
+/// decode models (`XdnaLfm2Model`, `XdnaLfm3Model`).
+///
+/// Captures the small per-token NPU readbacks (`conv` taps + BF16 K/V rows)
+/// using preallocated scratch buffers so `LayerState::Conv` history pushes and
+/// BF16-to-F16/F32 cache writes overlap with the next token's `runlist.execute()`.
+pub(crate) struct PendingHybridCpuKv {
+    pending_pos: usize,
+    conv_taps: usize,
+    hidden_size: usize,
+    kv_dim: usize,
+    conv_len: usize,
+    attn_len: usize,
+    conv: Vec<(usize, Vec<f32>)>,
+    attn: Vec<(usize, Vec<u8>, Vec<u8>)>,
+}
+
+impl PendingHybridCpuKv {
+    pub(crate) fn prepare(
+        spare: &mut Option<Self>,
+        pending_pos: usize,
+        conv_taps: usize,
+        hidden_size: usize,
+        kv_dim: usize,
+    ) -> Self {
+        match spare.take() {
+            Some(mut p) => {
+                p.pending_pos = pending_pos;
+                p.conv_taps = conv_taps;
+                p.hidden_size = hidden_size;
+                p.kv_dim = kv_dim;
+                p.conv_len = 0;
+                p.attn_len = 0;
+                p
+            }
+            None => Self {
+                pending_pos,
+                conv_taps,
+                hidden_size,
+                kv_dim,
+                conv_len: 0,
+                attn_len: 0,
+                conv: Vec::new(),
+                attn: Vec::new(),
+            },
+        }
+    }
+
+    pub(crate) fn push_conv_from_kvo(&mut self, layer: usize, kvo_bytes: &[u8]) {
+        let idx = self.conv_len;
+        let taps = self.conv_taps;
+        let hidden = self.hidden_size;
+        let needed = taps * hidden;
+        if idx >= self.conv.len() {
+            self.conv.push((layer, vec![0.0f32; needed]));
+        }
+        let entry = &mut self.conv[idx];
+        entry.0 = layer;
+        if entry.1.len() != needed {
+            entry.1.resize(needed, 0.0);
+        }
+        for col in 0..8 {
+            for k in 0..taps {
+                read_le_f32_slice(
+                    kvo_bytes,
+                    col * Q4LAYER_TILE_F32 + k * 256,
+                    &mut entry.1[k * hidden + col * 256..][..256],
+                );
+            }
+        }
+        self.conv_len = idx + 1;
+    }
+
+    pub(crate) fn push_attn_bf16(
+        &mut self,
+        layer: usize,
+        kvo_bytes: &[u8],
+        n_kv_heads: usize,
+        head_dim: usize,
+        kvo_stride_bytes: usize,
+    ) {
+        let idx = self.attn_len;
+        let row_bytes = head_dim * 2;
+        assert!(
+            768 + row_bytes <= kvo_stride_bytes,
+            "kvo_stride_bytes ({kvo_stride_bytes}) too small for K@512 and V@768 + {row_bytes} B row"
+        );
+        assert!(
+            n_kv_heads * kvo_stride_bytes <= kvo_bytes.len(),
+            "kvo_bytes ({} B) smaller than {n_kv_heads} x {kvo_stride_bytes} B",
+            kvo_bytes.len()
+        );
+        let total_bytes = n_kv_heads * row_bytes;
+        if idx >= self.attn.len() {
+            self.attn
+                .push((layer, vec![0u8; total_bytes], vec![0u8; total_bytes]));
+        }
+        let entry = &mut self.attn[idx];
+        entry.0 = layer;
+        if entry.1.len() != total_bytes {
+            entry.1.resize(total_bytes, 0);
+        }
+        if entry.2.len() != total_bytes {
+            entry.2.resize(total_bytes, 0);
+        }
+        for kvh in 0..n_kv_heads {
+            let src_base = kvh * kvo_stride_bytes;
+            let dst_off = kvh * row_bytes;
+            entry.1[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&kvo_bytes[src_base + 512..src_base + 512 + row_bytes]);
+            entry.2[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&kvo_bytes[src_base + 768..src_base + 768 + row_bytes]);
+        }
+        self.attn_len = idx + 1;
+    }
+
+    pub(crate) fn discard(pending: &mut Option<Self>, spare: &mut Option<Self>) {
+        if let Some(mut p) = pending.take() {
+            p.conv_len = 0;
+            p.attn_len = 0;
+            *spare = Some(p);
+        }
+    }
+
+    pub(crate) fn flush_into(
+        pending: &mut Option<Self>,
+        spare: &mut Option<Self>,
+        state: &mut InferenceState,
+    ) {
+        let Some(mut p) = pending.take() else {
+            return;
+        };
+        let expected_kv = p.pending_pos.checked_mul(p.kv_dim);
+        let state_matches = expected_kv.is_some_and(|exp| {
+            p.pending_pos.checked_add(1) == Some(state.seq_len)
+                && p.conv[..p.conv_len].iter().all(|(l, _)| {
+                    *l < state.layers.len() && matches!(&state.layers[*l], LayerState::Conv { .. })
+                })
+                && p.attn[..p.attn_len].iter().all(|(l, _, _)| {
+                    *l < state.layers.len()
+                        && matches!(
+                            &state.layers[*l],
+                            LayerState::Attention {
+                                key_cache,
+                                value_cache,
+                                key_cache_f16,
+                                value_cache_f16,
+                                ..
+                            } if if state.kv_f16 {
+                                key_cache.is_empty()
+                                    && value_cache.is_empty()
+                                    && key_cache_f16.len() == exp
+                                    && value_cache_f16.len() == exp
+                            } else {
+                                key_cache_f16.is_empty()
+                                    && value_cache_f16.is_empty()
+                                    && key_cache.len() == exp
+                                    && value_cache.len() == exp
+                            }
+                        )
+                })
+        });
+        if !state_matches {
+            p.conv_len = 0;
+            p.attn_len = 0;
+            *spare = Some(p);
+            return;
+        }
+        let next_pos = p.pending_pos + 1;
+        for (l, src_buf) in &p.conv[..p.conv_len] {
+            if let LayerState::Conv { buffer, history } = &mut state.layers[*l] {
+                if buffer.len() != src_buf.len() {
+                    buffer.resize(src_buf.len(), 0.0);
+                }
+                buffer.copy_from_slice(src_buf);
+                history.push(next_pos, buffer);
+            }
+        }
+        let use_f16 = state.kv_f16;
+        for (l, k_raw, v_raw) in &p.attn[..p.attn_len] {
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &mut state.layers[*l]
+            {
+                if use_f16 {
+                    key_cache_f16.reserve(p.kv_dim);
+                    value_cache_f16.reserve(p.kv_dim);
+                    for (&kc, &vc) in k_raw
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(v_raw.as_chunks::<2>().0.iter())
+                    {
+                        let kf = bf16_to_f32(u16::from_le_bytes(kc));
+                        let vf = bf16_to_f32(u16::from_le_bytes(vc));
+                        key_cache_f16.push(f32_to_f16(kf));
+                        value_cache_f16.push(f32_to_f16(vf));
+                    }
+                } else {
+                    key_cache.reserve(p.kv_dim);
+                    value_cache.reserve(p.kv_dim);
+                    for (&kc, &vc) in k_raw
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(v_raw.as_chunks::<2>().0.iter())
+                    {
+                        key_cache.push(bf16_to_f32(u16::from_le_bytes(kc)));
+                        value_cache.push(bf16_to_f32(u16::from_le_bytes(vc)));
+                    }
+                }
+            }
+        }
+        p.conv_len = 0;
+        p.attn_len = 0;
+        *spare = Some(p);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HybridPendingSlot {
+    pending: Option<PendingHybridCpuKv>,
+    spare: Option<PendingHybridCpuKv>,
+}
+
+impl HybridPendingSlot {
+    pub(crate) fn prepare(
+        &mut self,
+        pending_pos: usize,
+        conv_taps: usize,
+        hidden_size: usize,
+        kv_dim: usize,
+    ) -> PendingHybridCpuKv {
+        PendingHybridCpuKv::prepare(&mut self.spare, pending_pos, conv_taps, hidden_size, kv_dim)
+    }
+
+    pub(crate) fn commit(&mut self, next: PendingHybridCpuKv) {
+        self.pending = Some(next);
+    }
+
+    pub(crate) fn discard(&mut self) {
+        PendingHybridCpuKv::discard(&mut self.pending, &mut self.spare);
+    }
+
+    pub(crate) fn flush_into(&mut self, state: &mut InferenceState) {
+        PendingHybridCpuKv::flush_into(&mut self.pending, &mut self.spare, state);
+    }
+
+    pub(crate) fn as_ref(&self) -> Option<&PendingHybridCpuKv> {
+        self.pending.as_ref()
+    }
+}
+
+pub(crate) fn check_hybrid_kv_rewind_state(
+    is_causal: bool,
+    state_torn: bool,
+    pending: Option<&PendingHybridCpuKv>,
+    state: &InferenceState,
+    len: usize,
+) -> Result<(), KvRewindError> {
+    check_xdna_kv_rewind_preconditions(is_causal, state_torn, state, len)?;
+    if len == state.seq_len {
+        return Ok(());
+    }
+    if let Some(p) = pending {
+        if p.pending_pos.checked_add(1) != Some(state.seq_len) {
+            return Err(KvRewindError::InvalidCacheLayout {
+                layer: 0,
+                detail: "deferred NPU KV row does not match the current position",
+            });
+        }
+        let expected =
+            p.pending_pos
+                .checked_mul(p.kv_dim)
+                .ok_or(KvRewindError::InvalidCacheLayout {
+                    layer: 0,
+                    detail: "deferred NPU KV row count overflows cache indexing",
+                })?;
+        for (layer, layer_state) in state.layers.iter().enumerate() {
+            let invalid = |detail| KvRewindError::InvalidCacheLayout { layer, detail };
+            match layer_state {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
+                    ..
+                } => {
+                    let (keys, values, inactive_keys, inactive_values) = if state.kv_f16 {
+                        (
+                            key_cache_f16.len(),
+                            value_cache_f16.len(),
+                            key_cache.len(),
+                            value_cache.len(),
+                        )
+                    } else {
+                        (
+                            key_cache.len(),
+                            value_cache.len(),
+                            key_cache_f16.len(),
+                            value_cache_f16.len(),
+                        )
+                    };
+                    if inactive_keys != 0 || inactive_values != 0 {
+                        return Err(invalid("inactive precision contains live rows"));
+                    }
+                    if keys != values || keys != expected {
+                        return Err(invalid("key/value rows do not match the current position"));
+                    }
+                }
+                LayerState::Conv { buffer, history } => {
+                    if buffer.len() != history.buf_len() {
+                        return Err(invalid("convolution buffer and history widths differ"));
+                    }
+                    if !history.has_pos(len) {
+                        return Err(KvRewindError::MissingConvolutionCheckpoint {
+                            layer,
+                            position: len,
+                        });
+                    }
+                }
+                _ => return Err(invalid("unsupported layer state for XDNA hybrid rewind")),
+            }
+        }
+        return Ok(());
+    }
+    state.check_truncate_to(len)
+}
+
 pub(crate) fn check_xdna_kv_rewind_preconditions(
     is_causal: bool,
     state_torn: bool,
@@ -1064,6 +1397,240 @@ impl XdnaLlamaModel {
     fn record_device_fault(&self, msg: String, out_len: usize) -> Vec<f32> {
         self.record_device_fault_err(CeraError::Backend(msg), out_len)
     }
+
+    fn forward_npu_decode_into(
+        &self,
+        token: u32,
+        pos: usize,
+        state: &mut InferenceState,
+        logits_out: &mut [f32],
+    ) -> Result<(), Vec<f32>> {
+        let cfg = self.cpu.config();
+        let vocab_size = cfg.vocab_size;
+        let mut npu = self.lock_npu();
+        if self.state_torn.load(Ordering::SeqCst) {
+            return Err(self.record_device_fault(
+                "XDNA NPU state torn after a fault; reset the session".to_string(),
+                vocab_size,
+            ));
+        }
+        if let Err(e) = quiesce_in_flight(&mut npu) {
+            return Err(
+                self.record_device_fault(format!("forward failed to quiesce NPU: {e}"), vocab_size)
+            );
+        }
+        if pos != state.seq_len {
+            return Err(self.reject_input(
+                format!(
+                    "forward pos ({pos}) does not match state.seq_len ({})",
+                    state.seq_len
+                ),
+                vocab_size,
+            ));
+        }
+        if pos >= cfg.max_seq_len {
+            return Err(self.reject_input_err(
+                CeraError::ContextOverflow {
+                    max_seq_len: cfg.max_seq_len as u32,
+                    by: (pos + 1 - cfg.max_seq_len) as u32,
+                },
+                vocab_size,
+            ));
+        }
+        if pos == 0 {
+            Self::discard_pending_cpu_kv(&mut npu);
+        }
+        if npu.synced_kv_len != pos
+            && let Err(e) = self.sync_cpu_kv_to_npu(&mut npu, state, pos)
+        {
+            return Err(self.record_device_fault(e, vocab_size));
+        }
+
+        let hidden = self.cpu.embed_token(token, "forward");
+
+        let rope_cs = match npu.cached_rope {
+            Some((cached_pos, cs)) if cached_pos == pos => cs,
+            _ => self.compute_rope_cs(pos),
+        };
+
+        let (bucket_idx, skip_kv) = select_q4layer_kv_bucket(&npu.bucket_chunks, pos);
+
+        let prof = self.profile_decode;
+        let tc0 = prof.then(crate::time::Instant::now);
+        for l in 0..N_LAYERS {
+            let yl = npu.layer_bo_y[l].as_mut_slice();
+            if l == 0 {
+                write_le_f32_slice(yl, 0, &hidden);
+            }
+            write_q4layer_step_params(yl, &rope_cs, pos, skip_kv);
+            if l == 0
+                && let Err(e) = npu.layer_bo_y[0].sync_range_to_device(HIDDEN_SIZE * 4, 0)
+            {
+                return Err(self.record_device_fault(
+                    format!("layer 0 hidden sync to device: {e}"),
+                    vocab_size,
+                ));
+            }
+            if let Err(e) = npu.layer_bo_y[l].sync_range_to_device(132 * 4, Q4LAYER_ROPE_CS * 4) {
+                return Err(self.record_device_fault(
+                    format!("layer {l} bo_y sync to device: {e}"),
+                    vocab_size,
+                ));
+            }
+        }
+        let t_crit_sync = tc0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+
+        let t0 = prof.then(crate::time::Instant::now);
+        npu.in_flight_bucket = Some(bucket_idx);
+        if let Err(e) = npu.bucket_runlists[bucket_idx].execute() {
+            npu.in_flight_bucket = None;
+            return Err(self.record_device_fault(format!("token runlist execute: {e}"), vocab_size));
+        }
+        // Overlap previous token's f16 CPU KV cache extension and next token's
+        // RoPE cos/sin table while the NPU runs.
+        Self::flush_pending_cpu_kv(&mut npu, state);
+        npu.cached_rope = Some((pos + 1, self.compute_rope_cs(pos + 1)));
+        let (mut pending_k, mut pending_v) = npu.spare_kv.take().unwrap_or_else(|| {
+            (
+                vec![[0.0f32; KV_DIM]; N_LAYERS],
+                vec![[0.0f32; KV_DIM]; N_LAYERS],
+            )
+        });
+        if let Err(e) = npu.bucket_runlists[bucket_idx].wait(QUIESCE_TIMEOUT_MS) {
+            npu.spare_kv = Some((pending_k, pending_v));
+            return Err(self.record_device_fault(format!("token runlist wait: {e}"), vocab_size));
+        }
+        npu.in_flight_bucket = None;
+        let t_npu_wait = t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+
+        let tkv0 = prof.then(crate::time::Instant::now);
+        let mut hidden_dump =
+            transformer::oracle_dump::is_active().then(|| vec![0.0f32; HIDDEN_SIZE]);
+        for l in 0..N_LAYERS {
+            if let Some(hidden) = hidden_dump.as_mut() {
+                {
+                    let next_bo = if l + 1 < N_LAYERS {
+                        &mut npu.layer_bo_y[l + 1]
+                    } else {
+                        &mut npu.head_bo_y
+                    };
+                    if let Err(e) = next_bo.sync_range_from_device(HIDDEN_SIZE * 4, 0) {
+                        npu.spare_kv = Some((pending_k, pending_v));
+                        return Err(self.record_device_fault(
+                            format!("layer {l} out sync from device: {e}"),
+                            vocab_size,
+                        ));
+                    }
+                    read_le_f32_slice(next_bo.as_slice(), 0, hidden);
+                }
+                transformer::oracle_dump::record(&format!("l_out-{l}"), hidden);
+                if l + 1 == N_LAYERS {
+                    let mut normed = vec![0.0f32; HIDDEN_SIZE];
+                    let XdnaDecodeState {
+                        ref mut q8_scales,
+                        ref mut q8_quants,
+                        ..
+                    } = *npu;
+                    cpu::rmsnorm_and_quantize_q8_0(
+                        hidden,
+                        self.cpu.output_norm_slice(),
+                        cfg.rms_norm_eps,
+                        q8_scales,
+                        q8_quants,
+                        Some(&mut normed),
+                    );
+                    transformer::oracle_dump::record("result_norm", &normed);
+                }
+            }
+
+            if let Err(e) =
+                npu.layer_bo_y[l].sync_range_from_device(KV_DIM * 4, 2 * Q4LAYER_ACT_SLOT * 4)
+            {
+                npu.spare_kv = Some((pending_k, pending_v));
+                return Err(self.record_device_fault(
+                    format!("layer {l} slot 2 sync from device: {e}"),
+                    vocab_size,
+                ));
+            }
+            if let Err(e) =
+                npu.layer_bo_y[l].sync_range_from_device(KV_DIM * 4, 3 * Q4LAYER_ACT_SLOT * 4)
+            {
+                npu.spare_kv = Some((pending_k, pending_v));
+                return Err(self.record_device_fault(
+                    format!("layer {l} slot 3 sync from device: {e}"),
+                    vocab_size,
+                ));
+            }
+            let k_cur = &mut pending_k[l];
+            let v_cur = &mut pending_v[l];
+            {
+                let yl = npu.layer_bo_y[l].as_slice();
+                read_le_f32_slice(yl, 2 * Q4LAYER_ACT_SLOT, k_cur);
+                read_le_f32_slice(yl, 3 * Q4LAYER_ACT_SLOT, v_cur);
+            }
+            let mut k_offs = [0usize; N_KV_HEADS];
+            {
+                let kv_mut = npu.layer_bo_kv[l].as_mut_slice();
+                for (kvh, k_off) in k_offs.iter_mut().enumerate() {
+                    let src_fl = kvh * HEAD_DIM;
+                    *k_off = write_q4layer_kv_bf16(
+                        kv_mut,
+                        kvh,
+                        pos,
+                        &k_cur[src_fl..src_fl + HEAD_DIM],
+                        &v_cur[src_fl..src_fl + HEAD_DIM],
+                    );
+                }
+            }
+            for &k_byte_off in &k_offs {
+                if let Err(e) = npu.layer_bo_kv[l]
+                    .sync_range_to_device(Q4LAYER_SILU_HALF * 4 + HEAD_DIM * 2, k_byte_off)
+                {
+                    npu.spare_kv = Some((pending_k, pending_v));
+                    return Err(self.record_device_fault(
+                        format!("layer {l} kv sync to device: {e}"),
+                        vocab_size,
+                    ));
+                }
+            }
+        }
+        let t_kv_sync = tkv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+
+        let th0 = prof.then(crate::time::Instant::now);
+        if let Err(e) = npu
+            .head_bo_y
+            .sync_range_from_device(vocab_size * 4, Q4LAYER_TILE_F32 * 4)
+        {
+            npu.spare_kv = Some((pending_k, pending_v));
+            return Err(
+                self.record_device_fault(format!("head bo_y sync from device: {e}"), vocab_size)
+            );
+        }
+        let t_head_sync = th0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+        if prof && !(20..520).contains(&pos) {
+            eprintln!(
+                "xdna prof pos={pos}: npu_wait={t_npu_wait:.0}us crit_sync={t_crit_sync:.0}us kv_sync={t_kv_sync:.0}us head_sync={t_head_sync:.0}us"
+            );
+        }
+
+        read_le_f32_slice(
+            npu.head_bo_y.as_slice(),
+            Q4LAYER_TILE_F32,
+            &mut logits_out[..vocab_size],
+        );
+        if cfg.scalars.logit != 1.0 {
+            cpu::scale_inplace(&mut logits_out[..vocab_size], 1.0 / cfg.scalars.logit);
+        }
+
+        state.seq_len = pos + 1;
+        npu.pending_cpu_kv = Some((pos, (pending_k, pending_v)));
+        if pos + 1 >= MAX_KV_CACHE_TOKENS {
+            Self::flush_pending_cpu_kv(&mut npu, state);
+        }
+        npu.synced_kv_len = pos + 1;
+        transformer::oracle_dump::record("result_output", &logits_out[..vocab_size]);
+        Ok(())
+    }
 }
 
 impl Model for XdnaLlamaModel {
@@ -1676,229 +2243,74 @@ impl Model for XdnaLlamaModel {
             return self.cpu.forward(tokens, pos, state);
         }
 
-        let mut npu = self.lock_npu();
-        if self.state_torn.load(Ordering::SeqCst) {
-            return self.record_device_fault(
-                "XDNA NPU state torn after a fault; reset the session".to_string(),
-                vocab_size,
-            );
-        }
-        if let Err(e) = quiesce_in_flight(&mut npu) {
-            return self
-                .record_device_fault(format!("forward failed to quiesce NPU: {e}"), vocab_size);
-        }
-        if pos != state.seq_len {
-            return self.reject_input(
-                format!(
-                    "forward pos ({pos}) does not match state.seq_len ({})",
-                    state.seq_len
-                ),
-                vocab_size,
-            );
-        }
-        if pos >= cfg.max_seq_len {
-            return self.reject_input_err(
-                CeraError::ContextOverflow {
-                    max_seq_len: cfg.max_seq_len as u32,
-                    by: (pos + 1 - cfg.max_seq_len) as u32,
-                },
-                vocab_size,
-            );
-        }
-        if pos == 0 {
-            Self::discard_pending_cpu_kv(&mut npu);
-        }
-        if npu.synced_kv_len != pos
-            && let Err(e) = self.sync_cpu_kv_to_npu(&mut npu, state, pos)
-        {
-            return self.record_device_fault(e, vocab_size);
-        }
-
-        let mut hidden = self.cpu.embed_token(tokens[0], "forward");
-
-        let rope_cs = match npu.cached_rope {
-            Some((cached_pos, cs)) if cached_pos == pos => cs,
-            _ => self.compute_rope_cs(pos),
-        };
-
-        let (bucket_idx, skip_kv) = select_q4layer_kv_bucket(&npu.bucket_chunks, pos);
-
-        let prof = self.profile_decode;
-        let tc0 = prof.then(crate::time::Instant::now);
-        for l in 0..N_LAYERS {
-            let yl = npu.layer_bo_y[l].as_mut_slice();
-            if l == 0 {
-                write_le_f32_slice(yl, 0, &hidden);
-            }
-            write_q4layer_step_params(yl, &rope_cs, pos, skip_kv);
-            if l == 0
-                && let Err(e) = npu.layer_bo_y[0].sync_range_to_device(HIDDEN_SIZE * 4, 0)
-            {
-                return self.record_device_fault(
-                    format!("layer 0 hidden sync to device: {e}"),
-                    vocab_size,
-                );
-            }
-            if let Err(e) = npu.layer_bo_y[l].sync_range_to_device(132 * 4, Q4LAYER_ROPE_CS * 4) {
-                return self.record_device_fault(
-                    format!("layer {l} bo_y sync to device: {e}"),
-                    vocab_size,
-                );
-            }
-        }
-        let t_crit_sync = tc0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-
-        let t0 = prof.then(crate::time::Instant::now);
-        npu.in_flight_bucket = Some(bucket_idx);
-        if let Err(e) = npu.bucket_runlists[bucket_idx].execute() {
-            npu.in_flight_bucket = None;
-            return self.record_device_fault(format!("token runlist execute: {e}"), vocab_size);
-        }
-        // Overlap host-side allocations, previous token's f16 CPU KV cache
-        // extension, and next token's RoPE cos/sin table while the NPU runs.
         let mut logits = vec![0.0f32; vocab_size];
-        Self::flush_pending_cpu_kv(&mut npu, state);
-        npu.cached_rope = Some((pos + 1, self.compute_rope_cs(pos + 1)));
-        let (mut pending_k, mut pending_v) = npu.spare_kv.take().unwrap_or_else(|| {
-            (
-                vec![[0.0f32; KV_DIM]; N_LAYERS],
-                vec![[0.0f32; KV_DIM]; N_LAYERS],
-            )
-        });
-        if let Err(e) = npu.bucket_runlists[bucket_idx].wait(QUIESCE_TIMEOUT_MS) {
-            npu.spare_kv = Some((pending_k, pending_v));
-            return self.record_device_fault(format!("token runlist wait: {e}"), vocab_size);
+        match self.forward_npu_decode_into(tokens[0], pos, state, &mut logits) {
+            Ok(()) => logits,
+            Err(err_logits) => err_logits,
         }
-        npu.in_flight_bucket = None;
-        let t_npu_wait = t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+    }
 
-        let tkv0 = prof.then(crate::time::Instant::now);
-        for l in 0..N_LAYERS {
-            if transformer::oracle_dump::is_active() {
-                {
-                    let next_bo = if l + 1 < N_LAYERS {
-                        &mut npu.layer_bo_y[l + 1]
-                    } else {
-                        &mut npu.head_bo_y
-                    };
-                    if let Err(e) = next_bo.sync_range_from_device(HIDDEN_SIZE * 4, 0) {
-                        npu.spare_kv = Some((pending_k, pending_v));
-                        return self.record_device_fault(
-                            format!("layer {l} out sync from device: {e}"),
-                            vocab_size,
-                        );
-                    }
-                    read_le_f32_slice(next_bo.as_slice(), 0, &mut hidden);
-                }
-                transformer::oracle_dump::record(&format!("l_out-{l}"), &hidden);
-                if l + 1 == N_LAYERS {
-                    let mut normed = vec![0.0f32; HIDDEN_SIZE];
-                    let XdnaDecodeState {
-                        ref mut q8_scales,
-                        ref mut q8_quants,
-                        ..
-                    } = *npu;
-                    cpu::rmsnorm_and_quantize_q8_0(
-                        &hidden,
-                        self.cpu.output_norm_slice(),
-                        cfg.rms_norm_eps,
-                        q8_scales,
-                        q8_quants,
-                        Some(&mut normed),
-                    );
-                    transformer::oracle_dump::record("result_norm", &normed);
-                }
-            }
-
-            if let Err(e) =
-                npu.layer_bo_y[l].sync_range_from_device(KV_DIM * 4, 2 * Q4LAYER_ACT_SLOT * 4)
-            {
-                npu.spare_kv = Some((pending_k, pending_v));
-                return self.record_device_fault(
-                    format!("layer {l} slot 2 sync from device: {e}"),
-                    vocab_size,
-                );
-            }
-            if let Err(e) =
-                npu.layer_bo_y[l].sync_range_from_device(KV_DIM * 4, 3 * Q4LAYER_ACT_SLOT * 4)
-            {
-                npu.spare_kv = Some((pending_k, pending_v));
-                return self.record_device_fault(
-                    format!("layer {l} slot 3 sync from device: {e}"),
-                    vocab_size,
-                );
-            }
-            let k_cur = &mut pending_k[l];
-            let v_cur = &mut pending_v[l];
-            {
-                let yl = npu.layer_bo_y[l].as_slice();
-                read_le_f32_slice(yl, 2 * Q4LAYER_ACT_SLOT, k_cur);
-                read_le_f32_slice(yl, 3 * Q4LAYER_ACT_SLOT, v_cur);
-            }
-            let mut k_offs = [0usize; N_KV_HEADS];
-            {
-                let kv_mut = npu.layer_bo_kv[l].as_mut_slice();
-                for (kvh, k_off) in k_offs.iter_mut().enumerate() {
-                    let src_fl = kvh * HEAD_DIM;
-                    *k_off = write_q4layer_kv_bf16(
-                        kv_mut,
-                        kvh,
-                        pos,
-                        &k_cur[src_fl..src_fl + HEAD_DIM],
-                        &v_cur[src_fl..src_fl + HEAD_DIM],
-                    );
-                }
-            }
-            for &k_byte_off in &k_offs {
-                if let Err(e) = npu.layer_bo_kv[l].sync_range_to_device(HEAD_DIM * 2, k_byte_off) {
-                    npu.spare_kv = Some((pending_k, pending_v));
-                    return self.record_device_fault(
-                        format!("layer {l} k sync to device: {e}"),
-                        vocab_size,
-                    );
-                }
-                if let Err(e) = npu.layer_bo_kv[l]
-                    .sync_range_to_device(HEAD_DIM * 2, k_byte_off + Q4LAYER_SILU_HALF * 4)
-                {
-                    npu.spare_kv = Some((pending_k, pending_v));
-                    return self.record_device_fault(
-                        format!("layer {l} v sync to device: {e}"),
-                        vocab_size,
-                    );
-                }
-            }
-        }
-        let t_kv_sync = tkv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-
-        let th0 = prof.then(crate::time::Instant::now);
-        if let Err(e) = npu
-            .head_bo_y
-            .sync_range_from_device(vocab_size * 4, Q4LAYER_TILE_F32 * 4)
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        let cfg = self.cpu.config();
+        let vocab_size = cfg.vocab_size;
+        if tokens.len() != 1
+            || (tokens[0] as usize) >= vocab_size
+            || state.is_compressed()
+            || self.state_torn.load(Ordering::SeqCst)
+            || pos != state.seq_len
+            || pos >= cfg.max_seq_len
         {
-            npu.spare_kv = Some((pending_k, pending_v));
-            return self
-                .record_device_fault(format!("head bo_y sync from device: {e}"), vocab_size);
-        }
-        let t_head_sync = th0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-        if prof && !(20..520).contains(&pos) {
-            eprintln!(
-                "xdna prof pos={pos}: npu_wait={t_npu_wait:.0}us crit_sync={t_crit_sync:.0}us kv_sync={t_kv_sync:.0}us head_sync={t_head_sync:.0}us"
-            );
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
         }
 
-        read_le_f32_slice(npu.head_bo_y.as_slice(), Q4LAYER_TILE_F32, &mut logits);
-        if cfg.scalars.logit != 1.0 {
-            cpu::scale_inplace(&mut logits, 1.0 / cfg.scalars.logit);
+        if pos == 0 || pos >= MAX_KV_CACHE_TOKENS || state.lora.is_some() {
+            {
+                let mut npu = self.lock_npu();
+                if self.state_torn.load(Ordering::SeqCst) {
+                    let _ = self.record_device_fault(
+                        "XDNA NPU state torn after a fault; reset the session".to_string(),
+                        vocab_size,
+                    );
+                    return 0;
+                }
+                if let Err(e) = quiesce_in_flight(&mut npu) {
+                    let _ = self.record_device_fault(
+                        format!("forward_greedy failed to quiesce NPU: {e}"),
+                        vocab_size,
+                    );
+                    return 0;
+                }
+                if pos != state.seq_len {
+                    let _ = self.reject_input(
+                        format!(
+                            "forward pos ({pos}) does not match state.seq_len ({})",
+                            state.seq_len
+                        ),
+                        vocab_size,
+                    );
+                    return 0;
+                }
+                Self::discard_or_flush_pending_kv(&mut npu, state, pos);
+            }
+            return self.cpu.forward_greedy(tokens, pos, state);
         }
 
-        state.seq_len = pos + 1;
-        npu.pending_cpu_kv = Some((pos, (pending_k, pending_v)));
-        if pos + 1 >= MAX_KV_CACHE_TOKENS {
-            Self::flush_pending_cpu_kv(&mut npu, state);
+        if state.scratch.logits.len() < vocab_size {
+            state.scratch.logits.resize(vocab_size, 0.0);
         }
-        npu.synced_kv_len = pos + 1;
-        transformer::oracle_dump::record("result_output", &logits);
-        logits
+        let mut logits_buf = std::mem::take(&mut state.scratch.logits);
+        let tok = match self.forward_npu_decode_into(
+            tokens[0],
+            pos,
+            state,
+            &mut logits_buf[..vocab_size],
+        ) {
+            Ok(()) => crate::sampler::argmax(&logits_buf[..vocab_size]),
+            Err(_) => 0,
+        };
+        state.scratch.logits = logits_buf;
+        tok
     }
 }
 
@@ -2566,6 +2978,140 @@ mod tests {
             model
                 .check_kv_rewind(&state, 0)
                 .expect("reset state is healthy");
+
+            // `forward_greedy` reports input/torn faults without panicking and clears via reset.
+            let tok_oob = model.forward_greedy(&[0], 64, &mut state);
+            assert_eq!(tok_oob, 0);
+            assert!(model.take_decode_error().is_some());
+            assert!(!model.state_torn.load(Ordering::SeqCst));
         });
+    }
+
+    fn test_hybrid_config(conv_taps: usize) -> ModelConfig {
+        let n_layers = 2;
+        ModelConfig {
+            architecture: "lfm2".to_string(),
+            n_layers,
+            hidden_size: 2048,
+            intermediate_size: 4096,
+            n_heads: 16,
+            n_kv_heads: 4,
+            head_dim: 128,
+            vocab_size: 1024,
+            max_seq_len: 64,
+            rope_theta: 100_000.0,
+            rms_norm_eps: 1e-5,
+            block_types: vec![
+                crate::model::BlockType::GatedConv,
+                crate::model::BlockType::Attention,
+            ],
+            conv_kernel_size: Some(conv_taps),
+            ssm: None,
+            kv_heads_per_layer: vec![4; n_layers],
+            scalars: ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hybrid_pending_slot_rewind_and_flush_cover_conv_and_attn() {
+        let cfg = test_hybrid_config(4); // conv_taps = 3 (d_conv) when matching explicit buffer
+        let kv_dim = 4 * 128;
+        let conv_taps = 3;
+        let mut state = InferenceState::from_config_capped(&cfg, &KvCompression::F16, 64)
+            .expect("hybrid state");
+        // Seed pos=0 checkpoint so rewind(0) can validate before pending pos=0 flushes.
+        if let LayerState::Conv { buffer, history } = &mut state.layers[0] {
+            buffer.resize(conv_taps * 2048, 0.0);
+            *history = crate::kv_cache::ConvHistory::new(conv_taps * 2048);
+            history.push(0, buffer);
+        }
+        state.seq_len = 1;
+
+        let mut slot = HybridPendingSlot::default();
+        let mut p = slot.prepare(0, conv_taps, 2048, kv_dim);
+        let mut kvo_conv = vec![0u8; 8 * Q4LAYER_TILE_F32 * 4];
+        write_le_f32_slice(&mut kvo_conv, 0, &[1.25f32; 256]);
+        p.push_conv_from_kvo(0, &kvo_conv);
+
+        let mut kvo_attn = vec![0u8; 4 * 512 * 4];
+        let bf16_one = 0x3F80u16.to_le_bytes();
+        let bf16_two = 0x4000u16.to_le_bytes();
+        for d in 0..128 {
+            kvo_attn[512 + d * 2..512 + d * 2 + 2].copy_from_slice(&bf16_one);
+            kvo_attn[768 + d * 2..768 + d * 2 + 2].copy_from_slice(&bf16_two);
+        }
+        p.push_attn_bf16(1, &kvo_attn, 4, 128, 512 * 4);
+        slot.commit(p);
+
+        // Before flush, `check_hybrid_kv_rewind_state` accepts `len=0` and rejects missing `len=1`.
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 0),
+            Ok(())
+        );
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 2),
+            Err(KvRewindError::OutOfBounds {
+                requested: 2,
+                current: 1,
+            })
+        );
+
+        slot.flush_into(&mut state);
+        assert!(slot.as_ref().is_none());
+        assert_eq!(state.kv_cache_f16(1).0.len(), kv_dim);
+        assert_eq!(crate::quant::f16_to_f32(state.kv_cache_f16(1).0[0]), 1.0);
+        assert_eq!(crate::quant::f16_to_f32(state.kv_cache_f16(1).1[0]), 2.0);
+        if let LayerState::Conv { buffer, history } = &state.layers[0] {
+            assert_eq!(buffer[0], 1.25);
+            assert!(history.has_pos(1));
+        } else {
+            panic!("expected conv layer state");
+        }
+        // After flush, spare buffer is recycled for next token and discard clears pending cleanly.
+        let p2 = slot.prepare(1, conv_taps, 2048, kv_dim);
+        slot.commit(p2);
+        slot.discard();
+        assert!(slot.as_ref().is_none());
+    }
+
+    #[test]
+    fn hybrid_pending_slot_supports_lfm2_1024_byte_kvo_stride() {
+        let cfg = test_hybrid_config(2);
+        let kv_dim = 8 * 64;
+        let mut lfm2_cfg = cfg;
+        lfm2_cfg.n_kv_heads = 8;
+        lfm2_cfg.head_dim = 64;
+        lfm2_cfg.kv_heads_per_layer = vec![8; lfm2_cfg.n_layers];
+        let mut state = InferenceState::from_config_capped(&lfm2_cfg, &KvCompression::F16, 64)
+            .expect("lfm2 hybrid state");
+        state.seq_len = 1;
+
+        let mut slot = HybridPendingSlot::default();
+        let mut p = slot.prepare(0, 2, 2048, kv_dim);
+        let mut kvo_attn = vec![0u8; 8 * 1024];
+        let bf16_one = 0x3F80u16.to_le_bytes();
+        let bf16_two = 0x4000u16.to_le_bytes();
+        for kvh in 0..8 {
+            let base = kvh * 1024;
+            for d in 0..64 {
+                kvo_attn[base + 512 + d * 2..base + 512 + d * 2 + 2].copy_from_slice(&bf16_one);
+                kvo_attn[base + 768 + d * 2..base + 768 + d * 2 + 2].copy_from_slice(&bf16_two);
+            }
+        }
+        p.push_attn_bf16(1, &kvo_attn, 8, 64, 1024);
+        slot.commit(p);
+        slot.flush_into(&mut state);
+        assert_eq!(state.kv_cache_f16(1).0.len(), kv_dim);
+        assert_eq!(
+            crate::quant::f16_to_f32(state.kv_cache_f16(1).0[kv_dim - 1]),
+            1.0
+        );
+        assert_eq!(
+            crate::quant::f16_to_f32(state.kv_cache_f16(1).1[kv_dim - 1]),
+            2.0
+        );
     }
 }

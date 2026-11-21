@@ -33,12 +33,16 @@ LFM2/LFM2.5-1.2B, and LFM3-1.7B / d1-2B prefill and decode:
   ShortConv Mode 0 (`insts_lfm3_dec_conv.bin`), causal/SWA Mode 1
   (`insts_lfm3_dec_attn_c0..c255.bin`), and >8K paged Modes 2–4
   (`insts_lfm3_dec_phase_a.bin`, `insts_lfm3_dec_fa_part_c256.bin`,
-  `insts_lfm3_dec_fa_fin_c0..c255.bin`) sharing `q4layer_lfm3.xclbin`.
+  `insts_lfm3_dec_fa_fin_c0..c255.bin`) sharing `q4layer_lfm3.xclbin`
+  (single `SLOT_NORM_0` parameter+RoPE packet, merged `Q+K+V+ATTN_GATE`
+  broadcasts, packed 4-chunk `FFN_DOWN` activations, and overlaid `DecState`).
 - `q4prefill_lfm2` / `q4layer_lfm2`: unified LFM2/LFM2.5 prefill (`B=64`) and
   decode (`B=1`) kernels covering ShortConv, SWA/causal attention, and >8K
   paged online-softmax modes (`q4prefill_lfm2.xclbin` + `insts_lfm2_pre_*.bin`,
-  `q4layer_lfm2.xclbin` + `insts_lfm2_dec_*.bin`; legacy `B=32` sources remain
-  in `iron/`).
+  `q4layer_lfm2.xclbin` + `insts_lfm2_dec_*.bin` with merged `SLOT_NORM_0`
+  parameter+RoPE packet, merged `Q+K+V` broadcasts, packed 4-chunk `FFN_DOWN`
+  inputs, and inline `y_op==11` residual accumulation; legacy `B=32` sources
+  remain in `iron/`).
 - `gemm_bf16`: standalone BF16 GEMM (`gemm_bf16.xclbin`, `insts_gemm_bf16_k*.bin`).
 
 Sources in `iron/` are cera's own code (Apache-2.0 OR MIT, developed in
@@ -130,40 +134,40 @@ full copyright lines and license texts are in `NOTICE.md` (see
 | `insts_lfm3_pre_fa_part_c256.bin` | `c5068419dd29fc0d5d950f694e8d311cee4c8697f63291f2994d45757fe89aea` |
 | `insts_lfm3_pre_phase_a.bin` | `17fb68860f911723f557211c9f3d6e094f4568e5d80227f862fb1f3e63fa58e0` |
 | `q4prefill_lfm3.xclbin` | `21344f8f72364f8a6d4c55f1d4ecee1828755f03ba6055509b425fdd5097b36c` |
-| `insts_lfm3_dec_attn_c0.bin` | `121fb12c92e3e963b64e3e4381db1c9c5a32cc74e9a22034fcd15e885502cbb2` |
-| `insts_lfm3_dec_attn_c1.bin` | `d8b339c93e1de7905dcc2a99b94f5970703fcc4490e4a30a1bc5eb7a8a5246d6` |
-| `insts_lfm3_dec_attn_c12.bin` | `0c901dc20aa9d33248231bfda489c3abb645f60254f64991ba9abbdc0db3f55b` |
-| `insts_lfm3_dec_attn_c128.bin` | `5486cda0ac099c7dec701ca1b5aa5dc31f9280e5b91e7e2518ba2c44e829ff98` |
-| `insts_lfm3_dec_attn_c16.bin` | `26a16dc5a9f726d4b5661899455a5b68ff70945f3db2e239f4e5593927962a83` |
-| `insts_lfm3_dec_attn_c192.bin` | `9f14547c4ea31b32492757a2e5e5eb9349e0bbed3efec599469dcca975eceb12` |
-| `insts_lfm3_dec_attn_c2.bin` | `a232861e2d68cf5a0d57dbc5ea2820693e9df74b749f2e00368c5957f364169b` |
-| `insts_lfm3_dec_attn_c24.bin` | `772b09e22e426ac07e1fb2429de77b27a0d42a164133311bc6ddd8f37780d4d1` |
-| `insts_lfm3_dec_attn_c255.bin` | `780e437610d7f167e66a06d70d54f556e5c916c80849b48705b45f82bf32834a` |
-| `insts_lfm3_dec_attn_c32.bin` | `e9999266fcf9563cd8bf5fd23f5b9cc7e6c5da82698a5ca30e04103e4018fadd` |
-| `insts_lfm3_dec_attn_c4.bin` | `f53480b5dde45b8ae51d608927c71799bc46050519c00a4c33e54fdc2b5ebb89` |
-| `insts_lfm3_dec_attn_c48.bin` | `c7d366f8eba9a0ad1bc0fb0c3e8fa7b3850c7edf5ae23a117bd184fa0d4c65a8` |
-| `insts_lfm3_dec_attn_c64.bin` | `7b7292748be66d1e5477568cb500900df3d81395c702ec7703b88f87d5bf8446` |
-| `insts_lfm3_dec_attn_c8.bin` | `23061a72c3b6acaee5a9d953a5cd284c5b769f3da9a1c9e75bf9cb70b5d6c6e1` |
-| `insts_lfm3_dec_attn_c96.bin` | `187b4b7d5479f4ca0e5e28f3466fffc18fba999fddc36e0791b728fc40ff858c` |
-| `insts_lfm3_dec_conv.bin` | `a010677024534a5c9e6051ae257e2a032c9f4794e86218c58b5ae53cd41bd542` |
-| `insts_lfm3_dec_fa_fin_c0.bin` | `596c3b4b5c3a598c055adb9e7a3d5b513bda2324aa89390502add694d0adb9dd` |
-| `insts_lfm3_dec_fa_fin_c1.bin` | `70bf838ce6097f38d29c165474b7426df446290465bd29de3c0848c65de7344c` |
-| `insts_lfm3_dec_fa_fin_c12.bin` | `ccec1c7b2b5769142767ba172937d9aa49d8c18a736ab6a1b7d0746b9307dc12` |
-| `insts_lfm3_dec_fa_fin_c128.bin` | `026a55beefa717f1eb87a5375a4972e4f065bf121cf1a881b01f82a5ea77671d` |
-| `insts_lfm3_dec_fa_fin_c16.bin` | `549f5ff9ebbc6744ef77e3ca2c384f45bb1d4235c078f68ffcdbe4774e9bb8ff` |
-| `insts_lfm3_dec_fa_fin_c192.bin` | `4cf6f5d85f4dda913bc5a920d14804d22eef8b049df9b723c56b531bd9c152db` |
-| `insts_lfm3_dec_fa_fin_c2.bin` | `1297219722d0c53bd8bea0865289738c8c6adbc75a8eb5684f5769a31d89c1f1` |
-| `insts_lfm3_dec_fa_fin_c24.bin` | `c42792e07d07441d914d40d42c8639adab36775333fca09c27bf9dd5c3211576` |
-| `insts_lfm3_dec_fa_fin_c255.bin` | `e4becdd3dff8ab338066a2522a586356ccf2723bd99b7b2ab6f9dfd64a05e9e9` |
-| `insts_lfm3_dec_fa_fin_c32.bin` | `d919ab3eec7e7aeeaaddec0af68d2ddaa64478ad2d6cef7feb82dbfd6d774476` |
-| `insts_lfm3_dec_fa_fin_c4.bin` | `2c9fd2faac147f835175cc43178819613e42dda56a719858c95d279f14222b6f` |
-| `insts_lfm3_dec_fa_fin_c48.bin` | `3aa34014561dc6b3e306fb001a829c682bae5906a0a009688a038e15c69d7599` |
-| `insts_lfm3_dec_fa_fin_c64.bin` | `bc09f24d39ec16a445f49f50eebf5e97325933dcae18e1456caa20c9424a10c3` |
-| `insts_lfm3_dec_fa_fin_c8.bin` | `45e06ab1e2a5bc42f949ea518eb1343442a48eeaa49f5be96c59ebd6a3254881` |
-| `insts_lfm3_dec_fa_fin_c96.bin` | `b5cd7cba6adf6b436c7a578f4bd5752758fd21533ed05c4778487891c4559242` |
-| `insts_lfm3_dec_fa_part_c256.bin` | `f0963e4a938fc791aac782a16eba7c049282011ceaafcb600c587360b7fcc578` |
-| `insts_lfm3_dec_phase_a.bin` | `630a1f75d90c160e10bcd91e776039c51fc625a59b40619946e46e85be7c307b` |
-| `q4layer_lfm3.xclbin` | `d2cb5e7bc00ee142c863ff5429f3cfb89d4ed63620d2e14be0b46b22e9cdac21` |
+| `insts_lfm3_dec_attn_c0.bin` | `9c73ce435e1d90f2208d65e0a11bd7a298d3767cdcf4a50fb3bba6810e9044b0` |
+| `insts_lfm3_dec_attn_c1.bin` | `e4771163594e6565b8cf28fbd35b470ae7bff15b1778e9842539129d105f46e5` |
+| `insts_lfm3_dec_attn_c12.bin` | `093405d6e6ef1e0ce8477bcc7351bef23f85301462c996e6df268cb74e077883` |
+| `insts_lfm3_dec_attn_c128.bin` | `8eb1865d7a74258fbbcd45851f941fde457d79cde1ca14ba0fb5f96f8cfa365b` |
+| `insts_lfm3_dec_attn_c16.bin` | `078e9352ca7df564f1816755155df2ee9bf5ec423a457ff1768e29deaba3784e` |
+| `insts_lfm3_dec_attn_c192.bin` | `2af03116f08d81b10091e6fa1ed938f2c095410d16d7ca5494888a8b270d8d7d` |
+| `insts_lfm3_dec_attn_c2.bin` | `60c80148d694886c296858ec692662b0144dfea3c8ef55090563a35727ea7e92` |
+| `insts_lfm3_dec_attn_c24.bin` | `c97cccbbab33a9a2a4bbe11271277dd19f3995530ba348e81211824146f599e6` |
+| `insts_lfm3_dec_attn_c255.bin` | `dbf361635ae9ea3b204148666558cec8c957c9414e4458cf223cd6ce509098d2` |
+| `insts_lfm3_dec_attn_c32.bin` | `f63fad6cd7d6560da27df6371ffb4c0b0e987dba759ef9f9b59824c73141e49f` |
+| `insts_lfm3_dec_attn_c4.bin` | `5b0abcc6b68fba2b8d397435228e58ad0d96ba85f2ff39c47d0e2a513632ad68` |
+| `insts_lfm3_dec_attn_c48.bin` | `faf24e633abb684f357d5b48cb3f7027d0485db7a1b9b1591e3fa887c3f32237` |
+| `insts_lfm3_dec_attn_c64.bin` | `40fe8674dfb1736620465c86e3664676b02dedcb56a45323fa895420e68d0bed` |
+| `insts_lfm3_dec_attn_c8.bin` | `d7568ac7a8d85fa2f4a556aa0b05bc52f72461a69b536f4a4db1d9850025921c` |
+| `insts_lfm3_dec_attn_c96.bin` | `5cca3617a3c4659476ed830210b05e683e06add8e23eecea1927423980da8463` |
+| `insts_lfm3_dec_conv.bin` | `b435890b935c7b7a4faf75322ad8b26672fdd3fbc5da35d656d31984af0f0a59` |
+| `insts_lfm3_dec_fa_fin_c0.bin` | `5e99ef5673a992d19b07d4af1f4363fea184ec704d9fb0bda5c3a998d831061c` |
+| `insts_lfm3_dec_fa_fin_c1.bin` | `687b7c1d17594960dd713262b0b31f7fafeb1812163405762f3a18454c875d62` |
+| `insts_lfm3_dec_fa_fin_c12.bin` | `aa90e37fa4069bb1f5642f71d0f9547175b175a53136ca4eb855058c7dff610c` |
+| `insts_lfm3_dec_fa_fin_c128.bin` | `9410a50132c9febc2671b1616ca9f809e03f05503babd7a0c4f159abbcbb7464` |
+| `insts_lfm3_dec_fa_fin_c16.bin` | `0f4f9e4e6d444bb7f2eb6dba98f23741800594410e97fe23f099d317dfb0128e` |
+| `insts_lfm3_dec_fa_fin_c192.bin` | `2fb41431ca60568af182a7b783c79fc473036ac4d5e001d11bee584ce420bd86` |
+| `insts_lfm3_dec_fa_fin_c2.bin` | `b0dfe2078be671c0a8fb0ddccc5572c377aeda638b0bbbc491234585f5554836` |
+| `insts_lfm3_dec_fa_fin_c24.bin` | `99eab1d00bcdac34dd1d9b04e2bdda18a2a91d41154c7531485e7aed57dcbb53` |
+| `insts_lfm3_dec_fa_fin_c255.bin` | `cd38cfa6e06f2eaa3f73ef59dbdbb80e88ca120e0ad6e2ba7059de3112af488e` |
+| `insts_lfm3_dec_fa_fin_c32.bin` | `309778b358fd58fe066865a23f577e763d4b4509e45f35a3888fbcd274bb8315` |
+| `insts_lfm3_dec_fa_fin_c4.bin` | `24084caf9858bda35db0ce29a3287f188acecce18a97a629aa29f933f23776a9` |
+| `insts_lfm3_dec_fa_fin_c48.bin` | `8c00892afc1015bd496ca16d284285d29c60f4f5af3b18ece80dd7306d9328f3` |
+| `insts_lfm3_dec_fa_fin_c64.bin` | `31d5096a573b72491b28853bc597fd7def7b73f50345d756b22eece061e821d0` |
+| `insts_lfm3_dec_fa_fin_c8.bin` | `99aa6596e8d76e1c9803d55787a9ee18a0703759762b8989fc0edf33f29cad41` |
+| `insts_lfm3_dec_fa_fin_c96.bin` | `419e0ec2cb454d53bd25e487f9704fd27301d01ab4ed687220a13595ac220971` |
+| `insts_lfm3_dec_fa_part_c256.bin` | `54cb6c416be9bd72e82a8d85be00d3624bea69ce2c39ba879e7dd70b605e079e` |
+| `insts_lfm3_dec_phase_a.bin` | `92e4f34ddb884cb588ce61001b2d9d8a411cb3fd61ed7528447d0a7dc9211608` |
+| `q4layer_lfm3.xclbin` | `28a518d5c6c4b513d076031603b1c781c052345a40b21efe3e0c27003babb43f` |
 | `insts_lfm2_pre_attn_c0.bin` | `aeb8a73662a15c8aeffcf1411d123d1690eab684398316cbdc97c353babb8640` |
 | `insts_lfm2_pre_attn_c1.bin` | `a0c700acb2d071aa70f5a6906daefde2e4ba400b606744b9126ec5f8feb04208` |
 | `insts_lfm2_pre_attn_c12.bin` | `1dfab33454d11881afceefd95d51b292048f93ccd370352586c991681c09b7dc` |
@@ -198,40 +202,40 @@ full copyright lines and license texts are in `NOTICE.md` (see
 | `insts_lfm2_pre_fa_part_c256.bin` | `3be6c1be4618bda6d14cef3a2b88649bde9bf5a8eb2a0010a10b557e1aa5becd` |
 | `insts_lfm2_pre_phase_a.bin` | `1fca97ce39141b2533794c48cf02553907166d98a7dd5a99252524f917f0232f` |
 | `q4prefill_lfm2.xclbin` | `65276157dd2659dc282a16e0caf6a25ebdb632d3d0ecc62b092ede43e618fc47` |
-| `insts_lfm2_dec_attn_c0.bin` | `2407e0c5d2ca05845630e92131a2e253b31e3128f0e00827082c86905df51863` |
-| `insts_lfm2_dec_attn_c1.bin` | `fe4772411ad0db7ee89465863e18d38344a06f7609501cc6f9df57307693d2e3` |
-| `insts_lfm2_dec_attn_c12.bin` | `00469f22df6c5666113d6306e182c59a4ff57763c03f2c4e01b6b5c42692ecb2` |
-| `insts_lfm2_dec_attn_c128.bin` | `82a6a26eca24eb2c370fc9c17aec65e6a38d987939c42c0daf8d92b3c57b34c5` |
-| `insts_lfm2_dec_attn_c16.bin` | `ae47e9cefbf64a547dd02d38c64d677da7abad408abf8c5592b9c74694d31138` |
-| `insts_lfm2_dec_attn_c192.bin` | `fceaf2d920855ca723478b14601d44de5716f762fb612d88fef35f70f30f57b2` |
-| `insts_lfm2_dec_attn_c2.bin` | `fe00d5e488a32dd863fc4ef2e579f92d95cd7ab9488dc74757745502a2c2649e` |
-| `insts_lfm2_dec_attn_c24.bin` | `e63fff179dd3cd3ce9bfc160bfe4ef1abb5fbec4b0197ada37a08b062b5142bc` |
-| `insts_lfm2_dec_attn_c255.bin` | `05c2c5e1f70fd93f73400b5aa6e1daa087e893fe8f8e15a0f925d3e1d7b90c51` |
-| `insts_lfm2_dec_attn_c32.bin` | `6c10bbfe703ba9cb10c4f5bdc55cd9af82407bbed2b7e1c6b62d4d921cd4d3d4` |
-| `insts_lfm2_dec_attn_c4.bin` | `c768da570dd170ef0f7737a0bf124948ca6a261f71e50507879b622566682389` |
-| `insts_lfm2_dec_attn_c48.bin` | `6ac2102ffc5258140b4e7d27feac1a33e0291528a7c08f3dccf7731c33a6f8be` |
-| `insts_lfm2_dec_attn_c64.bin` | `a8563cdf78735e42836b8c1c0fc23b58115ffebf5118db2ea045ac3aa0cb1ee6` |
-| `insts_lfm2_dec_attn_c8.bin` | `7afc6a1ab75510f9ee8e2b208855aa9b1fd1f7ecbd57094773445c4137475c93` |
-| `insts_lfm2_dec_attn_c96.bin` | `9cd54ff7944216f16dba7f13ebc93d0a3e01336c65403603e511807ca0c22771` |
-| `insts_lfm2_dec_conv.bin` | `38f958b18346a033d66559db104219a9262f305d18096335ac9b1ef77120fae8` |
-| `insts_lfm2_dec_fa_fin_c0.bin` | `294f22f9e87f273738eef22dc724a335832e105e47493e7cea9b6ed0671b5c6f` |
-| `insts_lfm2_dec_fa_fin_c1.bin` | `000ecc295f394e374162bcd6642d95401d4b4db2ea5664c98b0ab3f7e7ac3e1f` |
-| `insts_lfm2_dec_fa_fin_c12.bin` | `b001a8ab650df844f3996920190ef81766c1036eeb2fc29b9aaa8f5e4cb2c40e` |
-| `insts_lfm2_dec_fa_fin_c128.bin` | `14f159573a0c9a40ab84a7bb33bf8088c10305e06136dc6ea8aa28ceb1dff3cd` |
-| `insts_lfm2_dec_fa_fin_c16.bin` | `b9bce413d1a212524533cb271419a499afc84a7925d4651a8ddfc5da0ca798a0` |
-| `insts_lfm2_dec_fa_fin_c192.bin` | `65e2e8d234c4d6ee26be0472d59f43defd01996092da9224f5772eeaf78242e2` |
-| `insts_lfm2_dec_fa_fin_c2.bin` | `4c180992d4929b399a406901319b72b8403d1536ac7565249ac72a41f4198840` |
-| `insts_lfm2_dec_fa_fin_c24.bin` | `34e8af30628693f6f2314e6a5669661c6918ce722b56c788126d32de496214e9` |
-| `insts_lfm2_dec_fa_fin_c255.bin` | `ad311ac717b480c75b93e51f9213748517c472da10b2acd90efaa3aafcf1c0c9` |
-| `insts_lfm2_dec_fa_fin_c32.bin` | `844b06e3f2d0f782e85303e2ff60a293910fd80b30fb779d6cf90c1cc02260d0` |
-| `insts_lfm2_dec_fa_fin_c4.bin` | `b5c779773e34d7ae8247fd6c38cb3c2a7c23f230e3f5526d413363537e0a309c` |
-| `insts_lfm2_dec_fa_fin_c48.bin` | `6c37fb118b23ec8005a39e07a02fc23a97913342fc2db8aa3ea7ed73767556ab` |
-| `insts_lfm2_dec_fa_fin_c64.bin` | `0bc476831830b755b297db0cf9a45b876b9b57b1bc5d55283da03e16c6898dea` |
-| `insts_lfm2_dec_fa_fin_c8.bin` | `87d43f4b0913b7d6226cd3c1338abd98db925bc6efde7f0f810abceaa703862c` |
-| `insts_lfm2_dec_fa_fin_c96.bin` | `89024eab6368f7f2414fd757814578a5a8aa1470b479aeb06b80459f113fd6b4` |
-| `insts_lfm2_dec_fa_part_c256.bin` | `45b3a6abe2a1e665207c870ebc730462081d6113fc8555666f6c3ccc5e810d85` |
-| `insts_lfm2_dec_phase_a.bin` | `5eb518352b4bb5f5369816803e2580d91ff509a70a076e2545708ad1a0164f58` |
-| `q4layer_lfm2.xclbin` | `290fc050dd76efc6071c2e118e776b5a6a6d46374179f80529727781f4dcfbd0` |
+| `insts_lfm2_dec_attn_c0.bin` | `c5ec41bc5002f3c5dec0b70a27dced6a61666026a6327bb09b6415114ef73a46` |
+| `insts_lfm2_dec_attn_c1.bin` | `1dcbbf71c9ecc21286a562a16fd7e4dee6d5dc201dd478618625060bf0235d89` |
+| `insts_lfm2_dec_attn_c12.bin` | `f8ffc0151be16ab2d42c1c7c9694ef6ebd317d2f1f16e4466574414774d50d49` |
+| `insts_lfm2_dec_attn_c128.bin` | `dc1adaa1c5ee98655c495726e81012b0174a7b860d64c5d9cf8f61336223c1c2` |
+| `insts_lfm2_dec_attn_c16.bin` | `49c278e050a52ee42ad1d6d68db057bcad66f2292f222d1cde18bc212b2c567f` |
+| `insts_lfm2_dec_attn_c192.bin` | `594a1f6f20dc09586063b69859ea06c513912bb16b571e9d3edec2a128d6f00b` |
+| `insts_lfm2_dec_attn_c2.bin` | `6f20c2a19b0c0d8b8cd709a8a31b17e39009cadf0bf78d1129431a7c59c8f0e9` |
+| `insts_lfm2_dec_attn_c24.bin` | `2cc196bcc20dd3d5f0cb82b8ad207dc17bc6ec92046a1dab7f2fb0e3fef2c092` |
+| `insts_lfm2_dec_attn_c255.bin` | `5ea6fe09bdcec9712ad54acd45df45ba837113f3fd205a327425e2e5ae370c25` |
+| `insts_lfm2_dec_attn_c32.bin` | `e72b5686be219ef362019f4ba870ed0b921d0b8d679b2d70b7ded44dadbca038` |
+| `insts_lfm2_dec_attn_c4.bin` | `4dccf2ccffaf496ef18c1b7ad7a7668d34f15db43584a2098de3827c123f4ec0` |
+| `insts_lfm2_dec_attn_c48.bin` | `3a7556a6881eae953d0afc29342d2d82abbf3eb189b8bba816e7088688040933` |
+| `insts_lfm2_dec_attn_c64.bin` | `a7de2b639af2b58a3bc32f844ea4d49d70fd35dcfac4113678f132eb59e18cd9` |
+| `insts_lfm2_dec_attn_c8.bin` | `f9a92d450f12032cbbad4a6bb8200624fed61cc5140110c9cba180943330cf61` |
+| `insts_lfm2_dec_attn_c96.bin` | `bb53deaa90992a8d60c5bc08e99c367e1b77c5c1ae0a306dca80ed1a00d287bd` |
+| `insts_lfm2_dec_conv.bin` | `0d9897f5414106a972cc44def7f5b85fc900d6f7dd18d5801a4d1387cf996ed1` |
+| `insts_lfm2_dec_fa_fin_c0.bin` | `49f84b0deef58c9d0651e550f242b985b8176f14a3761f4858ca2c05bcd05a5c` |
+| `insts_lfm2_dec_fa_fin_c1.bin` | `a88a6dd5eabce9e061f4f608ed4f89b3e630ccd236d5d41db595cf6e13dffee4` |
+| `insts_lfm2_dec_fa_fin_c12.bin` | `89264bf2ebdaa0262000337eef9b427a35532acf83c328630cb2eee7cd24ae0d` |
+| `insts_lfm2_dec_fa_fin_c128.bin` | `98d3432ca566f3ada03b37082d8f9b11611c310b4d583e6ec7055810646347b3` |
+| `insts_lfm2_dec_fa_fin_c16.bin` | `91633d00d84cae3f8f9c4cd66dea02176e5868379e15aa8335595231880cbc21` |
+| `insts_lfm2_dec_fa_fin_c192.bin` | `7d918eab9d6371f5b7a1bdfc59c88e5972a862278e125565b9966b15c6b57151` |
+| `insts_lfm2_dec_fa_fin_c2.bin` | `d4663ceebb11a4693589500588847b14d53275f1af7093a2a0f235571af423fb` |
+| `insts_lfm2_dec_fa_fin_c24.bin` | `9d801f1961d6c0fc08a12e4d5ac6813ecf096723fe59a926f964c126e4d69238` |
+| `insts_lfm2_dec_fa_fin_c255.bin` | `662ad0b8422180e0e0a4a26bb7662dcf060795bdd232b279b2325295237e9eb5` |
+| `insts_lfm2_dec_fa_fin_c32.bin` | `1502dc54d2f0fcfff3f8b7ced30d9050655606dd4c3cedcf8af67f73ed8e9714` |
+| `insts_lfm2_dec_fa_fin_c4.bin` | `e62550b13fa833f621b51746bbf4ffdd90730491e77468cb91c4903ddf0530bd` |
+| `insts_lfm2_dec_fa_fin_c48.bin` | `881123020d870be1b9fd6e46a59d6b110c4d912cd73372742f6a893c9d586037` |
+| `insts_lfm2_dec_fa_fin_c64.bin` | `92302a050bf699271f25c4ee5d6d37fd9619b66898595c015a5f0fa0debf784f` |
+| `insts_lfm2_dec_fa_fin_c8.bin` | `4cb4b1ed96fd135682062906c18c2a4152773cfa819d3f699c884f0cff1c7651` |
+| `insts_lfm2_dec_fa_fin_c96.bin` | `f7e4e599c25ded55beafd9a0381813af3224a577d4639f8c3aa92dcac338132e` |
+| `insts_lfm2_dec_fa_part_c256.bin` | `7b3f7c13ec039cef3617faae123207db5fea5da4741b45a6e233a60ff72691c1` |
+| `insts_lfm2_dec_phase_a.bin` | `79b86f29bb8fd0a679f47db547a78ec52edfa38e509ae352007b493ca2bf85b3` |
+| `q4layer_lfm2.xclbin` | `698ea3ae4cef2b69e6213d8013dfaff88027bb88294ac85640c4bf60768cc426` |
 | `gemm_bf16.xclbin` | `c0a004456a93d232b29c8a5644e3b1c5fe28d7186ebc2658376d7249e9fcca2b` |
 | `insts_gemm_bf16_k1.bin` | `bbe0a11ce4d5e50c888b759f43e36dfd1b1785f3489687eece82d9ff814ed613` |
 | `insts_gemm_bf16_k12.bin` | `b2a7538bae2965ba4fe583d2ee8c086eba35f8b31e3a46451c0eb8e65b264c28` |

@@ -25,6 +25,7 @@ struct DecState {
   alignas(64) float ffn_gate[4][16];
   alignas(64) uint8_t xq_out[64];
   alignas(64) bfloat16 xd_out[8];
+  alignas(64) float xq_buf[4 * X_ELEMS];
   float sum_sq;
   alignas(64) float conv_wt[3][64];
   alignas(64) float conv_state[2][64];

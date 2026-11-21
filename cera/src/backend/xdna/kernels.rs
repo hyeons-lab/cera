@@ -977,11 +977,11 @@ pub fn init_lfm3_bo_y_norms(
     if buf.len() >= LFM3_DEC_ACT_BYTES {
         write_le_f32_slice(buf, LFM3_DEC_SLOT_FIN_NORM + LFM3_H, post_attn_norm);
     }
-    if let (Some(rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
+    if let (Some(_rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
         assert_eq!(qn.len(), LFM3_HEAD_DIM);
         assert_eq!(kn.len(), LFM3_HEAD_DIM);
-        write_le_f32_slice(buf, rope_slot + 4096, qn);
-        write_le_f32_slice(buf, rope_slot + 4224, kn);
+        write_le_f32_slice(buf, slot_norm_0 + 4240, qn);
+        write_le_f32_slice(buf, slot_norm_0 + 4368, kn);
     }
 }
 
@@ -1090,11 +1090,11 @@ pub fn init_lfm2_bo_y_norms(
     assert_eq!(ffn_norm.len(), LFM2_H);
     write_le_f32_slice(buf, slot_norm_0, attn_norm);
     write_le_f32_slice(buf, slot_norm_1, ffn_norm);
-    if let (Some(rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
+    if let (Some(_rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
         assert_eq!(qn.len(), LFM2_HEAD_DIM);
         assert_eq!(kn.len(), LFM2_HEAD_DIM);
-        write_le_f32_slice(buf, rope_slot + 4096, qn);
-        write_le_f32_slice(buf, rope_slot + 4224, kn);
+        write_le_f32_slice(buf, slot_norm_0 + 4240, qn);
+        write_le_f32_slice(buf, slot_norm_0 + 4368, kn);
     }
 }
 
@@ -2679,7 +2679,6 @@ mod tests {
         const W_TOTAL: usize = 1992 * W_ELEMS;
         const SLOT_NORM_0: usize = 41472;
         const SLOT_NORM_1: usize = 46080;
-        const SLOT_ROPE_PKT: usize = 50688;
         const ACT_TOTAL: usize = LFM3_DEC_ACT_BYTES / 4;
         const KV_TOTAL: usize = 256 * N_KV * W_ELEMS;
         const KVO_TOTAL: usize = 8 * W_ELEMS;
@@ -3091,9 +3090,9 @@ mod tests {
                 write_le_i32(yb, SLOT_NORM_0 + 4103, eps.to_bits() as i32);
                 write_le_f32_slice(yb, SLOT_NORM_1, &n1);
                 write_le_f32_slice(yb, SLOT_NORM_1 + H, &p1);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT, &r0);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4096, &qnw);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4224, &knw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4112, &r0);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4240, &qnw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4368, &knw);
             }
             bo_y.sync_to_device().unwrap();
             bo_kv.as_mut_slice().fill(0);
@@ -3179,9 +3178,9 @@ mod tests {
                 write_le_i32(yb, SLOT_NORM_0 + 4103, eps.to_bits() as i32);
                 write_le_f32_slice(yb, SLOT_NORM_1, &n1);
                 write_le_f32_slice(yb, SLOT_NORM_1 + H, &p1);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT, &r1);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4096, &qnw);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4224, &knw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4112, &r1);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4240, &qnw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4368, &knw);
             }
             bo_y.sync_to_device().unwrap();
             bo_yn.as_mut_slice().fill(0);
