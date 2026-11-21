@@ -105,7 +105,7 @@
 use std::cell::UnsafeCell;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -122,6 +122,11 @@ const SPIN_BEFORE_PARK: u32 = 100_000;
 /// prefill workers warm at the same bounded spin as decode.
 #[cfg(all(not(miri), target_os = "windows"))]
 const PREFILL_SPIN_BEFORE_PARK: u32 = 100_000;
+/// Extended prefill-pool spin budget while a Windows hybrid XDNA decode model is alive.
+/// Keeps Q6_K LM-head workers warm across ~13–25 ms NPU token latencies without
+/// multi-millisecond OS park/wake stalls, while still parking after ~36 ms of idleness.
+#[cfg(all(any(feature = "xdna", test), not(miri), target_os = "windows"))]
+const XDNA_PREFILL_SPIN_BEFORE_PARK: u32 = 24_000_000;
 /// Shorter spin limit for prefill pools on non-Windows targets so workers park quickly
 /// when a chunk finishes or decode begins instead of contending for core clocks/TDP.
 #[cfg(all(not(miri), not(target_os = "windows")))]
@@ -243,6 +248,14 @@ struct Shared {
     /// as parking then re-waking workers costs more than it saves). Immutable
     /// after `build`.
     active_barrier: bool,
+    /// Baseline spin limit before parking (`CERA_SPIN` or pool default).
+    #[cfg(any(feature = "xdna", test))]
+    default_spin: u32,
+    /// Whether an explicit `CERA_SPIN` override prevents temporary warm-spin bumps.
+    #[cfg(any(feature = "xdna", test))]
+    spin_locked_by_env: bool,
+    /// Active spin budget polled by waiting workers before calling [`thread::park`].
+    spin_limit: AtomicU32,
     /// Packed `(epoch, active)` — see [`pack_state`]. Bumped once per dispatch;
     /// workers wake when the epoch changes and read `active` from the same load.
     state: AtomicU64,
@@ -755,10 +768,25 @@ impl RowPool {
         } else {
             SPIN_BEFORE_PARK
         };
-        let spin_limit = std::env::var("CERA_SPIN")
+        let env_spin = std::env::var("CERA_SPIN")
             .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(default_spin);
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        #[cfg(any(feature = "xdna", test))]
+        let spin_locked_by_env = env_spin.is_some();
+        #[cfg(any(feature = "xdna", test))]
+        let initial_spin = if spin_locked_by_env {
+            env_spin.unwrap_or(default_spin)
+        } else if active_barrier {
+            resolved_prefill_spin(
+                default_spin,
+                PREFILL_WARM_LEASES.load(Ordering::SeqCst),
+                xdna_warm_spin_target(),
+            )
+        } else {
+            default_spin
+        };
+        #[cfg(not(any(feature = "xdna", test)))]
+        let initial_spin = env_spin.unwrap_or(default_spin);
         // Only carry weights when at least one worker would actually scale down.
         // An all-`WEIGHT_FULL` vector (a host with no spread) would make
         // `worker_chunk_rows` do lookup work per dispatch to conclude nothing,
@@ -781,6 +809,11 @@ impl RowPool {
         };
         let shared = Arc::new(Shared {
             active_barrier,
+            #[cfg(any(feature = "xdna", test))]
+            default_spin,
+            #[cfg(any(feature = "xdna", test))]
+            spin_locked_by_env,
+            spin_limit: AtomicU32::new(initial_spin),
             state: AtomicU64::new(0),
             next_row: AtomicUsize::new(0),
             worker_weights,
@@ -799,7 +832,7 @@ impl RowPool {
             let pin = pin_cores.get(id).copied();
             match thread::Builder::new()
                 .name(format!("cera-rowpool-{id}"))
-                .spawn(move || worker_loop(shared, id, pin, spread_mask, spin_limit))
+                .spawn(move || worker_loop(shared, id, pin, spread_mask))
             {
                 Ok(handle) => workers.push(handle),
                 // Couldn't spawn: cap the pool at what we have, loudly. The
@@ -1141,6 +1174,14 @@ fn swap_rebuilt_pool(
         entry.pool.num_threads(),
         new.num_threads(),
     );
+    #[cfg(any(feature = "xdna", test))]
+    if new.shared.active_barrier {
+        apply_prefill_spin_target(
+            &new,
+            PREFILL_WARM_LEASES.load(Ordering::SeqCst),
+            xdna_warm_spin_target(),
+        );
+    }
     *entry = PoolSlot {
         pool: Arc::new(new),
         usable: usable.clone(),
@@ -1457,7 +1498,76 @@ fn restore_current_thread_affinity(set: &libc::cpu_set_t) -> bool {
     unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) == 0 }
 }
 
+#[cfg(any(feature = "xdna", test))]
+static PREFILL_WARM_LEASES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(feature = "xdna", test))]
+const fn xdna_warm_spin_target() -> u32 {
+    #[cfg(all(not(miri), target_os = "windows"))]
+    {
+        XDNA_PREFILL_SPIN_BEFORE_PARK
+    }
+    #[cfg(any(miri, not(target_os = "windows")))]
+    {
+        PREFILL_SPIN_BEFORE_PARK
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+const fn resolved_prefill_spin(default_spin: u32, leases: usize, warm_target: u32) -> u32 {
+    if leases > 0 && warm_target > default_spin {
+        warm_target
+    } else {
+        default_spin
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+fn apply_prefill_spin_target(pool: &RowPool, leases: usize, warm_target: u32) {
+    if !pool.shared.spin_locked_by_env {
+        let target = resolved_prefill_spin(pool.shared.default_spin, leases, warm_target);
+        pool.shared.spin_limit.store(target, Ordering::Release);
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+fn sync_prefill_slot_spin_limit(warm_target: u32) {
+    let guard = match PREFILL_SLOT.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let leases = PREFILL_WARM_LEASES.load(Ordering::SeqCst);
+    if let Some(slot) = guard.as_ref() {
+        apply_prefill_spin_target(&slot.pool, leases, warm_target);
+    }
+}
+
+/// RAII lease keeping [`RowPool::prefill`] workers spinning across hybrid NPU
+/// token gaps on Windows until dropped (or bypassed by an explicit `CERA_SPIN`).
+#[cfg(any(feature = "xdna", test))]
+#[derive(Debug)]
+pub(crate) struct PrefillWarmGuard {
+    _private: (),
+}
+
+#[cfg(any(feature = "xdna", test))]
+impl Drop for PrefillWarmGuard {
+    fn drop(&mut self) {
+        PREFILL_WARM_LEASES.fetch_sub(1, Ordering::SeqCst);
+        sync_prefill_slot_spin_limit(xdna_warm_spin_target());
+    }
+}
+
 impl RowPool {
+    /// Acquire a refcounted lease that extends [`RowPool::prefill`]'s spin budget
+    /// while a hybrid XDNA decode model is live, restoring the baseline budget on drop.
+    #[cfg(any(feature = "xdna", test))]
+    pub(crate) fn acquire_prefill_warm_spin() -> PrefillWarmGuard {
+        PREFILL_WARM_LEASES.fetch_add(1, Ordering::SeqCst);
+        sync_prefill_slot_spin_limit(xdna_warm_spin_target());
+        PrefillWarmGuard { _private: () }
+    }
+
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
     /// every host thread that ever dispatches would be permanently pinned to
@@ -2159,7 +2269,6 @@ fn worker_loop(
     worker_id: usize,
     pin_core: Option<usize>,
     spread_mask: &'static [usize],
-    spin_limit: u32,
 ) {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
@@ -2237,7 +2346,7 @@ fn worker_loop(
             // builds — a panic here would wedge the pool (`pending` never hits
             // 0). Matches the `DrainGuard` counter.
             spins = spins.saturating_add(1);
-            if spins < spin_limit {
+            if spins < shared.spin_limit.load(Ordering::Relaxed) {
                 std::hint::spin_loop();
             } else {
                 let _guard = ParkedGuard::enter(&shared.parked_count);
@@ -3214,6 +3323,9 @@ mod tests {
         // A Tensor G5's three tiers: prime 1024, A725 824, A520 207, rescaled.
         let shared = Shared {
             active_barrier: true,
+            default_spin: 0,
+            spin_locked_by_env: false,
+            spin_limit: AtomicU32::new(0),
             state: AtomicU64::new(0),
             next_row: AtomicUsize::new(0),
             worker_weights: vec![full, 206, 52],
@@ -3257,6 +3369,9 @@ mod tests {
     fn weight_scaling_floors_at_one_row() {
         let shared = Shared {
             active_barrier: true,
+            default_spin: 0,
+            spin_locked_by_env: false,
+            spin_limit: AtomicU32::new(0),
             state: AtomicU64::new(0),
             next_row: AtomicUsize::new(0),
             worker_weights: vec![super::super::cpu_features::WEIGHT_FULL, 1],
@@ -3615,5 +3730,89 @@ mod tests {
         let mut z = vec![0.0f32; 4096];
         pool.dispatch_rows(&mut z, 1, 1, |row, slice| slice[0] = row as f32);
         assert!(z.iter().enumerate().all(|(i, &v)| v == i as f32));
+    }
+
+    #[test]
+    fn prefill_warm_spin_updates_and_respects_env_override() {
+        assert_eq!(resolved_prefill_spin(100_000, 0, 24_000_000), 100_000);
+        assert_eq!(resolved_prefill_spin(100_000, 1, 24_000_000), 24_000_000);
+        assert_eq!(resolved_prefill_spin(30_000_000, 1, 24_000_000), 30_000_000);
+
+        let pool = RowPool::build(1, &[], &[], &[], true);
+        let baseline = pool.shared.spin_limit.load(Ordering::Acquire);
+        let unlocked = !pool.shared.spin_locked_by_env;
+        if unlocked {
+            apply_prefill_spin_target(&pool, 1, 24_000_000);
+            assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), 24_000_000);
+            apply_prefill_spin_target(&pool, 0, 24_000_000);
+            assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), baseline);
+        } else {
+            apply_prefill_spin_target(&pool, 1, 24_000_000);
+            assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), baseline);
+        }
+
+        let locked_pool = RowPool {
+            shared: Arc::new(Shared {
+                active_barrier: true,
+                default_spin: 100_000,
+                spin_locked_by_env: true,
+                spin_limit: AtomicU32::new(42),
+                state: AtomicU64::new(0),
+                next_row: AtomicUsize::new(0),
+                worker_weights: Vec::new(),
+                pending: AtomicUsize::new(0),
+                shutdown: AtomicBool::new(false),
+                panicked: AtomicBool::new(false),
+                parked_count: AtomicUsize::new(0),
+                panic_payload: Mutex::new(None),
+                job: UnsafeCell::new(None),
+            }),
+            workers: Vec::new(),
+            dispatch_lock: Mutex::new(()),
+            caller_pin: None,
+            num_threads: 1,
+            #[cfg(test)]
+            workers_pinned: false,
+        };
+        apply_prefill_spin_target(&locked_pool, 2, 24_000_000);
+        assert_eq!(locked_pool.shared.spin_limit.load(Ordering::Acquire), 42);
+    }
+
+    #[test]
+    fn acquire_prefill_warm_spin_refcounts_global_prefill_pool() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let pool = RowPool::prefill();
+        let baseline = pool.shared.default_spin;
+        let expected_warm = if pool.shared.spin_locked_by_env {
+            pool.shared.spin_limit.load(Ordering::Acquire)
+        } else {
+            resolved_prefill_spin(baseline, 1, xdna_warm_spin_target())
+        };
+        let expected_restored = if pool.shared.spin_locked_by_env {
+            pool.shared.spin_limit.load(Ordering::Acquire)
+        } else {
+            baseline
+        };
+
+        let g1 = RowPool::acquire_prefill_warm_spin();
+        assert_eq!(
+            pool.shared.spin_limit.load(Ordering::Acquire),
+            expected_warm
+        );
+        let g2 = RowPool::acquire_prefill_warm_spin();
+        assert_eq!(
+            pool.shared.spin_limit.load(Ordering::Acquire),
+            expected_warm
+        );
+        drop(g1);
+        assert_eq!(
+            pool.shared.spin_limit.load(Ordering::Acquire),
+            expected_warm
+        );
+        drop(g2);
+        assert_eq!(
+            pool.shared.spin_limit.load(Ordering::Acquire),
+            expected_restored
+        );
     }
 }

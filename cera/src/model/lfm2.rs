@@ -2388,12 +2388,25 @@ impl LfmModel {
 
     #[cfg(feature = "xdna")]
     pub(crate) fn xdna_project_logits_into(&self, hidden: &[f32], logits: &mut [f32]) {
+        /// Cap the CPU Q6_K head below SMT siblings while leaving physical cores free for the NPU driver.
+        fn default_xdna_head_threads() -> usize {
+            let cores = crate::backend::cpu_features::physical_core_count().unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+            if cores > 8 {
+                (cores * 3 / 4).clamp(4, 12)
+            } else {
+                cores.max(1)
+            }
+        }
         static HEAD_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let max_active = *HEAD_THREADS.get_or_init(|| {
             std::env::var("CERA_NPU_HEAD_THREADS")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(0)
+                .unwrap_or_else(default_xdna_head_threads)
         });
         let mut normed = [0.0f32; 2048];
         let normed_slice = if hidden.len() <= normed.len() {

@@ -164,61 +164,38 @@ static inline float read_eps() {
 }
 
 __attribute__((noinline, minsize)) static void q4_dec_rms_q8_step(
-    const float *__restrict x_pkt,
+    const float *__restrict w_pkt,
     int32_t core_id,
-    int32_t chunk,
     int32_t flags) {
   const int32_t save_res = flags & 1;
   const int32_t skip_norm = (flags >> 1) & 1;
-  if (!skip_norm) {
-    if (chunk == 0) g_dec.sum_sq = 0.0f;
-    g_dec.sum_sq += sum_sq_f32(x_pkt, 512);
-  }
-  if (chunk == (core_id >> 3)) {
-    copy_f32_16(g_dec.x_slice, x_pkt + (core_id & 7) * 64, 64);
-    if (save_res) copy_f32_16(g_dec.res_acc, g_dec.x_slice, 64);
-  }
-  if (chunk == 3) {
-    if (!skip_norm) {
-      apply_rmsnorm_n(g_dec.x_slice, g_dec.norm_w, g_dec.sum_sq, 1.0f / 2048.0f, read_eps(), 64, g_dec.x_slice);
-    }
-    quantize_q8_block32_x2(g_dec.x_slice, g_dec.xq_out, g_dec.xd_out);
-  }
-}
-
-__attribute__((noinline, minsize)) static void q4_dec_res_step(
-    const float *__restrict x_pkt,
-    int32_t core_id,
-    int32_t chunk,
-    int32_t update_res) {
-  if (chunk == (core_id >> 3)) {
-    const float *__restrict src = x_pkt + (core_id & 7) * 64;
-    if (update_res == 2) {
-      copy_f32_16(g_dec.res_acc, src, 64);
-      return;
-    }
+  const float ss = skip_norm ? 0.0f : sum_sq_f32(w_pkt, CHUNK_K);
+  copy_f32_16(g_dec.x_slice, w_pkt + core_id * 64, 64);
+  if (save_res) {
 #pragma clang loop unroll(disable)
-    for (int i = 0; i < 64; i += 16) {
-      aie::store_v(g_dec.x_slice + i, aie::add(aie::load_v<16>(src + i), aie::load_v<16>(g_dec.res_acc + i)));
+    for (int p = 0; p < 4; ++p) {
+      copy_f32_16(g_dec.res_acc + p * 16, w_pkt + p * 512 + core_id * 16, 16);
     }
-    if (update_res) copy_f32_16(g_dec.res_acc, g_dec.x_slice, 64);
   }
+  if (!skip_norm) {
+    apply_rmsnorm_n(g_dec.x_slice, g_dec.norm_w, ss, 1.0f / (float)CHUNK_K, read_eps(), 64, g_dec.x_slice);
+  }
+  quantize_q8_block32_x2(g_dec.x_slice, g_dec.xq_out, g_dec.xd_out);
 }
 
 __attribute__((noinline, minsize)) static void q4_dec_rope_step(
-    const float *__restrict x_pkt,
+    const float *__restrict w_pkt,
     int32_t core_id,
-    int32_t chunk,
     int32_t mode) {
   const int32_t c = core_id >> 2;
   const int32_t r = core_id & 3;
   if (mode == 2) {
-    copy_f32_16((float *)g_dec.q_bf16, x_pkt + r * 64, 32);
+    copy_f32_16((float *)g_dec.q_bf16, w_pkt + r * 64, 32);
     return;
   }
   if (mode == 3) {
     if (g_dec.params[9]) {
-      const float *__restrict src = x_pkt + r * 128;
+      const float *__restrict src = w_pkt + r * 128;
       copy_f32_16(g_dec.o_acc, src, 64);
       g_dec.row_m = src[64];
       g_dec.row_l = src[65];
@@ -226,45 +203,28 @@ __attribute__((noinline, minsize)) static void q4_dec_rope_step(
     return;
   }
   const float eps = read_eps();
-  if (mode == 0) {
-    const int32_t q_h = c * 4 + r;
-    if (chunk == (q_h >> 3)) {
-      apply_rmsnorm_neox_rope_64(x_pkt + (q_h & 7) * HEAD_DIM, g_dec.q_norm_w, eps, g_dec.rope_cs, g_dec.q_bf16);
-    }
-  } else {
-    const int32_t kv_h = c;
-    if (r == 2 && chunk == 0) {
-      apply_rmsnorm_neox_rope_64(x_pkt + kv_h * HEAD_DIM, g_dec.k_norm_w, eps, g_dec.rope_cs, g_dec.kv_bf16);
-    } else if (r == 3 && chunk == 1) {
-      f32_to_bf16_n(g_dec.kv_bf16, x_pkt + kv_h * HEAD_DIM, HEAD_DIM);
-    }
+  apply_rmsnorm_neox_rope_64(w_pkt + core_id * HEAD_DIM, g_dec.q_norm_w, eps, g_dec.rope_cs, g_dec.q_bf16);
+  if (r == 2) {
+    apply_rmsnorm_neox_rope_64(w_pkt + 2560 + c * HEAD_DIM, g_dec.k_norm_w, eps, g_dec.rope_cs, g_dec.kv_bf16);
+  } else if (r == 3) {
+    f32_to_bf16_n(g_dec.kv_bf16, w_pkt + 3072 + c * HEAD_DIM, HEAD_DIM);
   }
 }
 
-__attribute__((noinline, minsize)) static void q4_dec_conv_step(
-    const float *__restrict x_pkt,
-    int32_t row,
-    int32_t which) {
-  const float *__restrict src = x_pkt + row * 64;
-  if (which == 0) {
-    copy_f32_16(g_dec.conv_bx, src, 64);
-  } else if (which == 1) {
-    copy_f32_16(g_dec.conv_c, src, 64);
-  } else {
+__attribute__((noinline, minsize)) static void q4_dec_conv_step() {
 #pragma clang loop unroll(disable)
-    for (int i = 0; i < 64; i += 16) {
-      aie::vector<float, 16> bx = dec_fmul_16(aie::load_v<16>(g_dec.conv_bx + i), aie::load_v<16>(src + i));
-      aie::vector<float, 16> acc = dec_fmul_16(bx, aie::load_v<16>(&g_dec.conv_wt[2][i]));
+  for (int i = 0; i < 64; i += 16) {
+    aie::vector<float, 16> bx = dec_fmul_16(aie::load_v<16>(&g_dec.ffn_gate[0][0] + i), aie::load_v<16>(&g_dec.y_gemm[0][0] + i));
+    aie::vector<float, 16> acc = dec_fmul_16(bx, aie::load_v<16>(&g_dec.conv_wt[2][i]));
 #pragma clang loop unroll(disable)
-      for (int k = 0; k < 2; ++k) {
-        acc = aie::add(acc, dec_fmul_16(aie::load_v<16>(&g_dec.conv_state[k][i]), aie::load_v<16>(&g_dec.conv_wt[k][i])));
-      }
-      aie::store_v(g_dec.x_slice + i, dec_fmul_16(acc, aie::load_v<16>(g_dec.conv_c + i)));
-      aie::store_v(g_dec.conv_bx + i, bx);
+    for (int k = 0; k < 2; ++k) {
+      acc = aie::add(acc, dec_fmul_16(aie::load_v<16>(&g_dec.conv_state[k][i]), aie::load_v<16>(&g_dec.conv_wt[k][i])));
     }
-    copy_f32_16(&g_dec.conv_state[0][0], &g_dec.conv_state[1][0], 64);
-    copy_f32_16(&g_dec.conv_state[1][0], g_dec.conv_bx, 64);
+    aie::store_v(g_dec.x_slice + i, dec_fmul_16(acc, aie::load_v<16>(g_dec.conv_c + i)));
+    aie::store_v(g_dec.conv_bx + i, bx);
   }
+  copy_f32_16(&g_dec.conv_state[0][0], &g_dec.conv_state[1][0], 64);
+  copy_f32_16(&g_dec.conv_state[1][0], g_dec.conv_bx, 64);
 }
 
 __attribute__((noinline, minsize)) static void q4_dec_silu_mul_step(int32_t n_passes) {
@@ -280,38 +240,52 @@ __attribute__((noinline, minsize)) static void q4_dec_silu_mul_step(int32_t n_pa
 
 extern "C" {
 
-__attribute__((minsize)) void q4_lfm2_dec_w_op_impl(const float *__restrict w_pkt, int32_t op, int32_t a0, int32_t a1) {
-  if (op == 0) {
-    copy_f32_16(g_dec.norm_w, w_pkt + a0 * 64, 64);
-    if (a1) {
-      aie::store_v((float *)g_dec.params, aie::load_v<16>(w_pkt + 4096));
-    }
-  } else if (op == 1) {
-    copy_f32_16(g_dec.rope_cs, w_pkt, HEAD_DIM);
-    copy_f32_16(g_dec.q_norm_w, w_pkt + 4096, HEAD_DIM);
-    copy_f32_16(g_dec.k_norm_w, w_pkt + 4224, HEAD_DIM);
-  } else {
-    const int n = (op == 3) ? 3 : 2;
-    float *__restrict dst = (op == 3) ? &g_dec.conv_wt[0][0] : &g_dec.conv_state[0][0];
-#pragma clang loop unroll(disable)
-    for (int k = 0; k < n; ++k) copy_f32_16(dst + k * 64, w_pkt + k * 256 + a0 * 64, 64);
-  }
-}
-
-__attribute__((minsize)) void q4_lfm2_dec_x_op_impl(
-    const float *__restrict x_pkt,
+__attribute__((minsize)) void q4_lfm2_dec_w_op_impl(
+    const float *__restrict w_pkt,
     int32_t op,
     int32_t a0,
     int32_t a1,
     int32_t a2) {
   if (op == 0) {
-    q4_dec_rms_q8_step(x_pkt, a0, a1, a2);
-  } else if (op == 1) {
-    q4_dec_res_step(x_pkt, a0, a1, a2);
-  } else if (op == 2) {
-    q4_dec_rope_step(x_pkt, a0, a1, a2);
+    copy_f32_16(g_dec.norm_w, w_pkt + a0 * 64, 64);
+    if (a1) {
+      aie::store_v((float *)g_dec.params, aie::load_v<16>(w_pkt + 4096));
+      copy_f32_16(g_dec.rope_cs, w_pkt + 4112, HEAD_DIM);
+      copy_f32_16(g_dec.q_norm_w, w_pkt + 4240, HEAD_DIM);
+      copy_f32_16(g_dec.k_norm_w, w_pkt + 4368, HEAD_DIM);
+    }
+  } else if (op == 3 || op == 4) {
+    const int n = (op == 3) ? 3 : 2;
+    float *__restrict dst = (op == 3) ? &g_dec.conv_wt[0][0] : &g_dec.conv_state[0][0];
+#pragma clang loop unroll(disable)
+    for (int k = 0; k < n; ++k) copy_f32_16(dst + k * 64, w_pkt + k * 256 + a0 * 64, 64);
+  } else if (op == 5) {
+    const int n_chk = a1 ? 4 : 1;
+    const int stride = a1 ? 36 : 64;
+#pragma clang loop unroll(disable)
+    for (int kc = 0; kc < n_chk; ++kc) {
+      const float *__restrict wp = w_pkt + kc * 1152;
+      float *__restrict dp = g_dec.xq_buf + kc * X_ELEMS;
+#pragma clang loop unroll(disable)
+      for (int i = 0; i < 32; ++i) {
+        const float *__restrict s = wp + i * stride;
+        float *__restrict d = dp + i * 20;
+        aie::store_v(d + 0, aie::load_v<4>(s + 0));
+        aie::store_v(d + 4, aie::load_v<4>(s + 4));
+        aie::store_v(d + 8, aie::load_v<4>(s + 8));
+        aie::store_v(d + 12, aie::load_v<4>(s + 12));
+        d[16] = s[16];
+      }
+    }
+  } else if (op == 6) {
+    q4_dec_rms_q8_step(w_pkt, a0, a2);
+  } else if (op == 7) {
+#pragma clang loop unroll(disable)
+    for (int p = 0; p < 4; ++p) {
+      copy_f32_16(g_dec.res_acc + p * 16, w_pkt + p * 512 + a0 * 16, 16);
+    }
   } else {
-    q4_dec_conv_step(x_pkt, a0, a1);
+    q4_dec_rope_step(w_pkt, a0, op - 8);
   }
 }
 
@@ -323,10 +297,14 @@ __attribute__((noinline, minsize)) static void drain_q8_y_out(float *__restrict 
 }
 
 __attribute__((minsize)) void q4_lfm2_dec_y_op(float *__restrict y_out, int32_t op, int32_t arg) {
-  if (op == 0) {
-    drain_q8_y_out(y_out);
-  } else if (op == 7) {
-    quantize_q8_block32_x2(g_dec.x_slice, g_dec.xq_out, g_dec.xd_out);
+  if (op == 0 || op == 6 || op == 7) {
+    if (op == 6) {
+      q4_dec_silu_mul_step(4);
+      quantize_q8_block32_x2(&g_dec.y_gemm[0][0], g_dec.xq_out, g_dec.xd_out);
+    } else if (op == 7) {
+      q4_dec_conv_step();
+      quantize_q8_block32_x2(g_dec.x_slice, g_dec.xq_out, g_dec.xd_out);
+    }
     drain_q8_y_out(y_out);
   } else if (op == 4) {
     float denom = aie::max(aie::broadcast<float, 16>(g_dec.row_l), aie::broadcast<float, 16>(1e-35f)).get(0);
@@ -344,10 +322,16 @@ __attribute__((minsize)) void q4_lfm2_dec_y_op(float *__restrict y_out, int32_t 
       y_out[0] = g_dec.row_m;
       y_out[1] = g_dec.row_l;
     }
+  } else if (op == 11) {
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < 64; i += 16) {
+      aie::store_v(
+          y_out + i,
+          aie::add(aie::load_v<16>(&g_dec.y_gemm[0][0] + i), aie::load_v<16>(g_dec.res_acc + i)));
+    }
   } else {
-    if (op == 6) q4_dec_silu_mul_step(arg);
     const float *__restrict src =
-        (op == 1 || op == 6) ? &g_dec.y_gemm[0][0] :
+        (op == 1) ? &g_dec.y_gemm[0][0] :
         (op == 2) ? g_dec.x_slice :
         (op == 3) ? &g_dec.conv_state[arg][0] :
         (op == 8) ? (const float *)g_dec.q_bf16 :
