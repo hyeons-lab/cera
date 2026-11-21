@@ -8,7 +8,7 @@ Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 > benchmarks and design notes.
 
 `cera` is the core library: GGUF loading, a quantized CPU kernel stack
-(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU, Qualcomm Hexagon NPU, and BLAS backends, a
+(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU, Qualcomm Hexagon NPU, AMD XDNA NPU (`xdna`), and BLAS backends, a
 stateful session API with prefix caching, and a streaming token sink. It powers
 the [`cera-cli`](https://github.com/hyeons-lab/cera/tree/main/cera-cli) CLI, the
 [`cera-ffi`](https://github.com/hyeons-lab/cera/tree/main/cera-ffi) mobile
@@ -638,7 +638,8 @@ size from):
 | `CERA_VIT_STREAM`, `CERA_VIT_WARMUP` | on | wgpu vision tower: `CERA_VIT_STREAM=off` restores the generic kernels instead of the fp16 streaming GEMMs and attention; `CERA_VIT_WARMUP=off` skips the blank-image warm-up encode at load (about 190 ms once). |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
-| `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
+| `CERA_SPIN` | 100000 (`2000` non-Windows prefill) | Spin iterations before an idle worker parks; on Windows while a hybrid XDNA decode model is active and unset, prefill workers temporarily raise this to `24000000`. |
+| `CERA_NPU_HEAD_THREADS` | `(cores * 3 / 4).clamp(4, 12)` (`cores > 8`) | Worker count for the CPU `Q6_K` LM-head projection on AMD XDNA hybrid decode (`LFM2`/`LFM3`). |
 | `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
 | `RAYON_NUM_THREADS` | detected perf-core count (moved by `CERA_THREADS`) | Width of rayon's global pool, which covers the parallel sites outside the RowPools: dequantization (so, model load), the ViT patch embed, and the LFM2-Audio conv stem. It does **not** move text prefill or decode width; every GEMM and GEMV on that path runs on a `RowPool`, sized by `CERA_PREFILL_THREADS` for prefill and `CERA_DECODE_THREADS` for decode (both defaulting from `CERA_THREADS`). It can still move a VL or audio prefill, whose encoders fan out on rayon. Read by `cera` itself rather than left to rayon, so the pool is built eagerly with a known CPU mask instead of lazily inheriting the mask of whichever thread reached it first. |
 | `CERA_RAYON_GLOBAL` | on | `0` / `false` / `off` stops `cera` claiming rayon's process-global pool, for a Rust host that wants to build it itself. Such a host can also just call `rayon::ThreadPoolBuilder::new().build_global()` before loading a model; `cera` then logs a warning and leaves it alone. |

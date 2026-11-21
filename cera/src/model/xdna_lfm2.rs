@@ -1561,6 +1561,7 @@ impl XdnaLfm2Model {
                         dec.layer_bo_kvo[l].as_slice(),
                         LFM2_N_KV_HEADS,
                         LFM2_HEAD_DIM,
+                        1024,
                     );
                 }
             }

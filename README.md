@@ -110,9 +110,10 @@ or you can pin one:
 | **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature; dynamic cpuset awareness |
 | **Native Metal** | `metal` | macOS, iOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
 | **Qualcomm Hexagon NPU** | `hexagon` | Android, Linux (aarch64) | FastRPC Unsigned Process Domain, shared DMA memory, repacked 32x32 Q4_0/Q8_0 matrix kernels on Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite |
+| **AMD XDNA NPU** | `npu` | Windows (opt-in `xdna` feature) | XRT runtime shim + fused mlir-aie / IRON kernels on Ryzen AI Strix Halo (XDNA2) for Llama-3.2-1B, LFM2/LFM2.5-1.2B, and LFM3 |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise. A routed-expert model too large for the DSP's mappable memory (LFM2.5-8B-A1B) skips the NPU under `auto`, since paging it is slower than the CPU; set `CERA_HEXAGON_PAGE_EXPERTS=1`, or ask for `--device hexagon`, to page it.
+`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise (AMD XDNA is opt-in via `--device npu`). A routed-expert model too large for the DSP's mappable memory (LFM2.5-8B-A1B) skips the NPU under `auto`, since paging it is slower than the CPU; set `CERA_HEXAGON_PAGE_EXPERTS=1`, or ask for `--device hexagon`, to page it.
 
 ### Qualcomm Hexagon NPU backend
 
@@ -624,6 +625,8 @@ optimal on any one. The knobs below override them.
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. Clamped to the number of pinnable cores on hosts that have any, with a warning: past that the surplus workers run unpinned and contend with pinned ones that are spin-waiting (measured 35x slower on a Tensor G4). Not clamped where nothing gets pinned anyway, i.e. hosts with no affinity or `CERA_PIN=0`. |
 | `CERA_PREFILL_THREADS=<n>` | Prefill pool width on its own, without moving decode. May reach past the performance cores up to every pinnable core, for sweeping a part where widening might pay; it does not on the parts measured so far. Subject to the same clamp rule as `CERA_THREADS`, and to `CERA_THREADS` itself, which lowers the ceiling it is clamped against. |
 | `CERA_PIN=0` | Disables worker affinity pinning, for host apps that manage thread placement themselves. Also lifts the clamps above, since with nothing pinned there is no oversubscription cliff to guard against. |
+| `CERA_SPIN=<n>` | Spin iterations before an idle worker parks (default `100000`, or `2000` on non-Windows prefill pools). On Windows while a hybrid XDNA decode model (`LFM2`/`LFM3`) is live and `CERA_SPIN` is unset, the prefill pool temporarily uses `24000000` to avoid inter-token scheduler stalls during the CPU LM-head dispatch. |
+| `CERA_NPU_HEAD_THREADS=<n>` | Worker count for the CPU `Q6_K` LM-head projection during hybrid AMD XDNA decode (`LFM2`/`LFM3`, default `(cores * 3 / 4).clamp(4, 12)` when `cores > 8`). |
 | `CERA_POOL_STATS=1` | Annotates each `cera bench` run with pool fan-out health: how many dispatches wanted more than one worker, and how many of those silently ran serially because the pool was busy. The counts are exact; the work percentage mixes units across dispatch kinds, so read the counts. |
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade, useful for A/B-ing a kernel path. |
 | `CERA_ATTN_PREFETCH=<n>` | Positions ahead to prefetch KV rows in CPU f16 decode attention on aarch64 (default 16; 0, off, false disables; clamped to 1024). |

@@ -309,9 +309,19 @@ impl PendingHybridCpuKv {
         kvo_bytes: &[u8],
         n_kv_heads: usize,
         head_dim: usize,
+        kvo_stride_bytes: usize,
     ) {
         let idx = self.attn_len;
         let row_bytes = head_dim * 2;
+        assert!(
+            768 + row_bytes <= kvo_stride_bytes,
+            "kvo_stride_bytes ({kvo_stride_bytes}) too small for K@512 and V@768 + {row_bytes} B row"
+        );
+        assert!(
+            n_kv_heads * kvo_stride_bytes <= kvo_bytes.len(),
+            "kvo_bytes ({} B) smaller than {n_kv_heads} x {kvo_stride_bytes} B",
+            kvo_bytes.len()
+        );
         let total_bytes = n_kv_heads * row_bytes;
         if idx >= self.attn.len() {
             self.attn
@@ -325,9 +335,8 @@ impl PendingHybridCpuKv {
         if entry.2.len() != total_bytes {
             entry.2.resize(total_bytes, 0);
         }
-        let stride = row_bytes * 8;
         for kvh in 0..n_kv_heads {
-            let src_base = kvh * stride;
+            let src_base = kvh * kvo_stride_bytes;
             let dst_off = kvh * row_bytes;
             entry.1[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&kvo_bytes[src_base + 512..src_base + 512 + row_bytes]);
@@ -1574,19 +1583,12 @@ impl XdnaLlamaModel {
                 }
             }
             for &k_byte_off in &k_offs {
-                if let Err(e) = npu.layer_bo_kv[l].sync_range_to_device(HEAD_DIM * 2, k_byte_off) {
-                    npu.spare_kv = Some((pending_k, pending_v));
-                    return Err(self.record_device_fault(
-                        format!("layer {l} k sync to device: {e}"),
-                        vocab_size,
-                    ));
-                }
                 if let Err(e) = npu.layer_bo_kv[l]
-                    .sync_range_to_device(HEAD_DIM * 2, k_byte_off + Q4LAYER_SILU_HALF * 4)
+                    .sync_range_to_device(Q4LAYER_SILU_HALF * 4 + HEAD_DIM * 2, k_byte_off)
                 {
                     npu.spare_kv = Some((pending_k, pending_v));
                     return Err(self.record_device_fault(
-                        format!("layer {l} v sync to device: {e}"),
+                        format!("layer {l} kv sync to device: {e}"),
                         vocab_size,
                     ));
                 }
@@ -3041,7 +3043,7 @@ mod tests {
             kvo_attn[512 + d * 2..512 + d * 2 + 2].copy_from_slice(&bf16_one);
             kvo_attn[768 + d * 2..768 + d * 2 + 2].copy_from_slice(&bf16_two);
         }
-        p.push_attn_bf16(1, &kvo_attn, 4, 128);
+        p.push_attn_bf16(1, &kvo_attn, 4, 128, 512 * 4);
         slot.commit(p);
 
         // Before flush, `check_hybrid_kv_rewind_state` accepts `len=0` and rejects missing `len=1`.
@@ -3073,5 +3075,43 @@ mod tests {
         slot.commit(p2);
         slot.discard();
         assert!(slot.as_ref().is_none());
+    }
+
+    #[test]
+    fn hybrid_pending_slot_supports_lfm2_1024_byte_kvo_stride() {
+        let cfg = test_hybrid_config(2);
+        let kv_dim = 8 * 64;
+        let mut lfm2_cfg = cfg;
+        lfm2_cfg.n_kv_heads = 8;
+        lfm2_cfg.head_dim = 64;
+        lfm2_cfg.kv_heads_per_layer = vec![8; lfm2_cfg.n_layers];
+        let mut state = InferenceState::from_config_capped(&lfm2_cfg, &KvCompression::F16, 64)
+            .expect("lfm2 hybrid state");
+        state.seq_len = 1;
+
+        let mut slot = HybridPendingSlot::default();
+        let mut p = slot.prepare(0, 2, 2048, kv_dim);
+        let mut kvo_attn = vec![0u8; 8 * 1024];
+        let bf16_one = 0x3F80u16.to_le_bytes();
+        let bf16_two = 0x4000u16.to_le_bytes();
+        for kvh in 0..8 {
+            let base = kvh * 1024;
+            for d in 0..64 {
+                kvo_attn[base + 512 + d * 2..base + 512 + d * 2 + 2].copy_from_slice(&bf16_one);
+                kvo_attn[base + 768 + d * 2..base + 768 + d * 2 + 2].copy_from_slice(&bf16_two);
+            }
+        }
+        p.push_attn_bf16(1, &kvo_attn, 8, 64, 1024);
+        slot.commit(p);
+        slot.flush_into(&mut state);
+        assert_eq!(state.kv_cache_f16(1).0.len(), kv_dim);
+        assert_eq!(
+            crate::quant::f16_to_f32(state.kv_cache_f16(1).0[kv_dim - 1]),
+            1.0
+        );
+        assert_eq!(
+            crate::quant::f16_to_f32(state.kv_cache_f16(1).1[kv_dim - 1]),
+            2.0
+        );
     }
 }
