@@ -1,7 +1,6 @@
 #include "q4_lfm3_dec_state.h"
 
 extern "C" void q4_lfm3_dec_gemm_op(
-    const uint8_t *__restrict x_slot,
     const uint8_t *__restrict w_tile,
     int32_t out_idx,
     int32_t flags) {
@@ -16,7 +15,8 @@ extern "C" void q4_lfm3_dec_gemm_op(
   aie::vector<int8, 64> a2 = aie::zeros<int8, 64>();
   aie::vector<int8, 64> a3 = aie::zeros<int8, 64>();
 
-  const uint8_t *__restrict x_blk = x_slot;
+  const int32_t x_slot = (flags >> 3) & 3;
+  const uint8_t *__restrict x_blk = (const uint8_t *)(g_dec.xq_buf + x_slot * X_ELEMS);
   const uint8_t *__restrict whalf = w_tile;
 #pragma clang loop unroll(disable)
   for (int kh = 0; kh < 2; ++kh) {

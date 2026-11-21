@@ -32,11 +32,14 @@ use crate::backend::xdna::repack::{f32_to_bf16, pack_q4_0_stage_k1024};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
 use crate::model::lfm2::LfmModel;
-use crate::model::xdna_llama::{check_xdna_kv_rewind_preconditions, validate_xdna_kv_compression};
+use crate::model::xdna_llama::{
+    HybridPendingSlot, check_hybrid_kv_rewind_state, validate_xdna_kv_compression,
+};
 use crate::model::{BlockType, Model, ModelConfig, ModelSessionGate, ModelSessionLease, WeightRef};
 use crate::tensor::DType;
 
 const TILE_BYTES: usize = Q4LAYER_TILE_F32 * 4;
+const CONV_SYNC_BYTES: usize = 7 * TILE_BYTES + LFM2_D_CONV * 256 * 4;
 
 fn take_fault(slot: &Mutex<Option<String>>) -> Option<CeraError> {
     slot.lock()
@@ -450,6 +453,7 @@ struct XdnaLfm2State {
     layer_kv_blocks: Vec<Vec<XdnaBo>>,
     prefill: Option<Lfm2PrefillBuffers>,
     decode: Option<Lfm2DecodeBuffers>,
+    pending_kv: HybridPendingSlot,
     synced_len: usize,
     force_conv_sync: bool,
 }
@@ -540,6 +544,7 @@ pub struct XdnaLfm2Model {
     state_torn: AtomicBool,
     session_gate: ModelSessionGate,
     profile_decode: bool,
+    _prefill_warm_guard: crate::backend::PrefillWarmGuard,
 }
 
 impl XdnaLfm2Model {
@@ -627,6 +632,7 @@ impl XdnaLfm2Model {
             layer_kv_blocks,
             prefill: None,
             decode: None,
+            pending_kv: HybridPendingSlot::default(),
             synced_len: 0,
             force_conv_sync: false,
         };
@@ -639,6 +645,7 @@ impl XdnaLfm2Model {
             state_torn: AtomicBool::new(false),
             session_gate: ModelSessionGate::default(),
             profile_decode: crate::backend::cpu_features::profile_decode_enabled(),
+            _prefill_warm_guard: crate::backend::acquire_prefill_warm_spin(),
         })
     }
 
@@ -945,11 +952,15 @@ impl XdnaLfm2Model {
         use_f16: bool,
     ) -> Result<(), String> {
         let _ = use_f16;
+        if target_pos == 0 {
+            npu.pending_kv.discard();
+        }
         let sync_conv = npu.force_conv_sync || npu.synced_len != target_pos;
         let sync_attn = npu.synced_len != target_pos;
         if !sync_conv && !sync_attn {
             return Ok(());
         }
+        npu.pending_kv.flush_into(state);
         for (l, layer) in self.layers.iter().enumerate() {
             if layer.is_conv && sync_conv {
                 match &state.layers[l] {
@@ -1249,14 +1260,12 @@ impl XdnaLfm2Model {
         }
     }
 
-    fn save_attn_dec_kvo_to_kv_and_state(
+    fn save_attn_dec_kvo_to_npu(
         kernels: &Lfm2Kernels,
         kvo: &XdnaBo,
         kv_blocks: &mut Vec<XdnaBo>,
-        layer_state: &mut LayerState,
         pos: usize,
         layer: usize,
-        use_f16: bool,
     ) -> Result<(), String> {
         let g_chk = pos / LFM2_KV_CHUNK_T;
         let blk = g_chk / LFM2_MAX_KV_CHUNKS;
@@ -1287,18 +1296,24 @@ impl XdnaLfm2Model {
         for kvh in 0..LFM2_N_KV_HEADS {
             let dst_chk = (kvh * LFM2_MAX_KV_CHUNKS + chk) * TILE_BYTES;
             let k_off = dst_chk + slot * row_bytes;
-            let v_pre_off = dst_chk + 1024 * 4 + slot * row_bytes;
-            let v_dec_off = dst_chk + 2304 * 4 + slot * row_bytes;
             bo_kv
-                .sync_range_to_device(row_bytes, k_off)
-                .map_err(|e| format!("kvh {kvh} dec K bo_kv sync: {e}"))?;
-            bo_kv
-                .sync_range_to_device(row_bytes, v_pre_off)
-                .map_err(|e| format!("kvh {kvh} dec V pre bo_kv sync: {e}"))?;
-            bo_kv
-                .sync_range_to_device(row_bytes, v_dec_off)
-                .map_err(|e| format!("kvh {kvh} dec V bo_kv sync: {e}"))?;
+                .sync_range_to_device(2304 * 4 + row_bytes, k_off)
+                .map_err(|e| format!("kvh {kvh} dec KV bo_kv sync: {e}"))?;
         }
+        Ok(())
+    }
+
+    fn save_attn_dec_kvo_to_kv_and_state(
+        kernels: &Lfm2Kernels,
+        kvo: &XdnaBo,
+        kv_blocks: &mut Vec<XdnaBo>,
+        layer_state: &mut LayerState,
+        pos: usize,
+        layer: usize,
+        use_f16: bool,
+    ) -> Result<(), String> {
+        Self::save_attn_dec_kvo_to_npu(kernels, kvo, kv_blocks, pos, layer)?;
+        let row_bytes = LFM2_HEAD_DIM * 2;
         let kvo_bytes = kvo.as_slice();
 
         if let LayerState::Attention {
@@ -1427,6 +1442,7 @@ impl XdnaLfm2Model {
                 ref layer_bo_w,
                 ref mut layer_kv_blocks,
                 ref mut decode,
+                ref mut pending_kv,
                 ..
             } = *npu;
             let dec = decode.as_mut().expect("initialized decode buffers");
@@ -1473,7 +1489,7 @@ impl XdnaLfm2Model {
                     write_lfm3_step_params(
                         yb,
                         LFM2_DEC_SLOT_NORM_0,
-                        Some(LFM2_DEC_SLOT_ROPE_PKT),
+                        Some(LFM2_DEC_SLOT_NORM_0 + 4112),
                         pos,
                         1,
                         attn_kv_cap,
@@ -1485,27 +1501,30 @@ impl XdnaLfm2Model {
                         Some(&cs),
                     );
                     dec.layer_bo_y[l]
-                        .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
-                        .map_err(|e| format!("layer {l} dec attn params sync: {e}"))?;
-                    dec.layer_bo_y[l]
-                        .sync_range_to_device(LFM2_HEAD_DIM * 4, LFM2_DEC_SLOT_ROPE_PKT * 4)
-                        .map_err(|e| format!("layer {l} dec rope_cs sync: {e}"))?;
+                        .sync_range_to_device(
+                            (16 + LFM2_HEAD_DIM) * 4,
+                            (LFM2_DEC_SLOT_NORM_0 + 4096) * 4,
+                        )
+                        .map_err(|e| format!("layer {l} dec attn params+rope sync: {e}"))?;
                 }
             }
             let t_prep_us = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
             let t_npu0 = prof.then(crate::time::Instant::now);
-            {
+            let mut pending_next = {
                 let plan = dec.bucket_plans[parity_idx][attn_bidx]
                     .as_ref()
                     .expect("initialized decode bucket plan");
                 plan.runlist
                     .execute()
                     .map_err(|e| format!("dec runlist execute: {e}"))?;
+                let pending_next = pending_kv.prepare(pos, LFM2_D_CONV, LFM2_H, LFM2_KV_DIM);
+                pending_kv.flush_into(state);
                 plan.runlist
                     .wait(0)
                     .map_err(|e| format!("dec runlist wait: {e}"))?;
-            }
+                pending_next
+            };
             let t_npu_us = t_npu0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
             let t_kv0 = prof.then(crate::time::Instant::now);
@@ -1523,28 +1542,36 @@ impl XdnaLfm2Model {
                         &mut dec.layer_bo_kvo[l]
                     };
                     kvo_written
-                        .sync_range_from_device(LFM2_KVO_BYTES, 0)
+                        .sync_range_from_device(CONV_SYNC_BYTES, 0)
                         .map_err(|e| format!("layer {l} dec conv kvo readback: {e}"))?;
-                    Self::save_conv_kvo_to_state(kvo_written, &mut state.layers[l], pos + 1, true);
+                    pending_next.push_conv_from_kvo(l, &kvo_written.as_slice()[..CONV_SYNC_BYTES]);
                 } else {
                     dec.layer_bo_kvo[l]
                         .sync_range_from_device(LFM2_ATTN_DEC_KVO_BYTES, 0)
                         .map_err(|e| format!("layer {l} dec attn kvo readback: {e}"))?;
-                    Self::save_attn_dec_kvo_to_kv_and_state(
+                    Self::save_attn_dec_kvo_to_npu(
                         kernels,
                         &dec.layer_bo_kvo[l],
                         &mut layer_kv_blocks[l],
-                        &mut state.layers[l],
                         pos,
                         l,
-                        use_f16,
                     )?;
+                    pending_next.push_attn_bf16(
+                        l,
+                        dec.layer_bo_kvo[l].as_slice(),
+                        LFM2_N_KV_HEADS,
+                        LFM2_HEAD_DIM,
+                    );
                 }
             }
             dec.conv_kv_in_kvo = !conv_kv_in_kvo;
 
+            pending_kv.commit(pending_next);
             state.seq_len = pos + 1;
             npu.synced_len = pos + 1;
+            if pos + 1 >= cfg.max_seq_len.min(LFM2_MAX_TOKENS) {
+                npu.pending_kv.flush_into(state);
+            }
             let t_kv_us = t_kv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
             let t_head0 = prof.then(crate::time::Instant::now);
@@ -1559,6 +1586,7 @@ impl XdnaLfm2Model {
         }
 
         // >8K paged decode path (Mode 2 Phase A + Mode 3 c=256 + Mode 4 final + batched Conv)
+        npu.pending_kv.flush_into(state);
         let fin_caps: Vec<usize> = Q4LAYER_LFM2_FA_FIN_BUCKETS
             .iter()
             .map(|&(c, _)| c)
@@ -1678,7 +1706,7 @@ impl XdnaLfm2Model {
             write_lfm3_step_params(
                 dec.layer_bo_y[l].as_mut_slice(),
                 LFM2_DEC_SLOT_NORM_0,
-                Some(LFM2_DEC_SLOT_ROPE_PKT),
+                Some(LFM2_DEC_SLOT_NORM_0 + 4112),
                 pos,
                 1,
                 0,
@@ -1690,11 +1718,8 @@ impl XdnaLfm2Model {
                 Some(&cs),
             );
             dec.layer_bo_y[l]
-                .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
-                .map_err(|e| format!("layer {l} ext dec phase A params sync: {e}"))?;
-            dec.layer_bo_y[l]
-                .sync_range_to_device(LFM2_HEAD_DIM * 4, LFM2_DEC_SLOT_ROPE_PKT * 4)
-                .map_err(|e| format!("layer {l} ext dec rope_cs sync: {e}"))?;
+                .sync_range_to_device((16 + LFM2_HEAD_DIM) * 4, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
+                .map_err(|e| format!("layer {l} ext dec phase A params+rope sync: {e}"))?;
             {
                 let ext = dec.ext_runs.as_mut().expect("ext cache");
                 if ext.phase_a_runs[l].is_none() {
@@ -1847,7 +1872,7 @@ impl XdnaLfm2Model {
                     &mut dec.layer_bo_kvo[l]
                 };
                 kvo_written
-                    .sync_range_from_device(LFM2_KVO_BYTES, 0)
+                    .sync_range_from_device(CONV_SYNC_BYTES, 0)
                     .map_err(|e| format!("layer {l} ext dec conv kvo readback: {e}"))?;
                 Self::save_conv_kvo_to_state(kvo_written, &mut state.layers[l], pos + 1, true);
             }
@@ -1949,6 +1974,7 @@ impl XdnaLfm2Model {
                 Err(e) => return self.record_device_fault(format!("{e:#}"), out_len),
             };
         }
+        npu.pending_kv.flush_into(state);
 
         let n_chunks = n_tokens.div_ceil(LFM2_PREFILL_CHUNK_T);
         let attn_caps: Vec<usize> = Q4PREFILL_LFM2_ATTN_BUCKETS
@@ -2822,6 +2848,7 @@ impl Model for XdnaLfm2Model {
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
         let mut npu = self.lock_npu();
+        npu.pending_kv.flush_into(state);
         self.cpu.shift_kv(state, n_keep, shift);
         npu.synced_len = npu.synced_len.min(n_keep).min(state.seq_len);
         npu.force_conv_sync = true;
@@ -2837,33 +2864,40 @@ impl Model for XdnaLfm2Model {
             "truncate_kv({len}) exceeds seq_len {}",
             state.seq_len
         );
+        if len == state.seq_len {
+            return;
+        }
         let mut npu = self.lock_npu();
+        npu.pending_kv.flush_into(state);
         self.cpu.truncate_kv(state, len);
         npu.synced_len = npu.synced_len.min(len);
         npu.force_conv_sync = true;
     }
 
     fn check_kv_rewind(&self, state: &InferenceState, len: usize) -> Result<(), KvRewindError> {
-        check_xdna_kv_rewind_preconditions(
+        let npu = self.lock_npu();
+        check_hybrid_kv_rewind_state(
             self.cpu.config().is_causal,
             self.state_torn.load(Ordering::SeqCst),
+            npu.pending_kv.as_ref(),
             state,
             len,
-        )?;
-        self.cpu.check_kv_rewind(state, len)
+        )
     }
 
     fn try_truncate_kv(&self, state: &mut InferenceState, len: usize) -> Result<(), KvRewindError> {
         let mut npu = self.lock_npu();
-        check_xdna_kv_rewind_preconditions(
+        check_hybrid_kv_rewind_state(
             self.cpu.config().is_causal,
             self.state_torn.load(Ordering::SeqCst),
+            npu.pending_kv.as_ref(),
             state,
             len,
         )?;
         if len == state.seq_len {
             return Ok(());
         }
+        npu.pending_kv.flush_into(state);
         self.cpu.try_truncate_kv(state, len)?;
         npu.synced_len = npu.synced_len.min(len);
         npu.force_conv_sync = true;
@@ -2881,6 +2915,7 @@ impl Model for XdnaLfm2Model {
         let mut fresh =
             InferenceState::from_config_capped(self.cpu.config(), compression, max_seq_len)?;
         fresh.lora = state.lora.clone();
+        npu.pending_kv.discard();
         for (l, layer) in self.layers.iter().enumerate() {
             if layer.is_conv {
                 npu.layer_kv_blocks[l][0].as_mut_slice()[..LFM2_KVO_BYTES].fill(0);

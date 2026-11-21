@@ -42,7 +42,10 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
 use crate::model::lfm2::LfmModel;
 use crate::model::transformer::{self, WeightRef};
-use crate::model::xdna_llama::{check_xdna_kv_rewind_preconditions, validate_xdna_kv_compression};
+use crate::model::xdna_llama::{
+    HybridPendingSlot, PendingHybridCpuKv, check_hybrid_kv_rewind_state,
+    validate_xdna_kv_compression,
+};
 use crate::model::{
     BlockType, Model, ModelConfig, ModelSessionGate, ModelSessionLease, record_first_fault,
     take_fault,
@@ -53,6 +56,7 @@ use crate::tensor::DType;
 const QUIESCE_TIMEOUT_MS: u32 = 30_000;
 const TILE_BYTES: usize = Q4LAYER_TILE_F32 * 4;
 const CONV_TAPS_STORED: usize = LFM3_CONV_TAP - 1;
+const CONV_SYNC_BYTES: usize = 7 * TILE_BYTES + CONV_TAPS_STORED * 256 * 4;
 const ATTN_PREFILL_SUB_KVO_BYTES: usize = LFM3_N_KV_HEADS * TILE_BYTES;
 const ATTN_PREFILL_KVO_BYTES: usize = 2 * ATTN_PREFILL_SUB_KVO_BYTES;
 const ATTN_DEC_KVO_BYTES: usize = LFM3_N_KV_HEADS * 512 * 4;
@@ -741,6 +745,7 @@ struct XdnaLfm3State {
     pre_bo_kvo: XdnaBo,
     decode: Option<XdnaLfm3DecodeBuffers>,
     prefill: Option<XdnaLfm3PrefillBuffers>,
+    pending_kv: HybridPendingSlot,
     synced_len: usize,
     force_conv_sync: bool,
 }
@@ -759,6 +764,7 @@ pub struct XdnaLfm3Model {
     decode_error: Mutex<Option<CeraError>>,
     session_gate: ModelSessionGate,
     profile_decode: bool,
+    _prefill_warm_guard: Option<crate::backend::PrefillWarmGuard>,
 }
 
 impl XdnaLfm3Model {
@@ -906,6 +912,7 @@ impl XdnaLfm3Model {
                 pre_bo_kvo,
                 decode,
                 prefill: None,
+                pending_kv: HybridPendingSlot::default(),
                 synced_len: 0,
                 force_conv_sync: false,
             }),
@@ -913,6 +920,7 @@ impl XdnaLfm3Model {
             decode_error: Mutex::new(None),
             session_gate: ModelSessionGate::default(),
             profile_decode: crate::backend::cpu_features::profile_decode_enabled(),
+            _prefill_warm_guard: is_causal.then(crate::backend::acquire_prefill_warm_spin),
         })
     }
 
@@ -1416,15 +1424,19 @@ impl XdnaLfm3Model {
     fn sync_cpu_state_to_npu(
         &self,
         npu: &mut XdnaLfm3State,
-        state: &InferenceState,
+        state: &mut InferenceState,
         target_pos: usize,
     ) -> Result<(), String> {
+        if target_pos == 0 {
+            npu.pending_kv.discard();
+        }
         let sync_conv = npu.force_conv_sync || target_pos != npu.synced_len;
         let sync_attn = (target_pos != npu.synced_len)
             || (target_pos == 0 && npu.swa_base_chunk.iter().any(|&b| b != 0));
         if !sync_conv && !sync_attn {
             return Ok(());
         }
+        npu.pending_kv.flush_into(state);
         let rewind = target_pos < npu.synced_len;
         let start = if rewind { 0 } else { npu.synced_len };
         let use_f16 = state.kv_f16;
@@ -1801,15 +1813,16 @@ impl XdnaLfm3Model {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn save_attn_dec_kvo_to_kv_and_state(
         kvo: &XdnaBo,
         blocks: &mut Vec<XdnaBo>,
         allocator: &XdnaKernel,
         swa_base: &mut usize,
         swa_window: usize,
-        layer_state: Option<&mut LayerState>,
+        layer_idx: usize,
+        pending_cpu_kv: Option<&mut PendingHybridCpuKv>,
         pos: usize,
-        use_f16: bool,
     ) -> Result<(), String> {
         let global_chunk = pos / LFM3_KV_CHUNK_T;
         let rem = pos % LFM3_KV_CHUNK_T;
@@ -1848,53 +1861,11 @@ impl XdnaLfm3Model {
                     .copy_from_slice(&kvo_bytes[v_src..v_src + LFM3_HEAD_DIM * 2]);
             }
             bo_kv
-                .sync_range_to_device(LFM3_HEAD_DIM * 2, k_dst)
-                .map_err(|e| format!("decode kvh {kvh} k bo_kv sync failed: {e}"))?;
-            bo_kv
-                .sync_range_to_device(LFM3_HEAD_DIM * 2, v_dst)
-                .map_err(|e| format!("decode kvh {kvh} v bo_kv sync failed: {e}"))?;
+                .sync_range_to_device(ATTN_KV_CHUNK_V_OFFSET + LFM3_HEAD_DIM * 2, k_dst)
+                .map_err(|e| format!("decode kvh {kvh} kv bo_kv sync failed: {e}"))?;
         }
-        if let Some(LayerState::Attention {
-            key_cache,
-            value_cache,
-            key_cache_f16,
-            value_cache_f16,
-            ..
-        }) = layer_state
-        {
-            let needed = (pos + 1) * LFM3_KV_DIM;
-            if use_f16 {
-                if key_cache_f16.len() < needed {
-                    key_cache_f16.resize(needed, 0);
-                }
-                if value_cache_f16.len() < needed {
-                    value_cache_f16.resize(needed, 0);
-                }
-            } else {
-                if key_cache.len() < needed {
-                    key_cache.resize(needed, 0.0);
-                }
-                if value_cache.len() < needed {
-                    value_cache.resize(needed, 0.0);
-                }
-            }
-            let dst_row = pos * LFM3_KV_DIM;
-            for kvh in 0..LFM3_N_KV_HEADS {
-                let k_src = kvh * 512 * 4 + 128 * 4;
-                let v_src = kvh * 512 * 4 + 192 * 4;
-                let dst = dst_row + kvh * LFM3_HEAD_DIM;
-                for d in 0..LFM3_HEAD_DIM {
-                    let kb = [kvo_bytes[k_src + d * 2], kvo_bytes[k_src + d * 2 + 1]];
-                    let vb = [kvo_bytes[v_src + d * 2], kvo_bytes[v_src + d * 2 + 1]];
-                    if use_f16 {
-                        key_cache_f16[dst + d] = bf16_bytes_to_f16(kb);
-                        value_cache_f16[dst + d] = bf16_bytes_to_f16(vb);
-                    } else {
-                        key_cache[dst + d] = bf16_bytes_to_f32(kb);
-                        value_cache[dst + d] = bf16_bytes_to_f32(vb);
-                    }
-                }
-            }
+        if let Some(pending) = pending_cpu_kv {
+            pending.push_attn_bf16(layer_idx, kvo_bytes, LFM3_N_KV_HEADS, LFM3_HEAD_DIM);
         }
         Ok(())
     }
@@ -2135,10 +2106,23 @@ impl XdnaLfm3Model {
         pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, String> {
+        let vocab_size = self.cpu.config().vocab_size;
+        let mut logits = vec![0.0f32; vocab_size];
+        self.run_npu_decode_embedding_step_into(npu, embedding, pos, state, &mut logits)?;
+        Ok(logits)
+    }
+
+    fn run_npu_decode_embedding_step_into(
+        &self,
+        npu: &mut XdnaLfm3State,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+        logits_out: &mut [f32],
+    ) -> Result<(), String> {
         let cfg = self.cpu.config();
         let eps = cfg.rms_norm_eps;
         let is_causal = cfg.is_causal;
-        let use_f16 = state.kv_f16;
         let prof = self.profile_decode;
         let attn_bucket_caps: Vec<usize> =
             Q4LAYER_LFM3_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
@@ -2175,6 +2159,7 @@ impl XdnaLfm3Model {
             ref mut layer_kv_blocks,
             ref mut swa_base_chunk,
             ref mut decode,
+            ref mut pending_kv,
             ..
         } = *npu;
         let dec = decode.as_mut().expect("initialized decode buffers");
@@ -2239,7 +2224,7 @@ impl XdnaLfm3Model {
                     write_lfm3_step_params(
                         yb,
                         LFM3_DEC_SLOT_NORM_0,
-                        Some(LFM3_DEC_SLOT_ROPE_PKT),
+                        Some(LFM3_DEC_SLOT_NORM_0 + 4112),
                         pos,
                         1,
                         swa_cap,
@@ -2261,7 +2246,7 @@ impl XdnaLfm3Model {
                     write_lfm3_step_params(
                         yb,
                         LFM3_DEC_SLOT_NORM_0,
-                        Some(LFM3_DEC_SLOT_ROPE_PKT),
+                        Some(LFM3_DEC_SLOT_NORM_0 + 4112),
                         pos,
                         1,
                         attn_kv_cap,
@@ -2276,7 +2261,7 @@ impl XdnaLfm3Model {
                     write_lfm3_step_params(
                         yb,
                         LFM3_DEC_SLOT_NORM_0,
-                        Some(LFM3_DEC_SLOT_ROPE_PKT),
+                        Some(LFM3_DEC_SLOT_NORM_0 + 4112),
                         pos,
                         1,
                         0,
@@ -2328,8 +2313,13 @@ impl XdnaLfm3Model {
                     .sync_range_to_device(LFM3_H * 4, 0)
                     .map_err(|e| format!("layer 0 hidden sync: {e}"))?;
             }
+            let sync_bytes = if layer.is_conv {
+                step_params_bytes
+            } else {
+                (16 + LFM3_HEAD_DIM) * 4
+            };
             dec_bo_y[l]
-                .sync_range_to_device(step_params_bytes, step_params_byte_off)
+                .sync_range_to_device(sync_bytes, step_params_byte_off)
                 .map_err(|e| format!("layer {l} step_params sync: {e}"))?;
             if sync_ext_part {
                 dec_bo_y[l]
@@ -2340,11 +2330,6 @@ impl XdnaLfm3Model {
                 dec_bo_y[l]
                     .sync_range_to_device(step_params_bytes, DEC_FIN_PARAMS_BYTE_OFF)
                     .map_err(|e| format!("layer {l} fa_fin step_params sync: {e}"))?;
-            }
-            if !layer.is_conv {
-                dec_bo_y[l]
-                    .sync_range_to_device(LFM3_HEAD_DIM * 4, LFM3_DEC_SLOT_ROPE_PKT * 4)
-                    .map_err(|e| format!("layer {l} rope sync: {e}"))?;
             }
         }
 
@@ -2383,18 +2368,20 @@ impl XdnaLfm3Model {
                 )
             })?
         };
-        let _t_prep_done = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+        let t_prep_us = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
         let t_npu0 = prof.then(crate::time::Instant::now);
         plan.runlist
             .execute()
             .map_err(|e| format!("dec runlist execute: {e}"))?;
+        let mut pending_next =
+            is_causal.then(|| pending_kv.prepare(pos, CONV_TAPS_STORED, LFM3_H, LFM3_KV_DIM));
+        pending_kv.flush_into(state);
         plan.runlist
             .wait(QUIESCE_TIMEOUT_MS)
             .map_err(|e| format!("dec runlist wait: {e}"))?;
         let t_npu_us = t_npu0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-        let t_prep_us = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-        let mut hidden = vec![0.0f32; LFM3_H];
+        let mut hidden = [0.0f32; LFM3_H];
         dec.conv_kv_in_kvo = !parity;
 
         let t_kv0 = prof.then(crate::time::Instant::now);
@@ -2412,9 +2399,11 @@ impl XdnaLfm3Model {
                         &mut dec.layer_bo_kvo[l]
                     };
                     conv_out_bo
-                        .sync_range_from_device(LFM3_KVO_BYTES, 0)
+                        .sync_range_from_device(CONV_SYNC_BYTES, 0)
                         .map_err(|e| format!("layer {l} conv kvo sync_from_device: {e}"))?;
-                    Self::save_conv_kvo_to_state(conv_out_bo, &mut state.layers[l], pos + 1, true);
+                    if let Some(pending) = pending_next.as_mut() {
+                        pending.push_conv_from_kvo(l, &conv_out_bo.as_slice()[..CONV_SYNC_BYTES]);
+                    }
                 }
             } else {
                 dec.layer_bo_kvo[l]
@@ -2426,19 +2415,27 @@ impl XdnaLfm3Model {
                     &kernels.prefill_conv,
                     &mut swa_base_chunk[l],
                     layer.swa_window,
-                    is_causal.then_some(&mut state.layers[l]),
+                    l,
+                    pending_next.as_mut(),
                     pos,
-                    use_f16,
                 )?;
             }
         }
         let t_kv_us = t_kv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
+        if let Some(next) = pending_next {
+            pending_kv.commit(next);
+        } else {
+            pending_kv.discard();
+        }
         state.seq_len = pos + 1;
         npu.synced_len = pos + 1;
+        if pos + 1 >= cfg.max_seq_len.min(LFM3_MAX_TOKENS) {
+            npu.pending_kv.flush_into(state);
+        }
 
         let t_head0 = prof.then(crate::time::Instant::now);
-        let logits = self.cpu.xdna_project_logits_from_hidden(&hidden);
+        self.cpu.xdna_project_logits_into(&hidden, logits_out);
         let t_head_us = t_head0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
         if prof {
             tracing::info!(
@@ -2448,7 +2445,7 @@ impl XdnaLfm3Model {
                 "lfm3 decode pos={pos} bucket={attn_kv_cap}: prep={t_prep_us:.0}us npu={t_npu_us:.0}us kv={t_kv_us:.0}us head={t_head_us:.0}us"
             );
         }
-        Ok(logits)
+        Ok(())
     }
 
     fn run_npu_prefill_embeddings(
@@ -2536,6 +2533,7 @@ impl XdnaLfm3Model {
         if let Err(e) = self.flush_conv_ping_pong_to_kv(&mut npu) {
             return self.record_device_fault(e, out_len);
         }
+        npu.pending_kv.flush_into(state);
         let n_chunks = rem_tokens.div_ceil(LFM3_PREFILL_B);
         let total_tokens = pos_aligned + rem_tokens;
         let eps = cfg.rms_norm_eps;
@@ -3733,6 +3731,53 @@ impl Model for XdnaLfm3Model {
         self.run_single_embedding_forward(&emb, pos, state)
     }
 
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        let cfg = self.cpu.config();
+        let vocab_size = cfg.vocab_size;
+        if tokens.len() != 1
+            || self.state_torn.load(Ordering::SeqCst)
+            || pos >= cfg.max_seq_len
+            || pos >= LFM3_MAX_TOKENS
+            || self.validate_state(state).is_err()
+        {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
+        let Some(emb) = self.cpu.embed_token_rows(tokens) else {
+            let _ = self.reject_input(
+                format!("token id {} out of range for vocab {vocab_size}", tokens[0]),
+                vocab_size,
+            );
+            return 0;
+        };
+        if state.scratch.logits.len() < vocab_size {
+            state.scratch.logits.resize(vocab_size, 0.0);
+        }
+        let mut logits_buf = std::mem::take(&mut state.scratch.logits);
+        let res = {
+            let mut npu = self.lock_npu();
+            self.sync_cpu_state_to_npu(&mut npu, state, pos)
+                .and_then(|()| {
+                    self.run_npu_decode_embedding_step_into(
+                        &mut npu,
+                        &emb,
+                        pos,
+                        state,
+                        &mut logits_buf[..vocab_size],
+                    )
+                })
+        };
+        let tok = match res {
+            Ok(()) => crate::sampler::argmax(&logits_buf[..vocab_size]),
+            Err(e) => {
+                let _ = self.record_device_fault(e, vocab_size);
+                0
+            }
+        };
+        state.scratch.logits = logits_buf;
+        tok
+    }
+
     fn forward_prefill(
         &self,
         tokens: &[u32],
@@ -3785,6 +3830,7 @@ impl Model for XdnaLfm3Model {
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
         let mut npu = self.lock_npu();
+        npu.pending_kv.flush_into(state);
         self.cpu.shift_kv(state, n_keep, shift);
         npu.synced_len = npu.synced_len.min(n_keep).min(state.seq_len);
         npu.force_conv_sync = true;
@@ -3800,33 +3846,40 @@ impl Model for XdnaLfm3Model {
             "truncate_kv({len}) exceeds seq_len {}",
             state.seq_len
         );
+        if len == state.seq_len {
+            return;
+        }
         let mut npu = self.lock_npu();
+        npu.pending_kv.flush_into(state);
         self.cpu.truncate_kv(state, len);
         npu.synced_len = npu.synced_len.min(len);
         npu.force_conv_sync = true;
     }
 
     fn check_kv_rewind(&self, state: &InferenceState, len: usize) -> Result<(), KvRewindError> {
-        check_xdna_kv_rewind_preconditions(
+        let npu = self.lock_npu();
+        check_hybrid_kv_rewind_state(
             self.cpu.config().is_causal,
             self.state_torn.load(Ordering::SeqCst),
+            npu.pending_kv.as_ref(),
             state,
             len,
-        )?;
-        self.cpu.check_kv_rewind(state, len)
+        )
     }
 
     fn try_truncate_kv(&self, state: &mut InferenceState, len: usize) -> Result<(), KvRewindError> {
         let mut npu = self.lock_npu();
-        check_xdna_kv_rewind_preconditions(
+        check_hybrid_kv_rewind_state(
             self.cpu.config().is_causal,
             self.state_torn.load(Ordering::SeqCst),
+            npu.pending_kv.as_ref(),
             state,
             len,
         )?;
         if len == state.seq_len {
             return Ok(());
         }
+        npu.pending_kv.flush_into(state);
         self.cpu.try_truncate_kv(state, len)?;
         npu.synced_len = npu.synced_len.min(len);
         npu.force_conv_sync = true;
@@ -3844,6 +3897,7 @@ impl Model for XdnaLfm3Model {
         let mut fresh =
             InferenceState::from_config_capped(self.cpu.config(), compression, max_seq_len)?;
         fresh.lora = state.lora.clone();
+        npu.pending_kv.discard();
         for (l, layer) in self.layers.iter().enumerate() {
             if layer.is_conv {
                 npu.layer_kv_blocks[l][0].as_mut_slice()[..LFM3_KVO_BYTES].fill(0);
