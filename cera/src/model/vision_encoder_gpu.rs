@@ -2886,7 +2886,11 @@ pub fn build_vit_stack(
         BP::Gpu => try_wgpu_stack(spec, false),
         BP::Auto => try_metal_stack(spec)
             .or_else(|| try_hexagon_stack(spec, MAX_VIT_TOKENS))
-            .or_else(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
+            .or_else(|| {
+                xdna_vit_worthwhile_for_auto(spec.blocks.len(), spec.width)
+                    .then(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
+                    .flatten()
+            })
             .or_else(|| try_wgpu_stack(spec, false)),
         BP::Hexagon => try_hexagon_stack(spec, MAX_VIT_TOKENS),
         BP::Npu => {
@@ -2911,7 +2915,11 @@ pub fn build_vit_stack_fast(
         BP::Gpu => try_wgpu_stack(spec, true),
         BP::Auto => try_metal_stack(spec)
             .or_else(|| try_hexagon_stack(spec, LONG_STACK_ROWS))
-            .or_else(|| try_xdna_stack(spec, LONG_STACK_ROWS))
+            .or_else(|| {
+                xdna_vit_worthwhile_for_auto(spec.blocks.len(), spec.width)
+                    .then(|| try_xdna_stack(spec, LONG_STACK_ROWS))
+                    .flatten()
+            })
             .or_else(|| try_wgpu_stack(spec, true)),
         BP::Hexagon => try_hexagon_stack(spec, LONG_STACK_ROWS),
         BP::Npu => try_hexagon_stack(spec, LONG_STACK_ROWS)
@@ -2959,6 +2967,11 @@ fn try_hexagon_stack(spec: &VitStackSpec, rows: usize) -> Option<std::sync::Arc<
 #[cfg(not(feature = "hexagon"))]
 fn try_hexagon_stack(_spec: &VitStackSpec, _rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
     None
+}
+
+#[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+fn xdna_vit_worthwhile_for_auto(n_layers: usize, hidden: usize) -> bool {
+    !(n_layers <= 4 && hidden <= 768)
 }
 
 #[cfg(feature = "xdna")]
@@ -3145,12 +3158,15 @@ pub fn build_gpu_vision_encoder(
     if is_lfm3 && !matches!(backend, crate::engine::BackendPreference::Cpu) {
         tracing::debug!("vision encoder: lfm3 has no accelerated encoder; using the CPU encoder");
     }
+    let allow_auto_xdna = backend != crate::engine::BackendPreference::Auto
+        || xdna_vit_worthwhile_for_auto(weights.blocks.len(), weights.config.n_embd);
     vision_encoder_candidates(is_lfm3, backend)
         .iter()
         .find_map(|accel| match accel {
             VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
             VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
-            VisionEncoderAccel::Xdna => try_xdna_vision_encoder_for(weights),
+            VisionEncoderAccel::Xdna if allow_auto_xdna => try_xdna_vision_encoder_for(weights),
+            VisionEncoderAccel::Xdna => None,
             VisionEncoderAccel::Metal => try_metal_vision_encoder(weights),
         })
 }
@@ -3350,6 +3366,14 @@ mod tests {
             &[VisionEncoderAccel::Hexagon, VisionEncoderAccel::Xdna]
         );
         assert!(vision_encoder_candidates(false, BP::Cpu).is_empty());
+    }
+
+    #[test]
+    fn xdna_auto_skips_short_narrow_vits_only() {
+        assert!(!super::xdna_vit_worthwhile_for_auto(4, 768));
+        assert!(super::xdna_vit_worthwhile_for_auto(12, 768));
+        assert!(super::xdna_vit_worthwhile_for_auto(27, 1152));
+        assert!(super::xdna_vit_worthwhile_for_auto(4, 1152));
     }
 
     #[cfg(feature = "gpu")]

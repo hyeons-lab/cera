@@ -483,14 +483,30 @@ fn use_fused_gate_up() -> bool {
 }
 
 /// Whether single-token decode fuses the FFN's gate, up, and SwiGLU projections into one
-/// resident-stream GEMV (`CERA_GPU_FUSED_GATE_UP=1`).
+/// resident-stream GEMV (`CERA_GPU_FUSED_GATE_UP=0` disables).
 fn use_fused_gate_up_gemv() -> bool {
     #[cfg(test)]
-    let enabled = std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1");
+    let enabled = !crate::backend::cpu_features::env_disabled("CERA_GPU_FUSED_GATE_UP");
     #[cfg(not(test))]
     let enabled = {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1"))
+        *ENABLED
+            .get_or_init(|| !crate::backend::cpu_features::env_disabled("CERA_GPU_FUSED_GATE_UP"))
+    };
+    enabled
+}
+
+/// Whether non-profiled GPU decode batches all layers and the tail into one compute pass
+/// (`CERA_GPU_SINGLE_PASS_DECODE=0` disables).
+fn use_single_pass_decode() -> bool {
+    #[cfg(test)]
+    let enabled = !crate::backend::cpu_features::env_disabled("CERA_GPU_SINGLE_PASS_DECODE");
+    #[cfg(not(test))]
+    let enabled = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !crate::backend::cpu_features::env_disabled("CERA_GPU_SINGLE_PASS_DECODE")
+        })
     };
     enabled
 }
@@ -8440,10 +8456,7 @@ impl GpuLfmModel {
         let mut enc = self.new_encoder();
         let profiling = self.ctx.profiling();
 
-        if !profiling
-            && self.tq_cache().is_none()
-            && std::env::var("CERA_GPU_SINGLE_PASS_DECODE").as_deref() == Ok("1")
-        {
+        if !profiling && self.tq_cache().is_none() && use_single_pass_decode() {
             let scale_bg = self
                 .logit_scale_params
                 .as_ref()
