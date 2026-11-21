@@ -39,19 +39,33 @@ def parse_time_output(stderr):
             footprint = int(line.strip().split()[0])
     return rss, footprint
 
-def run_cera(cera_bin, model_path, prompt_len, gen_len, runs):
-    print(f"  [cera] p={prompt_len} n={gen_len}...")
+DEFAULT_PROMPT_LENGTHS = [128, 1024, 1100, 2048, 2100, 3000, 4096, 8192, 16384, 32768]
+DEFAULT_GEN_LENGTHS = [64, 256, 1024]
+
+def context_size_for(prompt_len, gen_len):
+    needed = prompt_len + gen_len
+    return max(16384, ((needed + 2047) // 2048) * 2048)
+
+def run_cera(cera_bin, model_path, prompt_len, gen_len, runs, device="metal", warmup=None):
+    print(f"  [cera] device={device} p={prompt_len} n={gen_len}...")
+    cera_path = Path(cera_bin).expanduser().resolve()
+    if os.name == "nt" and not cera_path.exists() and cera_path.with_suffix(".exe").exists():
+        cera_path = cera_path.with_suffix(".exe")
+    ctx_size = context_size_for(prompt_len, gen_len)
     cmd = [
-        "/usr/bin/time", "-l",
-        str(Path(cera_bin).expanduser().resolve()), "bench",
+        str(cera_path), "bench",
         "--model", str(Path(model_path).expanduser().resolve()),
         "--prompt-tokens", str(prompt_len),
         "--max-tokens", str(gen_len),
         "--runs", str(runs),
-        "--device", "metal",
-        "--context-size", "16384",
-        "--no-cache"
+        "--device", device,
+        "--context-size", str(ctx_size),
+        "--no-cache",
     ]
+    if warmup is not None:
+        cmd.extend(["--warmup", str(warmup)])
+    if sys.platform == "darwin":
+        cmd = ["/usr/bin/time", "-l"] + cmd
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         combined = proc.stdout + "\n" + proc.stderr
@@ -61,7 +75,7 @@ def run_cera(cera_bin, model_path, prompt_len, gen_len, runs):
         decode_tps = float(decode_match.group(1)) if decode_match else 0.0
         prefill_tps = float(prefill_match.group(1)) if prefill_match else 0.0
         
-        rss, footprint = parse_time_output(proc.stderr)
+        rss, footprint = parse_time_output(proc.stderr) if sys.platform == "darwin" else (0, 0)
         return prefill_tps, decode_tps, rss, footprint
     except Exception as e:
         print(f"    Error running cera: {e}")
@@ -118,14 +132,26 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("benchmark_results.csv"), help="Output CSV file")
     parser.add_argument("--output-md", type=Path, default=Path("benchmarks/deltas_table.md"), help="Output Markdown deltas table")
     parser.add_argument("--model-name", type=str, default=None, help="Target specific model name (e.g. LFM2.5-2.6B-Q5_K_M.gguf)")
+    parser.add_argument("--device", type=str, default="metal", help="Cera device backend (e.g. metal, gpu, cpu, npu)")
+    parser.add_argument("--warmup", type=int, default=None, help="Override cera bench warmup runs")
+    parser.add_argument("--prompt-lengths", type=str, default=None, help="Comma-separated prompt lengths override")
+    parser.add_argument("--gen-lengths", type=str, default=None, help="Comma-separated generation lengths override")
     parser.add_argument("--runs", type=int, default=3, help="Number of runs per configuration")
     parser.add_argument("--all-models", action="store_true", help="Benchmark all discovered LFM models instead of flagships")
     parser.add_argument("--append", action="store_true", help="Append to existing output files rather than overwriting")
     
     args = parser.parse_args()
 
-    PROMPT_LENGTHS = [128, 1024, 4096]
-    GEN_LENGTHS = [64, 256, 1024]
+    PROMPT_LENGTHS = (
+        [int(x) for x in args.prompt_lengths.split(",") if x.strip()]
+        if args.prompt_lengths
+        else DEFAULT_PROMPT_LENGTHS
+    )
+    GEN_LENGTHS = (
+        [int(x) for x in args.gen_lengths.split(",") if x.strip()]
+        if args.gen_lengths
+        else DEFAULT_GEN_LENGTHS
+    )
 
     target_names = [args.model_name] if args.model_name else (None if args.all_models else DEFAULT_FLAGSHIPS)
     models = find_models(args.models_dir, target_names)
@@ -149,7 +175,10 @@ def main():
             for p_len in PROMPT_LENGTHS:
                 for g_len in GEN_LENGTHS:
                     # Run Cera
-                    c_ptps, c_dtps, c_rss, c_foot = run_cera(args.cera_bin, model, p_len, g_len, args.runs)
+                    c_ptps, c_dtps, c_rss, c_foot = run_cera(
+                        args.cera_bin, model, p_len, g_len, args.runs,
+                        device=args.device, warmup=args.warmup,
+                    )
                     c_rss_mb = c_rss / 1024 / 1024
                     c_foot_mb = c_foot / 1024 / 1024
                     writer.writerow({

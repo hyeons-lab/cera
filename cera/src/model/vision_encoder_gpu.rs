@@ -909,6 +909,7 @@ pub enum WgpuVitWeight {
 /// Requires `k % 32 == 0`; when `k % 64 == 32`, the trailing 32-element half-slice is zero-padded.
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    use crate::par::*;
     assert!(
         m > 0 && k > 0 && k.is_multiple_of(32),
         "q8_0 streaming repack needs m > 0, k > 0, and k % 32 == 0, got m={m}, k={k}"
@@ -920,24 +921,42 @@ pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, 
         m * blocks_per_row * 34,
         "q8_0 repack: wrong byte count"
     );
+    const ROW_TILE: usize = 64;
     let mut q = vec![0u32; m * k_pad / 4];
     let mut d = vec![0u32; m * (k_pad / 64)];
-    for row in 0..m {
-        for b in 0..blocks_per_row {
-            let base = (row * blocks_per_row + b) * 34;
-            let scale_bits = u16::from_le_bytes([data[base], data[base + 1]]) as u32;
-            let pair = b / 2;
-            if b % 2 == 0 {
-                d[pair * m + row] = scale_bits;
+
+    q[..blocks_per_row * 8 * m]
+        .par_chunks_mut(8 * m)
+        .enumerate()
+        .for_each(|(b, q_blk)| {
+            for row_base in (0..m).step_by(ROW_TILE) {
+                let row_end = (row_base + ROW_TILE).min(m);
+                for row in row_base..row_end {
+                    let base = (row * blocks_per_row + b) * 34;
+                    for w in 0..8 {
+                        let src = &data[base + 2 + w * 4..base + 2 + w * 4 + 4];
+                        q_blk[w * m + row] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                    }
+                }
+            }
+        });
+
+    d.par_chunks_mut(m).enumerate().for_each(|(pair, d_pair)| {
+        let b0 = pair * 2;
+        let b1 = b0 + 1;
+        for (row, out) in d_pair.iter_mut().enumerate() {
+            let base0 = (row * blocks_per_row + b0) * 34;
+            let s0 = u16::from_le_bytes([data[base0], data[base0 + 1]]) as u32;
+            let s1 = if b1 < blocks_per_row {
+                let base1 = base0 + 34;
+                u16::from_le_bytes([data[base1], data[base1 + 1]]) as u32
             } else {
-                d[pair * m + row] |= scale_bits << 16;
-            }
-            for w in 0..8 {
-                let src = &data[base + 2 + w * 4..base + 2 + w * 4 + 4];
-                q[(b * 8 + w) * m + row] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-            }
+                0
+            };
+            *out = s0 | (s1 << 16);
         }
-    }
+    });
+
     (q, d)
 }
 
@@ -947,6 +966,7 @@ pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, 
 /// LFM2.5-VL-1.6B's `ffn_down` with `k = 4304`).
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_f16_as_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    use crate::par::*;
     assert!(
         m > 0 && k > 0,
         "f16 streaming repack needs m > 0 and k > 0, got m={m}, k={k}"
@@ -956,47 +976,78 @@ pub(crate) fn repack_f16_as_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec
         m * k * 2,
         "f16 streaming repack: wrong byte count"
     );
+    const ROW_TILE: usize = 64;
     let k_pad = k.next_multiple_of(64);
     let blocks_per_row = k.div_ceil(32);
     let mut q = vec![0u32; m * k_pad / 4];
     let mut d = vec![0u32; m * (k_pad / 64)];
-    for row in 0..m {
-        let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
-        for b in 0..blocks_per_row {
-            let col_start = b * 32;
-            let valid = (k - col_start).min(32);
-            let mut block = [0.0f32; 32];
-            let mut amax = 0.0f32;
-            for (i, dst) in block[..valid].iter_mut().enumerate() {
-                let off = (col_start + i) * 2;
-                let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
-                let val = half::f16::from_bits(bits).to_f32();
-                *dst = val;
-                let a = val.abs();
-                if a > amax {
-                    amax = a;
-                }
-            }
-            let scale_f32 = amax / 127.0;
-            let scale_f16 = half::f16::from_f32(scale_f32);
-            let scale_bits = scale_f16.to_bits() as u32;
-            let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-            let pair = b / 2;
-            if b % 2 == 0 {
-                d[pair * m + row] = scale_bits;
-            } else {
-                d[pair * m + row] |= scale_bits << 16;
-            }
-            for w in 0..8 {
-                let mut bytes = [0u8; 4];
-                for j in 0..4 {
-                    let qi = (block[w * 4 + j] * inv_scale).round().clamp(-127.0, 127.0) as i8;
-                    bytes[j] = qi as u8;
-                }
-                q[(b * 8 + w) * m + row] = u32::from_le_bytes(bytes);
+
+    let block_amax = |row_bytes: &[u8], b: usize| -> f32 {
+        let col_start = b * 32;
+        let valid = (k - col_start).min(32);
+        let mut amax = 0.0f32;
+        for i in 0..valid {
+            let off = (col_start + i) * 2;
+            let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
+            let a = half::f16::from_bits(bits).to_f32().abs();
+            if a > amax {
+                amax = a;
             }
         }
-    }
+        amax
+    };
+
+    q[..blocks_per_row * 8 * m]
+        .par_chunks_mut(8 * m)
+        .enumerate()
+        .for_each(|(b, q_blk)| {
+            let col_start = b * 32;
+            let valid = (k - col_start).min(32);
+            for row_base in (0..m).step_by(ROW_TILE) {
+                let row_end = (row_base + ROW_TILE).min(m);
+                for row in row_base..row_end {
+                    let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
+                    let mut block = [0.0f32; 32];
+                    let mut amax = 0.0f32;
+                    for (i, dst) in block[..valid].iter_mut().enumerate() {
+                        let off = (col_start + i) * 2;
+                        let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
+                        let val = half::f16::from_bits(bits).to_f32();
+                        *dst = val;
+                        let a = val.abs();
+                        if a > amax {
+                            amax = a;
+                        }
+                    }
+                    let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    for w in 0..8 {
+                        let mut bytes = [0u8; 4];
+                        for j in 0..4 {
+                            let qi =
+                                (block[w * 4 + j] * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                            bytes[j] = qi as u8;
+                        }
+                        q_blk[w * m + row] = u32::from_le_bytes(bytes);
+                    }
+                }
+            }
+        });
+
+    d.par_chunks_mut(m).enumerate().for_each(|(pair, d_pair)| {
+        let b0 = pair * 2;
+        let b1 = b0 + 1;
+        for (row, out) in d_pair.iter_mut().enumerate() {
+            let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
+            let s0 = half::f16::from_f32(block_amax(row_bytes, b0) / 127.0).to_bits() as u32;
+            let s1 = if b1 < blocks_per_row {
+                half::f16::from_f32(block_amax(row_bytes, b1) / 127.0).to_bits() as u32
+            } else {
+                0
+            };
+            *out = s0 | (s1 << 16);
+        }
+    });
+
     (q, d)
 }
 
@@ -1319,6 +1370,7 @@ impl WgpuVitOps {
             Some((a, b, c, d, e, f)) => (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)),
             None => (None, None, None, None, None, None),
         };
+        ctx.save_pipeline_cache();
         Ok(Self {
             pending: Default::default(),
             param_cache: Default::default(),
@@ -2561,6 +2613,7 @@ pub trait VitStack: Send + Sync {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 struct StackBlock<O: VitGpuOps> {
@@ -2584,10 +2637,11 @@ struct StackBlock<O: VitGpuOps> {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
-struct GpuStack<O: VitGpuOps> {
-    ops: O,
+pub(crate) struct GpuStack<O: VitGpuOps> {
+    pub(crate) ops: O,
     width: usize,
     heads: usize,
     ffn: usize,
@@ -2600,6 +2654,7 @@ struct GpuStack<O: VitGpuOps> {
 #[cfg(any(
     feature = "gpu",
     feature = "hexagon",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 /// The caller-supplied public spec is enforced before uploading: a zero head count would
@@ -2684,10 +2739,11 @@ pub(crate) fn check_spec(spec: &VitStackSpec) -> Result<()> {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl<O: VitGpuOps> GpuStack<O> {
-    fn build(ops: O, spec: &VitStackSpec) -> Result<Self> {
+    pub(crate) fn build(ops: O, spec: &VitStackSpec) -> Result<Self> {
         check_spec(spec)?;
         if spec.activation == VitStackActivation::Relu {
             anyhow::ensure!(
@@ -2732,7 +2788,7 @@ impl<O: VitGpuOps> GpuStack<O> {
         })
     }
 
-    fn run(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
+    pub(crate) fn run(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
         let ops = &self.ops;
         let (d, ff) = (self.width, self.ffn);
         anyhow::ensure!(
@@ -2817,9 +2873,9 @@ impl VitStack for GpuStack<WgpuVitOps> {
     }
 }
 
-/// Upload `spec` to the GPU that `backend` names: `Metal`, `Gpu`, or `Auto` (Metal, then
-/// wgpu). Returns `None` for `Cpu`, `Hexagon`, and `Npu`, when the named feature is not
-/// compiled, or when no device could be opened.
+/// Upload `spec` to the device that `backend` names: `Metal`, `Gpu`, `Hexagon`, `Npu`
+/// (Hexagon then XDNA), or `Auto` (Metal, then Hexagon, then XDNA, then wgpu). Returns
+/// `None` for `Cpu`, when the named feature is not compiled, or when no device could be opened.
 pub fn build_vit_stack(
     spec: &VitStackSpec,
     backend: crate::engine::BackendPreference,
@@ -2830,16 +2886,20 @@ pub fn build_vit_stack(
         BP::Gpu => try_wgpu_stack(spec, false),
         BP::Auto => try_metal_stack(spec)
             .or_else(|| try_hexagon_stack(spec, MAX_VIT_TOKENS))
+            .or_else(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
             .or_else(|| try_wgpu_stack(spec, false)),
-        BP::Hexagon | BP::Npu => try_hexagon_stack(spec, MAX_VIT_TOKENS),
+        BP::Hexagon => try_hexagon_stack(spec, MAX_VIT_TOKENS),
+        BP::Npu => {
+            try_hexagon_stack(spec, MAX_VIT_TOKENS).or_else(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
+        }
         BP::Cpu => None,
     }
 }
 
-/// [`build_vit_stack`] for a stack that sees long sequences, which only pays on a GPU whose
-/// attention is fast: Metal, or wgpu where the adapter runs the register-tiled flash kernel
-/// (head_dim 64, see `crate::backend::wgpu::GpuContext::uses_flash_attention`). The scalar
-/// wgpu attention kernels are slower than the host's blocked kernel on a long sequence, so
+/// [`build_vit_stack`] for a stack that sees long sequences, which only pays on an accelerator
+/// whose attention or GEMM path is fast: Metal, Hexagon, XDNA, or wgpu where the adapter runs the
+/// register-tiled flash kernel (head_dim 64, see `crate::backend::wgpu::GpuContext::uses_flash_attention`).
+/// The scalar wgpu attention kernels are slower than the host's blocked kernel on a long sequence, so
 /// elsewhere this returns `None` and the caller stays on the host.
 pub fn build_vit_stack_fast(
     spec: &VitStackSpec,
@@ -2851,8 +2911,11 @@ pub fn build_vit_stack_fast(
         BP::Gpu => try_wgpu_stack(spec, true),
         BP::Auto => try_metal_stack(spec)
             .or_else(|| try_hexagon_stack(spec, LONG_STACK_ROWS))
+            .or_else(|| try_xdna_stack(spec, LONG_STACK_ROWS))
             .or_else(|| try_wgpu_stack(spec, true)),
-        BP::Hexagon | BP::Npu => try_hexagon_stack(spec, LONG_STACK_ROWS),
+        BP::Hexagon => try_hexagon_stack(spec, LONG_STACK_ROWS),
+        BP::Npu => try_hexagon_stack(spec, LONG_STACK_ROWS)
+            .or_else(|| try_xdna_stack(spec, LONG_STACK_ROWS)),
         BP::Cpu => None,
     }
 }
@@ -2863,9 +2926,10 @@ pub fn build_vit_stack_fast(
 /// (An absent device is ordinary Auto fallthrough and stays at debug at the call site.)
 #[cfg(any(
     feature = "gpu",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
-fn warn_stack_unavailable(what: &str, e: impl std::fmt::Display) {
+pub(crate) fn warn_stack_unavailable(what: &str, e: impl std::fmt::Display) {
     tracing::warn!("vit stack: {what} unavailable: {e:#}");
     eprintln!("vit stack: {what} unavailable: {e:#}");
 }
@@ -2894,6 +2958,16 @@ fn try_hexagon_stack(spec: &VitStackSpec, rows: usize) -> Option<std::sync::Arc<
 
 #[cfg(not(feature = "hexagon"))]
 fn try_hexagon_stack(_spec: &VitStackSpec, _rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
+}
+
+#[cfg(feature = "xdna")]
+fn try_xdna_stack(spec: &VitStackSpec, rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
+    crate::model::xdna_towers::try_xdna_vit_stack(spec, rows)
+}
+
+#[cfg(not(feature = "xdna"))]
+fn try_xdna_stack(_spec: &VitStackSpec, _rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
     None
 }
 
@@ -3002,30 +3076,30 @@ fn try_wgpu_stack(_spec: &VitStackSpec, _need_flash: bool) -> Option<std::sync::
 enum VisionEncoderAccel {
     Wgpu,
     Hexagon,
+    Xdna,
     Metal,
 }
 
 /// The accelerators to try for a vision encoder, in order. The LFM3 ViT (conv-gated blocks,
 /// temporal patch embedding, `lfm3_blocks`) has no accelerated implementation: the Hexagon
-/// encoder iterates `weights.blocks`, which is empty for it, so it would run zero blocks and
-/// return wrong embeddings with no error. It stays on the CPU.
+/// and XDNA encoders iterate `weights.blocks`, which is empty for it, so they would run zero
+/// blocks and return wrong embeddings with no error. It stays on the CPU.
 fn vision_encoder_candidates(
     is_lfm3: bool,
     backend: crate::engine::BackendPreference,
 ) -> &'static [VisionEncoderAccel] {
     use crate::engine::BackendPreference as BP;
-    use VisionEncoderAccel::{Hexagon, Metal, Wgpu};
+    use VisionEncoderAccel::{Hexagon, Metal, Wgpu, Xdna};
     if is_lfm3 {
         return &[];
     }
     match backend {
         BP::Cpu => &[],
-        // Hexagon is the only NPU with a vision encoder today; `Npu` takes the
-        // same path and gains other vendors here as they grow one.
-        BP::Hexagon | BP::Npu => &[Hexagon],
+        BP::Hexagon => &[Hexagon],
+        BP::Npu => &[Hexagon, Xdna],
         BP::Metal => &[Metal],
         BP::Gpu => &[Wgpu],
-        BP::Auto => &[Metal, Hexagon, Wgpu],
+        BP::Auto => &[Metal, Hexagon, Xdna, Wgpu],
     }
 }
 
@@ -3043,11 +3117,26 @@ fn try_hexagon_vision_encoder_for(
     None
 }
 
+#[cfg(feature = "xdna")]
+fn try_xdna_vision_encoder_for(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    crate::model::xdna_towers::try_xdna_vision_encoder(weights)
+}
+
+#[cfg(not(feature = "xdna"))]
+fn try_xdna_vision_encoder_for(
+    _weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    None
+}
+
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, for an LFM3 encoder (CPU only, see `vision_encoder_candidates`),
 /// when the chosen backend's feature isn't compiled,
 /// when the device/context can't be created, or (wgpu, native only) when the blank-image warm-up
-/// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
+/// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon,
+/// then XDNA, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
     backend: crate::engine::BackendPreference,
@@ -3061,6 +3150,7 @@ pub fn build_gpu_vision_encoder(
         .find_map(|accel| match accel {
             VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
             VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
+            VisionEncoderAccel::Xdna => try_xdna_vision_encoder_for(weights),
             VisionEncoderAccel::Metal => try_metal_vision_encoder(weights),
         })
 }
@@ -3247,12 +3337,17 @@ mod tests {
             &[
                 VisionEncoderAccel::Metal,
                 VisionEncoderAccel::Hexagon,
-                VisionEncoderAccel::Wgpu
+                VisionEncoderAccel::Xdna,
+                VisionEncoderAccel::Wgpu,
             ]
         );
         assert_eq!(
             vision_encoder_candidates(false, BP::Hexagon),
             &[VisionEncoderAccel::Hexagon]
+        );
+        assert_eq!(
+            vision_encoder_candidates(false, BP::Npu),
+            &[VisionEncoderAccel::Hexagon, VisionEncoderAccel::Xdna]
         );
         assert!(vision_encoder_candidates(false, BP::Cpu).is_empty());
     }

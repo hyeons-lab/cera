@@ -1,0 +1,2136 @@
+//! AMD XDNA2 NPU vision and audio encoder towers via the dense `gemm_bf16` IRON kernel.
+//!
+//! All dense `linear` projections (ViT QKV/O/FFN + pixel-shuffle projector, d1 head
+//! transformer stack + projector, Conformer QKV/P/O + macaron FFNs + conv pointwise +
+//! adapter MLP) execute on the 32-core AIE2P `gemm_bf16` array (`M_TILE=128`,
+//! `N_TILE=256`, `K=k_chunks*64`) batched with `XdnaRunList`. Non-linearities, layer
+//! norms, conv2d/1d stem + depthwise passes, attention softmax/PV, and STFT/mel
+//! reductions run on the host using the crate's SIMD/CPU primitives (`dot_f32`,
+//! `layer_norm_inplace`, `gelu_inplace`, `gelu_erf_inplace`, `relu_inplace`,
+//! `silu_inplace`, `softmax_inplace`, `add_inplace`, `axpy_inplace`, `glu_split`).
+//!
+//! Because `VitGpuOps` and `AudioEncoderGpuOps` methods return buffers directly rather
+//! than `Result`, NPU allocation, sync, or execution errors are recorded into the
+//! runner's fault slot (`last_err`) and surfaced as `Err(...)` at the surrounding
+//! fallible boundary (`build`, `encode_image`, `encode_pcm`, `encode_mel`, `run`,
+//! `run_projector`), matching the Metal/wgpu fault discipline.
+
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use rustfft::FftPlanner;
+use rustfft::num_complex::Complex32;
+
+use crate::backend::cpu::{
+    add_inplace, axpy_inplace, dot_f32, gelu_erf_inplace, gelu_inplace, glu_split,
+    layer_norm_inplace, relu_inplace, silu_inplace, softmax_inplace,
+};
+use crate::backend::xdna::device::{XdnaBo, XdnaDevice, XdnaKernel, XdnaRun};
+use crate::backend::xdna::kernels::{
+    GEMM_BF16_BUCKETS, GEMM_BF16_K_CHUNK, GEMM_BF16_M_TILE, GEMM_BF16_N_TILE, GEMM_BF16_XCLBIN,
+};
+use crate::backend::xdna::repack::{
+    f32_to_bf16, gemm_bf16_bucket_chunks, pack_gemm_bf16_f32_slice, pack_gemm_bf16_weight_slice,
+};
+use crate::model::audio_encoder::{
+    AudioEncoderWeights, HOP_LEN, LOG_MEL_EPS, N_FFT, NORM_VAR_EPS, PREEMPH,
+};
+use crate::model::audio_encoder_gpu::{
+    AudioEncoderGpuOps, AudioGpuEncode, Conv2dSpec, GpuAudioWeights, encode_audio_mel_gpu,
+    encode_audio_pcm_gpu,
+};
+use crate::model::audio_preprocessor::N_FFT_BINS;
+use crate::model::vision_encoder::VisionEncoderWeights;
+use crate::model::vision_encoder_gpu::{
+    GpuStack, GpuVitWeights, LONG_STACK_ROWS, MAX_VIT_TOKENS, VisionGpuEncode, VitGpuOps, VitStack,
+    VitStackSpec, encode_image_gpu, warn_stack_unavailable,
+};
+use crate::model::weights::MmapWeight;
+
+/// Runlist wait timeout for tower GEMM dispatches (`ms`).
+const GEMM_WAIT_TIMEOUT_MS: u32 = 30_000;
+/// Maximum `K` per single `gemm_bf16` invocation (`128 * 64 = 8192`).
+const MAX_K_SLICE: usize = 128 * GEMM_BF16_K_CHUNK;
+/// Byte size of one `C` output tile (`128 x 256` f32).
+const C_TILE_BYTES: usize = GEMM_BF16_M_TILE * GEMM_BF16_N_TILE * std::mem::size_of::<f32>();
+/// Byte size of the `gemm_bf16` runtime header packet BO (`1024 x u32` = `4096 B`).
+const P_BO_BYTES: usize = 4096;
+
+/// Host buffer handle backing [`VitGpuOps::Buf`] and [`AudioEncoderGpuOps::Buf`].
+pub struct XdnaBuf(Arc<Mutex<Vec<f32>>>);
+
+impl XdnaBuf {
+    fn from_vec(v: Vec<f32>) -> Self {
+        Self(Arc::new(Mutex::new(v)))
+    }
+
+    fn zeroed(len: usize) -> Self {
+        Self::from_vec(vec![0.0; len])
+    }
+
+    fn read_clone(&self, len: usize) -> Vec<f32> {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let copy_len = len.min(g.len());
+        g[..copy_len].to_vec()
+    }
+}
+
+/// Wrapper for static weight BOs synced once during upload and read under lock.
+struct SendSyncBo(XdnaBo);
+
+// SAFETY: `XdnaBo` wraps an XRT buffer object handle. A static weight BO is written
+// and synced to the device during upload, then only referenced read-only inside
+// `XdnaGemmRunner`'s mutex while launching `gemm_bf16` runs.
+unsafe impl Send for SendSyncBo {}
+// SAFETY: Shared read-only reference access (`&XdnaGemmWeight`) never mutates the BO.
+unsafe impl Sync for SendSyncBo {}
+
+/// One K-slice `[k_start .. k_start + k_len]` of a linear weight matrix `[out_dim, in_dim]`.
+struct WeightKSlice {
+    k_start: usize,
+    k_len: usize,
+    k_chunks: usize,
+    tiles: Vec<SendSyncBo>,
+}
+
+/// Linear weight matrix `[out_dim, in_dim]` pre-packed into `gemm_bf16` BO tiles.
+pub struct XdnaGemmWeight {
+    out_dim: usize,
+    in_dim: usize,
+    k_slices: Vec<WeightKSlice>,
+}
+
+struct BucketSlot {
+    kernel: XdnaKernel,
+    p_bo: XdnaBo,
+    a_pool: Vec<XdnaBo>,
+    c_pool: Vec<XdnaBo>,
+}
+
+struct XdnaGemmInner {
+    /// One slot per entry in [`GEMM_BF16_BUCKETS`], populated lazily after probing bucket 0.
+    buckets: Vec<Option<BucketSlot>>,
+    device: XdnaDevice,
+}
+
+// SAFETY: All fields of `XdnaGemmInner` (including XRT device/kernel/BO pointers)
+// are serialized behind `XdnaGemmRunner::inner: Mutex<XdnaGemmInner>`, and BOs/kernels
+// precede `device` in struct declaration order so Rust drops children before `device`.
+unsafe impl Send for XdnaGemmInner {}
+// SAFETY: Access only occurs while holding `XdnaGemmRunner::inner`.
+unsafe impl Sync for XdnaGemmInner {}
+
+/// Shared `gemm_bf16` XDNA2 NPU executor used by the vision and audio towers.
+#[derive(Clone)]
+pub struct XdnaGemmRunner {
+    inner: Arc<Mutex<XdnaGemmInner>>,
+    last_err: Arc<Mutex<Option<anyhow::Error>>>,
+}
+
+impl XdnaGemmRunner {
+    fn load_bucket(device: &XdnaDevice, idx: usize) -> Result<BucketSlot> {
+        let (k_chunks, inst_bytes) = GEMM_BF16_BUCKETS[idx];
+        let words = bytes_to_u32_words(inst_bytes);
+        let kernel = device
+            .load_kernel(GEMM_BF16_XCLBIN, &words)
+            .map_err(|e| anyhow::anyhow!("load gemm_bf16 kernel (k_chunks={k_chunks}): {e}"))?;
+        let mut p_bo = kernel
+            .alloc_bo(P_BO_BYTES, 6)
+            .map_err(|e| anyhow::anyhow!("alloc gemm_bf16 param BO (k_chunks={k_chunks}): {e}"))?;
+        let p_bytes = p_bo.as_mut_slice();
+        p_bytes.fill(0);
+        p_bytes[..4].copy_from_slice(&(k_chunks as u32).to_le_bytes());
+        p_bo.sync_to_device()
+            .map_err(|e| anyhow::anyhow!("sync gemm_bf16 param BO (k_chunks={k_chunks}): {e}"))?;
+        Ok(BucketSlot {
+            kernel,
+            p_bo,
+            a_pool: Vec::new(),
+            c_pool: Vec::new(),
+        })
+    }
+
+    /// Open XRT device 0 and validate `gemm_bf16.xclbin` by loading its smallest bucket.
+    pub fn open() -> Result<Self> {
+        let device = XdnaDevice::open(0).map_err(|e| anyhow::anyhow!("open XDNA device: {e}"))?;
+        let mut buckets: Vec<Option<BucketSlot>> =
+            (0..GEMM_BF16_BUCKETS.len()).map(|_| None).collect();
+        buckets[0] = Some(Self::load_bucket(&device, 0)?);
+        Ok(Self {
+            inner: Arc::new(Mutex::new(XdnaGemmInner { buckets, device })),
+            last_err: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn record_err(&self, err: anyhow::Error) {
+        let mut slot = self.last_err.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    }
+
+    /// Take and clear the first recorded NPU fault, if any.
+    pub fn take_err(&self) -> Option<anyhow::Error> {
+        self.last_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// Ensure the bucket slot for `k_chunks` is loaded and return its mutable reference.
+    fn bucket_mut(inner: &mut XdnaGemmInner, k_chunks: usize) -> Result<&mut BucketSlot> {
+        let idx = GEMM_BF16_BUCKETS
+            .iter()
+            .position(|&(c, _)| c == k_chunks)
+            .ok_or_else(|| anyhow::anyhow!("unsupported gemm_bf16 k_chunks={k_chunks}"))?;
+        if inner.buckets[idx].is_none() {
+            inner.buckets[idx] = Some(Self::load_bucket(&inner.device, idx)?);
+        }
+        Ok(inner.buckets[idx]
+            .as_mut()
+            .expect("bucket populated immediately above"))
+    }
+
+    fn upload_weight_with(
+        &self,
+        out_dim: usize,
+        in_dim: usize,
+        fill_tile: impl Fn(&mut [u8], usize, usize, usize, usize),
+    ) -> Result<XdnaGemmWeight> {
+        if out_dim == 0 || in_dim == 0 {
+            return Ok(XdnaGemmWeight {
+                out_dim,
+                in_dim,
+                k_slices: Vec::new(),
+            });
+        }
+        let n_tiles = out_dim.div_ceil(GEMM_BF16_N_TILE);
+        let mut k_slices = Vec::with_capacity(in_dim.div_ceil(MAX_K_SLICE));
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut k_start = 0;
+        while k_start < in_dim {
+            let k_len = (in_dim - k_start).min(MAX_K_SLICE);
+            let k_chunks = gemm_bf16_bucket_chunks(k_len);
+            let b_bytes =
+                GEMM_BF16_N_TILE * k_chunks * GEMM_BF16_K_CHUNK * std::mem::size_of::<u16>();
+            let bucket = Self::bucket_mut(&mut inner, k_chunks)?;
+            let mut tiles = Vec::with_capacity(n_tiles);
+            for nt in 0..n_tiles {
+                let row_start = nt * GEMM_BF16_N_TILE;
+                let mut bo = bucket
+                    .kernel
+                    .alloc_bo(b_bytes, 4)
+                    .map_err(|e| anyhow::anyhow!("alloc weight BO: {e}"))?;
+                fill_tile(bo.as_mut_slice(), row_start, k_start, k_len, k_chunks);
+                bo.sync_to_device()
+                    .map_err(|e| anyhow::anyhow!("sync weight BO: {e}"))?;
+                tiles.push(SendSyncBo(bo));
+            }
+            k_slices.push(WeightKSlice {
+                k_start,
+                k_len,
+                k_chunks,
+                tiles,
+            });
+            k_start += k_len;
+        }
+        Ok(XdnaGemmWeight {
+            out_dim,
+            in_dim,
+            k_slices,
+        })
+    }
+
+    /// Pack and upload an [`MmapWeight`] `[out_dim, in_dim]` into `gemm_bf16` BO tiles.
+    pub fn upload_mmap_weight(&self, w: &MmapWeight) -> Result<XdnaGemmWeight> {
+        self.upload_weight_with(
+            w.rows,
+            w.cols,
+            |dst, row_start, k_start, k_len, k_chunks| {
+                pack_gemm_bf16_weight_slice(dst, w, row_start, k_start, k_len, k_chunks);
+            },
+        )
+    }
+
+    /// Pack and upload a dense `f32` matrix `[out_dim, in_dim]` into `gemm_bf16` BO tiles.
+    pub fn upload_f32_weight(
+        &self,
+        data: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<XdnaGemmWeight> {
+        anyhow::ensure!(
+            data.len() == out_dim * in_dim,
+            "gemm_bf16 weight length {} != {out_dim} * {in_dim}",
+            data.len()
+        );
+        self.upload_weight_with(
+            out_dim,
+            in_dim,
+            |dst, row_start, k_start, k_len, k_chunks| {
+                pack_gemm_bf16_f32_slice(
+                    dst, data, out_dim, in_dim, row_start, k_start, k_len, k_chunks,
+                );
+            },
+        )
+    }
+
+    /// Execute `Y[rows, out_dim] = X[rows, in_dim] @ W[out_dim, in_dim]^T` on XDNA2.
+    pub fn matmul_f32(
+        &self,
+        x: &[f32],
+        w: &XdnaGemmWeight,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            out_dim == w.out_dim && in_dim == w.in_dim,
+            "gemm_bf16 weight shape [{}, {}] does not match linear [{out_dim}, {in_dim}]",
+            w.out_dim,
+            w.in_dim
+        );
+        anyhow::ensure!(
+            x.len() >= rows * in_dim,
+            "gemm_bf16 input length {} < {rows} * {in_dim}",
+            x.len()
+        );
+        let mut out = vec![0.0f32; rows * out_dim];
+        if rows == 0 || out_dim == 0 || in_dim == 0 || w.k_slices.is_empty() {
+            return Ok(out);
+        }
+
+        let m_tiles = rows.div_ceil(GEMM_BF16_M_TILE);
+        let n_tiles = out_dim.div_ceil(GEMM_BF16_N_TILE);
+        let total_tiles = m_tiles * n_tiles;
+
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (slice_idx, slice) in w.k_slices.iter().enumerate() {
+            let bucket = Self::bucket_mut(&mut inner, slice.k_chunks)?;
+            let k_pad = slice.k_chunks * GEMM_BF16_K_CHUNK;
+            let a_tile_bytes = GEMM_BF16_M_TILE * k_pad * std::mem::size_of::<u16>();
+
+            while bucket.a_pool.len() < m_tiles {
+                let bo = bucket
+                    .kernel
+                    .alloc_bo(a_tile_bytes, 3)
+                    .map_err(|e| anyhow::anyhow!("alloc activation BO: {e}"))?;
+                bucket.a_pool.push(bo);
+            }
+            while bucket.c_pool.len() < total_tiles {
+                let bo = bucket
+                    .kernel
+                    .alloc_bo(C_TILE_BYTES, 5)
+                    .map_err(|e| anyhow::anyhow!("alloc output BO: {e}"))?;
+                bucket.c_pool.push(bo);
+            }
+
+            // Pack and sync each M_TILE=128 strip of A once, reused across N_TILEs.
+            for mt in 0..m_tiles {
+                let r_start = mt * GEMM_BF16_M_TILE;
+                let r_count = (rows - r_start).min(GEMM_BF16_M_TILE);
+                pack_activation_tile(
+                    bucket.a_pool[mt].as_mut_slice(),
+                    x,
+                    in_dim,
+                    r_start,
+                    r_count,
+                    slice.k_start,
+                    slice.k_len,
+                    k_pad,
+                );
+                bucket.a_pool[mt]
+                    .sync_to_device()
+                    .map_err(|e| anyhow::anyhow!("sync activation BO: {e}"))?;
+            }
+
+            // Submit all (m_tile, n_tile) tiles in one ordered runlist batch.
+            {
+                let mut runlist = bucket
+                    .kernel
+                    .create_runlist()
+                    .map_err(|e| anyhow::anyhow!("create gemm_bf16 runlist: {e}"))?;
+                let mut runs: Vec<XdnaRun> = Vec::with_capacity(total_tiles);
+                for mt in 0..m_tiles {
+                    for nt in 0..n_tiles {
+                        let c_idx = mt * n_tiles + nt;
+                        let run = bucket
+                            .kernel
+                            .create_run(&[
+                                &bucket.a_pool[mt],
+                                &slice.tiles[nt].0,
+                                &bucket.c_pool[c_idx],
+                                &bucket.p_bo,
+                            ])
+                            .map_err(|e| anyhow::anyhow!("create gemm_bf16 run: {e}"))?;
+                        runlist
+                            .add(&run)
+                            .map_err(|e| anyhow::anyhow!("add gemm_bf16 run: {e}"))?;
+                        runs.push(run);
+                    }
+                }
+                runlist
+                    .execute()
+                    .map_err(|e| anyhow::anyhow!("execute gemm_bf16 runlist: {e}"))?;
+                runlist
+                    .wait(GEMM_WAIT_TIMEOUT_MS)
+                    .map_err(|e| anyhow::anyhow!("wait gemm_bf16 runlist: {e}"))?;
+                // Drop `runlist` before `runs`, and `runs` before reading/syncing `c_pool`.
+                drop(runlist);
+                drop(runs);
+            }
+
+            // Read back output tiles and unpack valid [r_count, n_count] regions.
+            let accumulate = slice_idx > 0;
+            for mt in 0..m_tiles {
+                let r_start = mt * GEMM_BF16_M_TILE;
+                let r_count = (rows - r_start).min(GEMM_BF16_M_TILE);
+                for nt in 0..n_tiles {
+                    let c_idx = mt * n_tiles + nt;
+                    let bo_c = &mut bucket.c_pool[c_idx];
+                    bo_c.sync_from_device()
+                        .map_err(|e| anyhow::anyhow!("sync output BO: {e}"))?;
+                    let c_start = nt * GEMM_BF16_N_TILE;
+                    let c_count = (out_dim - c_start).min(GEMM_BF16_N_TILE);
+                    unpack_output_tile(
+                        bo_c.as_slice(),
+                        &mut out,
+                        out_dim,
+                        r_start,
+                        r_count,
+                        c_start,
+                        c_count,
+                        accumulate,
+                    );
+                }
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+fn bytes_to_u32_words(bytes: &[u8]) -> Vec<u32> {
+    debug_assert!(bytes.len().is_multiple_of(4));
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_le_bytes)
+        .collect()
+}
+
+/// Pack `[r_count, k_len]` f32 activation strip into row-major `[128, k_pad]` bf16 bytes.
+#[allow(clippy::too_many_arguments)]
+fn pack_activation_tile(
+    dst_bytes: &mut [u8],
+    x: &[f32],
+    stride_k: usize,
+    r_start: usize,
+    r_count: usize,
+    k_start: usize,
+    k_len: usize,
+    k_pad: usize,
+) {
+    dst_bytes.fill(0);
+    for r in 0..r_count {
+        let src_row =
+            &x[(r_start + r) * stride_k + k_start..(r_start + r) * stride_k + k_start + k_len];
+        let dst_row_off = r * k_pad * 2;
+        for (k, &v) in src_row.iter().enumerate() {
+            let le = f32_to_bf16(v).to_le_bytes();
+            dst_bytes[dst_row_off + k * 2] = le[0];
+            dst_bytes[dst_row_off + k * 2 + 1] = le[1];
+        }
+    }
+}
+
+/// Copy (or accumulate for split-K) `[r_count, c_count]` from `[128, 256]` f32 BO bytes.
+#[allow(clippy::too_many_arguments)]
+fn unpack_output_tile(
+    src_bytes: &[u8],
+    out: &mut [f32],
+    out_dim: usize,
+    r_start: usize,
+    r_count: usize,
+    c_start: usize,
+    c_count: usize,
+    accumulate: bool,
+) {
+    for r in 0..r_count {
+        let src_row_off = r * GEMM_BF16_N_TILE * 4;
+        let dst_row = &mut out
+            [(r_start + r) * out_dim + c_start..(r_start + r) * out_dim + c_start + c_count];
+        for (c, dst_val) in dst_row.iter_mut().enumerate() {
+            let off = src_row_off + c * 4;
+            let val = f32::from_le_bytes([
+                src_bytes[off],
+                src_bytes[off + 1],
+                src_bytes[off + 2],
+                src_bytes[off + 3],
+            ]);
+            if accumulate {
+                *dst_val += val;
+            } else {
+                *dst_val = val;
+            }
+        }
+    }
+}
+
+/// Hybrid parallel helper: uses `rayon` when compiled with `parallel`, sequential otherwise.
+fn maybe_par_for(count: usize, f: impl Fn(usize) + Sync + Send) {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        (0..count).into_par_iter().for_each(f);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for idx in 0..count {
+            f(idx);
+        }
+    }
+}
+
+/// XDNA implementation of [`VitGpuOps`].
+pub struct XdnaVitOps {
+    runner: XdnaGemmRunner,
+    attn_limit: usize,
+}
+
+impl XdnaVitOps {
+    /// Create vision ops backed by an open [`XdnaGemmRunner`].
+    pub fn new(runner: XdnaGemmRunner) -> Self {
+        Self {
+            runner,
+            attn_limit: LONG_STACK_ROWS.max(MAX_VIT_TOKENS),
+        }
+    }
+
+    /// Override the attention sequence length cap advertised through [`VitGpuOps`].
+    pub fn with_attention_limit(mut self, limit: usize) -> Self {
+        self.attn_limit = limit;
+        self
+    }
+
+    /// Drain any fault captured during non-fallible [`VitGpuOps`] calls.
+    pub fn take_err(&self) -> Option<anyhow::Error> {
+        self.runner.take_err()
+    }
+}
+
+impl VitGpuOps for XdnaVitOps {
+    type Buf = XdnaBuf;
+    type Weight = XdnaGemmWeight;
+
+    fn upload(&self, data: &[f32]) -> Self::Buf {
+        XdnaBuf::from_vec(data.to_vec())
+    }
+
+    fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
+        buf.read_clone(len)
+    }
+
+    fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
+        match self.runner.upload_mmap_weight(w) {
+            Ok(packed) => packed,
+            Err(e) => {
+                let out_dim = w.rows;
+                let in_dim = w.cols;
+                self.runner.record_err(e);
+                XdnaGemmWeight {
+                    out_dim,
+                    in_dim,
+                    k_slices: Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn upload_weight_f32(&self, data: &[f32], out_dim: usize, in_dim: usize) -> Self::Weight {
+        match self.runner.upload_f32_weight(data, out_dim, in_dim) {
+            Ok(packed) => packed,
+            Err(e) => {
+                self.runner.record_err(e);
+                XdnaGemmWeight {
+                    out_dim,
+                    in_dim,
+                    k_slices: Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn linear(
+        &self,
+        x: &Self::Buf,
+        w: &Self::Weight,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Self::Buf {
+        let x_data = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        match self.runner.matmul_f32(&x_data, w, rows, out_dim, in_dim) {
+            Ok(out) => XdnaBuf::from_vec(out),
+            Err(e) => {
+                self.runner.record_err(e);
+                XdnaBuf::zeroed(rows * out_dim)
+            }
+        }
+    }
+
+    fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
+        let b = bias.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        for row in d[..rows * dim].chunks_exact_mut(dim) {
+            add_inplace(row, &b[..dim]);
+        }
+    }
+
+    fn layernorm(
+        &self,
+        src: &Self::Buf,
+        weight: &Self::Buf,
+        bias: &Self::Buf,
+        eps: f32,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buf {
+        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+        let w = weight.0.lock().unwrap_or_else(|e| e.into_inner());
+        let b = bias.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = s[..rows * dim].to_vec();
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            out.par_chunks_exact_mut(dim).for_each(|row| {
+                layer_norm_inplace(row, &w[..dim], &b[..dim], eps);
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for row in out.chunks_exact_mut(dim) {
+                layer_norm_inplace(row, &w[..dim], &b[..dim], eps);
+            }
+        }
+        XdnaBuf::from_vec(out)
+    }
+
+    fn gelu(&self, x: &Self::Buf, len: usize) {
+        let mut d = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        gelu_inplace(&mut d[..len]);
+    }
+
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        let mut d = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        relu_inplace(&mut d[..len]);
+    }
+
+    fn supports_relu(&self) -> bool {
+        true
+    }
+
+    fn attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        tokens: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Self::Buf {
+        let dim = n_head * head_dim;
+        if tokens == 0 || dim == 0 {
+            return XdnaBuf::zeroed(tokens * dim);
+        }
+        let q_vec = q.read_clone(tokens * dim);
+        let k_vec = k.read_clone(tokens * dim);
+        let v_vec = v.read_clone(tokens * dim);
+
+        // Rearrange to `[n_head, tokens, head_dim]` so `dot_f32` and the value
+        // accumulation sweep contiguous `[head_dim]` slices per key token.
+        let head_stride = tokens * head_dim;
+        let mut k_hm = vec![0.0f32; n_head * head_stride];
+        let mut v_hm = vec![0.0f32; n_head * head_stride];
+        for t in 0..tokens {
+            for h in 0..n_head {
+                let src = t * dim + h * head_dim;
+                let dst = h * head_stride + t * head_dim;
+                k_hm[dst..dst + head_dim].copy_from_slice(&k_vec[src..src + head_dim]);
+                v_hm[dst..dst + head_dim].copy_from_slice(&v_vec[src..src + head_dim]);
+            }
+        }
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut out_hm = vec![0.0f32; n_head * head_stride];
+        let out_hm_ptr = out_hm.as_mut_ptr() as usize;
+
+        maybe_par_for(n_head, |h| {
+            let k_head = &k_hm[h * head_stride..(h + 1) * head_stride];
+            let v_head = &v_hm[h * head_stride..(h + 1) * head_stride];
+            let mut scores = vec![0.0f32; tokens];
+            // SAFETY: distinct heads write disjoint `[h * head_stride .. (h+1) * head_stride]` slices.
+            let out_head = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (out_hm_ptr as *mut f32).add(h * head_stride),
+                    head_stride,
+                )
+            };
+            for qt in 0..tokens {
+                let q_row = &q_vec[qt * dim + h * head_dim..qt * dim + (h + 1) * head_dim];
+                for kt in 0..tokens {
+                    let k_row = &k_head[kt * head_dim..(kt + 1) * head_dim];
+                    scores[kt] = dot_f32(q_row, k_row) * scale;
+                }
+                softmax_inplace(&mut scores);
+                let out_row = &mut out_head[qt * head_dim..(qt + 1) * head_dim];
+                out_row.fill(0.0);
+                for kt in 0..tokens {
+                    axpy_inplace(
+                        out_row,
+                        &v_head[kt * head_dim..(kt + 1) * head_dim],
+                        scores[kt],
+                    );
+                }
+            }
+        });
+
+        let mut out = vec![0.0f32; tokens * dim];
+        for t in 0..tokens {
+            for h in 0..n_head {
+                let src = h * head_stride + t * head_dim;
+                let dst = t * dim + h * head_dim;
+                out[dst..dst + head_dim].copy_from_slice(&out_hm[src..src + head_dim]);
+            }
+        }
+        XdnaBuf::from_vec(out)
+    }
+
+    fn attention_token_limit(&self, _head_dim: usize) -> usize {
+        self.attn_limit
+    }
+
+    fn max_rows(&self) -> usize {
+        usize::MAX
+    }
+
+    fn max_buffer_bytes(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
+        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
+        add_inplace(&mut d[..len], &s[..len]);
+    }
+}
+
+/// XDNA implementation of [`VitStack::run`], forwarding through [`GpuStack<XdnaVitOps>`].
+impl VitStack for GpuStack<XdnaVitOps> {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let _ = self.ops.take_err();
+        let out = GpuStack::run(self, x, tokens)?;
+        if let Some(e) = self.ops.take_err() {
+            return Err(e);
+        }
+        Ok(out)
+    }
+}
+
+struct XdnaProjector {
+    in_dim: usize,
+    inter_dim: usize,
+    out_dim: usize,
+    mm1_w: XdnaGemmWeight,
+    mm1_b: XdnaBuf,
+    mm2_w: XdnaGemmWeight,
+    mm2_b: XdnaBuf,
+}
+
+/// [`VitStack`] on AMD XDNA2: block stack + optional two-layer exact-GELU projector.
+pub struct XdnaVitStack {
+    stack: GpuStack<XdnaVitOps>,
+    projector: Option<XdnaProjector>,
+    run_lock: Mutex<()>,
+}
+
+impl XdnaVitStack {
+    /// Build an XDNA transformer stack (and optional projector) from `spec`.
+    pub fn build(runner: XdnaGemmRunner, spec: &VitStackSpec, max_rows: usize) -> Result<Self> {
+        let ops = XdnaVitOps::new(runner).with_attention_limit(max_rows);
+        let _ = ops.take_err();
+        let stack = GpuStack::build(ops, spec)?;
+        if let Some(e) = stack.ops.take_err() {
+            return Err(e);
+        }
+
+        let projector = if let Some(proj) = &spec.projector {
+            anyhow::ensure!(
+                proj.mm1_b.len() == proj.mm1.rows
+                    && proj.mm2.cols == proj.mm1.rows
+                    && proj.mm2_b.len() == proj.mm2.rows,
+                "vit stack projector dimensions disagree (mm1 [{}x{}] / bias {}, mm2 [{}x{}] / bias {})",
+                proj.mm1.rows,
+                proj.mm1.cols,
+                proj.mm1_b.len(),
+                proj.mm2.rows,
+                proj.mm2.cols,
+                proj.mm2_b.len(),
+            );
+            let mm1_w = stack.ops.runner.upload_mmap_weight(&proj.mm1)?;
+            let mm1_b = stack.ops.upload(&proj.mm1_b);
+            let mm2_w = stack.ops.runner.upload_mmap_weight(&proj.mm2)?;
+            let mm2_b = stack.ops.upload(&proj.mm2_b);
+            Some(XdnaProjector {
+                in_dim: proj.mm1.cols,
+                inter_dim: proj.mm1.rows,
+                out_dim: proj.mm2.rows,
+                mm1_w,
+                mm1_b,
+                mm2_w,
+                mm2_b,
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            stack,
+            projector,
+            run_lock: Mutex::new(()),
+        })
+    }
+}
+
+impl VitStack for XdnaVitStack {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let _serial = self.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+        VitStack::run(&self.stack, x, tokens)
+    }
+
+    fn run_projector(&self, pooled: &[f32]) -> Result<Option<Vec<f32>>> {
+        let Some(proj) = &self.projector else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            proj.in_dim > 0 && pooled.len().is_multiple_of(proj.in_dim),
+            "vit projector input length {} is not a multiple of width {}",
+            pooled.len(),
+            proj.in_dim
+        );
+        let rows = pooled.len() / proj.in_dim;
+        if rows == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let _serial = self.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.stack.ops.take_err();
+        let x = self.stack.ops.upload(pooled);
+        let mid = self
+            .stack
+            .ops
+            .linear(&x, &proj.mm1_w, rows, proj.inter_dim, proj.in_dim);
+        self.stack
+            .ops
+            .bias_add(&mid, &proj.mm1_b, rows, proj.inter_dim);
+        {
+            let mut d = mid.0.lock().unwrap_or_else(|e| e.into_inner());
+            gelu_erf_inplace(&mut d[..rows * proj.inter_dim]);
+        }
+        let out = self
+            .stack
+            .ops
+            .linear(&mid, &proj.mm2_w, rows, proj.out_dim, proj.inter_dim);
+        self.stack
+            .ops
+            .bias_add(&out, &proj.mm2_b, rows, proj.out_dim);
+        let res = self.stack.ops.download(&out, rows * proj.out_dim);
+        if let Some(e) = self.stack.ops.take_err() {
+            return Err(e);
+        }
+        Ok(Some(res))
+    }
+}
+
+struct XdnaVisionEncoder {
+    ops: XdnaVitOps,
+    weights: GpuVitWeights<XdnaVitOps>,
+    encode_lock: Mutex<()>,
+}
+
+impl VisionGpuEncode for XdnaVisionEncoder {
+    fn backend_label(&self) -> &'static str {
+        "xdna"
+    }
+
+    fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.ops.take_err();
+        let out = encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)?;
+        if let Some(e) = self.ops.take_err() {
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    fn encode_image_async<'a>(
+        &'a self,
+        pixels: &'a [f32],
+        grid_w: usize,
+        grid_h: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(async move { self.encode_image(pixels, grid_w, grid_h) })
+    }
+}
+
+/// Build an XDNA [`VitStack`] for `spec`, returning `None` if XRT/NPU is unavailable.
+pub(crate) fn try_xdna_vit_stack(
+    spec: &VitStackSpec,
+    max_rows: usize,
+) -> Option<Arc<dyn VitStack>> {
+    let runner = match XdnaGemmRunner::open() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("vit stack: XDNA backend unavailable ({e:#}); falling back");
+            return None;
+        }
+    };
+    match XdnaVitStack::build(runner, spec, max_rows) {
+        Ok(stack) => {
+            tracing::info!("vit stack: using AMD XDNA2 NPU backend");
+            Some(Arc::new(stack))
+        }
+        Err(e) => {
+            warn_stack_unavailable("XDNA stack spec", e);
+            None
+        }
+    }
+}
+
+/// Build an XDNA [`VisionGpuEncode`] for `weights`, returning `None` if unavailable.
+pub(crate) fn try_xdna_vision_encoder(
+    weights: &VisionEncoderWeights,
+) -> Option<Arc<dyn VisionGpuEncode>> {
+    if weights.config.projector_type.is_lfm3() {
+        return None;
+    }
+    let runner = match XdnaGemmRunner::open() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("vision encoder: XDNA backend unavailable ({e:#}); falling back");
+            return None;
+        }
+    };
+    let ops = XdnaVitOps::new(runner);
+    let _ = ops.take_err();
+    let gpu_w = GpuVitWeights::build(&ops, weights);
+    if let Some(e) = ops.take_err() {
+        tracing::warn!("vision encoder: XDNA weight upload failed, falling back: {e:#}");
+        eprintln!("vision encoder: XDNA weight upload failed, falling back: {e:#}");
+        return None;
+    }
+    tracing::info!("vision encoder: using AMD XDNA2 NPU backend");
+    Some(Arc::new(XdnaVisionEncoder {
+        ops,
+        weights: gpu_w,
+        encode_lock: Mutex::new(()),
+    }))
+}
+
+/// XDNA implementation of [`AudioEncoderGpuOps`].
+pub struct XdnaAudioOps {
+    vit: XdnaVitOps,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+}
+
+impl XdnaAudioOps {
+    /// Create audio encoder ops backed by an open [`XdnaGemmRunner`].
+    pub fn new(runner: XdnaGemmRunner) -> Self {
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(N_FFT);
+        Self {
+            vit: XdnaVitOps::new(runner),
+            fft,
+        }
+    }
+
+    fn take_err(&self) -> Option<anyhow::Error> {
+        self.vit.take_err()
+    }
+}
+
+impl AudioEncoderGpuOps for XdnaAudioOps {
+    type Buf = XdnaBuf;
+    type Weight = XdnaGemmWeight;
+
+    fn upload(&self, data: &[f32]) -> Self::Buf {
+        self.vit.upload(data)
+    }
+
+    fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
+        self.vit.download(buf, len)
+    }
+
+    fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
+        self.vit.upload_weight(w)
+    }
+
+    fn linear(
+        &self,
+        x: &Self::Buf,
+        w: &Self::Weight,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Self::Buf {
+        self.vit.linear(x, w, rows, out_dim, in_dim)
+    }
+
+    fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
+        self.vit.bias_add(x, bias, rows, dim);
+    }
+
+    fn layernorm(
+        &self,
+        src: &Self::Buf,
+        weight: &Self::Buf,
+        bias: &Self::Buf,
+        eps: f32,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buf {
+        self.vit.layernorm(src, weight, bias, eps, rows, dim)
+    }
+
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        self.vit.relu(x, len);
+    }
+
+    fn silu(&self, x: &Self::Buf, len: usize) {
+        let mut d = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        silu_inplace(&mut d[..len]);
+    }
+
+    fn gelu_erf(&self, x: &Self::Buf, len: usize) {
+        let mut d = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        gelu_erf_inplace(&mut d[..len]);
+    }
+
+    fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
+        self.vit.add(dst, src, len);
+    }
+
+    fn scaled_add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize, scale: f32) {
+        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
+        axpy_inplace(&mut d[..len], &s[..len], scale);
+    }
+
+    fn conv2d(
+        &self,
+        input: &Self::Buf,
+        weight: &Self::Buf,
+        bias: &Self::Buf,
+        spec: &Conv2dSpec,
+    ) -> Self::Buf {
+        let total = spec.out_len();
+        if total == 0 {
+            return XdnaBuf::zeroed(0);
+        }
+        let in_data = input.0.lock().unwrap_or_else(|e| e.into_inner());
+        let w_data = weight.0.lock().unwrap_or_else(|e| e.into_inner());
+        let b_data = bias.0.lock().unwrap_or_else(|e| e.into_inner());
+        let in_per_group = spec.in_ch / spec.groups;
+        let out_per_group = spec.out_ch / spec.groups;
+        let plane_out = spec.h_out * spec.w_out;
+        let plane_in = spec.h_in * spec.w_in;
+        let k_plane = spec.kh * spec.kw;
+
+        let mut out = vec![0.0f32; total];
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        maybe_par_for(spec.out_ch, |oc| {
+            let g = oc / out_per_group;
+            let bias_val = b_data[oc];
+            // SAFETY: distinct `oc` channels own disjoint `[oc * plane_out .. (oc+1) * plane_out]` output planes.
+            let out_plane = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(oc * plane_out), plane_out)
+            };
+            for oh in 0..spec.h_out {
+                let ih_base = (oh * spec.stride_h) as isize - spec.pad_h as isize;
+                for ow in 0..spec.w_out {
+                    let iw_base = (ow * spec.stride_w) as isize - spec.pad_w as isize;
+                    let mut acc = bias_val;
+                    for ic_local in 0..in_per_group {
+                        let ic = g * in_per_group + ic_local;
+                        let w_row = (oc * in_per_group + ic_local) * k_plane;
+                        let in_plane = ic * plane_in;
+                        for ki in 0..spec.kh {
+                            let ih = ih_base + ki as isize;
+                            if ih < 0 || ih >= spec.h_in as isize {
+                                continue;
+                            }
+                            let in_row = in_plane + ih as usize * spec.w_in;
+                            for kj in 0..spec.kw {
+                                let iw = iw_base + kj as isize;
+                                if iw < 0 || iw >= spec.w_in as isize {
+                                    continue;
+                                }
+                                acc += w_data[w_row + ki * spec.kw + kj]
+                                    * in_data[in_row + iw as usize];
+                            }
+                        }
+                    }
+                    out_plane[oh * spec.w_out + ow] = acc;
+                }
+            }
+        });
+
+        XdnaBuf::from_vec(out)
+    }
+
+    fn transpose_blocked(&self, src: &Self::Buf, a: usize, b: usize, k: usize) -> Self::Buf {
+        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dst = vec![0.0f32; a * b * k];
+        for ia in 0..a {
+            for ib in 0..b {
+                let src_off = (ia * b + ib) * k;
+                let dst_off = (ib * a + ia) * k;
+                dst[dst_off..dst_off + k].copy_from_slice(&s[src_off..src_off + k]);
+            }
+        }
+        XdnaBuf::from_vec(dst)
+    }
+
+    fn glu_split(&self, src: &Self::Buf, rows: usize, n: usize) -> Self::Buf {
+        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dst = vec![0.0f32; rows * n];
+        for r in 0..rows {
+            glu_split(&s[r * 2 * n..(r + 1) * 2 * n], &mut dst[r * n..(r + 1) * n]);
+        }
+        XdnaBuf::from_vec(dst)
+    }
+
+    fn chan_affine_silu(
+        &self,
+        x: &Self::Buf,
+        w: &Self::Buf,
+        b: &Self::Buf,
+        channels: usize,
+        t: usize,
+    ) {
+        let w_data = w.0.lock().unwrap_or_else(|e| e.into_inner());
+        let b_data = b.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut x_data = x.0.lock().unwrap_or_else(|e| e.into_inner());
+        for c in 0..channels {
+            let wc = w_data[c];
+            let bc = b_data[c];
+            let row = &mut x_data[c * t..(c + 1) * t];
+            for v in row.iter_mut() {
+                *v = *v * wc + bc;
+            }
+            silu_inplace(row);
+        }
+    }
+
+    fn xl_attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        p: &Self::Buf,
+        bias_u: &Self::Buf,
+        bias_v: &Self::Buf,
+        tokens: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Self::Buf {
+        let dim = n_head * head_dim;
+        if tokens == 0 || dim == 0 {
+            return XdnaBuf::zeroed(tokens * dim);
+        }
+        let q_vec = q.read_clone(tokens * dim);
+        let k_vec = k.read_clone(tokens * dim);
+        let v_vec = v.read_clone(tokens * dim);
+        let p_rows = 2 * tokens - 1;
+        let p_vec = p.read_clone(p_rows * dim);
+        let u_vec = bias_u.read_clone(dim);
+        let vb_vec = bias_v.read_clone(dim);
+
+        let kv_stride = tokens * head_dim;
+        let p_stride = p_rows * head_dim;
+        let mut k_hm = vec![0.0f32; n_head * kv_stride];
+        let mut v_hm = vec![0.0f32; n_head * kv_stride];
+        let mut p_hm = vec![0.0f32; n_head * p_stride];
+        for t in 0..tokens {
+            for h in 0..n_head {
+                let src = t * dim + h * head_dim;
+                let dst = h * kv_stride + t * head_dim;
+                k_hm[dst..dst + head_dim].copy_from_slice(&k_vec[src..src + head_dim]);
+                v_hm[dst..dst + head_dim].copy_from_slice(&v_vec[src..src + head_dim]);
+            }
+        }
+        for pr in 0..p_rows {
+            for h in 0..n_head {
+                let src = pr * dim + h * head_dim;
+                let dst = h * p_stride + pr * head_dim;
+                p_hm[dst..dst + head_dim].copy_from_slice(&p_vec[src..src + head_dim]);
+            }
+        }
+
+        let scale = 1.0f64 / (head_dim as f64).sqrt();
+        let t_minus_1 = tokens - 1;
+        let mut out_hm = vec![0.0f32; n_head * kv_stride];
+        let out_hm_ptr = out_hm.as_mut_ptr() as usize;
+
+        maybe_par_for(n_head, |h| {
+            let k_head = &k_hm[h * kv_stride..(h + 1) * kv_stride];
+            let v_head = &v_hm[h * kv_stride..(h + 1) * kv_stride];
+            let p_head = &p_hm[h * p_stride..(h + 1) * p_stride];
+            let u_h = &u_vec[h * head_dim..(h + 1) * head_dim];
+            let v_h = &vb_vec[h * head_dim..(h + 1) * head_dim];
+            let mut q_u = vec![0.0f32; head_dim];
+            let mut q_v = vec![0.0f32; head_dim];
+            let mut scores = vec![0.0f32; tokens];
+            // SAFETY: distinct heads write disjoint `[h * kv_stride .. (h+1) * kv_stride]` slices.
+            let out_head = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (out_hm_ptr as *mut f32).add(h * kv_stride),
+                    kv_stride,
+                )
+            };
+            for qt in 0..tokens {
+                let q_row = &q_vec[qt * dim + h * head_dim..qt * dim + (h + 1) * head_dim];
+                for d in 0..head_dim {
+                    q_u[d] = q_row[d] + u_h[d];
+                    q_v[d] = q_row[d] + v_h[d];
+                }
+                for kt in 0..tokens {
+                    let pos_idx = t_minus_1 + kt - qt;
+                    let k_row = &k_head[kt * head_dim..(kt + 1) * head_dim];
+                    let p_row = &p_head[pos_idx * head_dim..(pos_idx + 1) * head_dim];
+                    let ac = dot_f32(&q_u, k_row) as f64;
+                    let bd = dot_f32(&q_v, p_row) as f64;
+                    scores[kt] = ((ac + bd) * scale) as f32;
+                }
+                softmax_inplace(&mut scores);
+                let out_row = &mut out_head[qt * head_dim..(qt + 1) * head_dim];
+                out_row.fill(0.0);
+                for kt in 0..tokens {
+                    axpy_inplace(
+                        out_row,
+                        &v_head[kt * head_dim..(kt + 1) * head_dim],
+                        scores[kt],
+                    );
+                }
+            }
+        });
+
+        let mut out = vec![0.0f32; tokens * dim];
+        for t in 0..tokens {
+            for h in 0..n_head {
+                let src = h * kv_stride + t * head_dim;
+                let dst = t * dim + h * head_dim;
+                out[dst..dst + head_dim].copy_from_slice(&out_hm[src..src + head_dim]);
+            }
+        }
+        XdnaBuf::from_vec(out)
+    }
+
+    fn stft_frames(
+        &self,
+        pcm: &Self::Buf,
+        hann: &Self::Buf,
+        n_samples: usize,
+        n_frames: usize,
+    ) -> Self::Buf {
+        let p = pcm.0.lock().unwrap_or_else(|e| e.into_inner());
+        let h = hann.0.lock().unwrap_or_else(|e| e.into_inner());
+        let pad = N_FFT / 2;
+        let mut frames = vec![0.0f32; n_frames * N_FFT];
+        for ti in 0..n_frames {
+            let base = ti * HOP_LEN;
+            let dst = &mut frames[ti * N_FFT..(ti + 1) * N_FFT];
+            for k in 0..N_FFT {
+                let idx = base + k;
+                if idx < pad || idx >= pad + n_samples {
+                    dst[k] = 0.0;
+                } else {
+                    let s = idx - pad;
+                    let cur = p[s];
+                    let sample = if s == 0 {
+                        cur
+                    } else {
+                        cur - PREEMPH * p[s - 1]
+                    };
+                    dst[k] = sample * h[k];
+                }
+            }
+        }
+        XdnaBuf::from_vec(frames)
+    }
+
+    fn power_spec(&self, frames: &Self::Buf, _twiddle: &Self::Buf, n_frames: usize) -> Self::Buf {
+        let fr = frames.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fft_buf = vec![Complex32::new(0.0, 0.0); N_FFT];
+        let mut power = vec![0.0f32; n_frames * N_FFT_BINS];
+        for ti in 0..n_frames {
+            let src = &fr[ti * N_FFT..(ti + 1) * N_FFT];
+            for (fb, &s) in fft_buf.iter_mut().zip(src.iter()) {
+                *fb = Complex32::new(s, 0.0);
+            }
+            self.fft.process(&mut fft_buf);
+            let dst = &mut power[ti * N_FFT_BINS..(ti + 1) * N_FFT_BINS];
+            for (p, c) in dst.iter_mut().zip(fft_buf.iter().take(N_FFT_BINS)) {
+                *p = ((c.re as f64) * (c.re as f64) + (c.im as f64) * (c.im as f64)) as f32;
+            }
+        }
+        XdnaBuf::from_vec(power)
+    }
+
+    fn mel_project(
+        &self,
+        power: &Self::Buf,
+        filters: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+    ) -> Self::Buf {
+        let p = power.0.lock().unwrap_or_else(|e| e.into_inner());
+        let f = filters.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mel = vec![0.0f32; n_mel * n_frames];
+        for mi in 0..n_mel {
+            let f_row = &f[mi * N_FFT_BINS..(mi + 1) * N_FFT_BINS];
+            for ti in 0..n_frames {
+                let p_row = &p[ti * N_FFT_BINS..(ti + 1) * N_FFT_BINS];
+                let sum: f64 = p_row
+                    .iter()
+                    .zip(f_row.iter())
+                    .map(|(&pv, &fv)| (pv as f64) * (fv as f64))
+                    .sum();
+                mel[mi * n_frames + ti] = (sum + LOG_MEL_EPS as f64).ln() as f32;
+            }
+        }
+        XdnaBuf::from_vec(mel)
+    }
+
+    fn mel_norm(
+        &self,
+        mel: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+        effective_n_len: usize,
+    ) -> Self::Buf {
+        let mut norm = mel.read_clone(n_mel * n_frames);
+        let eff = effective_n_len.min(n_frames);
+        for mi in 0..n_mel {
+            let row = &mut norm[mi * n_frames..(mi + 1) * n_frames];
+            if eff > 1 {
+                let mean = row[..eff].iter().map(|&v| v as f64).sum::<f64>() / eff as f64;
+                let var = row[..eff]
+                    .iter()
+                    .map(|&v| {
+                        let d = v as f64 - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / (eff - 1) as f64;
+                let inv_std = 1.0 / (var.sqrt() + NORM_VAR_EPS);
+                for v in row[..eff].iter_mut() {
+                    *v = ((*v as f64 - mean) * inv_std) as f32;
+                }
+                row[eff..].fill(0.0);
+            } else {
+                row.fill(0.0);
+            }
+        }
+        let mut time_major = vec![0.0f32; n_frames * n_mel];
+        for mi in 0..n_mel {
+            for ti in 0..n_frames {
+                time_major[ti * n_mel + mi] = norm[mi * n_frames + ti];
+            }
+        }
+        XdnaBuf::from_vec(time_major)
+    }
+}
+
+struct XdnaAudioEncoder {
+    ops: XdnaAudioOps,
+    weights: GpuAudioWeights<XdnaAudioOps>,
+    encode_lock: Mutex<()>,
+}
+
+impl AudioGpuEncode for XdnaAudioEncoder {
+    fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.ops.take_err();
+        let out = encode_audio_pcm_gpu(&self.ops, &self.weights, pcm)?;
+        if let Some(e) = self.ops.take_err() {
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.ops.take_err();
+        let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
+        if let Some(e) = self.ops.take_err() {
+            return Err(e);
+        }
+        Ok(out)
+    }
+}
+
+/// Build an XDNA [`AudioGpuEncode`] for `weights`, returning `None` if unavailable.
+pub(crate) fn try_xdna_audio_encoder(
+    weights: &Arc<AudioEncoderWeights>,
+) -> Option<Arc<dyn AudioGpuEncode>> {
+    if weights.is_lfm3a() {
+        return None;
+    }
+    let runner = match XdnaGemmRunner::open() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("audio encoder: XDNA backend unavailable ({e:#}); falling back");
+            return None;
+        }
+    };
+    let ops = XdnaAudioOps::new(runner);
+    let _ = ops.take_err();
+    let gpu_w = match GpuAudioWeights::build(&ops, weights) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("audio encoder: XDNA backend unavailable for this model: {e:#}");
+            eprintln!("audio encoder: XDNA backend unavailable for this model: {e:#}");
+            return None;
+        }
+    };
+    if let Some(e) = ops.take_err() {
+        tracing::warn!("audio encoder: XDNA weight upload failed, falling back: {e:#}");
+        eprintln!("audio encoder: XDNA weight upload failed, falling back: {e:#}");
+        return None;
+    }
+    tracing::info!("audio encoder: using AMD XDNA2 NPU backend");
+    Some(Arc::new(XdnaAudioEncoder {
+        ops,
+        weights: gpu_w,
+        encode_lock: Mutex::new(()),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::xdna::sys::fake::{self, Config as FakeConfig};
+    use crate::model::audio_encoder::{
+        AudioEncoderConfig, AudioMlpAdapterWeights, ConformerLayerWeights, ConvLayerWeights,
+        ConvStemWeights, POS_EMB_DIM, audio_encoder_forward, conformer_self_attention_forward,
+        encode_audio_pcm,
+    };
+    use crate::model::audio_preprocessor::log_mel_spectrogram;
+    use crate::model::vision_encoder::{
+        PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionProjectorType,
+        VitBlockWeights,
+    };
+    use crate::model::vision_encoder_gpu::{VitStackActivation, VitStackBlock, VitStackProjector};
+    use crate::tensor::DType;
+
+    fn det_vec(len: usize, seed: usize, scale: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let x = ((i * 131 + seed * 17) % 97) as f32 / 97.0 - 0.5;
+                x * scale
+            })
+            .collect()
+    }
+
+    fn f32_weight(rows: usize, cols: usize, seed: usize, scale: f32) -> MmapWeight {
+        MmapWeight::from_owned_f32(det_vec(rows * cols, seed, scale), rows, cols)
+    }
+
+    fn q8_0_weight(rows: usize, cols: usize, seed: usize, scale: f32) -> MmapWeight {
+        assert!(cols.is_multiple_of(32));
+        let dense = det_vec(rows * cols, seed, scale);
+        let blocks_per_row = cols / 32;
+        let mut bytes = Vec::with_capacity(rows * blocks_per_row * 34);
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let block = &dense[r * cols + b * 32..r * cols + (b + 1) * 32];
+                let amax = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let d = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+                let d_f16 = half::f16::from_f32(d);
+                bytes.extend_from_slice(&d_f16.to_le_bytes());
+                let d_real = d_f16.to_f32();
+                for &v in block {
+                    let q = (v / d_real).round().clamp(-127.0, 127.0) as i8;
+                    bytes.push(q as u8);
+                }
+            }
+        }
+        MmapWeight::from_owned_bytes(bytes, DType::Q8_0, rows, cols)
+    }
+
+    fn synth_vit_weights(
+        q8: bool,
+        n_layer: usize,
+        n_embd: usize,
+        n_ff: usize,
+        n_head: usize,
+    ) -> VisionEncoderWeights {
+        let patch_size = 8;
+        let in_dim = 3 * patch_size * patch_size;
+        let proj_dim = 64;
+        let scale_factor = 2;
+        let pooled_dim = n_embd * scale_factor * scale_factor;
+        let cfg = VisionEncoderConfig {
+            projector_type: VisionProjectorType::Lfm2,
+            n_layer,
+            n_embd,
+            n_ff,
+            n_head,
+            n_head_kv: n_head,
+            rope_theta: 1_000_000.0,
+            eps: 1e-6,
+            image_size: 32,
+            patch_size,
+            n_trained_patches: 16,
+            projection_dim: proj_dim,
+            scale_factor,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: 256,
+            image_max_pixels: 4096,
+        };
+        let w_scale = 0.15 * (128.0f32 / n_embd as f32).sqrt();
+        let lin = |r: usize, c: usize, seed: usize| {
+            let s = if c > n_embd {
+                w_scale * (n_embd as f32 / c as f32).sqrt()
+            } else {
+                w_scale
+            };
+            if q8 {
+                q8_0_weight(r, c, seed, s)
+            } else {
+                f32_weight(r, c, seed, s)
+            }
+        };
+        let blocks = (0..n_layer)
+            .map(|l| VitBlockWeights {
+                ln1_w: det_vec(n_embd, l * 10 + 1, 0.5)
+                    .into_iter()
+                    .map(|v| 1.0 + v * 0.2)
+                    .collect(),
+                ln1_b: det_vec(n_embd, l * 10 + 2, 0.05),
+                q_w: lin(n_embd, n_embd, l * 10 + 3),
+                q_b: det_vec(n_embd, l * 10 + 4, 0.05),
+                k_w: lin(n_embd, n_embd, l * 10 + 5),
+                k_b: det_vec(n_embd, l * 10 + 6, 0.05),
+                v_w: lin(n_embd, n_embd, l * 10 + 7),
+                v_b: det_vec(n_embd, l * 10 + 8, 0.05),
+                o_w: lin(n_embd, n_embd, l * 10 + 9),
+                o_b: det_vec(n_embd, l * 10 + 10, 0.05),
+                ln2_w: det_vec(n_embd, l * 10 + 11, 0.5)
+                    .into_iter()
+                    .map(|v| 1.0 + v * 0.2)
+                    .collect(),
+                ln2_b: det_vec(n_embd, l * 10 + 12, 0.05),
+                ffn_up_w: lin(n_ff, n_embd, l * 10 + 13),
+                ffn_up_b: det_vec(n_ff, l * 10 + 14, 0.05),
+                ffn_down_w: lin(n_embd, n_ff, l * 10 + 15),
+                ffn_down_b: det_vec(n_embd, l * 10 + 16, 0.05),
+            })
+            .collect();
+
+        VisionEncoderWeights {
+            config: cfg,
+            patch_embed: PatchEmbedWeights {
+                conv_w: det_vec(in_dim * n_embd, 100, 0.1),
+                conv_b: det_vec(n_embd, 101, 0.05),
+            },
+            patch_embed_1: None,
+            embedding_norm: None,
+            position_embed: det_vec(16 * n_embd, 102, 0.05),
+            blocks,
+            lfm3_blocks: Vec::new(),
+            post_ln_w: det_vec(n_embd, 103, 0.2)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect(),
+            post_ln_b: det_vec(n_embd, 104, 0.05),
+            mm_input_norm: None,
+            projector: ProjectorWeights {
+                mm1_w: lin(proj_dim * 2, pooled_dim, 105),
+                mm1_b: det_vec(proj_dim * 2, 106, 0.05),
+                mm2_w: lin(proj_dim, proj_dim * 2, 107),
+                mm2_b: det_vec(proj_dim, 108, 0.05),
+            },
+        }
+    }
+
+    fn synth_vit_stack_spec(activation: VitStackActivation, with_proj: bool) -> VitStackSpec {
+        let (width, heads, ffn) = (64, 4, 128);
+        VitStackSpec {
+            width,
+            heads,
+            ffn,
+            eps: 1e-6,
+            activation,
+            blocks: vec![VitStackBlock {
+                ln1_w: vec![1.0; width],
+                ln1_b: det_vec(width, 1, 0.02),
+                q: f32_weight(width, width, 2, 0.1),
+                q_b: det_vec(width, 3, 0.02),
+                k: f32_weight(width, width, 4, 0.1),
+                k_b: det_vec(width, 5, 0.02),
+                v: f32_weight(width, width, 6, 0.1),
+                v_b: det_vec(width, 7, 0.02),
+                o: f32_weight(width, width, 8, 0.1),
+                o_b: det_vec(width, 9, 0.02),
+                ln2_w: vec![1.0; width],
+                ln2_b: det_vec(width, 10, 0.02),
+                up: f32_weight(ffn, width, 11, 0.1),
+                up_b: det_vec(ffn, 12, 0.02),
+                down: f32_weight(width, ffn, 13, 0.1),
+                down_b: det_vec(width, 14, 0.02),
+            }],
+            post: Some((vec![1.0; width], det_vec(width, 15, 0.02))),
+            projector: with_proj.then(|| VitStackProjector {
+                mm1: f32_weight(96, width, 16, 0.1),
+                mm1_b: det_vec(96, 17, 0.02),
+                mm2: f32_weight(48, 96, 18, 0.1),
+                mm2_b: det_vec(48, 19, 0.02),
+            }),
+        }
+    }
+
+    fn synth_audio_weights(
+        n_layer: usize,
+        n_embd: usize,
+        n_ff: usize,
+        n_head: usize,
+    ) -> AudioEncoderWeights {
+        let n_mel_bins = 64;
+        let stem_ch = 32;
+        let llm_hidden_size = 48;
+        let f_out = n_mel_bins / 8; // 3 stride-2 layers: 64 -> 32 -> 16 -> 8
+        let cfg = AudioEncoderConfig {
+            n_layer,
+            n_embd,
+            n_ff,
+            n_head,
+            eps: 1e-5,
+            n_mel_bins,
+            llm_hidden_size,
+        };
+        let stem = ConvStemWeights {
+            layers: vec![
+                ConvLayerWeights {
+                    name: "conv1d.0".into(),
+                    weight: det_vec(stem_ch * 3 * 3, 1, 0.05),
+                    bias: det_vec(stem_ch, 2, 0.02),
+                    shape: vec![3, 3, 1, stem_ch],
+                },
+                ConvLayerWeights {
+                    name: "conv1d.2".into(),
+                    weight: det_vec(stem_ch * 3 * 3, 3, 0.05),
+                    bias: det_vec(stem_ch, 4, 0.02),
+                    shape: vec![3, 3, 1, stem_ch],
+                },
+                ConvLayerWeights {
+                    name: "conv1d.3".into(),
+                    weight: det_vec(stem_ch * stem_ch, 5, 0.05),
+                    bias: det_vec(stem_ch, 6, 0.02),
+                    shape: vec![1, 1, stem_ch, stem_ch],
+                },
+                ConvLayerWeights {
+                    name: "conv1d.5".into(),
+                    weight: det_vec(stem_ch * 3 * 3, 7, 0.05),
+                    bias: det_vec(stem_ch, 8, 0.02),
+                    shape: vec![3, 3, 1, stem_ch],
+                },
+                ConvLayerWeights {
+                    name: "conv1d.6".into(),
+                    weight: det_vec(stem_ch * stem_ch, 9, 0.05),
+                    bias: det_vec(stem_ch, 10, 0.02),
+                    shape: vec![1, 1, stem_ch, stem_ch],
+                },
+            ],
+            pre_encode_out_w: f32_weight(n_embd, stem_ch * f_out, 11, 0.05),
+            pre_encode_out_b: det_vec(n_embd, 12, 0.02),
+        };
+        let dw_k = 7;
+        let layers = (0..n_layer)
+            .map(|l| ConformerLayerWeights {
+                ffn_norm_w: vec![1.0; n_embd],
+                ffn_norm_b: det_vec(n_embd, l * 30 + 1, 0.02),
+                ffn_up_w: f32_weight(n_ff, n_embd, l * 30 + 2, 0.08),
+                ffn_up_b: det_vec(n_ff, l * 30 + 3, 0.02),
+                ffn_down_w: f32_weight(n_embd, n_ff, l * 30 + 4, 0.08),
+                ffn_down_b: det_vec(n_embd, l * 30 + 5, 0.02),
+                ln1_w: vec![1.0; n_embd],
+                ln1_b: det_vec(n_embd, l * 30 + 6, 0.02),
+                attn_q_w: f32_weight(n_embd, n_embd, l * 30 + 7, 0.08),
+                attn_q_b: det_vec(n_embd, l * 30 + 8, 0.02),
+                attn_k_w: f32_weight(n_embd, n_embd, l * 30 + 9, 0.08),
+                attn_k_b: det_vec(n_embd, l * 30 + 10, 0.02),
+                attn_v_w: f32_weight(n_embd, n_embd, l * 30 + 11, 0.08),
+                attn_v_b: det_vec(n_embd, l * 30 + 12, 0.02),
+                attn_o_w: f32_weight(n_embd, n_embd, l * 30 + 13, 0.08),
+                attn_o_b: det_vec(n_embd, l * 30 + 14, 0.02),
+                pos_bias_u: det_vec(n_embd, l * 30 + 15, 0.05),
+                pos_bias_v: det_vec(n_embd, l * 30 + 16, 0.05),
+                linear_pos_w: f32_weight(n_embd, POS_EMB_DIM, l * 30 + 17, 0.08),
+                norm_conv_w: vec![1.0; n_embd],
+                norm_conv_b: det_vec(n_embd, l * 30 + 18, 0.02),
+                conv_pw1_w: f32_weight(2 * n_embd, n_embd, l * 30 + 19, 0.08),
+                conv_pw1_b: det_vec(2 * n_embd, l * 30 + 20, 0.02),
+                conv_dw_w: det_vec(n_embd * dw_k, l * 30 + 21, 0.08),
+                conv_dw_b: det_vec(n_embd, l * 30 + 22, 0.02),
+                conv_dw_shape: vec![dw_k, 1, n_embd],
+                conv_norm_w: vec![1.0; n_embd],
+                conv_norm_b: det_vec(n_embd, l * 30 + 23, 0.02),
+                conv_pw2_w: f32_weight(n_embd, n_embd, l * 30 + 24, 0.08),
+                conv_pw2_b: det_vec(n_embd, l * 30 + 25, 0.02),
+                ffn_norm_1_w: vec![1.0; n_embd],
+                ffn_norm_1_b: det_vec(n_embd, l * 30 + 26, 0.02),
+                ffn_up_1_w: f32_weight(n_ff, n_embd, l * 30 + 27, 0.08),
+                ffn_up_1_b: det_vec(n_ff, l * 30 + 28, 0.02),
+                ffn_down_1_w: f32_weight(n_embd, n_ff, l * 30 + 29, 0.08),
+                ffn_down_1_b: det_vec(n_embd, l * 30 + 30, 0.02),
+                ln2_w: vec![1.0; n_embd],
+                ln2_b: det_vec(n_embd, l * 30 + 31, 0.02),
+                lfm3a: None,
+            })
+            .collect();
+
+        AudioEncoderWeights {
+            config: cfg,
+            conv_stem: stem,
+            layers,
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: vec![1.0; n_embd],
+                norm_b: det_vec(n_embd, 500, 0.02),
+                up_w: f32_weight(n_ff, n_embd, 501, 0.08),
+                up_b: det_vec(n_ff, 502, 0.02),
+                down_w: f32_weight(llm_hidden_size, n_ff, 503, 0.08),
+                down_b: det_vec(llm_hidden_size, 504, 0.02),
+            },
+        }
+    }
+
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let x = x as f64;
+            let y = y as f64;
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        dot / (na.sqrt() * nb.sqrt()).max(1e-30)
+    }
+
+    fn cpu_matmul_nt(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                let mut acc = 0.0f64;
+                for i in 0..k {
+                    acc += x[r * k + i] as f64 * w[c * k + i] as f64;
+                }
+                out[r * n + c] = acc as f32;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fake_shim_vision_encoder_lifecycle_zero_bo_leaks() {
+        fake::with_shim(FakeConfig::default(), || {
+            let w = synth_vit_weights(true, 1, 64, 128, 4);
+            let enc = try_xdna_vision_encoder(&w).expect("xdna vision encoder on fake shim");
+            assert_eq!(enc.backend_label(), "xdna");
+            let pixels = det_vec(3 * 32 * 32, 99, 1.0);
+            let out = enc.encode_image(&pixels, 4, 4).expect("encode_image");
+            assert_eq!(out.len(), 4 * 64);
+            drop(enc);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_vit_stack_gelu_relu_and_projector_zero_leaks() {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            let spec_gelu = synth_vit_stack_spec(VitStackActivation::GeluTanh, true);
+            let stack_gelu = XdnaVitStack::build(runner.clone(), &spec_gelu, 128).expect("gelu");
+            let x = det_vec(6 * 64, 3, 0.5);
+            assert_eq!(stack_gelu.run(&x, 6).expect("run").len(), 6 * 64);
+            assert_eq!(
+                stack_gelu
+                    .run_projector(&x)
+                    .expect("proj")
+                    .expect("some")
+                    .len(),
+                6 * 48
+            );
+
+            let spec_relu = synth_vit_stack_spec(VitStackActivation::Relu, false);
+            let stack_relu = XdnaVitStack::build(runner, &spec_relu, 128).expect("relu");
+            assert_eq!(stack_relu.run(&x, 6).expect("run").len(), 6 * 64);
+            assert!(stack_relu.run_projector(&x).expect("no proj").is_none());
+
+            drop(stack_gelu);
+            drop(stack_relu);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_audio_encoder_lifecycle_zero_leaks() {
+        fake::with_shim(FakeConfig::default(), || {
+            let w = Arc::new(synth_audio_weights(1, 64, 128, 4));
+            let enc = try_xdna_audio_encoder(&w).expect("xdna audio encoder on fake shim");
+            let pcm: Vec<f32> = (0..4000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+            let (out_pcm, t_pcm) = enc.encode_pcm(&pcm).expect("encode_pcm");
+            assert!(t_pcm > 0);
+            assert_eq!(out_pcm.len(), t_pcm * 48);
+
+            let mel = det_vec(25 * 64, 77, 0.5);
+            let (out_mel, t_mel) = enc.encode_mel(&mel, 25).expect("encode_mel");
+            assert!(t_mel > 0);
+            assert_eq!(out_mel.len(), t_mel * 48);
+
+            drop(enc);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_gemm_runlist_fault_surfaces_and_clears() {
+        let cfg = FakeConfig {
+            fail_runlist_wait: true,
+            ..Default::default()
+        };
+        fake::with_shim(cfg, || {
+            let w = synth_vit_weights(false, 1, 64, 128, 4);
+            let enc = try_xdna_vision_encoder(&w).expect("weights load before any runlist wait");
+            let pixels = det_vec(3 * 32 * 32, 12, 1.0);
+            let err = enc
+                .encode_image(&pixels, 4, 4)
+                .expect_err("runlist wait failure must surface as Err, not zeros");
+            assert!(err.to_string().contains("wait gemm_bf16 runlist"));
+            drop(enc);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn xdna_audio_host_ops_match_cpu_reference() {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            let ops = XdnaAudioOps::new(runner);
+            let fe = crate::model::audio_encoder_gpu::GpuMelFrontend::build(&ops, 64).expect("fe");
+            let pcm: Vec<f32> = (0..6400)
+                .map(|i| (i as f32 * 0.07).sin() * 0.4 + (i as f32 * 0.19).cos() * 0.2)
+                .collect();
+            let (cpu_mel, cpu_frames) = log_mel_spectrogram(&pcm, 64);
+            let (buf, gpu_frames) =
+                crate::model::audio_encoder_gpu::log_mel_spectrogram_gpu(&ops, &fe, &pcm)
+                    .expect("gpu mel")
+                    .expect("non-empty");
+            assert_eq!(gpu_frames, cpu_frames);
+            let got_mel = ops.download(&buf, cpu_frames * 64);
+            let cos = cosine_sim(&got_mel, &cpu_mel);
+            assert!(cos > 0.9999, "mel cosine {cos} < 0.9999");
+
+            // Check XL attention against CPU `conformer_self_attention_forward`.
+            let (t, n_head, head_dim) = (9usize, 4usize, 16usize);
+            let dim = n_head * head_dim;
+            let q = det_vec(t * dim, 1, 0.3);
+            let k = det_vec(t * dim, 2, 0.3);
+            let v = det_vec(t * dim, 3, 0.3);
+            let p = det_vec((2 * t - 1) * dim, 4, 0.3);
+            let bu = det_vec(dim, 5, 0.1);
+            let bv = det_vec(dim, 6, 0.1);
+            let out_buf = ops.xl_attention(
+                &ops.upload(&q),
+                &ops.upload(&k),
+                &ops.upload(&v),
+                &ops.upload(&p),
+                &ops.upload(&bu),
+                &ops.upload(&bv),
+                t,
+                n_head,
+                head_dim,
+            );
+            let got_attn = ops.download(&out_buf, t * dim);
+            // Reference via identity Q/K/V/O/P linears and ln1=identity: use XdnaAudioOps direct math check via conformer helper isn't needed if identity,
+            // wait: verify against scalar formula directly.
+            let mut ref_attn = vec![0.0f32; t * dim];
+            let scale = 1.0f64 / (head_dim as f64).sqrt();
+            for h in 0..n_head {
+                for qt in 0..t {
+                    let mut sc = vec![0.0f32; t];
+                    for kt in 0..t {
+                        let pidx = (t - 1) + kt - qt;
+                        let mut ac = 0.0f64;
+                        let mut bd = 0.0f64;
+                        for d in 0..head_dim {
+                            let qv = q[qt * dim + h * head_dim + d] as f64;
+                            let uv = bu[h * head_dim + d] as f64;
+                            let vv = bv[h * head_dim + d] as f64;
+                            ac += (qv + uv) * k[kt * dim + h * head_dim + d] as f64;
+                            bd += (qv + vv) * p[pidx * dim + h * head_dim + d] as f64;
+                        }
+                        sc[kt] = ((ac + bd) * scale) as f32;
+                    }
+                    softmax_inplace(&mut sc);
+                    for d in 0..head_dim {
+                        let mut sum = 0.0f64;
+                        for kt in 0..t {
+                            sum += sc[kt] as f64 * v[kt * dim + h * head_dim + d] as f64;
+                        }
+                        ref_attn[qt * dim + h * head_dim + d] = sum as f32;
+                    }
+                }
+            }
+            let max_diff = got_attn
+                .iter()
+                .zip(ref_attn.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-5, "xl_attention max_diff={max_diff}");
+            let _ = (conformer_self_attention_forward,);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_gemm_bf16_parity_and_throughput() {
+        let runner = XdnaGemmRunner::open().expect("open physical XDNA device");
+        for &(m, n, k, label) in &[
+            (17, 32, 64, "tiny_unaligned"),
+            (32, 32, 64, "core_k1"),
+            (32, 32, 128, "core_k2"),
+            (32, 32, 256, "core_k4"),
+            (128, 256, 64, "tile_k1"),
+            (128, 256, 128, "tile_k2"),
+            (128, 256, 256, "tile_k4"),
+            (128, 256, 768, "tile_768"),
+            (384, 768, 768, "vit_qkv_768"),
+            (729, 3072, 768, "vit_up_729"),
+            (729, 768, 3072, "vit_down_729"),
+            (200, 1152, 4304, "siglip_4304"),
+            (16, 128, 8256, "split_k_8256"),
+        ] {
+            let x = det_vec(m * k, 13, 0.5);
+            let w_f32 = det_vec(n * k, 29, 0.2);
+            let w_npu = runner
+                .upload_f32_weight(&w_f32, n, k)
+                .expect("upload weight");
+            let t0 = std::time::Instant::now();
+            let got = runner.matmul_f32(&x, &w_npu, m, n, k).expect("matmul_f32");
+            let dt = t0.elapsed();
+            let want = cpu_matmul_nt(&x, &w_f32, m, n, k);
+            let x_bf: Vec<f32> = x
+                .iter()
+                .map(|&v| half::bf16::from_bits(f32_to_bf16(v)).to_f32())
+                .collect();
+            let w_bf: Vec<f32> = w_f32
+                .iter()
+                .map(|&v| half::bf16::from_bits(f32_to_bf16(v)).to_f32())
+                .collect();
+            let want_bf = cpu_matmul_nt(&x_bf, &w_bf, m, n, k);
+            let cos = cosine_sim(&got, &want);
+            let cos_bf = cosine_sim(&got, &want_bf);
+            let max_diff_bf = got
+                .iter()
+                .zip(want_bf.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let mut worst_rc = (0, 0, 0.0f32, 0.0f32);
+            for r in 0..m {
+                for c in 0..n {
+                    let g = got[r * n + c];
+                    let wb = want_bf[r * n + c];
+                    let d = (g - wb).abs();
+                    if d >= max_diff_bf {
+                        worst_rc = (r, c, g, wb);
+                    }
+                }
+            }
+            let gflops = (2.0 * m as f64 * n as f64 * k as f64) / (dt.as_secs_f64() * 1e9);
+            eprintln!(
+                "gemm_bf16 {label} ({m}x{n}x{k}): cos={cos:.6} cos_bf16={cos_bf:.6} max_diff_bf={max_diff_bf:.4e} worst=({},{}: got={:.4} want_bf={:.4}) time={:.2}ms ({gflops:.1} GFLOP/s)",
+                worst_rc.0,
+                worst_rc.1,
+                worst_rc.2,
+                worst_rc.3,
+                dt.as_secs_f64() * 1e3
+            );
+            assert!(cos > 0.999, "{label} cos={cos}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_vision_encoder_parity_and_throughput() {
+        for (q8, tag) in [(false, "F32"), (true, "Q8_0")] {
+            let w = synth_vit_weights(q8, 2, 128, 256, 4);
+            let enc = try_xdna_vision_encoder(&w).expect("XDNA vision encoder");
+            let pixels = det_vec(3 * 32 * 32, 42, 0.8);
+            let want = w.encode_image(&pixels, 4, 4).expect("CPU encode_image");
+            let got = enc.encode_image(&pixels, 4, 4).expect("NPU encode_image");
+            let cos = cosine_sim(&got, &want);
+            eprintln!("ViT parity ({tag}): len={} cos={cos:.6}", got.len());
+            assert!(cos > 0.999, "ViT {tag} cos={cos}");
+        }
+
+        // Realistic SigLIP-style throughput check: 28x28=784 patches, width=768, ffn=3072.
+        let bench_w = synth_vit_weights(false, 4, 768, 3072, 12);
+        let enc = try_xdna_vision_encoder(&bench_w).expect("XDNA vision encoder bench");
+        let pixels = det_vec(3 * (28 * 8) * (28 * 8), 9, 0.5);
+        let _warm = enc.encode_image(&pixels, 28, 28).expect("warmup");
+        let t0 = std::time::Instant::now();
+        let out = enc.encode_image(&pixels, 28, 28).expect("timed encode");
+        let dt_npu = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out_cpu = bench_w.encode_image(&pixels, 28, 28).expect("CPU encode");
+        let dt_cpu = t1.elapsed();
+        let cos = cosine_sim(&out, &out_cpu);
+        eprintln!(
+            "ViT bench (4L, 784 patches, d=768, ff=3072): npu={:.1}ms cpu={:.1}ms cos={cos:.6}",
+            dt_npu.as_secs_f64() * 1e3,
+            dt_cpu.as_secs_f64() * 1e3,
+        );
+        assert!(cos > 0.999);
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_vit_stack_gelu_relu_and_projector_parity() {
+        for act in [VitStackActivation::GeluTanh, VitStackActivation::Relu] {
+            let spec = synth_vit_stack_spec(act, act == VitStackActivation::GeluTanh);
+            let stack = try_xdna_vit_stack(&spec, 256).expect("XDNA vit stack");
+            let tokens = 19;
+            let x = det_vec(tokens * spec.width, 7, 0.5);
+            let got = stack.run(&x, tokens).expect("NPU stack run");
+
+            // Compute exact host reference for the single block + optional post LN.
+            let b = &spec.blocks[0];
+            let mut cur = x.clone();
+            let mut n1 = cur.clone();
+            for row in n1.chunks_exact_mut(spec.width) {
+                layer_norm_inplace(row, &b.ln1_w, &b.ln1_b, spec.eps);
+            }
+            let lin_bias = |inp: &[f32], mw: &MmapWeight, bias: &[f32]| -> Vec<f32> {
+                let mut o = vec![0.0f32; tokens * mw.rows];
+                mw.batched_matmul(inp, &mut o, tokens);
+                for row in o.chunks_exact_mut(mw.rows) {
+                    add_inplace(row, bias);
+                }
+                o
+            };
+            let q = lin_bias(&n1, &b.q, &b.q_b);
+            let k = lin_bias(&n1, &b.k, &b.k_b);
+            let v = lin_bias(&n1, &b.v, &b.v_b);
+            let head_dim = spec.width / spec.heads;
+            let runner = XdnaGemmRunner::open().expect("open");
+            let ops = XdnaVitOps::new(runner);
+            let attn = ops.download(
+                &ops.attention(
+                    &ops.upload(&q),
+                    &ops.upload(&k),
+                    &ops.upload(&v),
+                    tokens,
+                    spec.heads,
+                    head_dim,
+                ),
+                tokens * spec.width,
+            );
+            let proj = lin_bias(&attn, &b.o, &b.o_b);
+            add_inplace(&mut cur, &proj);
+            let mut n2 = cur.clone();
+            for row in n2.chunks_exact_mut(spec.width) {
+                layer_norm_inplace(row, &b.ln2_w, &b.ln2_b, spec.eps);
+            }
+            let mut mid = lin_bias(&n2, &b.up, &b.up_b);
+            match act {
+                VitStackActivation::GeluTanh => gelu_inplace(&mut mid),
+                VitStackActivation::Relu => relu_inplace(&mut mid),
+            }
+            let down = lin_bias(&mid, &b.down, &b.down_b);
+            add_inplace(&mut cur, &down);
+            if let Some((pw, pb)) = &spec.post {
+                for row in cur.chunks_exact_mut(spec.width) {
+                    layer_norm_inplace(row, pw, pb, spec.eps);
+                }
+            }
+            let cos = cosine_sim(&got, &cur);
+            eprintln!("VitStack ({act:?}): cos={cos:.6}");
+            assert!(cos > 0.999, "VitStack {act:?} cos={cos}");
+
+            if let Some(p) = &spec.projector {
+                let got_p = stack.run_projector(&got).expect("proj").expect("some");
+                let mut m1 = lin_bias(&got, &p.mm1, &p.mm1_b);
+                gelu_erf_inplace(&mut m1);
+                let want_p = lin_bias(&m1, &p.mm2, &p.mm2_b);
+                let pcos = cosine_sim(&got_p, &want_p);
+                eprintln!("VitStack projector (exact GELU): cos={pcos:.6}");
+                assert!(pcos > 0.999, "projector cos={pcos}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_audio_encoder_parity_and_throughput() {
+        let w = Arc::new(synth_audio_weights(2, 128, 256, 4));
+        let enc = try_xdna_audio_encoder(&w).expect("XDNA audio encoder");
+
+        // 1. Direct mel entry point parity.
+        let mel = det_vec(81 * 64, 19, 0.5);
+        let (want_mel, want_tm) = audio_encoder_forward(&mel, 81, &w);
+        let (got_mel, got_tm) = enc.encode_mel(&mel, 81).expect("encode_mel");
+        assert_eq!(got_tm, want_tm);
+        let cos_mel = cosine_sim(&got_mel, &want_mel);
+        eprintln!("Audio encode_mel parity: t={got_tm} cos={cos_mel:.6}");
+        assert!(cos_mel > 0.999, "audio mel cos={cos_mel}");
+
+        // 2. End-to-end PCM entry point parity.
+        let pcm: Vec<f32> = (0..24_000)
+            .map(|i| (i as f32 * 0.04).sin() * 0.4 + (i as f32 * 0.13).cos() * 0.2)
+            .collect();
+        let (want_pcm, want_tp) = encode_audio_pcm(&pcm, &w);
+        let (got_pcm, got_tp) = enc.encode_pcm(&pcm).expect("encode_pcm");
+        assert_eq!(got_tp, want_tp);
+        let cos_pcm = cosine_sim(&got_pcm, &want_pcm);
+        eprintln!("Audio encode_pcm parity: t={got_tp} cos={cos_pcm:.6}");
+        assert!(cos_pcm > 0.999, "audio pcm cos={cos_pcm}");
+
+        // 3. Realistic Conformer throughput check (4 layers, n_embd=512, n_ff=2048, ~2.5s PCM -> ~250 mel frames).
+        let bench_w = Arc::new(synth_audio_weights(4, 512, 2048, 8));
+        let bench_enc = try_xdna_audio_encoder(&bench_w).expect("bench audio encoder");
+        let long_pcm: Vec<f32> = (0..40_000).map(|i| (i as f32 * 0.03).sin() * 0.3).collect();
+        let _ = bench_enc.encode_pcm(&long_pcm).expect("warmup");
+        let t0 = std::time::Instant::now();
+        let (o_npu, tn) = bench_enc.encode_pcm(&long_pcm).expect("npu");
+        let dt_npu = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let (o_cpu, tc) = encode_audio_pcm(&long_pcm, &bench_w);
+        let dt_cpu = t1.elapsed();
+        assert_eq!(tn, tc);
+        let cos = cosine_sim(&o_npu, &o_cpu);
+        eprintln!(
+            "Audio bench (4L, d=512, ff=2048, 2.5s PCM -> t={tn}): npu={:.1}ms cpu={:.1}ms cos={cos:.6}",
+            dt_npu.as_secs_f64() * 1e3,
+            dt_cpu.as_secs_f64() * 1e3,
+        );
+        assert!(cos > 0.999);
+    }
+}

@@ -689,8 +689,142 @@ pub fn physical_core_count() -> Option<usize> {
         if let Some(n) = macos_sysctl_usize(c"hw.perflevel0.physicalcpu") {
             return Some(n);
         }
+        #[cfg(target_os = "windows")]
+        if let Some(n) = windows_physical_cores() {
+            return Some(n);
+        }
         None
     })
+}
+
+/// Queries Windows for the physical processor core count across all groups
+/// via `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
+#[cfg(target_os = "windows")]
+fn windows_physical_cores() -> Option<usize> {
+    windows_core_layout().map(|(phys, _)| phys)
+}
+
+/// Ordered logical CPU indices for Windows worker pinning: primary logical
+/// CPU of each physical core (fastest `EfficiencyClass` first, then lowest
+/// index) followed by any SMT siblings. Returns `None` if Win32 detection fails.
+#[cfg(all(
+    target_os = "windows",
+    feature = "parallel",
+    not(target_arch = "wasm32")
+))]
+pub(crate) fn windows_ordered_cpus() -> &'static [usize] {
+    static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+    CPUS.get_or_init(|| {
+        windows_core_layout()
+            .map(|(_, ordered)| ordered)
+            .unwrap_or_default()
+    })
+}
+
+/// Parses `GetLogicalProcessorInformationEx(RelationProcessorCore)` once into
+/// `(physical_core_count, physical_first_then_smt_ordered_cpus)`.
+#[cfg(target_os = "windows")]
+fn windows_core_layout() -> Option<(usize, Vec<usize>)> {
+    /// `LOGICAL_PROCESSOR_RELATIONSHIP::RelationProcessorCore`.
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    /// Win32 error code returned on the initial buffer-size probe.
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(
+            relationship_type: u32,
+            buffer: *mut u8,
+            returned_length: *mut u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    let mut len: u32 = 0;
+    // SAFETY: Null buffer with out-length probes the required byte count.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len)
+    };
+    if ok != 0 || len < 8 {
+        return None;
+    }
+    // SAFETY: Reads the calling thread's Win32 last-error code.
+    if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+        return None;
+    }
+
+    // Align to `u64` to satisfy `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` fields.
+    let words = (len as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut buf = vec![0u64; words];
+    // SAFETY: `buf` provides at least `len` writable bytes aligned to `u64`.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RELATION_PROCESSOR_CORE,
+            buf.as_mut_ptr().cast::<u8>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let total = (len as usize).min(buf.len() * std::mem::size_of::<u64>());
+    // SAFETY: Win32 wrote `total` initialized bytes into `buf`.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), total) };
+    let mut offset = 0usize;
+    let mut cores = 0usize;
+    let mut group0_cores: Vec<(u8, usize, usize)> = Vec::new();
+    let affinity_stride = std::mem::size_of::<usize>() + 8;
+    while offset + 8 <= total {
+        let rel = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let size = u32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
+        if size < 8 || offset + size > total {
+            break;
+        }
+        if rel == RELATION_PROCESSOR_CORE {
+            cores += 1;
+            if size >= 32 + affinity_stride {
+                let eff_class = bytes[offset + 9];
+                let group_count =
+                    u16::from_ne_bytes(bytes[offset + 30..offset + 32].try_into().ok()?) as usize;
+                for g in 0..group_count {
+                    let g_off = offset + 32 + g * affinity_stride;
+                    if g_off + affinity_stride > offset + size {
+                        break;
+                    }
+                    let mask_sz = std::mem::size_of::<usize>();
+                    let mask = usize::from_ne_bytes(bytes[g_off..g_off + mask_sz].try_into().ok()?);
+                    let group = u16::from_ne_bytes(
+                        bytes[g_off + mask_sz..g_off + mask_sz + 2]
+                            .try_into()
+                            .ok()?,
+                    );
+                    if group == 0 && mask != 0 {
+                        let first = mask.trailing_zeros() as usize;
+                        group0_cores.push((eff_class, first, mask));
+                    }
+                }
+            }
+        }
+        offset += size;
+    }
+    if cores == 0 {
+        return None;
+    }
+    group0_cores.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut ordered = Vec::with_capacity(group0_cores.len() * 2);
+    for &(_, first, _) in &group0_cores {
+        ordered.push(first);
+    }
+    for &(_, first, mask) in &group0_cores {
+        let mut rem = mask & !(1usize << first);
+        while rem != 0 {
+            let smt = rem.trailing_zeros() as usize;
+            ordered.push(smt);
+            rem &= !(1usize << smt);
+        }
+    }
+    Some((cores, ordered))
 }
 
 /// Count distinct `thread_siblings_list` sets — SMT siblings share one, so the
@@ -1530,6 +1664,19 @@ mod tests {
         assert!(topo.pin_cores.is_empty() || topo.pin_cores.len() >= topo.perf_core_count);
         // Cached accessor agrees with a fresh detect (modulo env, which both read).
         assert_eq!(core_topology().perf_core_count, performance_core_count());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_reports_physical_core_count() {
+        let phys = physical_core_count().expect("Win32 physical core count");
+        let logical = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert!(
+            phys >= 1 && phys <= logical,
+            "phys={phys} logical={logical}"
+        );
     }
 
     #[test]

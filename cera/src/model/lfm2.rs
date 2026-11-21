@@ -158,10 +158,18 @@ pub enum FusedAttnProjections {
         scales: Vec<f32>,
         smmla: bool,
     },
+    Q40Lin16All {
+        packed: Vec<u8>,
+        scales_f16: Vec<u16>,
+    },
     Q40QkOnly {
         packed: Vec<u8>,
         scales: Vec<f32>,
         smmla: bool,
+    },
+    Q40Lin16QkOnly {
+        packed: Vec<u8>,
+        scales_f16: Vec<u16>,
     },
     Q4KAll {
         packed: Vec<u8>,
@@ -242,19 +250,65 @@ fn lfm3_bool(gguf: &GgufFile, key: &str) -> Result<Option<bool>> {
 /// The multi-tap prefill conv uses it so both paths round alike.
 // Its callers (the multi-tap batched prefill) are compiled only where a batched GEMM
 // exists: aarch64, x86_64 or BLAS.
-#[cfg_attr(
-    not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)),
-    allow(dead_code)
-)]
-#[inline(always)]
-fn conv_mac(acc: f32, a: f32, b: f32) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        a.mul_add(b, acc)
+/// Parallel row-wise `rmsnorm_into` when batch width justifies pool wakeup.
+#[inline]
+fn par_rmsnorm_into_rows(
+    src: &[f32],
+    dst: &mut [f32],
+    hs: usize,
+    n: usize,
+    weight: &[f32],
+    eps: f32,
+) {
+    if n >= 16 {
+        let src_ptr = src.as_ptr() as usize;
+        cpu::par_rows_n(&mut dst[..n * hs], hs, 4, move |(j, row)| unsafe {
+            let tok_src = core::slice::from_raw_parts((src_ptr as *const f32).add(j * hs), hs);
+            cpu::rmsnorm_into(tok_src, row, weight, eps);
+        });
+    } else {
+        for j in 0..n {
+            cpu::rmsnorm_into(
+                &src[j * hs..(j + 1) * hs],
+                &mut dst[j * hs..(j + 1) * hs],
+                weight,
+                eps,
+            );
+        }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        acc + a * b
+}
+
+/// Fused parallel residual add `hidden += delta` and RMSNorm `hidden -> dst`.
+#[inline]
+fn par_add_rmsnorm_into_rows(
+    hidden: &mut [f32],
+    delta: &[f32],
+    dst: &mut [f32],
+    hs: usize,
+    n: usize,
+    weight: &[f32],
+    eps: f32,
+) {
+    let h_ptr = hidden.as_mut_ptr() as usize;
+    let d_ptr = delta.as_ptr() as usize;
+    cpu::par_rows_n(&mut dst[..n * hs], hs, 4, move |(j, row)| unsafe {
+        let h_tok = core::slice::from_raw_parts_mut((h_ptr as *mut f32).add(j * hs), hs);
+        let d_tok = core::slice::from_raw_parts((d_ptr as *const f32).add(j * hs), hs);
+        cpu::add_rmsnorm_into(h_tok, d_tok, row, weight, eps);
+    });
+}
+
+/// Parallel row-wise in-place `rmsnorm` when batch width justifies pool wakeup.
+#[inline]
+fn par_rmsnorm_inplace_rows(buf: &mut [f32], hs: usize, n: usize, weight: &[f32], eps: f32) {
+    if n >= 16 {
+        cpu::par_rows_n(&mut buf[..n * hs], hs, 4, move |(_, row)| {
+            cpu::rmsnorm(row, weight, eps);
+        });
+    } else {
+        buf[..n * hs]
+            .chunks_exact_mut(hs)
+            .for_each(|row| cpu::rmsnorm(row, weight, eps));
     }
 }
 
@@ -2243,6 +2297,130 @@ impl LfmModel {
         out
     }
 
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_layer_attn_refs(
+        &self,
+        layer: usize,
+    ) -> Option<(&WeightRef, &WeightRef, &WeightRef, &WeightRef)> {
+        let lr = self.layer_refs.get(layer)?;
+        Some((
+            lr.attn_q.as_ref()?,
+            lr.attn_k.as_ref()?,
+            lr.attn_v.as_ref()?,
+            lr.attn_output.as_ref()?,
+        ))
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_layer_conv_refs(&self, layer: usize) -> Option<(&WeightRef, &WeightRef)> {
+        let lr = self.layer_refs.get(layer)?;
+        Some((
+            lr.shortconv_in_proj.as_ref()?,
+            lr.shortconv_out_proj.as_ref()?,
+        ))
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_layer_ffn_refs(
+        &self,
+        layer: usize,
+    ) -> Result<(&WeightRef, &WeightRef, &WeightRef)> {
+        let d = self
+            .layer_refs
+            .get(layer)
+            .ok_or_else(|| anyhow::anyhow!("layer {layer} out of range"))?
+            .ffn
+            .dense()?;
+        Ok((&d.gate, &d.up, &d.down))
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_conv_tap_first(&self, layer: usize) -> Option<&[f32]> {
+        self.conv_weights.get(layer)?.as_deref()
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_lfm3_post_attn_norm(&self, layer: usize) -> Option<&[f32]> {
+        self.lfm3
+            .as_ref()?
+            .layers
+            .get(layer)?
+            .post_operator_norm
+            .as_deref()
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_lfm3_post_ffn_norm(&self, layer: usize) -> Option<&[f32]> {
+        self.lfm3
+            .as_ref()?
+            .layers
+            .get(layer)?
+            .post_ffn_norm
+            .as_deref()
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_lfm3_attn_gate_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.lfm3
+            .as_ref()?
+            .layers
+            .get(layer)?
+            .attn
+            .as_ref()
+            .map(|a| &a.gate)
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_lfm3_attn_window(&self, layer: usize) -> Option<usize> {
+        self.lfm3.as_ref()?.layers.get(layer)?.attn.as_ref()?.window
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_lfm3_rope_params(&self, layer: usize) -> (f32, Option<&[f32]>) {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| l.layers.get(layer))
+            .and_then(|ly| ly.attn.as_ref())
+            .map_or((self.config.rope_theta, None), |a| {
+                (a.rope_theta, a.rope_freq_factors.as_deref())
+            })
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_project_logits_into(&self, hidden: &[f32], logits: &mut [f32]) {
+        static HEAD_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let max_active = *HEAD_THREADS.get_or_init(|| {
+            std::env::var("CERA_NPU_HEAD_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        });
+        let mut normed = [0.0f32; 2048];
+        let normed_slice = if hidden.len() <= normed.len() {
+            let s = &mut normed[..hidden.len()];
+            s.copy_from_slice(hidden);
+            cpu::rmsnorm(s, &self.output_norm_weight, self.config.rms_norm_eps);
+            &normed[..hidden.len()]
+        } else {
+            logits[..self.config.vocab_size].fill(0.0);
+            return;
+        };
+        transformer::gemv_active(
+            max_active,
+            &self.gguf,
+            &self.logits_ref,
+            normed_slice,
+            &mut logits[..self.config.vocab_size],
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_project_logits_from_hidden(&self, hidden: &[f32]) -> Vec<f32> {
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.xdna_project_logits_into(hidden, &mut logits);
+        logits
+    }
+
     /// Dequantize a single row into `out` (shared
     /// `transformer::dequantize_row_into`).
     fn dequantize_row_into(&self, wref: &WeightRef, row_idx: usize, out: &mut [f32]) {
@@ -3660,25 +3838,38 @@ impl LfmModel {
         #[allow(unused_mut)]
         let mut t_attn_scores = Duration::ZERO;
 
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+        let rope_cos_sin_64: Option<(Vec<f32>, Vec<f32>)> = if self.lfm3.is_none()
+            && n >= 4
+            && cfg.head_dim == 64
+            && cfg.block_types.contains(&BlockType::Attention)
+        {
+            let mut c = Vec::new();
+            let mut s = Vec::new();
+            cpu::precompute_rope_cos_sin(
+                start_pos,
+                n,
+                cfg.head_dim,
+                cfg.rope_theta,
+                &mut c,
+                &mut s,
+            );
+            Some((c, s))
+        } else {
+            None
+        };
+
         for layer in 0..cfg.n_layers {
             let t0 = Instant::now();
             // RMSnorm each token row
-            let w_attn = &self.attn_norm_weights[layer];
-            let eps = cfg.rms_norm_eps;
-            if n >= 512 {
-                let hidden_ptr = hidden.as_ptr() as usize;
-                cpu::par_rows_n(&mut normed[..n * hs], hs, 64, move |(j, row)| unsafe {
-                    let tok_h =
-                        core::slice::from_raw_parts((hidden_ptr as *const f32).add(j * hs), hs);
-                    cpu::rmsnorm_into(tok_h, row, w_attn, eps);
-                });
-            } else {
-                for j in 0..n {
-                    let tok_h = &hidden[j * hs..(j + 1) * hs];
-                    let tok_norm = &mut normed[j * hs..(j + 1) * hs];
-                    cpu::rmsnorm_into(tok_h, tok_norm, w_attn, eps);
-                }
-            }
+            par_rmsnorm_into_rows(
+                hidden,
+                normed,
+                hs,
+                n,
+                &self.attn_norm_weights[layer],
+                cfg.rms_norm_eps,
+            );
             if profile_prefill {
                 t_norm += t0.elapsed();
             }
@@ -3928,120 +4119,26 @@ impl LfmModel {
                                     }
                                 }
                             }
-                        } else if kernel_size != 3 {
-                            // Any other tap count (`lfm3` has 7): the loops below are written
-                            // for exactly three taps, so walk the taps. Same summation order and
-                            // rounding as the decode kernel (buffered taps oldest first, then the
-                            // new bx; see `conv_mac`).
-                            for j in 0..n {
-                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
-                                let (b_slice, c_slice, x_slice) =
-                                    (&proj[..hs], &proj[hs..2 * hs], &proj[2 * hs..3 * hs]);
-
-                                let LayerState::Conv { buffer, history } = &mut state.layers[layer]
-                                else {
-                                    panic!("expected Conv state for layer {layer}");
-                                };
-                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
-                                let bx = &mut state.scratch.conv_scratch[..hs];
-
-                                bx.iter_mut()
-                                    .zip(b_slice.iter().zip(x_slice))
-                                    .for_each(|(o, (&b, &x))| *o = b * x);
-                                out_in
-                                    .iter_mut()
-                                    .zip(buffer[..hs].iter().zip(&conv_wt[..hs]))
-                                    .for_each(|(o, (&s, &w))| *o = s * w);
-                                (1..d_conv).for_each(|t| {
-                                    out_in
-                                        .iter_mut()
-                                        .zip(buffer[t * hs..(t + 1) * hs].iter())
-                                        .zip(&conv_wt[t * hs..(t + 1) * hs])
-                                        .for_each(|((o, &s), &w)| *o = conv_mac(*o, s, w));
-                                });
-                                out_in
-                                    .iter_mut()
-                                    .zip(bx.iter().zip(&conv_wt[d_conv * hs..(d_conv + 1) * hs]))
-                                    .zip(c_slice)
-                                    .for_each(|((o, (&b, &w)), &c)| *o = c * conv_mac(*o, b, w));
-
-                                buffer.copy_within(hs.., 0);
-                                buffer[(d_conv - 1) * hs..d_conv * hs].copy_from_slice(bx);
-                                history.push(start_pos + j + 1, buffer);
-                            }
-                        } else {
-                            for j in 0..n {
-                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
-                                let b_slice = &proj[..hs];
-                                let c_slice = &proj[hs..2 * hs];
-                                let x_slice = &proj[2 * hs..3 * hs];
-
-                                let LayerState::Conv { buffer, history } = &mut state.layers[layer]
-                                else {
-                                    panic!("expected Conv state for layer {layer}");
-                                };
-
-                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
-                                let conv_scratch = &mut state.scratch.conv_scratch[..hs];
-
-                                #[cfg(target_arch = "aarch64")]
-                                unsafe {
-                                    use core::arch::aarch64::*;
-                                    let n_chunks = hs / 4;
-                                    let b_ptr = b_slice.as_ptr();
-                                    let x_ptr = x_slice.as_ptr();
-                                    let c_ptr = c_slice.as_ptr();
-                                    let b0_ptr = buffer.as_ptr();
-                                    let b1_ptr = buffer.as_ptr().add(hs);
-                                    let w0_ptr = conv_w0.as_ptr();
-                                    let w1_ptr = conv_w1.as_ptr();
-                                    let w2_ptr = conv_w2.as_ptr();
-                                    let out_in_ptr = out_in.as_mut_ptr();
-                                    let cs_ptr = conv_scratch.as_mut_ptr();
-
-                                    for i in 0..n_chunks {
-                                        let b_v = vld1q_f32(b_ptr.add(i * 4));
-                                        let x_v = vld1q_f32(x_ptr.add(i * 4));
-                                        let bx_v = vmulq_f32(b_v, x_v);
-                                        vst1q_f32(cs_ptr.add(i * 4), bx_v);
-
-                                        let b0_v = vld1q_f32(b0_ptr.add(i * 4));
-                                        let b1_v = vld1q_f32(b1_ptr.add(i * 4));
-                                        let w0_v = vld1q_f32(w0_ptr.add(i * 4));
-                                        let w1_v = vld1q_f32(w1_ptr.add(i * 4));
-                                        let w2_v = vld1q_f32(w2_ptr.add(i * 4));
-
-                                        let out_v = vfmaq_f32(
-                                            vfmaq_f32(vmulq_f32(b0_v, w0_v), b1_v, w1_v),
-                                            bx_v,
-                                            w2_v,
-                                        );
-                                        let c_v = vld1q_f32(c_ptr.add(i * 4));
-                                        let final_v = vmulq_f32(c_v, out_v);
-                                        vst1q_f32(out_in_ptr.add(i * 4), final_v);
-                                    }
-                                }
-
-                                #[cfg(not(target_arch = "aarch64"))]
-                                {
-                                    for i in 0..hs {
-                                        conv_scratch[i] = b_slice[i] * x_slice[i];
-                                        let conv_out = buffer[i] * conv_w0[i]
-                                            + buffer[hs + i] * conv_w1[i]
-                                            + conv_scratch[i] * conv_w2[i];
-                                        out_in[i] = c_slice[i] * conv_out;
-                                    }
-                                }
-
-                                if d_conv > 0 {
-                                    if d_conv > 1 {
-                                        buffer.copy_within(hs.., 0);
-                                    }
-                                    let last_slot = (d_conv - 1) * hs;
-                                    buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
-                                    history.push(start_pos + j + 1, buffer);
-                                }
-                            }
+                        } else if d_conv > 0 {
+                            let LayerState::Conv { buffer, history } = &mut state.layers[layer]
+                            else {
+                                panic!("expected Conv state for layer {layer}");
+                            };
+                            let (first_kept, ring_start, snapshots) =
+                                history.reserve_batch(start_pos, n);
+                            cpu::shortconv_causal_prefill(
+                                proj_mat,
+                                conv_wt,
+                                buffer,
+                                out_proj_input,
+                                Some(snapshots),
+                                first_kept,
+                                ring_start,
+                                crate::kv_cache::CONV_HISTORY_CAPACITY,
+                                n,
+                                hs,
+                                d_conv,
+                            );
                         }
                         if profile_prefill {
                             t_conv_core += t_c.elapsed();
@@ -4262,6 +4359,38 @@ impl LfmModel {
                                                     packed: p,
                                                     scales: s,
                                                     smmla: true,
+                                                });
+                                            }
+                                            (
+                                                transformer::Repacked::Q40Lin16 {
+                                                    packed: q_p,
+                                                    scales_f16: q_s,
+                                                },
+                                                transformer::Repacked::Q40Lin16 {
+                                                    packed: k_p,
+                                                    scales_f16: k_s,
+                                                },
+                                                transformer::Repacked::Q40Lin16 {
+                                                    packed: v_p,
+                                                    scales_f16: v_s,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut s = Vec::with_capacity(
+                                                    q_s.len() + k_s.len() + v_s.len(),
+                                                );
+                                                s.extend_from_slice(q_s);
+                                                s.extend_from_slice(k_s);
+                                                s.extend_from_slice(v_s);
+                                                return Some(FusedAttnProjections::Q40Lin16All {
+                                                    packed: p,
+                                                    scales_f16: s,
                                                 });
                                             }
                                             (
@@ -4545,6 +4674,28 @@ impl LfmModel {
                                             });
                                         }
                                         (
+                                            transformer::Repacked::Q40Lin16 {
+                                                packed: q_p,
+                                                scales_f16: q_s,
+                                            },
+                                            transformer::Repacked::Q40Lin16 {
+                                                packed: k_p,
+                                                scales_f16: k_s,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+
+                                            let mut s = Vec::with_capacity(q_s.len() + k_s.len());
+                                            s.extend_from_slice(q_s);
+                                            s.extend_from_slice(k_s);
+                                            return Some(FusedAttnProjections::Q40Lin16QkOnly {
+                                                packed: p,
+                                                scales_f16: s,
+                                            });
+                                        }
+                                        (
                                             transformer::Repacked::Q40 {
                                                 packed: q_p,
                                                 scales: q_s,
@@ -4622,6 +4773,32 @@ impl LfmModel {
                             let mut ran_fused = false;
                             if let Some(fused) = qkv_repacked.as_ref() {
                                 match fused {
+                                    FusedAttnProjections::Q40Lin16All {
+                                        packed,
+                                        scales_f16,
+                                    } => {
+                                        if crate::backend::cpu::gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
+                                            packed,
+                                            scales_f16,
+                                            bq_scales,
+                                            bq_quants,
+                                            &mut proj_mat[..qkv_dim * n],
+                                            n,
+                                            qkv_dim,
+                                            hs,
+                                        ) {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..hs + kv_dim]);
+                                                v_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                                            }
+                                        }
+                                    }
                                     FusedAttnProjections::Q40All {
                                         packed,
                                         scales,
@@ -4781,6 +4958,41 @@ impl LfmModel {
                                             )
                                         };
                                         if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qk_dim..(j + 1) * qk_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..qk_dim]);
+                                            }
+                                            transformer::gemm_preq_rowmajor(
+                                                &self.gguf,
+                                                attn_v_ref,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut v_mat[..kv_dim * n],
+                                                n,
+                                                kv_dim,
+                                                hs,
+                                            );
+                                        }
+                                    }
+                                    FusedAttnProjections::Q40Lin16QkOnly {
+                                        packed,
+                                        scales_f16,
+                                    } => {
+                                        let qk_dim = hs + kv_dim;
+                                        if crate::backend::cpu::gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
+                                            packed,
+                                            scales_f16,
+                                            bq_scales,
+                                            bq_quants,
+                                            &mut proj_mat[..qk_dim * n],
+                                            n,
+                                            qk_dim,
+                                            hs,
+                                        ) {
                                             ran_fused = true;
                                             for j in 0..n {
                                                 let row = &proj_mat[j * qk_dim..(j + 1) * qk_dim];
@@ -5061,7 +5273,21 @@ impl LfmModel {
                         let scale = 1.0 / (head_dim as f32).sqrt();
 
                         // ── Pass A: QK-norm + RoPE + KV cache append ──────────
-                        if n >= 4 {
+                        let used_fast_rope = rope_cos_sin_64.as_ref().is_some_and(|(ct, st)| {
+                            cpu::par_qk_rmsnorm_rope64(
+                                &mut q_mat[..n * hs],
+                                &mut k_mat[..n * kv_dim],
+                                q_norm,
+                                k_norm,
+                                ct,
+                                st,
+                                cfg.rms_norm_eps,
+                                cfg.n_heads,
+                                n_kv_heads,
+                                n,
+                            )
+                        });
+                        if !used_fast_rope && n >= 4 {
                             let q_ptr = q_mat.as_mut_ptr() as usize;
                             let k_ptr = k_mat.as_mut_ptr() as usize;
                             let n_heads = cfg.n_heads;
@@ -5121,7 +5347,7 @@ impl LfmModel {
                                     }
                                 },
                             );
-                        } else {
+                        } else if !used_fast_rope {
                             for j in 0..n {
                                 let pos = start_pos + j;
                                 let q = &mut q_mat[j * hs..(j + 1) * hs];
@@ -5163,60 +5389,92 @@ impl LfmModel {
                             }
                         }
 
-                        for j in 0..n {
-                            let k = &k_mat[j * kv_dim..(j + 1) * kv_dim];
-                            let v = &v_mat[j * kv_dim..(j + 1) * kv_dim];
+                        if will_compress_kv {
+                            for j in 0..n {
+                                let k = &k_mat[j * kv_dim..(j + 1) * kv_dim];
+                                let v = &v_mat[j * kv_dim..(j + 1) * kv_dim];
 
-                            // Append K, V to cache (f32 or TurboQuant-compressed).
-                            if let LayerState::Attention {
-                                key_cache,
-                                value_cache,
-                                key_cache_f16,
-                                value_cache_f16,
-                                compressed_keys,
-                                compressed_values,
-                            } = &mut state.layers[layer]
-                            {
-                                match (will_compress_kv, compressed_keys.as_mut()) {
-                                    (true, Some(k_cache_tq)) => {
-                                        turboquant::compress_and_append_keys(
-                                            k,
-                                            n_kv_heads,
-                                            head_dim,
-                                            tq_rotation.unwrap(),
-                                            tq_config.unwrap(),
-                                            k_cache_tq,
-                                            state.tq_encode_scratch.as_mut().unwrap(),
-                                        );
+                                // Append K, V to cache (f32 or TurboQuant-compressed).
+                                if let LayerState::Attention {
+                                    key_cache,
+                                    value_cache,
+                                    key_cache_f16,
+                                    value_cache_f16,
+                                    compressed_keys,
+                                    compressed_values,
+                                } = &mut state.layers[layer]
+                                {
+                                    match compressed_keys.as_mut() {
+                                        Some(k_cache_tq) => {
+                                            turboquant::compress_and_append_keys(
+                                                k,
+                                                n_kv_heads,
+                                                head_dim,
+                                                tq_rotation.unwrap(),
+                                                tq_config.unwrap(),
+                                                k_cache_tq,
+                                                state.tq_encode_scratch.as_mut().unwrap(),
+                                            );
+                                        }
+                                        None if use_f16 => {
+                                            let base = key_cache_f16.len();
+                                            key_cache_f16.resize(base + kv_dim, 0);
+                                            cpu::f32_slice_to_f16_into(
+                                                k,
+                                                &mut key_cache_f16[base..],
+                                            );
+                                        }
+                                        None => key_cache.extend_from_slice(k),
                                     }
-                                    _ if use_f16 => {
-                                        key_cache_f16
-                                            .extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
-                                    }
-                                    _ => {
-                                        key_cache.extend_from_slice(k);
+                                    match compressed_values.as_mut() {
+                                        Some(v_cache_tq) => {
+                                            turboquant::compress_and_append_values(
+                                                v,
+                                                n_kv_heads,
+                                                head_dim,
+                                                tq_rotation.unwrap(),
+                                                tq_config.unwrap(),
+                                                v_cache_tq,
+                                                state.tq_encode_scratch.as_mut().unwrap(),
+                                            );
+                                        }
+                                        None if use_f16 => {
+                                            let base = value_cache_f16.len();
+                                            value_cache_f16.resize(base + kv_dim, 0);
+                                            cpu::f32_slice_to_f16_into(
+                                                v,
+                                                &mut value_cache_f16[base..],
+                                            );
+                                        }
+                                        None => value_cache.extend_from_slice(v),
                                     }
                                 }
-                                match (will_compress_kv, compressed_values.as_mut()) {
-                                    (true, Some(v_cache_tq)) => {
-                                        turboquant::compress_and_append_values(
-                                            v,
-                                            n_kv_heads,
-                                            head_dim,
-                                            tq_rotation.unwrap(),
-                                            tq_config.unwrap(),
-                                            v_cache_tq,
-                                            state.tq_encode_scratch.as_mut().unwrap(),
-                                        );
-                                    }
-                                    _ if use_f16 => {
-                                        value_cache_f16
-                                            .extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
-                                    }
-                                    _ => {
-                                        value_cache.extend_from_slice(v);
-                                    }
-                                }
+                            }
+                        } else if let LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                            key_cache_f16,
+                            value_cache_f16,
+                            ..
+                        } = &mut state.layers[layer]
+                        {
+                            let total_kv = n * kv_dim;
+                            if use_f16 {
+                                let k_base = key_cache_f16.len();
+                                key_cache_f16.resize(k_base + total_kv, 0);
+                                cpu::par_f32_slice_to_f16_into(
+                                    &k_mat[..total_kv],
+                                    &mut key_cache_f16[k_base..],
+                                );
+                                let v_base = value_cache_f16.len();
+                                value_cache_f16.resize(v_base + total_kv, 0);
+                                cpu::par_f32_slice_to_f16_into(
+                                    &v_mat[..total_kv],
+                                    &mut value_cache_f16[v_base..],
+                                );
+                            } else {
+                                key_cache.extend_from_slice(&k_mat[..total_kv]);
+                                value_cache.extend_from_slice(&v_mat[..total_kv]);
                             }
                         }
 
@@ -5244,13 +5502,8 @@ impl LfmModel {
                                 ..
                             } = &state.layers[layer]
                         {
-                            kv_widen_k.clear();
-                            kv_widen_k
-                                .extend(key_cache_f16.iter().map(|&b| crate::quant::f16_to_f32(b)));
-                            kv_widen_v.clear();
-                            kv_widen_v.extend(
-                                value_cache_f16.iter().map(|&b| crate::quant::f16_to_f32(b)),
-                            );
+                            cpu::par_f16_slice_to_f32_into(key_cache_f16, kv_widen_k);
+                            cpu::par_f16_slice_to_f32_into(value_cache_f16, kv_widen_v);
                         }
 
                         if use_flash {
@@ -5267,76 +5520,92 @@ impl LfmModel {
                                 }
                             };
                             let n_heads = cfg.n_heads;
-                            let head_chunk = n * head_dim;
-                            let flash_buf = &mut flash_out[..n_heads * head_chunk];
                             let t_scores = Instant::now();
-                            // Q transpose to head-major columns, row-parallel using 4x4 vector tiles.
                             let max_active = cpu::prefill_threads_for_tokens(n);
-                            cpu::transpose_matrix_f32_parallel(
-                                &q_mat[..n * hs],
-                                &mut q_col[..hs * n],
-                                n,
-                                hs,
-                                max_active,
-                            );
-                            let q_ref = &q_col[..hs * n];
-
                             let is_causal =
                                 self.is_causal_for(state) && !self.layer_is_non_causal(layer);
-                            if !cpu::flash_attention_prefill_items(
-                                q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim,
-                                head_dim, scale, start_pos, is_causal, max_active,
+                            if !cpu::flash_attention_prefill_token_major(
+                                &q_mat[..n * hs],
+                                k_cache,
+                                v_cache,
+                                &mut out_proj_input[..n * hs],
+                                n_heads,
+                                group_size,
+                                n,
+                                kv_dim,
+                                head_dim,
+                                scale,
+                                start_pos,
+                                is_causal,
+                                max_active,
                             ) {
-                                cpu::par_rows_n_chunked_active(
-                                    flash_buf,
-                                    head_chunk,
-                                    1,
-                                    1,
+                                let head_chunk = n * head_dim;
+                                let flash_buf = &mut flash_out[..n_heads * head_chunk];
+                                // Q transpose to head-major columns, row-parallel using 4x4 vector tiles.
+                                cpu::transpose_matrix_f32_parallel(
+                                    &q_mat[..n * hs],
+                                    &mut q_col[..hs * n],
+                                    n,
+                                    hs,
                                     max_active,
-                                    |(h, chunk)| {
-                                        let kv_h = h / group_size;
-                                        cpu::flash_attention_gqa_cpu_opt(
-                                            q_ref,
-                                            k_cache,
-                                            v_cache,
-                                            chunk,
-                                            h,
-                                            1,
-                                            n,
-                                            n,
-                                            kv_dim,
-                                            kv_h * head_dim,
-                                            head_dim,
-                                            scale,
-                                            start_pos,
-                                            is_causal,
+                                );
+                                let q_ref = &q_col[..hs * n];
+
+                                if !cpu::flash_attention_prefill_items(
+                                    q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n,
+                                    kv_dim, head_dim, scale, start_pos, is_causal, max_active,
+                                ) {
+                                    cpu::par_rows_n_chunked_active(
+                                        flash_buf,
+                                        head_chunk,
+                                        1,
+                                        1,
+                                        max_active,
+                                        |(h, chunk)| {
+                                            let kv_h = h / group_size;
+                                            cpu::flash_attention_gqa_cpu_opt(
+                                                q_ref,
+                                                k_cache,
+                                                v_cache,
+                                                chunk,
+                                                h,
+                                                1,
+                                                n,
+                                                n,
+                                                kv_dim,
+                                                kv_h * head_dim,
+                                                head_dim,
+                                                scale,
+                                                start_pos,
+                                                is_causal,
+                                            );
+                                        },
+                                    );
+                                }
+
+                                // Output transpose back to token-major, row-parallel over
+                                // tokens (each row gathers one head-block per head).
+                                let flash_ptr = flash_buf.as_ptr() as usize;
+                                cpu::par_rows_n_active(
+                                    &mut out_proj_input[..n * hs],
+                                    hs,
+                                    64,
+                                    max_active,
+                                    move |(j, row)| unsafe {
+                                        let src_all = core::slice::from_raw_parts(
+                                            flash_ptr as *const f32,
+                                            n_heads * n * head_dim,
                                         );
+                                        for h in 0..n_heads {
+                                            let src_base = h * n * head_dim + j * head_dim;
+                                            let dst_base = h * head_dim;
+                                            row[dst_base..dst_base + head_dim].copy_from_slice(
+                                                &src_all[src_base..src_base + head_dim],
+                                            );
+                                        }
                                     },
                                 );
                             }
-
-                            // Output transpose back to token-major, row-parallel over
-                            // tokens (each row gathers one head-block per head).
-                            let flash_ptr = flash_buf.as_ptr() as usize;
-                            cpu::par_rows_n_active(
-                                &mut out_proj_input[..n * hs],
-                                hs,
-                                64,
-                                max_active,
-                                move |(j, row)| unsafe {
-                                    let src_all = core::slice::from_raw_parts(
-                                        flash_ptr as *const f32,
-                                        n_heads * n * head_dim,
-                                    );
-                                    for h in 0..n_heads {
-                                        let src_base = h * n * head_dim + j * head_dim;
-                                        let dst_base = h * head_dim;
-                                        row[dst_base..dst_base + head_dim].copy_from_slice(
-                                            &src_all[src_base..src_base + head_dim],
-                                        );
-                                    }
-                                },
-                            );
                             if profile_prefill {
                                 t_attn_scores += t_scores.elapsed();
                             }
@@ -5658,68 +5927,73 @@ impl LfmModel {
                 );
             }
 
-            // `lfm3` sandwich norm: the block output is normalized before the residual add.
-            if let Some(norm_w) = self
+            let post_op_norm = self
                 .lfm3
                 .as_ref()
-                .and_then(|l3| l3.layers[layer].post_operator_norm.as_ref())
-            {
-                block_out[..n * hs]
-                    .chunks_exact_mut(hs)
-                    .for_each(|row| cpu::rmsnorm(row, norm_w, cfg.rms_norm_eps));
-            }
+                .and_then(|l3| l3.layers[layer].post_operator_norm.as_ref());
 
-            let t_res1 = Instant::now();
-            // Residual: hidden += block_out
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                use core::arch::aarch64::*;
-                let total = hs * n;
-                let n_chunks = total / 4;
-                let h_ptr = hidden.as_mut_ptr();
-                let bo_ptr = block_out.as_ptr();
-                for i in 0..n_chunks {
-                    let h_v = vld1q_f32(h_ptr.add(i * 4));
-                    let bo_v = vld1q_f32(bo_ptr.add(i * 4));
-                    vst1q_f32(h_ptr.add(i * 4), vaddq_f32(h_v, bo_v));
+            if !debug_hidden && post_op_norm.is_none() && n >= 16 {
+                let t_fn = Instant::now();
+                par_add_rmsnorm_into_rows(
+                    hidden,
+                    block_out,
+                    ffn_input,
+                    hs,
+                    n,
+                    &self.ffn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
+                if profile_prefill {
+                    t_ffn_norm += t_fn.elapsed();
                 }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            for i in 0..hs * n {
-                hidden[i] += block_out[i];
-            }
-            if profile_prefill {
-                t_residuals += t_res1.elapsed();
-            }
-            if debug_hidden {
-                let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
-                    "conv"
-                } else {
-                    "attn"
-                };
-                log_rms(&format!("layer {layer} ({block_kind}) post-block"), hidden);
-            }
-
-            let t_fn = Instant::now();
-            // FFN pre-norm each row
-            let w_ffn = &self.ffn_norm_weights[layer];
-            let eps = cfg.rms_norm_eps;
-            if n >= 512 {
-                let hidden_ptr = hidden.as_ptr() as usize;
-                cpu::par_rows_n(&mut ffn_input[..n * hs], hs, 64, move |(j, row)| unsafe {
-                    let tok_h =
-                        core::slice::from_raw_parts((hidden_ptr as *const f32).add(j * hs), hs);
-                    cpu::rmsnorm_into(tok_h, row, w_ffn, eps);
-                });
             } else {
-                for j in 0..n {
-                    let tok_h = &hidden[j * hs..(j + 1) * hs];
-                    let tok_in = &mut ffn_input[j * hs..(j + 1) * hs];
-                    cpu::rmsnorm_into(tok_h, tok_in, w_ffn, eps);
+                // `lfm3` sandwich norm: the block output is normalized before the residual add.
+                if let Some(norm_w) = post_op_norm {
+                    par_rmsnorm_inplace_rows(block_out, hs, n, norm_w, cfg.rms_norm_eps);
                 }
-            }
-            if profile_prefill {
-                t_ffn_norm += t_fn.elapsed();
+
+                let t_res1 = Instant::now();
+                // Residual: hidden += block_out
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use core::arch::aarch64::*;
+                    let total = hs * n;
+                    let n_chunks = total / 4;
+                    let h_ptr = hidden.as_mut_ptr();
+                    let bo_ptr = block_out.as_ptr();
+                    for i in 0..n_chunks {
+                        let h_v = vld1q_f32(h_ptr.add(i * 4));
+                        let bo_v = vld1q_f32(bo_ptr.add(i * 4));
+                        vst1q_f32(h_ptr.add(i * 4), vaddq_f32(h_v, bo_v));
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                cpu::par_add_inplace(&mut hidden[..hs * n], &block_out[..hs * n]);
+                if profile_prefill {
+                    t_residuals += t_res1.elapsed();
+                }
+                if debug_hidden {
+                    let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
+                        "conv"
+                    } else {
+                        "attn"
+                    };
+                    log_rms(&format!("layer {layer} ({block_kind}) post-block"), hidden);
+                }
+
+                let t_fn = Instant::now();
+                // FFN pre-norm each row
+                par_rmsnorm_into_rows(
+                    hidden,
+                    ffn_input,
+                    hs,
+                    n,
+                    &self.ffn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
+                if profile_prefill {
+                    t_ffn_norm += t_fn.elapsed();
+                }
             }
 
             // FFN: batched GEMM (reads weights once for all n tokens) for the
@@ -6077,9 +6351,7 @@ impl LfmModel {
                 .as_ref()
                 .and_then(|l3| l3.layers[layer].post_ffn_norm.as_ref())
             {
-                ffn_out[..n * hs]
-                    .chunks_exact_mut(hs)
-                    .for_each(|row| cpu::rmsnorm(row, norm_w, cfg.rms_norm_eps));
+                par_rmsnorm_inplace_rows(ffn_out, hs, n, norm_w, cfg.rms_norm_eps);
             }
             let t_res2 = Instant::now();
             // Second residual: hidden += ffn_out
@@ -6097,9 +6369,7 @@ impl LfmModel {
                 }
             }
             #[cfg(not(target_arch = "aarch64"))]
-            for i in 0..hs * n {
-                hidden[i] += ffn_out[i];
-            }
+            cpu::par_add_inplace(&mut hidden[..hs * n], &ffn_out[..hs * n]);
             if profile_prefill {
                 t_residuals += t_res2.elapsed();
             }

@@ -90,6 +90,7 @@ const SLANG_KERNELS: &[&str] = &[
     "gemm_stream_q4_0",
     "gemm_stream_q4_0_k64",
     "attention_prefill_hd64_f16",
+    "attention_prefill_hd128_f16",
     "gemm_stream_q4_0_k64_xf32",
     "gemm_stream_q4_0_k64_r2",
     "gemm_stream_q4_0_k64_gateup",
@@ -104,6 +105,9 @@ const SLANG_KERNELS: &[&str] = &[
     "gemv_q6_k",
     "gemv_q6_k_flat",
     "gemv_q4_0_stream",
+    "gemv_q4_0_stream_sm",
+    "gemv_q4_0_stream_splitk",
+    "gemv_splitk_reduce",
     "gemv_q4_k",
     "gemv_q4_k_stream",
     "gemv_q5_k_stream",
@@ -118,21 +122,39 @@ const SLANG_KERNELS: &[&str] = &[
     "gemv_q4_0_stream_gateup",
 ];
 
+/// Cooperative-Matrix (`VK_KHR_cooperative_matrix`) Slang passthrough kernels.
+const SLANG_COOPMAT_KERNELS: &[&str] =
+    &["gemm_coopmat_q4_0_k64_xf32", "gemm_coopmat_q4_0_k64_gateup"];
+
 fn compile_slang_kernels() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR unset");
     let dir = "src/backend/shaders/spirv";
     let slangc = find_slangc();
 
-    for name in SLANG_KERNELS {
-        let src = format!("{dir}/{name}.slang");
-        let committed = format!("{dir}/{name}.spv");
-        let out = format!("{out_dir}/{name}.spv");
-        println!("cargo:rerun-if-changed={src}");
-        println!("cargo:rerun-if-changed={committed}");
+    let groups: &[(&[&str], &[&str])] = &[
+        (SLANG_KERNELS, &[]),
+        (
+            SLANG_COOPMAT_KERNELS,
+            &[
+                "-profile",
+                "spirv_1_6",
+                "-capability",
+                "spvCooperativeMatrixKHR+spvGroupNonUniform",
+            ],
+        ),
+    ];
 
-        let compiled = slangc.as_ref().is_some_and(|sc| {
-            Command::new(sc)
-                .args([
+    for &(names, extra_args) in groups {
+        for name in names {
+            let src = format!("{dir}/{name}.slang");
+            let committed = format!("{dir}/{name}.spv");
+            let out = format!("{out_dir}/{name}.spv");
+            println!("cargo:rerun-if-changed={src}");
+            println!("cargo:rerun-if-changed={committed}");
+
+            let compiled = slangc.as_ref().is_some_and(|sc| {
+                let mut cmd = Command::new(sc);
+                cmd.args([
                     src.as_str(),
                     "-target",
                     "spirv",
@@ -141,26 +163,25 @@ fn compile_slang_kernels() {
                     "main",
                     "-stage",
                     "compute",
-                    "-o",
-                    out.as_str(),
-                ])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        });
+                ]);
+                cmd.args(extra_args);
+                cmd.args(["-o", out.as_str()]);
+                cmd.status().map(|s| s.success()).unwrap_or(false)
+            });
 
-        if !compiled {
-            if slangc.is_none() {
-                println!(
-                    "cargo:warning=slangc not found; using committed {name}.spv. Set SLANGC or add ~/.local/slang/bin to PATH to recompile from {name}.slang."
-                );
-            } else {
-                println!(
-                    "cargo:warning=slangc failed on {name}.slang; using committed {name}.spv."
-                );
+            if !compiled {
+                if slangc.is_none() {
+                    println!(
+                        "cargo:warning=slangc not found; using committed {name}.spv. Set SLANGC or add ~/.local/slang/bin to PATH to recompile from {name}.slang."
+                    );
+                } else {
+                    println!(
+                        "cargo:warning=slangc failed on {name}.slang; using committed {name}.spv."
+                    );
+                }
+                std::fs::copy(&committed, &out)
+                    .unwrap_or_else(|e| panic!("no compiled or committed SPIR-V for {name}: {e}"));
             }
-            std::fs::copy(&committed, &out)
-                .unwrap_or_else(|e| panic!("no compiled or committed SPIR-V for {name}: {e}"));
         }
     }
     println!("cargo:rerun-if-env-changed=SLANGC");
@@ -420,6 +441,10 @@ fn find_slangc() -> Option<String> {
     }
     candidates.push("slangc".to_string());
     candidates.push(format!("{home}/.local/slang/bin/slangc"));
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let p = std::path::PathBuf::from(local).join(r"Programs\slang\bin\slangc.exe");
+        candidates.push(p.to_string_lossy().into_owned());
+    }
     candidates
         .into_iter()
         .find(|cand| Command::new(cand).arg("-v").output().is_ok())

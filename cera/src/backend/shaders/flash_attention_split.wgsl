@@ -59,6 +59,7 @@ fn flash_attention_split(
     let kv_dim = params[3];
     let seq_len = params[4];
     let scale = bitcast<f32>(params[5]);
+    let min_pos = params[6];
 
     let group_size = n_heads / n_kv_heads;
     let kv_head = head / group_size;
@@ -78,7 +79,7 @@ fn flash_attention_split(
     var acc_y = 0.0;
     workgroupBarrier();
 
-    var base = split * TILE;
+    var base = (min_pos & ~(TILE - 1u)) + split * TILE;
     while base < seq_len {
         // ── scores: four lanes per timestep, each a 16-dim slice of the key row, so a wave reads
         // contiguous 128-byte rows with 16-byte loads instead of one lane per row, 32 scalar loads each ──
@@ -88,7 +89,7 @@ fn flash_attention_split(
             let tl = rp * 64u + row_in_pass;
             let tt = base + tl;
             var pd = 0.0;
-            if tt < seq_len {
+            if tt >= min_pos && tt < seq_len {
                 let h = tt * kv_dim + kv_h_offset + lane * 16u;
                 let k0 = k_cache[h >> 3u];
                 let k1 = k_cache[(h >> 3u) + 1u];
@@ -115,7 +116,7 @@ fn flash_attention_split(
         workgroupBarrier();
         let t = base + tid;
         var score = NEG_INF;
-        if t < seq_len {
+        if t >= min_pos && t < seq_len {
             score = (pdot[tid * 4u] + pdot[tid * 4u + 1u] + pdot[tid * 4u + 2u] + pdot[tid * 4u + 3u]) * scale;
         }
         tile_scores[tid] = score;
@@ -151,7 +152,7 @@ fn flash_attention_split(
         let corr = st[3];
 
         var p = 0.0;
-        if t < seq_len {
+        if t >= min_pos && t < seq_len {
             p = exp(tile_scores[tid] - nm);
         }
         tile_scores[tid] = p;
@@ -184,7 +185,7 @@ fn flash_attention_split(
         for (var jj = 0u; jj < 32u; jj += 1u) {
             let j = part_id * 32u + jj;
             let tt = base + j;
-            if tt < seq_len {
+            if tt >= min_pos && tt < seq_len {
                 let pair = unpack2x16float(v_cache[((tt * kv_dim) >> 1u) + v_word]);
                 let pj = tile_scores[j];
                 sx += pj * pair.x;

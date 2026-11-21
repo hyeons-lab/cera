@@ -467,7 +467,7 @@ impl TqGpuCache {
             params_bytes,
         } = plan;
 
-        init_tq_cache_with(
+        let cache = init_tq_cache_with(
             || {
                 ctx.check_pipelines("tq pipelines", || TqPipelines {
                     encode_keys: ctx.create_pipeline(
@@ -524,7 +524,9 @@ impl TqGpuCache {
                 })
             },
             |stage| ctx.ensure_alive(stage),
-        )
+        )?;
+        ctx.save_pipeline_cache();
+        Ok(cache)
     }
 
     /// This layer's cache, or `None` for a conv layer.

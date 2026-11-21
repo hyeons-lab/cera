@@ -9,9 +9,10 @@
 use cera::backend::xdna::XdnaDevice;
 use cera::backend::xdna::kernels::{
     Q4LAYER_ACT_BYTES, Q4LAYER_ACT_FLOATS, Q4LAYER_ACT_SLOT, Q4LAYER_ATTN_NORM_W,
-    Q4LAYER_FFN_NORM_W, Q4LAYER_HEAD_DIM, Q4LAYER_KV_BUCKETS, Q4LAYER_N_KV_HEADS, Q4LAYER_XCLBIN,
-    init_q4layer_bo_y_norms, pack_q4layer_rope_cs, read_le_f32_slice, select_q4layer_kv_bucket,
-    try_inst_words, write_le_f32_slice, write_q4layer_kv_bf16, write_q4layer_step_params,
+    Q4LAYER_FFN_NORM_W, Q4LAYER_HEAD_DIM, Q4LAYER_KV_BUCKETS, Q4LAYER_KV_BYTES, Q4LAYER_N_KV_HEADS,
+    Q4LAYER_XCLBIN, init_q4layer_bo_y_norms, pack_q4layer_rope_cs, read_le_f32_slice,
+    select_q4layer_kv_bucket, try_inst_words, write_le_f32_slice, write_q4layer_kv_bf16,
+    write_q4layer_step_params,
 };
 use cera::backend::xdna::repack::{
     f32_to_bf16, interleave_worker_stages, pack_f32_stage, stage_bytes,
@@ -244,12 +245,27 @@ fn main() -> ExitCode {
         init_q4layer_bo_y_norms(y, &norm_w, &ffn_norm_w);
         write_le_f32_slice(y, 0, &hidden);
         write_q4layer_step_params(y, &rope_cs, ATTN_CACHE_T, skip_kv);
+    }
+    if let Err(e) = bo_y.sync_to_device() {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut bo_kv = match kernel.alloc_bo(Q4LAYER_KV_BYTES, 6) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    {
+        let kv = bo_kv.as_mut_slice();
         for kvh in 0..N_KV_HEADS {
             let src_base = kvh * ATTN_CACHE_T * HEAD_DIM;
             for t in 0..ATTN_CACHE_T {
                 let off = src_base + t * HEAD_DIM;
                 write_q4layer_kv_bf16(
-                    y,
+                    kv,
                     kvh,
                     t,
                     &k_cache[off..off + HEAD_DIM],
@@ -258,7 +274,7 @@ fn main() -> ExitCode {
             }
         }
     }
-    if let Err(e) = bo_y.sync_to_device() {
+    if let Err(e) = bo_kv.sync_to_device() {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
@@ -276,7 +292,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let run = match kernel.create_run(&[&bo_w, &bo_y, &bo_y_next]) {
+    let run = match kernel.create_run(&[&bo_w, &bo_y, &bo_y_next, &bo_kv]) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");

@@ -27,7 +27,7 @@ fn flash_attention_merge(
 ) {
     let head = wid.x;
     let d = lid.x;
-    if params[4] == 0u {
+    if params[4] == 0u || params[4] <= params[6] {
         out[head * HEAD_DIM + d] = 0.0;
         return;
     }
@@ -43,5 +43,9 @@ fn flash_attention_merge(
         num += w * part[rec + 2u + d];
         den += w * part[rec + 1u];
     }
-    out[head * HEAD_DIM + d] = num / den;
+    if den > 0.0 {
+        out[head * HEAD_DIM + d] = num / den;
+    } else {
+        out[head * HEAD_DIM + d] = 0.0;
+    }
 }

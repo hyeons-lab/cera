@@ -113,7 +113,7 @@ pub fn ensure_rayon_global_pool() {
 
         let n = rayon_pool_width(
             super::cpu_features::env_usize("RAYON_NUM_THREADS"),
-            super::cpu_features::performance_core_count(),
+            super::calibrate::prefill_thread_count(super::cpu_features::core_topology()),
         );
 
         // Perf cores only, matching the width policy: efficiency cores clock
@@ -381,6 +381,41 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+std::thread_local! {
+    static GEMV_MAX_ACTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the scoped worker cap for `gemv_dispatch_active` fallbacks (`0` = unbounded).
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[inline]
+fn current_gemv_max_active() -> usize {
+    GEMV_MAX_ACTIVE.with(std::cell::Cell::get)
+}
+
+/// Runs `f` while capping pool fan-out for GEMV dispatchers via TLS.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn with_gemv_max_active<R>(max_active: usize, f: impl FnOnce() -> R) -> R {
+    if max_active == 0 {
+        return f();
+    }
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GEMV_MAX_ACTIVE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = GEMV_MAX_ACTIVE.with(|c| c.replace(max_active));
+    let _guard = Restore(prev);
+    f()
+}
+
+/// Runs `f` directly when no persistent row pool is active (`wasm32` or serial builds).
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn with_gemv_max_active<R>(_max_active: usize, f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Row-parallel `for_each`: applies `f` to each element of `y`. Under
 /// `parallel` this dispatches through the persistent
 /// [`super::threadpool::RowPool`] (see that module for why not rayon), where
@@ -389,15 +424,29 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 /// are smaller. Otherwise it runs serially.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
-    super::threadpool::RowPool::decode().dispatch_rows(y, 1, min_rows, |row, slice| {
-        f((row, &mut slice[0]));
-    });
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        super::threadpool::RowPool::prefill().dispatch_rows_active(
+            y,
+            1,
+            min_rows,
+            cap,
+            |row, slice| {
+                f((row, &mut slice[0]));
+            },
+        );
+    } else {
+        super::threadpool::RowPool::decode().dispatch_rows(y, 1, min_rows, |row, slice| {
+            f((row, &mut slice[0]));
+        });
+    }
 }
 
-/// Row-parallel slice dispatch: hands the full claimed slice `(start_row, &mut [f32])`
-/// to `f`. This lets vector kernels process multiple output rows simultaneously (e.g. 4 rows in registers).
+/// Dispatch mutable 4-row chunks across `pool` (optionally capped at `max_active` workers).
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-pub fn par_rows_slice(
+fn par_rows_slice_in(
+    pool: &super::threadpool::RowPool,
+    max_active: usize,
     y: &mut [f32],
     min_rows: usize,
     f: impl Fn((usize, &mut [f32])) + Sync + Send,
@@ -410,23 +459,56 @@ pub fn par_rows_slice(
     let groups = total_rows / 4;
     if groups > 0 {
         let min_groups = min_rows.div_ceil(4).max(1);
-        super::threadpool::RowPool::decode().dispatch_range(
-            groups,
-            min_groups,
-            |g_start, g_count| {
-                let start = g_start * 4;
-                let count = g_count * 4;
-                let slice = unsafe {
-                    core::slice::from_raw_parts_mut((y_ptr as *mut f32).add(start), count)
-                };
-                f((start, slice));
-            },
-        );
+        let run = |g_start: usize, g_count: usize| {
+            let start = g_start * 4;
+            let count = g_count * 4;
+            let slice =
+                unsafe { core::slice::from_raw_parts_mut((y_ptr as *mut f32).add(start), count) };
+            f((start, slice));
+        };
+        if max_active > 0 {
+            pool.dispatch_range_active(groups, min_groups, max_active, run);
+        } else {
+            pool.dispatch_range(groups, min_groups, run);
+        }
     }
     let tail_start = groups * 4;
     if tail_start < total_rows {
         f((tail_start, &mut y[tail_start..]));
     }
+}
+
+/// Row-parallel slice dispatch: hands the full claimed slice `(start_row, &mut [f32])`
+/// to `f`. This lets vector kernels process multiple output rows simultaneously (e.g. 4 rows in registers).
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_slice(
+    y: &mut [f32],
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        par_rows_slice_active(cap, y, min_rows, f);
+    } else {
+        par_rows_slice_in(&super::threadpool::RowPool::decode(), 0, y, min_rows, f);
+    }
+}
+
+/// Row-parallel slice dispatch capped to `max_active` workers on the active-barrier pool.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_slice_active(
+    max_active: usize,
+    y: &mut [f32],
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_slice_in(
+        &super::threadpool::RowPool::prefill(),
+        max_active,
+        y,
+        min_rows,
+        f,
+    );
 }
 
 /// Row-parallel range dispatch: executes `f(start_row, num_rows)` across the worker pool
@@ -436,7 +518,12 @@ pub fn par_range(total_rows: usize, min_rows: usize, f: impl Fn(usize, usize) + 
     if total_rows == 0 {
         return;
     }
-    super::threadpool::RowPool::decode().dispatch_range(total_rows, min_rows, f);
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        super::threadpool::RowPool::prefill().dispatch_range_active(total_rows, min_rows, cap, f);
+    } else {
+        super::threadpool::RowPool::decode().dispatch_range(total_rows, min_rows, f);
+    }
 }
 
 /// Wasm32 fallback for `par_range`: runs serially on the calling thread.
@@ -628,6 +715,17 @@ pub fn par_rows(y: &mut [f32], _min_rows: usize, f: impl Fn((usize, &mut f32))) 
 #[cfg(not(feature = "parallel"))]
 pub fn par_rows_slice(y: &mut [f32], _min_rows: usize, f: impl Fn((usize, &mut [f32]))) {
     f((0, y));
+}
+
+/// Serial fallback for worker-capped row slice dispatch when `parallel` is off or on `wasm32`.
+#[cfg(any(not(feature = "parallel"), target_arch = "wasm32"))]
+pub fn par_rows_slice_active(
+    _max_active: usize,
+    y: &mut [f32],
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_slice(y, min_rows, f);
 }
 
 /// Like [`par_rows`] but each "row" is `n` contiguous f32 elements (GEMM
@@ -879,14 +977,19 @@ pub fn par_rows_n_chunked_decode(
     min_chunk_rows: usize,
     f: impl Fn((usize, &mut [f32])) + Sync + Send,
 ) {
-    par_rows_n_chunked_on(
-        super::threadpool::RowPool::decode(),
-        y,
-        n,
-        min_rows,
-        min_chunk_rows,
-        f,
-    );
+    let cap = current_gemv_max_active();
+    if cap > 0 {
+        par_rows_n_chunked_active(y, n, min_rows, min_chunk_rows, cap, f);
+    } else {
+        par_rows_n_chunked_on(
+            super::threadpool::RowPool::decode(),
+            y,
+            n,
+            min_rows,
+            min_chunk_rows,
+            f,
+        );
+    }
 }
 
 /// See the `wasm32` note on [`par_rows`]; rayon has no decode/prefill pool split
@@ -1383,6 +1486,23 @@ pub(crate) fn vnni_int8_available() -> bool {
         >= crate::backend::cpu_features::CpuTier::Avx512Vnni
 }
 
+/// Whether the linear-16 AVX-512 VNNI + F16C Q4_0 kernels are callable on this host.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+pub(crate) fn avx512_vnni_lin16_available() -> bool {
+    let f = crate::backend::cpu_features::cpu_features();
+    f.tier >= crate::backend::cpu_features::CpuTier::Avx512Vnni
+        && f.avx512bw
+        && f.avx512vl
+        && is_x86_feature_detected!("f16c")
+}
+
+/// Returns `false` when AVX-512 VNNI lin16 dispatch is not compiled in.
+#[cfg(not(all(target_arch = "x86_64", feature = "avx512")))]
+#[allow(dead_code)]
+pub(crate) fn avx512_vnni_lin16_available() -> bool {
+    false
+}
+
 /// Whether the VNNI-free AVX2 int8 kernels are callable on this host.
 ///
 /// The `Avx2` tier already implies `avx2` + `fma`, which is the whole
@@ -1839,6 +1959,188 @@ pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
     return int8_gemm_available() && m.is_multiple_of(8) && k.is_multiple_of(32);
 }
 
+/// Repack Q4_0 weights `[m, k]` into linear 16-row blocks (`256` bytes/block) + `f16` scales (`16` u16/block)
+/// for zero-permute AVX-512 VNNI (`w0 = raw & 0xF`, `w1 = (raw >> 4) & 0xF`) and hardware `vcvtph2ps`.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn repack_q4_0_lin16(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<u16>) {
+    assert!(
+        m.is_multiple_of(16),
+        "repack_q4_0_lin16: m must be a multiple of 16"
+    );
+    assert!(
+        k.is_multiple_of(32),
+        "repack_q4_0_lin16: k must be a multiple of 32"
+    );
+    let nb = k / 32;
+    let blk_bytes = std::mem::size_of::<crate::quant::BlockQ4_0>();
+    let expected = m * nb * blk_bytes;
+    assert_eq!(
+        src.len(),
+        expected,
+        "repack_q4_0_lin16: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        expected
+    );
+    let sr_count = m / 16;
+    let mut packed = vec![0u8; sr_count * nb * 256];
+    let mut scales_f16 = vec![0u16; sr_count * nb * 16];
+    for sr in 0..sr_count {
+        for block in 0..nb {
+            let p_base = (sr * nb + block) * 256;
+            let s_base = (sr * nb + block) * 16;
+            for r in 0..16 {
+                let row = sr * 16 + r;
+                let blk_off = (row * nb + block) * blk_bytes;
+                scales_f16[s_base + r] = u16::from_le_bytes([src[blk_off], src[blk_off + 1]]);
+                let qs = &src[blk_off + 2..blk_off + 18];
+                for p in 0..4 {
+                    let dst_off = p_base + p * 64 + r * 4;
+                    packed[dst_off..dst_off + 4].copy_from_slice(&qs[p * 4..p * 4 + 4]);
+                }
+            }
+        }
+    }
+    (packed, scales_f16)
+}
+
+/// Returns whether Q4_0 lin16 weight repacking and AVX-512 VNNI dispatch apply for `(m, k)`.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn q4_0_lin16_repack_supported(m: usize, k: usize) -> bool {
+    if m == 0 || k == 0 {
+        return false;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    return avx512_vnni_lin16_available() && m.is_multiple_of(16) && k.is_multiple_of(32);
+    #[cfg(not(all(target_arch = "x86_64", feature = "avx512")))]
+    false
+}
+
+/// Dispatch column-major `out[m, n]` GEMM over lin16-repacked Q4_0 weights when supported.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_0_lin16_colmajor_dispatch(
+    packed: &[u8],
+    scales_f16: &[u16],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, scales_f16, b_scales, b_quants, &out, m, n, k);
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if avx512_vnni_lin16_available() && m.is_multiple_of(16) && k.is_multiple_of(32) {
+        let nb = k / 32;
+        assert!(
+            packed.len() >= (m / 16) * nb * 256
+                && scales_f16.len() >= (m / 16) * nb * 16
+                && b_quants.len() >= n * k
+                && b_scales.len() >= n * nb
+                && out.len() == m * n
+        );
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_colmajor_zmm(
+                packed, scales_f16, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
+/// Dispatch row-major `out[n, m]` GEMM over lin16-repacked Q4_0 weights when supported.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
+    packed: &[u8],
+    scales_f16: &[u16],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, scales_f16, b_scales, b_quants, &out, n, m, k);
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if avx512_vnni_lin16_available() && m.is_multiple_of(16) && k.is_multiple_of(32) {
+        let nb = k / 32;
+        assert!(
+            packed.len() >= (m / 16) * nb * 256
+                && scales_f16.len() >= (m / 16) * nb * 16
+                && b_quants.len() >= n * k
+                && b_scales.len() >= n * nb
+                && out.len() == m * n
+        );
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_rowmajor_zmm(
+                packed, scales_f16, b_scales, b_quants, out, n, m, k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
+/// Dispatch fused gate/up projection + SiLU (`silu(gate @ x) * (up @ x)`) over lin16-repacked Q4_0 weights.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_0_lin16_gate_up_silu_dispatch(
+    gate_packed: &[u8],
+    gate_scales_f16: &[u16],
+    up_packed: &[u8],
+    up_scales_f16: &[u16],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (
+        gate_packed,
+        gate_scales_f16,
+        up_packed,
+        up_scales_f16,
+        b_scales,
+        b_quants,
+        &out,
+        m,
+        n,
+        k,
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if avx512_vnni_lin16_available() && m.is_multiple_of(16) && k.is_multiple_of(32) {
+        let nb = k / 32;
+        assert!(
+            gate_packed.len() >= (m / 16) * nb * 256
+                && up_packed.len() >= (m / 16) * nb * 256
+                && gate_scales_f16.len() >= (m / 16) * nb * 16
+                && up_scales_f16.len() >= (m / 16) * nb * 16
+                && b_quants.len() >= n * k
+                && b_scales.len() >= n * nb
+                && out.len() == m * n
+        );
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_gate_up_silu_rowmajor_zmm(
+                gate_packed,
+                gate_scales_f16,
+                up_packed,
+                up_scales_f16,
+                b_scales,
+                b_quants,
+                out,
+                n,
+                m,
+                k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
 /// Run the repacked-Q4_0 prefill GEMM for `m x n` output floats from `m x k`
 /// repacked weights against pre-quantized `k x n` activation columns. Returns
 /// `false` if no kernel is available for this host architecture.
@@ -1901,7 +2203,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
         #[cfg(feature = "avx512")]
         if vnni_int8_available() {
             unsafe {
-                crate::backend::simd::avx512_vnni::gemm_q4_0_8x8_q8_0(
+                crate::backend::simd::avx512_vnni::gemm_q4_0_8x8_q8_0_zmm(
                     packed, scales, b_scales, b_quants, out, m, n, k,
                 );
             }
@@ -1974,6 +2276,27 @@ pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
         return true;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(feature = "avx512")]
+        if vnni_int8_available() {
+            unsafe {
+                crate::backend::simd::avx512_vnni::gemm_q4_0_8x8_q8_0_rowmajor_zmm(
+                    packed, scales, b_scales, b_quants, out, n, m, k,
+                );
+            }
+            return true;
+        }
+        if avx2_int8_available() {
+            unsafe {
+                crate::backend::simd::avx2_int8::gemm_q4_0_8x8_q8_0_rowmajor(
+                    packed, scales, b_scales, b_quants, out, n, m, k,
+                );
+            }
+            return true;
+        }
+    }
+
     false
 }
 
@@ -1993,21 +2316,25 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
 ) -> bool {
     let _ = (gate_packed, gate_scales, up_packed, up_scales);
     let nb = k / 32;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         assert!(
             m.is_multiple_of(8) && k.is_multiple_of(32),
             "gemm_preq_repacked_q4_0_gate_up_silu_dispatch: m={m} must be %8 and k={k} must be %32"
         );
         let sr_count = m / 8;
+        #[cfg(target_arch = "aarch64")]
+        let expected_bytes_per_block = 256;
+        #[cfg(target_arch = "x86_64")]
+        let expected_bytes_per_block = 128;
         assert_eq!(
             gate_packed.len(),
-            sr_count * nb * 256,
+            sr_count * nb * expected_bytes_per_block,
             "gate packed bytes mismatch"
         );
         assert_eq!(
             up_packed.len(),
-            sr_count * nb * 256,
+            sr_count * nb * expected_bytes_per_block,
             "up packed bytes mismatch"
         );
         assert_eq!(gate_scales.len(), sr_count * nb * 8, "gate scales mismatch");
@@ -2035,6 +2362,45 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
             );
         }
         return true;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(feature = "avx512")]
+        if vnni_int8_available() {
+            unsafe {
+                crate::backend::simd::avx512_vnni::gemm_q4_0_gate_up_silu_rowmajor_zmm(
+                    gate_packed,
+                    gate_scales,
+                    up_packed,
+                    up_scales,
+                    b_scales,
+                    b_quants,
+                    out,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            return true;
+        }
+        if avx2_int8_available() {
+            unsafe {
+                crate::backend::simd::avx2_int8::gemm_q4_0_gate_up_silu_rowmajor(
+                    gate_packed,
+                    gate_scales,
+                    up_packed,
+                    up_scales,
+                    b_scales,
+                    b_quants,
+                    out,
+                    n,
+                    m,
+                    k,
+                );
+            }
+            return true;
+        }
     }
 
     false
@@ -2286,7 +2652,11 @@ thread_local! {
 }
 
 /// Parse the `CERA_CPU_ATTN_TILED` environment variable string.
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", feature = "avx512"),
+    test
+))]
 fn parse_attn_tiled_env(val: Option<&str>) -> bool {
     !val.is_some_and(|v| {
         let v = v.trim();
@@ -2296,9 +2666,12 @@ fn parse_attn_tiled_env(val: Option<&str>) -> bool {
     })
 }
 
-/// Whether the NEON prefill attention uses the register-tiled kernel (on by default;
+/// Whether prefill attention uses the register-tiled kernel (on by default on NEON and AVX-512;
 /// `CERA_CPU_ATTN_TILED=0` keeps the previous one, the A/B switch).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", feature = "avx512")
+))]
 fn attn_tiled_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
@@ -5235,6 +5608,33 @@ fn with_gemv_scratch<R>(
 
 /// Dispatch GEMV based on dtype: `y[m] = W[m,k] @ x[k]`.
 /// For Q4_0, pass scratch buffers to avoid per-call allocation.
+/// Like [`gemv_dispatch`], but allows capping active workers for narrow host dispatches (e.g. XDNA LM head).
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_dispatch_active(
+    max_active: usize,
+    dtype: DType,
+    data: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+) {
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if dtype == DType::Q6K && max_active > 0 && vnni_int8_available() {
+        with_gemv_scratch(q8_scratch, |s, q| unsafe {
+            crate::backend::simd::avx512_vnni::gemv_q6k_f32_active(
+                data, x, y, m, k, s, q, max_active,
+            );
+        });
+        return;
+    }
+    with_gemv_max_active(max_active, || {
+        gemv_dispatch(dtype, data, x, y, m, k, q8_scratch)
+    });
+}
+
+/// Dispatch quantized/float GEMV `y = W * x` across the host's optimal SIMD tier.
 pub fn gemv_dispatch(
     dtype: DType,
     data: &[u8],
@@ -5433,6 +5833,149 @@ unsafe fn rmsnorm_unweighted_neon(ptr: *mut f32, n: usize, eps: f32) {
     }
 }
 
+/// Compute exact `f64` sum of squares `sum_i x[i]^2` using AVX2+FMA when available.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn sum_sq_f32(x: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: `avx2` and `fma` were just verified for this CPU.
+        return unsafe { sum_sq_f32_avx2_fma(x) };
+    }
+    let mut sum_sq = 0.0f64;
+    for &v in x.iter() {
+        let d = v as f64;
+        sum_sq += d * d;
+    }
+    sum_sq
+}
+
+/// AVX2+FMA `f64` sum of squares `sum_i x[i]^2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sum_sq_f32_avx2_fma(x: &[f32]) -> f64 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let n = x.len();
+        let ptr = x.as_ptr();
+        let mut acc0 = _mm256_setzero_pd();
+        let mut acc1 = _mm256_setzero_pd();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let d0 = _mm256_cvtps_pd(_mm_loadu_ps(ptr.add(i)));
+            let d1 = _mm256_cvtps_pd(_mm_loadu_ps(ptr.add(i + 4)));
+            acc0 = _mm256_fmadd_pd(d0, d0, acc0);
+            acc1 = _mm256_fmadd_pd(d1, d1, acc1);
+            i += 8;
+        }
+        acc0 = _mm256_add_pd(acc0, acc1);
+        let hi = _mm256_extractf128_pd(acc0, 1);
+        let lo = _mm256_castpd256_pd128(acc0);
+        let sum2 = _mm_add_pd(lo, hi);
+        let sum1 = _mm_add_sd(sum2, _mm_unpackhi_pd(sum2, sum2));
+        let mut total = _mm_cvtsd_f64(sum1);
+        while i < n {
+            let d = *ptr.add(i) as f64;
+            total += d * d;
+            i += 1;
+        }
+        total
+    }
+}
+
+/// Apply RMS scaling `dst[i] = src[i] * inv_rms * weight[i]` (or `src[i] * inv_rms` when
+/// `weight` is `None`). Supports aliasing `src == dst`.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+unsafe fn apply_rmsnorm_scale(
+    src: *const f32,
+    dst: *mut f32,
+    weight: Option<*const f32>,
+    n: usize,
+    inv_rms: f32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: `avx2` was verified; caller guarantees `n`-element validity.
+        unsafe { apply_rmsnorm_scale_avx2(src, dst, weight, n, inv_rms) };
+        return;
+    }
+    unsafe {
+        match weight {
+            Some(w) => {
+                for i in 0..n {
+                    *dst.add(i) = *src.add(i) * inv_rms * *w.add(i);
+                }
+            }
+            None => {
+                for i in 0..n {
+                    *dst.add(i) = *src.add(i) * inv_rms;
+                }
+            }
+        }
+    }
+}
+
+/// AVX2 RMS scale pass: `dst = src * inv_rms (* weight)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_rmsnorm_scale_avx2(
+    src: *const f32,
+    dst: *mut f32,
+    weight: Option<*const f32>,
+    n: usize,
+    inv_rms: f32,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v_inv = _mm256_set1_ps(inv_rms);
+        let mut i = 0usize;
+        match weight {
+            Some(w) => {
+                while i + 16 <= n {
+                    let s0 = _mm256_loadu_ps(src.add(i));
+                    let s1 = _mm256_loadu_ps(src.add(i + 8));
+                    let w0 = _mm256_loadu_ps(w.add(i));
+                    let w1 = _mm256_loadu_ps(w.add(i + 8));
+                    let r0 = _mm256_mul_ps(_mm256_mul_ps(s0, v_inv), w0);
+                    let r1 = _mm256_mul_ps(_mm256_mul_ps(s1, v_inv), w1);
+                    _mm256_storeu_ps(dst.add(i), r0);
+                    _mm256_storeu_ps(dst.add(i + 8), r1);
+                    i += 16;
+                }
+                while i + 8 <= n {
+                    let s0 = _mm256_loadu_ps(src.add(i));
+                    let w0 = _mm256_loadu_ps(w.add(i));
+                    _mm256_storeu_ps(dst.add(i), _mm256_mul_ps(_mm256_mul_ps(s0, v_inv), w0));
+                    i += 8;
+                }
+                while i < n {
+                    *dst.add(i) = *src.add(i) * inv_rms * *w.add(i);
+                    i += 1;
+                }
+            }
+            None => {
+                while i + 16 <= n {
+                    let s0 = _mm256_loadu_ps(src.add(i));
+                    let s1 = _mm256_loadu_ps(src.add(i + 8));
+                    _mm256_storeu_ps(dst.add(i), _mm256_mul_ps(s0, v_inv));
+                    _mm256_storeu_ps(dst.add(i + 8), _mm256_mul_ps(s1, v_inv));
+                    i += 16;
+                }
+                while i + 8 <= n {
+                    let s0 = _mm256_loadu_ps(src.add(i));
+                    _mm256_storeu_ps(dst.add(i), _mm256_mul_ps(s0, v_inv));
+                    i += 8;
+                }
+                while i < n {
+                    *dst.add(i) = *src.add(i) * inv_rms;
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
 /// RMS normalization in-place: x = x / rms(x) * weight.
 pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
     if x.is_empty() || weight.len() < x.len() {
@@ -5446,17 +5989,17 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
     #[cfg(not(target_arch = "aarch64"))]
     {
         let n = x.len();
-        let mut sum_sq = 0.0f64;
-        for &v in x.iter() {
-            sum_sq += (v as f64) * (v as f64);
-        }
-        let mean = sum_sq / n as f64;
-        let rms = (mean + eps as f64).sqrt();
-        let inv_rms = (1.0 / rms) as f32;
-
-        for i in 0..n {
-            x[i] = x[i] * inv_rms * weight[i];
-        }
+        let mean = sum_sq_f32(x) / n as f64;
+        let inv_rms = (1.0 / (mean + eps as f64).sqrt()) as f32;
+        unsafe {
+            apply_rmsnorm_scale(
+                x.as_ptr(),
+                x.as_mut_ptr(),
+                Some(weight.as_ptr()),
+                n,
+                inv_rms,
+            )
+        };
     }
 }
 
@@ -5472,17 +6015,10 @@ pub fn rmsnorm_unweighted(x: &mut [f32], eps: f32) {
     #[cfg(not(target_arch = "aarch64"))]
     {
         let n = x.len();
-        let mut sum_sq = 0.0f64;
-        for &v in x.iter() {
-            sum_sq += (v as f64) * (v as f64);
-        }
-        let mean = sum_sq / n as f64;
+        let mean = sum_sq_f32(x) / n as f64;
         let rms = (mean + eps as f64).sqrt();
         let inv_rms = if rms > 0.0 { (1.0 / rms) as f32 } else { 0.0 };
-
-        for v in x.iter_mut() {
-            *v *= inv_rms;
-        }
+        unsafe { apply_rmsnorm_scale(x.as_ptr(), x.as_mut_ptr(), None, n, inv_rms) };
     }
 }
 
@@ -5503,18 +6039,85 @@ pub fn rmsnorm_into(src: &[f32], dst: &mut [f32], weight: &[f32], eps: f32) {
     #[cfg(not(target_arch = "aarch64"))]
     {
         let n = src.len();
-        let mut sum_sq = 0.0f64;
-        for &v in src.iter() {
-            sum_sq += (v as f64) * (v as f64);
+        if n == 0 {
+            return;
         }
-        let mean = sum_sq / n as f64;
-        let rms = (mean + eps as f64).sqrt();
-        let inv_rms = (1.0 / rms) as f32;
-
-        for i in 0..n {
-            dst[i] = src[i] * inv_rms * weight[i];
-        }
+        let mean = sum_sq_f32(src) / n as f64;
+        let inv_rms = (1.0 / (mean + eps as f64).sqrt()) as f32;
+        unsafe {
+            apply_rmsnorm_scale(
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+                Some(weight.as_ptr()),
+                n,
+                inv_rms,
+            )
+        };
     }
+}
+
+/// Fused AVX2+FMA residual update `a[i] += b[i]` and exact `f64` sum of squares.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn add_and_sum_sq_avx2_fma(a: *mut f32, b: *const f32, n: usize) -> f64 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut acc0 = _mm256_setzero_pd();
+        let mut acc1 = _mm256_setzero_pd();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let s = _mm256_add_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)));
+            _mm256_storeu_ps(a.add(i), s);
+            let d0 = _mm256_cvtps_pd(_mm256_castps256_ps128(s));
+            let d1 = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(s));
+            acc0 = _mm256_fmadd_pd(d0, d0, acc0);
+            acc1 = _mm256_fmadd_pd(d1, d1, acc1);
+            i += 8;
+        }
+        acc0 = _mm256_add_pd(acc0, acc1);
+        let hi = _mm256_extractf128_pd(acc0, 1);
+        let lo = _mm256_castpd256_pd128(acc0);
+        let sum2 = _mm_add_pd(lo, hi);
+        let sum1 = _mm_add_sd(sum2, _mm_unpackhi_pd(sum2, sum2));
+        let mut total = _mm_cvtsd_f64(sum1);
+        while i < n {
+            let v = *a.add(i) + *b.add(i);
+            *a.add(i) = v;
+            let d = v as f64;
+            total += d * d;
+            i += 1;
+        }
+        total
+    }
+}
+
+/// Fused residual add and RMS normalization: `a += b`, then `dst = a / rms(a) * weight`.
+pub fn add_rmsnorm_into(a: &mut [f32], b: &[f32], dst: &mut [f32], weight: &[f32], eps: f32) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), weight.len());
+    debug_assert_eq!(dst.len(), weight.len());
+    let n = a.len().min(b.len()).min(dst.len()).min(weight.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: `avx2` + `fma` verified and lengths clamped to `n`.
+        let sum_sq = unsafe { add_and_sum_sq_avx2_fma(a.as_mut_ptr(), b.as_ptr(), n) };
+        let inv_rms = (1.0 / (sum_sq / n as f64 + eps as f64).sqrt()) as f32;
+        unsafe {
+            apply_rmsnorm_scale(
+                a.as_ptr(),
+                dst.as_mut_ptr(),
+                Some(weight.as_ptr()),
+                n,
+                inv_rms,
+            )
+        };
+        return;
+    }
+    add_inplace(&mut a[..n], &b[..n]);
+    rmsnorm_into(&a[..n], &mut dst[..n], &weight[..n], eps);
 }
 
 /// Combined RMSNorm and Q8_0 quantization in a single pass.
@@ -7570,22 +8173,43 @@ pub fn flash_attention_gqa_cpu_opt(
     {
         if head_dim.is_multiple_of(16) && head_dim <= 256 && is_x86_feature_detected!("avx512f") {
             unsafe {
-                flash_attention_gqa_avx512_opt(
-                    q_mat,
-                    k_cache,
-                    v_cache,
-                    out,
-                    n_heads_start,
-                    group_size,
-                    n_queries,
-                    q_stride,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    start_pos,
-                    is_causal,
-                );
+                if attn_tiled_enabled() {
+                    flash_attention_gqa_avx512_tiled(
+                        q_mat,
+                        k_cache,
+                        v_cache,
+                        out,
+                        n_heads_start,
+                        group_size,
+                        n_queries,
+                        q_stride,
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        scale,
+                        start_pos,
+                        is_causal,
+                        0,
+                        n_queries,
+                    );
+                } else {
+                    flash_attention_gqa_avx512_opt(
+                        q_mat,
+                        k_cache,
+                        v_cache,
+                        out,
+                        n_heads_start,
+                        group_size,
+                        n_queries,
+                        q_stride,
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        scale,
+                        start_pos,
+                        is_causal,
+                    );
+                }
             }
             return;
         }
@@ -7642,14 +8266,25 @@ pub fn flash_attention_gqa_cpu_opt(
 }
 
 /// Whether [`flash_attention_gqa_cpu_opt_range`] is available for this head size: the NEON
-/// register-tiled kernel (on by default, `CERA_CPU_ATTN_TILED=0` turns it off) is the only one that
-/// can run a sub-range of the queries.
+/// or AVX-512 register-tiled kernel (on by default, `CERA_CPU_ATTN_TILED=0` turns it off) is the
+/// only one that can run a sub-range of the queries.
 pub fn flash_attention_range_supported(head_dim: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         head_dim > 0 && head_dim.is_multiple_of(4) && head_dim <= 128 && attn_tiled_enabled()
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    {
+        head_dim > 0
+            && head_dim.is_multiple_of(16)
+            && head_dim <= 256
+            && attn_tiled_enabled()
+            && is_x86_feature_detected!("avx512f")
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    )))]
     {
         let _ = head_dim;
         false
@@ -7738,21 +8373,51 @@ pub fn flash_attention_gqa_cpu_opt_range(
             q_hi,
         );
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    unsafe {
+        flash_attention_gqa_avx512_tiled(
+            q_mat,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_start,
+            group_size,
+            n_queries,
+            q_stride,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            start_pos,
+            is_causal,
+            q_lo,
+            q_hi,
+        );
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    )))]
     unreachable!("guarded by flash_attention_range_supported");
 }
 
 /// Run the prefill's flash attention as independent (head, 32-query) work items on the prefill pool,
 /// heaviest (latest queries) first, writing `[n_heads, n, head_dim]` into `out` (head `h` at
 /// `h * n * head_dim`, as one whole-head item would). Q is the prefill's stride-`n` column layout.
-/// Returns `false`, having done nothing, when the range kernel is unavailable (non-NEON, other head
+/// Returns `false`, having done nothing, when the range kernel is unavailable (no tiled kernel, other head
 /// sizes, `CERA_CPU_ATTN_TILED=0`): the caller then runs one item per head.
 ///
 /// 16 to 32 whole heads over workers of unequal speed leave the slow cores holding the barrier;
-/// the finer items let the pool's stealing balance prime and mid cores.
+/// the finer items let the pool's stealing balance cores.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(
-    not(all(feature = "parallel", target_arch = "aarch64")),
+    not(all(
+        feature = "parallel",
+        any(
+            target_arch = "aarch64",
+            all(target_arch = "x86_64", feature = "avx512")
+        )
+    )),
     allow(unused_variables)
 )]
 pub fn flash_attention_prefill_items(
@@ -7853,6 +8518,126 @@ pub fn flash_attention_prefill_items(
         run(&mut tickets);
     }
     true
+}
+
+/// Token-major AVX-512 GQA flash-attention prefill reading `q_mat[n, n_heads * head_dim]`
+/// and writing `out[n, n_heads * head_dim]` directly without separate transpose passes,
+/// sharing staged L1D K/V tiles across GQA heads in each KV group.
+/// Returns `false` if this target/shape should fall back to [`flash_attention_prefill_items`].
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn flash_attention_prefill_token_major(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    group_size: usize,
+    n: usize,
+    kv_dim: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    max_active: usize,
+) -> bool {
+    #[cfg(all(
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        target_arch = "x86_64",
+        feature = "avx512"
+    ))]
+    {
+        if !attn_tiled_enabled()
+            || !is_x86_feature_detected!("avx512f")
+            || head_dim == 0
+            || !head_dim.is_multiple_of(16)
+            || head_dim > 128
+            || group_size == 0
+            || n_heads == 0
+            || !n_heads.is_multiple_of(group_size)
+        {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+        let hs = n_heads * head_dim;
+        let n_kv_heads = n_heads / group_size;
+        assert!(kv_dim >= n_kv_heads * head_dim, "kv_dim too small");
+        assert!(
+            q_mat.len() >= n * hs && out.len() >= n * hs,
+            "q/out too small"
+        );
+        assert!(
+            k_cache.len() >= (start_pos + n - 1) * kv_dim + n_kv_heads * head_dim
+                && v_cache.len() >= (start_pos + n - 1) * kv_dim + n_kv_heads * head_dim,
+            "k/v cache too small"
+        );
+
+        const Q_ITEM: usize = 16;
+        let g_blk = (512 / head_dim).min(group_size).clamp(1, 8);
+        let n_g_sub = group_size.div_ceil(g_blk);
+        let n_qb = n.div_ceil(Q_ITEM);
+        let total_tickets = n_kv_heads * n_g_sub * n_qb;
+        let q_ptr = q_mat.as_ptr() as usize;
+        let k_ptr = k_cache.as_ptr() as usize;
+        let v_ptr = v_cache.as_ptr() as usize;
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        let mut stack_tickets = [0.0f32; 2048];
+        let run = |tickets: &mut [f32]| {
+            par_rows_n_chunked_active(tickets, 1, 1, 1, max_active, |(item, _)| {
+                let kv_sg = n_kv_heads * n_g_sub;
+                let qb = n_qb - 1 - item / kv_sg;
+                let rem = item % kv_sg;
+                let kv_h = rem / n_g_sub;
+                let sg = rem % n_g_sub;
+                let g_lo = sg * g_blk;
+                let g_cnt = (group_size - g_lo).min(g_blk);
+                let h_start = kv_h * group_size + g_lo;
+                let j0 = qb * Q_ITEM;
+                let jb = (n - j0).min(Q_ITEM);
+                // SAFETY: each `(h_start..h_start+g_cnt, j0..j0+jb)` output rectangle in
+                // `[n, hs]` is disjoint across work items; Q, K, V are read-only.
+                unsafe {
+                    flash_attention_gqa_avx512_token_major_tile(
+                        q_ptr as *const f32,
+                        k_ptr as *const f32,
+                        v_ptr as *const f32,
+                        out_ptr as *mut f32,
+                        hs,
+                        kv_dim,
+                        kv_h * head_dim,
+                        h_start,
+                        g_cnt,
+                        n,
+                        j0,
+                        jb,
+                        head_dim,
+                        scale,
+                        start_pos,
+                        is_causal,
+                    );
+                }
+            });
+        };
+        if total_tickets <= stack_tickets.len() {
+            run(&mut stack_tickets[..total_tickets]);
+        } else {
+            let mut tickets = vec![0.0f32; total_tickets];
+            run(&mut tickets);
+        }
+        true
+    }
+    #[cfg(not(all(
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        target_arch = "x86_64",
+        feature = "avx512"
+    )))]
+    {
+        false
+    }
 }
 
 #[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -8403,6 +9188,683 @@ unsafe fn flash_attention_gqa_avx512_opt(
                 for i in 0..n_vecs {
                     let r = _mm512_mul_ps(acc_vecs[i], inv_sum_v);
                     _mm512_storeu_ps(out_ptr.add(out_off + i * 16), r);
+                }
+            }
+        }
+    }
+}
+
+/// 64-byte aligned stack buffer for AVX-512 tiled flash attention.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[repr(C, align(64))]
+struct Align64<T>(T);
+
+/// Hoisted ZMM constants for [`ggml_expf_avx512`]: bit-identical constants
+/// to scalar [`ggml_expf`] / NEON [`ggml_expf_neon4`].
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[allow(clippy::missing_docs_in_private_items)]
+struct ExpConsts512 {
+    r: std::arch::x86_64::__m512,
+    log2e: std::arch::x86_64::__m512,
+    ln2_hi: std::arch::x86_64::__m512,
+    ln2_lo: std::arch::x86_64::__m512,
+    c1: std::arch::x86_64::__m512,
+    c2: std::arch::x86_64::__m512,
+    c3: std::arch::x86_64::__m512,
+    c4: std::arch::x86_64::__m512,
+    c5: std::arch::x86_64::__m512,
+    f126: std::arch::x86_64::__m512,
+    f192: std::arch::x86_64::__m512,
+    inf: std::arch::x86_64::__m512,
+    zero: std::arch::x86_64::__m512,
+    abs_mask: std::arch::x86_64::__m512i,
+    one_bits: std::arch::x86_64::__m512i,
+    d_neg: std::arch::x86_64::__m512i,
+    s1_base: std::arch::x86_64::__m512i,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+impl ExpConsts512 {
+    /// Load hoisted ZMM constants for `ggml_expf_avx512`.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn new() -> Self {
+        use std::arch::x86_64::*;
+        Self {
+            r: _mm512_set1_ps(f32::from_bits(0x4B400000)),
+            log2e: _mm512_set1_ps(f32::from_bits(0x3FB8AA3B)),
+            ln2_hi: _mm512_set1_ps(f32::from_bits(0x3F317200)),
+            ln2_lo: _mm512_set1_ps(f32::from_bits(0x35BFBE8E)),
+            c1: _mm512_set1_ps(f32::from_bits(0x3F7FFFF6)),
+            c2: _mm512_set1_ps(f32::from_bits(0x3EFFFEDB)),
+            c3: _mm512_set1_ps(f32::from_bits(0x3E2AAF33)),
+            c4: _mm512_set1_ps(f32::from_bits(0x3D2B9F17)),
+            c5: _mm512_set1_ps(f32::from_bits(0x3C072010)),
+            f126: _mm512_set1_ps(126.0),
+            f192: _mm512_set1_ps(192.0),
+            inf: _mm512_set1_ps(f32::INFINITY),
+            zero: _mm512_setzero_ps(),
+            abs_mask: _mm512_set1_epi32(0x7FFF_FFFFu32 as i32),
+            one_bits: _mm512_set1_epi32(0x3F80_0000u32 as i32),
+            d_neg: _mm512_set1_epi32(0x8200_0000u32 as i32),
+            s1_base: _mm512_set1_epi32(0x7F00_0000u32 as i32),
+        }
+    }
+}
+
+/// 16-wide [`ggml_expf`] on AVX-512F using identical op ordering (mul+add/sub)
+/// and branch masks as scalar [`ggml_expf`].
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn ggml_expf_avx512(
+    x: std::arch::x86_64::__m512,
+    c: &ExpConsts512,
+) -> std::arch::x86_64::__m512 {
+    use std::arch::x86_64::*;
+    let z = _mm512_add_ps(c.r, _mm512_mul_ps(x, c.log2e));
+    let n = _mm512_sub_ps(z, c.r);
+    let b = _mm512_sub_ps(
+        _mm512_sub_ps(x, _mm512_mul_ps(n, c.ln2_hi)),
+        _mm512_mul_ps(n, c.ln2_lo),
+    );
+    let e = _mm512_slli_epi32(_mm512_castps_si512(z), 23);
+    let k = _mm512_castsi512_ps(_mm512_add_epi32(e, c.one_bits));
+    let u = _mm512_mul_ps(b, b);
+    let j = _mm512_add_ps(
+        _mm512_mul_ps(c.c1, b),
+        _mm512_mul_ps(
+            _mm512_add_ps(
+                _mm512_add_ps(c.c2, _mm512_mul_ps(c.c3, b)),
+                _mm512_mul_ps(_mm512_add_ps(c.c4, _mm512_mul_ps(c.c5, b)), u),
+            ),
+            u,
+        ),
+    );
+    let fast = _mm512_add_ps(k, _mm512_mul_ps(j, k));
+    let abs_n = _mm512_castsi512_ps(_mm512_and_epi32(_mm512_castps_si512(n), c.abs_mask));
+    let fast_m = _mm512_cmp_ps_mask(abs_n, c.f126, _CMP_LE_OQ);
+    if fast_m == 0xFFFF {
+        return fast;
+    }
+    let big_m = _mm512_cmp_ps_mask(abs_n, c.f192, _CMP_GT_OQ);
+    let n_gt_0 = _mm512_cmp_ps_mask(n, c.zero, _CMP_GT_OQ);
+    let big = _mm512_mask_blend_ps(n_gt_0, c.zero, c.inf);
+
+    let n_le_0 = _mm512_cmp_ps_mask(n, c.zero, _CMP_LE_OQ);
+    let d = _mm512_maskz_mov_epi32(n_le_0, c.d_neg);
+    let s1 = _mm512_castsi512_ps(_mm512_add_epi32(d, c.s1_base));
+    let s2 = _mm512_castsi512_ps(_mm512_sub_epi32(e, d));
+    let mid = _mm512_mul_ps(_mm512_add_ps(s2, _mm512_mul_ps(s2, j)), s1);
+
+    let non_fast = _mm512_mask_blend_ps(big_m, mid, big);
+    _mm512_mask_blend_ps(fast_m, non_fast, fast)
+}
+
+/// Transpose a 16x16 matrix held in 16 AVX-512 vectors `rows[0..16]` in-place.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f")]
+#[inline]
+#[allow(clippy::needless_range_loop)]
+unsafe fn transpose16x16_f32_avx512(r: &mut [std::arch::x86_64::__m512; 16]) {
+    use std::arch::x86_64::*;
+    let mut b = [[_mm512_setzero_ps(); 4]; 4];
+    for k in 0..4 {
+        let v0 = r[k * 4];
+        let v1 = r[k * 4 + 1];
+        let v2 = r[k * 4 + 2];
+        let v3 = r[k * 4 + 3];
+        let a0 = _mm512_unpacklo_ps(v0, v1);
+        let a1 = _mm512_unpackhi_ps(v0, v1);
+        let a2 = _mm512_unpacklo_ps(v2, v3);
+        let a3 = _mm512_unpackhi_ps(v2, v3);
+        b[k][0] = _mm512_shuffle_ps(a0, a2, 0x44);
+        b[k][1] = _mm512_shuffle_ps(a0, a2, 0xEE);
+        b[k][2] = _mm512_shuffle_ps(a1, a3, 0x44);
+        b[k][3] = _mm512_shuffle_ps(a1, a3, 0xEE);
+    }
+    for c in 0..4 {
+        let t0 = _mm512_shuffle_f32x4::<0x44>(b[0][c], b[1][c]);
+        let t1 = _mm512_shuffle_f32x4::<0xEE>(b[0][c], b[1][c]);
+        let t2 = _mm512_shuffle_f32x4::<0x44>(b[2][c], b[3][c]);
+        let t3 = _mm512_shuffle_f32x4::<0xEE>(b[2][c], b[3][c]);
+        r[c] = _mm512_shuffle_f32x4::<0x88>(t0, t2);
+        r[c + 4] = _mm512_shuffle_f32x4::<0xDD>(t0, t2);
+        r[c + 8] = _mm512_shuffle_f32x4::<0x88>(t1, t3);
+        r[c + 12] = _mm512_shuffle_f32x4::<0xDD>(t1, t3);
+    }
+}
+
+/// Query-tiled AVX-512F flash attention for GQA over `q_lo..q_hi`.
+///
+/// Packs 16 consecutive queries across AVX-512 lanes (`q_blk[d][16]`), so
+/// `QK^T`, online softmax (`ggml_expf_avx512`), `acc` rescaling, and `AV`
+/// (`16`-dim register blocks) all stream K/V once per 16 queries with zero
+/// horizontal reductions or K repacking inside the KV tile loop.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_avx512_tiled(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    q_lo: usize,
+    q_hi: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        if q_lo >= q_hi {
+            return;
+        }
+        debug_assert!(
+            head_dim > 0 && head_dim.is_multiple_of(16) && head_dim <= 256,
+            "flash_attention_gqa_avx512_tiled: unsupported head_dim {head_dim}"
+        );
+
+        const Q_LANE: usize = 16;
+        let q_ptr = q_mat.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        let exp_c = ExpConsts512::new();
+        let scale_v = _mm512_set1_ps(scale);
+        let neg_inf_v = _mm512_set1_ps(f32::NEG_INFINITY);
+        let zero_v = _mm512_setzero_ps();
+        let one_v = _mm512_set1_ps(1.0);
+
+        let mut q_blk = Align64([0.0f32; 256 * Q_LANE]);
+        let mut acc_blk = Align64([0.0f32; 256 * Q_LANE]);
+        let mut scores_blk = Align64([0.0f32; FLASH_TILE_KV * Q_LANE]);
+        let mut tmp16 = Align64([0.0f32; Q_LANE]);
+        let mut rsum_lo;
+        let mut rsum_hi;
+
+        for g in 0..group_size {
+            let h = n_heads_start + g;
+            let h_off = h * head_dim;
+
+            for j0 in (q_lo..q_hi).step_by(Q_LANE) {
+                let jb = (q_hi - j0).min(Q_LANE);
+                let valid_q: u16 = if jb == Q_LANE {
+                    0xFFFF
+                } else {
+                    (1u16 << jb) - 1
+                };
+
+                // Load `[head_dim][jb]` aligned into L1D `[head_dim][16]`.
+                for d in 0..head_dim {
+                    let qv = _mm512_maskz_loadu_ps(valid_q, q_ptr.add((h_off + d) * q_stride + j0));
+                    _mm512_store_ps(q_blk.0.as_mut_ptr().add(d * Q_LANE), qv);
+                }
+
+                let mut block_kv = 0usize;
+                let mut max_kv_arr = [0i32; Q_LANE];
+                for jq in 0..jb {
+                    let j = j0 + jq;
+                    let mkv = if is_causal {
+                        start_pos + j + 1
+                    } else {
+                        start_pos + n_queries
+                    };
+                    max_kv_arr[jq] = mkv as i32;
+                    block_kv = block_kv.max(mkv);
+                }
+                let max_kv_v = _mm512_loadu_si512(max_kv_arr.as_ptr().cast());
+
+                let mut running_max_v = neg_inf_v;
+                rsum_lo = _mm512_setzero_pd();
+                rsum_hi = _mm512_setzero_pd();
+
+                for kv_start in (0..block_kv).step_by(FLASH_TILE_KV) {
+                    let tile_keys = (block_kv - kv_start).min(FLASH_TILE_KV);
+                    let mut tile_max_v = neg_inf_v;
+
+                    // 1. QK^T: 8 keys at a time x 16 queries in ZMMs.
+                    let mut tk = 0usize;
+                    while tk + 8 <= tile_keys {
+                        let k0 = k_ptr.add((kv_start + tk) * kv_dim + kv_h_offset);
+                        let k1 = k0.add(kv_dim);
+                        let k2 = k1.add(kv_dim);
+                        let k3 = k2.add(kv_dim);
+                        let k4 = k3.add(kv_dim);
+                        let k5 = k4.add(kv_dim);
+                        let k6 = k5.add(kv_dim);
+                        let k7 = k6.add(kv_dim);
+                        let mut s0 = zero_v;
+                        let mut s1 = zero_v;
+                        let mut s2 = zero_v;
+                        let mut s3 = zero_v;
+                        let mut s4 = zero_v;
+                        let mut s5 = zero_v;
+                        let mut s6 = zero_v;
+                        let mut s7 = zero_v;
+
+                        for d in 0..head_dim {
+                            let qd = _mm512_load_ps(q_blk.0.as_ptr().add(d * Q_LANE));
+                            s0 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k0.add(d)), s0);
+                            s1 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k1.add(d)), s1);
+                            s2 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k2.add(d)), s2);
+                            s3 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k3.add(d)), s3);
+                            s4 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k4.add(d)), s4);
+                            s5 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k5.add(d)), s5);
+                            s6 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k6.add(d)), s6);
+                            s7 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k7.add(d)), s7);
+                        }
+
+                        macro_rules! finish_k {
+                            ($s:expr, $offset:expr) => {{
+                                let kv_idx = _mm512_set1_epi32((kv_start + tk + $offset) as i32);
+                                let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                                let sc =
+                                    _mm512_mask_blend_ps(vm, neg_inf_v, _mm512_mul_ps($s, scale_v));
+                                tile_max_v = _mm512_max_ps(tile_max_v, sc);
+                                _mm512_store_ps(
+                                    scores_blk.0.as_mut_ptr().add((tk + $offset) * Q_LANE),
+                                    sc,
+                                );
+                            }};
+                        }
+                        finish_k!(s0, 0);
+                        finish_k!(s1, 1);
+                        finish_k!(s2, 2);
+                        finish_k!(s3, 3);
+                        finish_k!(s4, 4);
+                        finish_k!(s5, 5);
+                        finish_k!(s6, 6);
+                        finish_k!(s7, 7);
+                        tk += 8;
+                    }
+                    while tk < tile_keys {
+                        let k0 = k_ptr.add((kv_start + tk) * kv_dim + kv_h_offset);
+                        let mut s0 = zero_v;
+                        for d in 0..head_dim {
+                            let qd = _mm512_load_ps(q_blk.0.as_ptr().add(d * Q_LANE));
+                            s0 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k0.add(d)), s0);
+                        }
+                        let kv_idx = _mm512_set1_epi32((kv_start + tk) as i32);
+                        let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                        let sc = _mm512_mask_blend_ps(vm, neg_inf_v, _mm512_mul_ps(s0, scale_v));
+                        tile_max_v = _mm512_max_ps(tile_max_v, sc);
+                        _mm512_store_ps(scores_blk.0.as_mut_ptr().add(tk * Q_LANE), sc);
+                        tk += 1;
+                    }
+
+                    // 2. Vertical online softmax across the 16 queries.
+                    let new_max_v = _mm512_max_ps(running_max_v, tile_max_v);
+                    let need_rescale = kv_start > 0;
+                    let eq_mask = _mm512_cmp_ps_mask(running_max_v, new_max_v, _CMP_EQ_OQ);
+                    let rescale_v = if !need_rescale {
+                        zero_v
+                    } else if eq_mask == 0xFFFF {
+                        one_v
+                    } else {
+                        let has_prev = _mm512_cmp_ps_mask(running_max_v, neg_inf_v, _CMP_GT_OQ);
+                        let diff = _mm512_sub_ps(running_max_v, new_max_v);
+                        let ev = ggml_expf_avx512(diff, &exp_c);
+                        let nz = _mm512_maskz_mov_ps(has_prev, ev);
+                        _mm512_mask_blend_ps(eq_mask, nz, one_v)
+                    };
+
+                    let mut tile_sum_v = zero_v;
+                    for ti in 0..tile_keys {
+                        let kv_idx = _mm512_set1_epi32((kv_start + ti) as i32);
+                        let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                        let sv = _mm512_load_ps(scores_blk.0.as_ptr().add(ti * Q_LANE));
+                        let ev = ggml_expf_avx512(_mm512_sub_ps(sv, new_max_v), &exp_c);
+                        let pv = _mm512_maskz_mov_ps(vm, ev);
+                        _mm512_store_ps(scores_blk.0.as_mut_ptr().add(ti * Q_LANE), pv);
+                        tile_sum_v = _mm512_add_ps(tile_sum_v, pv);
+                    }
+
+                    // Update f64 running_sum (lanes 0..8 and 8..16).
+                    _mm512_store_ps(tmp16.0.as_mut_ptr(), tile_sum_v);
+                    let tsum_lo = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr()));
+                    let tsum_hi = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr().add(8)));
+                    if need_rescale {
+                        _mm512_store_ps(tmp16.0.as_mut_ptr(), rescale_v);
+                        let r_lo = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr()));
+                        let r_hi = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr().add(8)));
+                        rsum_lo = _mm512_fmadd_pd(rsum_lo, r_lo, tsum_lo);
+                        rsum_hi = _mm512_fmadd_pd(rsum_hi, r_hi, tsum_hi);
+                    } else {
+                        rsum_lo = tsum_lo;
+                        rsum_hi = tsum_hi;
+                    }
+                    running_max_v = new_max_v;
+
+                    // 3. AV in 16-dim register blocks (all 16 dims x 16 queries stay in 16 ZMMs).
+                    let do_rescale = need_rescale && (eq_mask != 0xFFFF);
+                    for d0 in (0..head_dim).step_by(16) {
+                        let mut a = [zero_v; 16];
+                        if need_rescale {
+                            let acc_p = acc_blk.0.as_ptr().add(d0 * Q_LANE);
+                            for dd in 0..16 {
+                                let prev = _mm512_load_ps(acc_p.add(dd * Q_LANE));
+                                a[dd] = if do_rescale {
+                                    _mm512_mul_ps(prev, rescale_v)
+                                } else {
+                                    prev
+                                };
+                            }
+                        }
+
+                        for ti in 0..tile_keys {
+                            let p = _mm512_load_ps(scores_blk.0.as_ptr().add(ti * Q_LANE));
+                            let vp = v_ptr.add((kv_start + ti) * kv_dim + kv_h_offset + d0);
+                            for dd in 0..16 {
+                                a[dd] = _mm512_fmadd_ps(p, _mm512_set1_ps(*vp.add(dd)), a[dd]);
+                            }
+                        }
+
+                        let acc_mp = acc_blk.0.as_mut_ptr().add(d0 * Q_LANE);
+                        for dd in 0..16 {
+                            _mm512_store_ps(acc_mp.add(dd * Q_LANE), a[dd]);
+                        }
+                    }
+                }
+
+                // 4. Normalize by 1 / running_sum and transpose 16x16 to [jb, head_dim].
+                let one_d = _mm512_set1_pd(1.0);
+                let inv_lo = _mm512_cvtpd_ps(_mm512_div_pd(one_d, rsum_lo));
+                let inv_hi = _mm512_cvtpd_ps(_mm512_div_pd(one_d, rsum_hi));
+                _mm256_store_ps(tmp16.0.as_mut_ptr(), inv_lo);
+                _mm256_store_ps(tmp16.0.as_mut_ptr().add(8), inv_hi);
+                let inv_sum_v = _mm512_load_ps(tmp16.0.as_ptr());
+
+                let out_base = (g * (q_hi - q_lo) + (j0 - q_lo)) * head_dim;
+                for d0 in (0..head_dim).step_by(16) {
+                    let mut rows = [zero_v; 16];
+                    let acc_p = acc_blk.0.as_ptr().add(d0 * Q_LANE);
+                    for dd in 0..16 {
+                        rows[dd] = _mm512_mul_ps(_mm512_load_ps(acc_p.add(dd * Q_LANE)), inv_sum_v);
+                    }
+                    transpose16x16_f32_avx512(&mut rows);
+                    for jq in 0..jb {
+                        _mm512_storeu_ps(out_ptr.add(out_base + jq * head_dim + d0), rows[jq]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Token-major AVX-512 GQA flash-attention kernel processing `g_cnt` GQA heads over
+/// `[j0..j0+jb)` tokens with shared L1D-staged K and V tiles.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn flash_attention_gqa_avx512_token_major_tile(
+    q_ptr: *const f32,
+    k_ptr: *const f32,
+    v_ptr: *const f32,
+    out_ptr: *mut f32,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    h_start: usize,
+    g_cnt: usize,
+    n_queries: usize,
+    j0: usize,
+    jb: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        const Q_LANE: usize = 16;
+        const MAX_G: usize = 8;
+        debug_assert!(jb > 0 && jb <= Q_LANE && g_cnt > 0 && g_cnt <= MAX_G);
+        debug_assert!(g_cnt * head_dim <= 512 && head_dim <= 128 && head_dim.is_multiple_of(16));
+
+        let exp_c = ExpConsts512::new();
+        let scale_v = _mm512_set1_ps(scale);
+        let neg_inf_v = _mm512_set1_ps(f32::NEG_INFINITY);
+        let zero_v = _mm512_setzero_ps();
+        let one_v = _mm512_set1_ps(1.0);
+        let valid_q: u16 = if jb == Q_LANE {
+            0xFFFF
+        } else {
+            (1u16 << jb) - 1
+        };
+
+        let mut q_grp = Align64([0.0f32; 512 * Q_LANE]);
+        let mut acc_grp = Align64([0.0f32; 512 * Q_LANE]);
+        let mut k_tile = Align64([0.0f32; FLASH_TILE_KV * 128]);
+        let mut v_tile = Align64([0.0f32; FLASH_TILE_KV * 128]);
+        let mut scores_blk = Align64([0.0f32; FLASH_TILE_KV * Q_LANE]);
+        let mut tmp16 = Align64([0.0f32; Q_LANE]);
+
+        let g_stride = head_dim * Q_LANE;
+        for g in 0..g_cnt {
+            let h_off = (h_start + g) * head_dim;
+            let q_g_base = q_grp.0.as_mut_ptr().add(g * g_stride);
+            for d0 in (0..head_dim).step_by(16) {
+                let mut rows = [zero_v; 16];
+                for (jq, row) in rows[..jb].iter_mut().enumerate() {
+                    *row = _mm512_loadu_ps(q_ptr.add((j0 + jq) * q_stride + h_off + d0));
+                }
+                transpose16x16_f32_avx512(&mut rows);
+                let q_dst = q_g_base.add(d0 * Q_LANE);
+                for (dd, &row) in rows.iter().enumerate() {
+                    _mm512_store_ps(q_dst.add(dd * Q_LANE), row);
+                }
+            }
+        }
+
+        let mut block_kv = 0usize;
+        let mut max_kv_arr = [0i32; Q_LANE];
+        for (jq, mkv_slot) in max_kv_arr[..jb].iter_mut().enumerate() {
+            let j = j0 + jq;
+            let mkv = if is_causal {
+                start_pos + j + 1
+            } else {
+                start_pos + n_queries
+            };
+            *mkv_slot = mkv as i32;
+            block_kv = block_kv.max(mkv);
+        }
+        let max_kv_v = _mm512_loadu_si512(max_kv_arr.as_ptr().cast());
+
+        let mut running_max = [neg_inf_v; MAX_G];
+        let mut rsum_lo = [_mm512_setzero_pd(); MAX_G];
+        let mut rsum_hi = [_mm512_setzero_pd(); MAX_G];
+
+        for kv_start in (0..block_kv).step_by(FLASH_TILE_KV) {
+            let tile_keys = (block_kv - kv_start).min(FLASH_TILE_KV);
+            let need_rescale = kv_start > 0;
+
+            // Stage contiguous `[tile_keys, head_dim]` K and V slices into L1D once per GQA group.
+            for ti in 0..tile_keys {
+                let kv_off = (kv_start + ti) * kv_dim + kv_h_offset;
+                let ks = k_ptr.add(kv_off);
+                let vs = v_ptr.add(kv_off);
+                let kd = k_tile.0.as_mut_ptr().add(ti * head_dim);
+                let vd = v_tile.0.as_mut_ptr().add(ti * head_dim);
+                let mut d = 0usize;
+                while d < head_dim {
+                    _mm512_store_ps(kd.add(d), _mm512_loadu_ps(ks.add(d)));
+                    _mm512_store_ps(vd.add(d), _mm512_loadu_ps(vs.add(d)));
+                    d += 16;
+                }
+            }
+
+            for g in 0..g_cnt {
+                let q_g_ptr = q_grp.0.as_ptr().add(g * g_stride);
+                let acc_g_ptr = acc_grp.0.as_mut_ptr().add(g * g_stride);
+                let mut tile_max_v = neg_inf_v;
+
+                let mut tk = 0usize;
+                while tk + 8 <= tile_keys {
+                    let k0 = k_tile.0.as_ptr().add(tk * head_dim);
+                    let k1 = k0.add(head_dim);
+                    let k2 = k1.add(head_dim);
+                    let k3 = k2.add(head_dim);
+                    let k4 = k3.add(head_dim);
+                    let k5 = k4.add(head_dim);
+                    let k6 = k5.add(head_dim);
+                    let k7 = k6.add(head_dim);
+                    let mut s0 = zero_v;
+                    let mut s1 = zero_v;
+                    let mut s2 = zero_v;
+                    let mut s3 = zero_v;
+                    let mut s4 = zero_v;
+                    let mut s5 = zero_v;
+                    let mut s6 = zero_v;
+                    let mut s7 = zero_v;
+
+                    for d in 0..head_dim {
+                        let qd = _mm512_load_ps(q_g_ptr.add(d * Q_LANE));
+                        s0 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k0.add(d)), s0);
+                        s1 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k1.add(d)), s1);
+                        s2 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k2.add(d)), s2);
+                        s3 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k3.add(d)), s3);
+                        s4 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k4.add(d)), s4);
+                        s5 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k5.add(d)), s5);
+                        s6 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k6.add(d)), s6);
+                        s7 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k7.add(d)), s7);
+                    }
+
+                    macro_rules! finish_k {
+                        ($s:expr, $offset:expr) => {{
+                            let kv_idx = _mm512_set1_epi32((kv_start + tk + $offset) as i32);
+                            let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                            let sc =
+                                _mm512_mask_blend_ps(vm, neg_inf_v, _mm512_mul_ps($s, scale_v));
+                            tile_max_v = _mm512_max_ps(tile_max_v, sc);
+                            _mm512_store_ps(
+                                scores_blk.0.as_mut_ptr().add((tk + $offset) * Q_LANE),
+                                sc,
+                            );
+                        }};
+                    }
+                    finish_k!(s0, 0);
+                    finish_k!(s1, 1);
+                    finish_k!(s2, 2);
+                    finish_k!(s3, 3);
+                    finish_k!(s4, 4);
+                    finish_k!(s5, 5);
+                    finish_k!(s6, 6);
+                    finish_k!(s7, 7);
+                    tk += 8;
+                }
+                while tk < tile_keys {
+                    let k0 = k_tile.0.as_ptr().add(tk * head_dim);
+                    let mut s0 = zero_v;
+                    for d in 0..head_dim {
+                        let qd = _mm512_load_ps(q_g_ptr.add(d * Q_LANE));
+                        s0 = _mm512_fmadd_ps(qd, _mm512_set1_ps(*k0.add(d)), s0);
+                    }
+                    let kv_idx = _mm512_set1_epi32((kv_start + tk) as i32);
+                    let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                    let sc = _mm512_mask_blend_ps(vm, neg_inf_v, _mm512_mul_ps(s0, scale_v));
+                    tile_max_v = _mm512_max_ps(tile_max_v, sc);
+                    _mm512_store_ps(scores_blk.0.as_mut_ptr().add(tk * Q_LANE), sc);
+                    tk += 1;
+                }
+
+                let prev_max_v = running_max[g];
+                let new_max_v = _mm512_max_ps(prev_max_v, tile_max_v);
+                let eq_mask = _mm512_cmp_ps_mask(prev_max_v, new_max_v, _CMP_EQ_OQ);
+                let rescale_v = if !need_rescale {
+                    zero_v
+                } else if eq_mask == 0xFFFF {
+                    one_v
+                } else {
+                    let has_prev = _mm512_cmp_ps_mask(prev_max_v, neg_inf_v, _CMP_GT_OQ);
+                    let diff = _mm512_sub_ps(prev_max_v, new_max_v);
+                    let ev = ggml_expf_avx512(diff, &exp_c);
+                    let nz = _mm512_maskz_mov_ps(has_prev, ev);
+                    _mm512_mask_blend_ps(eq_mask, nz, one_v)
+                };
+
+                let mut tile_sum_v = zero_v;
+                for ti in 0..tile_keys {
+                    let kv_idx = _mm512_set1_epi32((kv_start + ti) as i32);
+                    let vm = _mm512_cmpgt_epi32_mask(max_kv_v, kv_idx) & valid_q;
+                    let sv = _mm512_load_ps(scores_blk.0.as_ptr().add(ti * Q_LANE));
+                    let ev = ggml_expf_avx512(_mm512_sub_ps(sv, new_max_v), &exp_c);
+                    let pv = _mm512_maskz_mov_ps(vm, ev);
+                    _mm512_store_ps(scores_blk.0.as_mut_ptr().add(ti * Q_LANE), pv);
+                    tile_sum_v = _mm512_add_ps(tile_sum_v, pv);
+                }
+
+                _mm512_store_ps(tmp16.0.as_mut_ptr(), tile_sum_v);
+                let tsum_lo = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr()));
+                let tsum_hi = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr().add(8)));
+                if need_rescale {
+                    _mm512_store_ps(tmp16.0.as_mut_ptr(), rescale_v);
+                    let r_lo = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr()));
+                    let r_hi = _mm512_cvtps_pd(_mm256_load_ps(tmp16.0.as_ptr().add(8)));
+                    rsum_lo[g] = _mm512_fmadd_pd(rsum_lo[g], r_lo, tsum_lo);
+                    rsum_hi[g] = _mm512_fmadd_pd(rsum_hi[g], r_hi, tsum_hi);
+                } else {
+                    rsum_lo[g] = tsum_lo;
+                    rsum_hi[g] = tsum_hi;
+                }
+                running_max[g] = new_max_v;
+
+                let do_rescale = need_rescale && (eq_mask != 0xFFFF);
+                for d0 in (0..head_dim).step_by(16) {
+                    let mut a = [zero_v; 16];
+                    if need_rescale {
+                        let acc_p = acc_g_ptr.add(d0 * Q_LANE);
+                        for (dd, dst) in a.iter_mut().enumerate() {
+                            let prev = _mm512_load_ps(acc_p.add(dd * Q_LANE));
+                            *dst = if do_rescale {
+                                _mm512_mul_ps(prev, rescale_v)
+                            } else {
+                                prev
+                            };
+                        }
+                    }
+
+                    for ti in 0..tile_keys {
+                        let p = _mm512_load_ps(scores_blk.0.as_ptr().add(ti * Q_LANE));
+                        let vp = v_tile.0.as_ptr().add(ti * head_dim + d0);
+                        for (dd, dst) in a.iter_mut().enumerate() {
+                            *dst = _mm512_fmadd_ps(p, _mm512_set1_ps(*vp.add(dd)), *dst);
+                        }
+                    }
+
+                    let acc_mp = acc_g_ptr.add(d0 * Q_LANE);
+                    for (dd, &val) in a.iter().enumerate() {
+                        _mm512_store_ps(acc_mp.add(dd * Q_LANE), val);
+                    }
+                }
+            }
+        }
+
+        let one_d = _mm512_set1_pd(1.0);
+        for g in 0..g_cnt {
+            let h_off = (h_start + g) * head_dim;
+            let acc_g_ptr = acc_grp.0.as_ptr().add(g * g_stride);
+            let inv_lo = _mm512_cvtpd_ps(_mm512_div_pd(one_d, rsum_lo[g]));
+            let inv_hi = _mm512_cvtpd_ps(_mm512_div_pd(one_d, rsum_hi[g]));
+            _mm256_store_ps(tmp16.0.as_mut_ptr(), inv_lo);
+            _mm256_store_ps(tmp16.0.as_mut_ptr().add(8), inv_hi);
+            let inv_sum_v = _mm512_load_ps(tmp16.0.as_ptr());
+
+            for d0 in (0..head_dim).step_by(16) {
+                let mut rows = [zero_v; 16];
+                let acc_p = acc_g_ptr.add(d0 * Q_LANE);
+                for (dd, row) in rows.iter_mut().enumerate() {
+                    *row = _mm512_mul_ps(_mm512_load_ps(acc_p.add(dd * Q_LANE)), inv_sum_v);
+                }
+                transpose16x16_f32_avx512(&mut rows);
+                for (jq, &row) in rows[..jb].iter().enumerate() {
+                    _mm512_storeu_ps(out_ptr.add((j0 + jq) * q_stride + h_off + d0), row);
                 }
             }
         }
@@ -9984,18 +11446,10 @@ pub fn rope(
 ) {
     debug_assert_eq!(q.len(), n_heads * head_dim);
     debug_assert_eq!(k.len(), n_kv_heads * head_dim);
-
-    // Apply to Q heads
-    for h in 0..n_heads {
-        let offset = h * head_dim;
-        apply_rope_to_head(&mut q[offset..offset + head_dim], pos, head_dim, freq_base);
+    if head_dim == 0 || (n_heads == 0 && n_kv_heads == 0) {
+        return;
     }
-
-    // Apply to K heads
-    for h in 0..n_kv_heads {
-        let offset = h * head_dim;
-        apply_rope_to_head(&mut k[offset..offset + head_dim], pos, head_dim, freq_base);
-    }
+    rope_neox_freq_factors(q, k, pos, (n_heads, n_kv_heads), head_dim, freq_base, None);
 }
 
 /// NEOX-layout RoPE for Q and K with optional per-pair frequency factors.
@@ -10069,6 +11523,102 @@ pub fn rope_neox_freq_factors(
     };
     q.chunks_exact_mut(head_dim).for_each(rotate);
     k.chunks_exact_mut(head_dim).for_each(rotate);
+}
+
+/// Precompute NEOX RoPE `(cos, sin)` tables `[n, head_dim / 2]` for positions `start_pos..start_pos + n`.
+pub fn precompute_rope_cos_sin(
+    start_pos: usize,
+    n: usize,
+    head_dim: usize,
+    freq_base: f32,
+    cos_table: &mut Vec<f32>,
+    sin_table: &mut Vec<f32>,
+) {
+    let half_dim = head_dim / 2;
+    let total = n * half_dim;
+    cos_table.resize(total, 1.0);
+    sin_table.resize(total, 0.0);
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut inv_freqs = [0.0f32; 128];
+    let inv_f: &mut [f32] = if half_dim <= inv_freqs.len() {
+        let mut f = 1.0f32;
+        for slot in &mut inv_freqs[..half_dim] {
+            *slot = f;
+            f *= theta_scale;
+        }
+        &mut inv_freqs[..half_dim]
+    } else {
+        // Rare large head_dim
+        &mut []
+    };
+    if !inv_f.is_empty() {
+        for j in 0..n {
+            let pos = (start_pos + j) as f32;
+            let c_row = &mut cos_table[j * half_dim..(j + 1) * half_dim];
+            let s_row = &mut sin_table[j * half_dim..(j + 1) * half_dim];
+            for i in 0..half_dim {
+                let (s, c) = rope_sin_cos(pos * inv_f[i]);
+                s_row[i] = s;
+                c_row[i] = c;
+            }
+        }
+    } else {
+        for j in 0..n {
+            let mut theta = (start_pos + j) as f32;
+            let c_row = &mut cos_table[j * half_dim..(j + 1) * half_dim];
+            let s_row = &mut sin_table[j * half_dim..(j + 1) * half_dim];
+            for i in 0..half_dim {
+                let (s, c) = rope_sin_cos(theta);
+                s_row[i] = s;
+                c_row[i] = c;
+                theta *= theta_scale;
+            }
+        }
+    }
+}
+
+/// Fused parallel per-head Q/K RMSNorm + NEOX RoPE across `n` tokens for `head_dim == 64` (AVX-512 fast path).
+#[allow(clippy::too_many_arguments)]
+pub fn par_qk_rmsnorm_rope64(
+    q_mat: &mut [f32],
+    k_mat: &mut [f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    eps: f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n: usize,
+) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    if q_norm.len() == 64
+        && k_norm.len() == 64
+        && crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::Avx512
+    {
+        let hs = n_heads * 64;
+        let kv_dim = n_kv_heads * 64;
+        let k_ptr = k_mat.as_mut_ptr() as usize;
+        let max_active = prefill_threads_for_tokens(n);
+        par_rows_n_active(q_mat, hs, 8, max_active, move |(j, q)| {
+            let k = unsafe {
+                core::slice::from_raw_parts_mut((k_ptr as *mut f32).add(j * kv_dim), kv_dim)
+            };
+            let c_row = &cos_table[j * 32..(j + 1) * 32];
+            let s_row = &sin_table[j * 32..(j + 1) * 32];
+            unsafe {
+                crate::backend::simd::avx512_vnni::qk_rmsnorm_rope64_avx512(
+                    q, k, q_norm, k_norm, c_row, s_row, eps, n_heads, n_kv_heads,
+                );
+            }
+        });
+        return true;
+    }
+    let _ = (
+        q_mat, k_mat, q_norm, k_norm, cos_table, sin_table, eps, n_heads, n_kv_heads, n,
+    );
+    false
 }
 
 /// Parameters for YaRN (Yet another RoPE extensioN) rotary embeddings.
@@ -10994,11 +12544,830 @@ pub fn mamba2_ssd_step(
 
 // ── Element-wise operations ─────────────────────────────────────────────────
 
+/// AVX2 element-wise addition `a[i] += b[i]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_inplace_avx2(a: *mut f32, b: *const f32, n: usize) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let a0 = _mm256_loadu_ps(a.add(i));
+            let a1 = _mm256_loadu_ps(a.add(i + 8));
+            let a2 = _mm256_loadu_ps(a.add(i + 16));
+            let a3 = _mm256_loadu_ps(a.add(i + 24));
+            let b0 = _mm256_loadu_ps(b.add(i));
+            let b1 = _mm256_loadu_ps(b.add(i + 8));
+            let b2 = _mm256_loadu_ps(b.add(i + 16));
+            let b3 = _mm256_loadu_ps(b.add(i + 24));
+            _mm256_storeu_ps(a.add(i), _mm256_add_ps(a0, b0));
+            _mm256_storeu_ps(a.add(i + 8), _mm256_add_ps(a1, b1));
+            _mm256_storeu_ps(a.add(i + 16), _mm256_add_ps(a2, b2));
+            _mm256_storeu_ps(a.add(i + 24), _mm256_add_ps(a3, b3));
+            i += 32;
+        }
+        while i + 8 <= n {
+            let av = _mm256_loadu_ps(a.add(i));
+            let bv = _mm256_loadu_ps(b.add(i));
+            _mm256_storeu_ps(a.add(i), _mm256_add_ps(av, bv));
+            i += 8;
+        }
+        while i < n {
+            *a.add(i) += *b.add(i);
+            i += 1;
+        }
+    }
+}
+
 /// Element-wise addition: a += b.
 pub fn add_inplace(a: &mut [f32], b: &[f32]) {
     debug_assert_eq!(a.len(), b.len());
-    for (a, b) in a.iter_mut().zip(b.iter()) {
+    let n = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: `avx2` checked; `a` and `b` have at least `n` elements.
+        unsafe { add_inplace_avx2(a.as_mut_ptr(), b.as_ptr(), n) };
+        return;
+    }
+    for (a, b) in a[..n].iter_mut().zip(b[..n].iter()) {
         *a += *b;
+    }
+}
+
+/// Parallel element-wise addition `a += b` for large prefill buffers.
+pub fn par_add_inplace(a: &mut [f32], b: &[f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len().min(b.len());
+    const PAR_MIN_ELEMS: usize = 32_768;
+    if n < PAR_MIN_ELEMS {
+        add_inplace(&mut a[..n], &b[..n]);
+        return;
+    }
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    {
+        const CHUNK_ELEMS: usize = 4_096;
+        let n_chunks = n.div_ceil(CHUNK_ELEMS);
+        let a_ptr = a.as_mut_ptr() as usize;
+        let b_ptr = b.as_ptr() as usize;
+        let max_active = prefill_threads_for_tokens(n / CHUNK_ELEMS);
+        par_range_prefill_active(n_chunks, 1, max_active, move |start_c, count| {
+            let off = start_c * CHUNK_ELEMS;
+            let len = ((start_c + count) * CHUNK_ELEMS).min(n) - off;
+            // SAFETY: worker chunk `[off..off+len)` is disjoint across workers and within `n`.
+            let (a_s, b_s) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut((a_ptr as *mut f32).add(off), len),
+                    core::slice::from_raw_parts((b_ptr as *const f32).add(off), len),
+                )
+            };
+            add_inplace(a_s, b_s);
+        });
+    }
+    #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+    add_inplace(&mut a[..n], &b[..n]);
+}
+
+/// Convert `n` f32 values to IEEE-754 binary16 bit patterns using AVX + F16C.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx")]
+unsafe fn f32_to_f16_f16c(src: *const f32, dst: *mut u16, n: usize) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(src.add(i));
+            let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
+            _mm_storeu_si128(dst.add(i) as *mut __m128i, h);
+            i += 8;
+        }
+        while i < n {
+            *dst.add(i) = crate::quant::f32_to_f16(*src.add(i));
+            i += 1;
+        }
+    }
+}
+
+/// Convert `n` IEEE-754 binary16 bit patterns to f32 using AVX + F16C.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx")]
+unsafe fn f16_to_f32_f16c(src: *const u16, dst: *mut f32, n: usize) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let h = _mm_loadu_si128(src.add(i) as *const __m128i);
+            let v = _mm256_cvtph_ps(h);
+            _mm256_storeu_ps(dst.add(i), v);
+            i += 8;
+        }
+        while i < n {
+            *dst.add(i) = crate::quant::f16_to_f32(*src.add(i));
+            i += 1;
+        }
+    }
+}
+
+/// Convert `src` f32 values to IEEE-754 binary16 bit patterns in `dst`.
+pub fn f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
+    let n = src.len().min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+        // SAFETY: `f16c` + `avx` checked; pointers valid for `n` elements.
+        unsafe { f32_to_f16_f16c(src.as_ptr(), dst.as_mut_ptr(), n) };
+        return;
+    }
+    for (d, &s) in dst[..n].iter_mut().zip(src[..n].iter()) {
+        *d = crate::quant::f32_to_f16(s);
+    }
+}
+
+/// Convert `src` f32 values to IEEE-754 binary16 bit patterns in `dst`, parallelized when large.
+pub fn par_f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
+    let n = src.len().min(dst.len());
+    if n < 32_768 {
+        f32_slice_to_f16_into(&src[..n], &mut dst[..n]);
+        return;
+    }
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    {
+        let src_ptr = src.as_ptr() as usize;
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        let n_chunks = n / 1024;
+        let max_active = prefill_threads_for_tokens(n_chunks);
+        par_range_prefill_active(n_chunks, 4, max_active, move |sc, cnt| {
+            let off = sc * 1024;
+            let len = cnt * 1024;
+            let s_chunk =
+                unsafe { core::slice::from_raw_parts((src_ptr as *const f32).add(off), len) };
+            let d_chunk =
+                unsafe { core::slice::from_raw_parts_mut((dst_ptr as *mut u16).add(off), len) };
+            f32_slice_to_f16_into(s_chunk, d_chunk);
+        });
+        let rem_off = n_chunks * 1024;
+        if rem_off < n {
+            f32_slice_to_f16_into(&src[rem_off..n], &mut dst[rem_off..n]);
+        }
+    }
+    #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+    f32_slice_to_f16_into(&src[..n], &mut dst[..n]);
+}
+
+/// Convert `src` IEEE-754 binary16 bit patterns to f32 in `dst`, parallelized when large.
+pub fn par_f16_slice_to_f32_into(src: &[u16], dst: &mut Vec<f32>) {
+    let n = src.len();
+    if dst.len() != n {
+        dst.resize(n, 0.0);
+    }
+    let convert_chunk = |s: &[u16], d: &mut [f32]| {
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+            // SAFETY: `f16c` + `avx` checked; lengths match.
+            unsafe { f16_to_f32_f16c(s.as_ptr(), d.as_mut_ptr(), s.len()) };
+            return;
+        }
+        for (out, &bits) in d.iter_mut().zip(s.iter()) {
+            *out = crate::quant::f16_to_f32(bits);
+        }
+    };
+    const PAR_MIN: usize = 32_768;
+    if n < PAR_MIN {
+        convert_chunk(src, &mut dst[..n]);
+        return;
+    }
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    {
+        const CHUNK: usize = 8_192;
+        let n_chunks = n.div_ceil(CHUNK);
+        let src_ptr = src.as_ptr() as usize;
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        let max_active = prefill_threads_for_tokens(n / CHUNK);
+        par_range_prefill_active(n_chunks, 1, max_active, move |start_c, count| {
+            let off = start_c * CHUNK;
+            let len = ((start_c + count) * CHUNK).min(n) - off;
+            // SAFETY: worker chunk `[off..off+len)` is disjoint across workers and within `n`.
+            let (s, d) = unsafe {
+                (
+                    core::slice::from_raw_parts((src_ptr as *const u16).add(off), len),
+                    core::slice::from_raw_parts_mut((dst_ptr as *mut f32).add(off), len),
+                )
+            };
+            convert_chunk(s, d);
+        });
+    }
+    #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+    convert_chunk(src, &mut dst[..n]);
+}
+
+/// Batch causal gated short-convolution across `n` tokens, updating `buffer` in place
+/// and optionally writing trailing snapshots into `snapshots`.
+///
+/// Layout invariants:
+/// - `proj_mat`: `[n, 3 * hs]` (`B`, `C`, `X` slices of length `hs` per token).
+/// - `conv_wt`: `[d_conv + 1, hs]` (oldest tap `0` through newest `d_conv`).
+/// - `buffer`: `[d_conv, hs]` (updated in place to the state after token `n - 1`).
+/// - `out_proj_input`: `[n, hs]`.
+/// - `snapshots`: when `Some`, flat `[conv_cap, d_conv * hs]` ring buffer populated for
+///   token indices `j in first_kept..n` at slots `(ring_start + (j - first_kept)) % conv_cap`.
+#[allow(clippy::too_many_arguments)]
+pub fn shortconv_causal_prefill(
+    proj_mat: &[f32],
+    conv_wt: &[f32],
+    buffer: &mut [f32],
+    out_proj_input: &mut [f32],
+    snapshots: Option<&mut [f32]>,
+    first_kept: usize,
+    ring_start: usize,
+    conv_cap: usize,
+    n: usize,
+    hs: usize,
+    d_conv: usize,
+) {
+    if n == 0 || hs == 0 || d_conv == 0 {
+        return;
+    }
+    debug_assert!(proj_mat.len() >= n * 3 * hs);
+    debug_assert!(conv_wt.len() >= (d_conv + 1) * hs);
+    debug_assert!(buffer.len() >= d_conv * hs);
+    debug_assert!(out_proj_input.len() >= n * hs);
+
+    let (snap_ptr, snap_len) = match snapshots {
+        Some(s) if first_kept < n && conv_cap > 0 => (s.as_mut_ptr(), s.len()),
+        _ => (core::ptr::null_mut(), 0usize),
+    };
+    let buf_len = d_conv * hs;
+    if !snap_ptr.is_null() {
+        debug_assert!(snap_len >= conv_cap * buf_len);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        if n >= 16 && hs >= 512 {
+            const CHUNK: usize = 256;
+            let n_chunks = hs.div_ceil(CHUNK);
+            let proj_addr = proj_mat.as_ptr() as usize;
+            let wt_addr = conv_wt.as_ptr() as usize;
+            let buf_addr = buffer.as_mut_ptr() as usize;
+            let out_addr = out_proj_input.as_mut_ptr() as usize;
+            let snap_addr = snap_ptr as usize;
+            let max_active = prefill_threads_for_tokens(n);
+            par_range_prefill_active(n_chunks, 1, max_active, move |start_c, count| {
+                let c_start = start_c * CHUNK;
+                let c_end = ((start_c + count) * CHUNK).min(hs);
+                // SAFETY: `avx512f` verified; `[c_start..c_end)` is channel-disjoint across
+                // workers and 256-float aligned (no false sharing across rows or ring slots).
+                unsafe {
+                    shortconv_causal_ring_avx512_range(
+                        proj_addr as *const f32,
+                        wt_addr as *const f32,
+                        buf_addr as *mut f32,
+                        out_addr as *mut f32,
+                        snap_addr as *mut f32,
+                        first_kept,
+                        ring_start,
+                        conv_cap,
+                        n,
+                        hs,
+                        d_conv,
+                        c_start,
+                        c_end,
+                    );
+                }
+            });
+            let final_head = n % d_conv;
+            if final_head != 0 {
+                buffer[..buf_len].rotate_left(final_head * hs);
+            }
+            return;
+        }
+        // SAFETY: `avx512f` verified and buffer lengths asserted above.
+        unsafe {
+            shortconv_causal_ring_avx512_range(
+                proj_mat.as_ptr(),
+                conv_wt.as_ptr(),
+                buffer.as_mut_ptr(),
+                out_proj_input.as_mut_ptr(),
+                snap_ptr,
+                first_kept,
+                ring_start,
+                conv_cap,
+                n,
+                hs,
+                d_conv,
+                0,
+                hs,
+            );
+        }
+        let final_head = n % d_conv;
+        if final_head != 0 {
+            buffer[..buf_len].rotate_left(final_head * hs);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: `avx2` + `fma` verified and buffer lengths asserted above.
+        unsafe {
+            shortconv_causal_ring_avx2_range(
+                proj_mat.as_ptr(),
+                conv_wt.as_ptr(),
+                buffer.as_mut_ptr(),
+                out_proj_input.as_mut_ptr(),
+                snap_ptr,
+                first_kept,
+                ring_start,
+                conv_cap,
+                n,
+                hs,
+                d_conv,
+                0,
+                hs,
+            );
+        }
+        let final_head = n % d_conv;
+        if final_head != 0 {
+            buffer[..buf_len].rotate_left(final_head * hs);
+        }
+        return;
+    }
+
+    // Scalar fallback using a logical ring slot index without per-token `copy_within`.
+    let mut head = 0usize;
+    let mut snap_slot = ring_start % conv_cap.max(1);
+    for j in 0..n {
+        let p_base = j * 3 * hs;
+        let b_row = &proj_mat[p_base..p_base + hs];
+        let c_row = &proj_mat[p_base + hs..p_base + 2 * hs];
+        let x_row = &proj_mat[p_base + 2 * hs..p_base + 3 * hs];
+        let out_row = &mut out_proj_input[j * hs..(j + 1) * hs];
+        let mut s_idx = [0usize; 16];
+        debug_assert!(d_conv <= s_idx.len());
+        for (t, slot) in s_idx[..d_conv].iter_mut().enumerate() {
+            *slot = (head + t) % d_conv;
+        }
+        let oldest_off = s_idx[0] * hs;
+        for i in 0..hs {
+            let bx = b_row[i] * x_row[i];
+            let mut acc = buffer[oldest_off + i] * conv_wt[i];
+            for t in 1..d_conv {
+                acc += buffer[s_idx[t] * hs + i] * conv_wt[t * hs + i];
+            }
+            out_row[i] = c_row[i] * (acc + bx * conv_wt[d_conv * hs + i]);
+            buffer[oldest_off + i] = bx;
+        }
+        head = if head + 1 == d_conv { 0 } else { head + 1 };
+        if !snap_ptr.is_null() && j >= first_kept {
+            unsafe {
+                copy_ring_snapshot(buffer.as_ptr(), snap_ptr, snap_slot, head, d_conv, hs);
+            }
+            snap_slot += 1;
+            if snap_slot == conv_cap {
+                snap_slot = 0;
+            }
+        }
+    }
+    if head != 0 {
+        buffer[..buf_len].rotate_left(head * hs);
+    }
+}
+
+/// Copy a `d_conv * hs` logical ring buffer rotated by `head` slots into a linear snapshot slot.
+#[inline]
+unsafe fn copy_ring_snapshot(
+    buf_ptr: *const f32,
+    snap_ptr: *mut f32,
+    slot: usize,
+    head: usize,
+    d_conv: usize,
+    hs: usize,
+) {
+    unsafe {
+        let dst = snap_ptr.add(slot * d_conv * hs);
+        let first_len = (d_conv - head) * hs;
+        core::ptr::copy_nonoverlapping(buf_ptr.add(head * hs), dst, first_len);
+        if head > 0 {
+            core::ptr::copy_nonoverlapping(buf_ptr, dst.add(first_len), head * hs);
+        }
+    }
+}
+
+/// Copy channel subrange `[c_start..c_end)` of a `d_conv * hs` logical ring buffer rotated by
+/// `head` slots into a linear snapshot slot without writing sibling channels.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn copy_ring_snapshot_range(
+    buf_ptr: *const f32,
+    snap_ptr: *mut f32,
+    slot: usize,
+    head: usize,
+    d_conv: usize,
+    hs: usize,
+    c_start: usize,
+    c_end: usize,
+) {
+    if c_start == 0 && c_end == hs {
+        unsafe { copy_ring_snapshot(buf_ptr, snap_ptr, slot, head, d_conv, hs) };
+        return;
+    }
+    let c_len = c_end - c_start;
+    let dst_base = unsafe { snap_ptr.add(slot * d_conv * hs + c_start) };
+    for t in 0..d_conv {
+        let ring_idx = if head + t < d_conv {
+            head + t
+        } else {
+            head + t - d_conv
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf_ptr.add(ring_idx * hs + c_start),
+                dst_base.add(t * hs),
+                c_len,
+            );
+        }
+    }
+}
+
+/// Unit-stride `j`-outer AVX2+FMA causal short-convolution over channel slice `[c_start..c_end)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn shortconv_causal_ring_avx2_range(
+    proj_ptr: *const f32,
+    conv_wt_ptr: *const f32,
+    buf_ptr: *mut f32,
+    out_ptr: *mut f32,
+    snap_ptr: *mut f32,
+    first_kept: usize,
+    ring_start: usize,
+    conv_cap: usize,
+    n: usize,
+    hs: usize,
+    d_conv: usize,
+    c_start: usize,
+    c_end: usize,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut head = 0usize;
+        let mut snap_slot = ring_start % conv_cap.max(1);
+        let stride_p = 3 * hs;
+
+        for j in 0..n {
+            let p = proj_ptr.add(j * stride_p);
+            let b_ptr = p;
+            let c_ptr = p.add(hs);
+            let x_ptr = p.add(2 * hs);
+            let o_ptr = out_ptr.add(j * hs);
+
+            if d_conv == 6 {
+                let i0 = head;
+                let i1 = if i0 + 1 < 6 { i0 + 1 } else { i0 + 1 - 6 };
+                let i2 = if i0 + 2 < 6 { i0 + 2 } else { i0 + 2 - 6 };
+                let i3 = if i0 + 3 < 6 { i0 + 3 } else { i0 + 3 - 6 };
+                let i4 = if i0 + 4 < 6 { i0 + 4 } else { i0 + 4 - 6 };
+                let i5 = if i0 + 5 < 6 { i0 + 5 } else { i0 + 5 - 6 };
+                let s0_p = buf_ptr.add(i0 * hs);
+                let s1_p = buf_ptr.add(i1 * hs);
+                let s2_p = buf_ptr.add(i2 * hs);
+                let s3_p = buf_ptr.add(i3 * hs);
+                let s4_p = buf_ptr.add(i4 * hs);
+                let s5_p = buf_ptr.add(i5 * hs);
+                let w0_p = conv_wt_ptr;
+                let w1_p = conv_wt_ptr.add(hs);
+                let w2_p = conv_wt_ptr.add(2 * hs);
+                let w3_p = conv_wt_ptr.add(3 * hs);
+                let w4_p = conv_wt_ptr.add(4 * hs);
+                let w5_p = conv_wt_ptr.add(5 * hs);
+                let w6_p = conv_wt_ptr.add(6 * hs);
+
+                let mut c = c_start;
+                while c + 8 <= c_end {
+                    let bx =
+                        _mm256_mul_ps(_mm256_loadu_ps(b_ptr.add(c)), _mm256_loadu_ps(x_ptr.add(c)));
+                    let cv = _mm256_loadu_ps(c_ptr.add(c));
+                    let mut acc =
+                        _mm256_mul_ps(_mm256_loadu_ps(s0_p.add(c)), _mm256_loadu_ps(w0_p.add(c)));
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(s1_p.add(c)),
+                        _mm256_loadu_ps(w1_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(s2_p.add(c)),
+                        _mm256_loadu_ps(w2_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(s3_p.add(c)),
+                        _mm256_loadu_ps(w3_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(s4_p.add(c)),
+                        _mm256_loadu_ps(w4_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(s5_p.add(c)),
+                        _mm256_loadu_ps(w5_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm256_fmadd_ps(bx, _mm256_loadu_ps(w6_p.add(c)), acc);
+                    _mm256_storeu_ps(o_ptr.add(c), _mm256_mul_ps(cv, acc));
+                    _mm256_storeu_ps(s0_p.add(c), bx);
+                    c += 8;
+                }
+                while c < c_end {
+                    let bx = *b_ptr.add(c) * *x_ptr.add(c);
+                    let mut acc = *s0_p.add(c) * *w0_p.add(c);
+                    acc += *s1_p.add(c) * *w1_p.add(c);
+                    acc += *s2_p.add(c) * *w2_p.add(c);
+                    acc += *s3_p.add(c) * *w3_p.add(c);
+                    acc += *s4_p.add(c) * *w4_p.add(c);
+                    acc += *s5_p.add(c) * *w5_p.add(c);
+                    acc += bx * *w6_p.add(c);
+                    *o_ptr.add(c) = *c_ptr.add(c) * acc;
+                    *s0_p.add(c) = bx;
+                    c += 1;
+                }
+            } else if d_conv == 2 {
+                let s0_p = buf_ptr.add(head * hs);
+                let s1_p = buf_ptr.add((1 - head) * hs);
+                let w0_p = conv_wt_ptr;
+                let w1_p = conv_wt_ptr.add(hs);
+                let w2_p = conv_wt_ptr.add(2 * hs);
+
+                let mut c = c_start;
+                while c + 8 <= c_end {
+                    let bx =
+                        _mm256_mul_ps(_mm256_loadu_ps(b_ptr.add(c)), _mm256_loadu_ps(x_ptr.add(c)));
+                    let cv = _mm256_loadu_ps(c_ptr.add(c));
+                    let mut acc =
+                        _mm256_mul_ps(_mm256_loadu_ps(s0_p.add(c)), _mm256_loadu_ps(w0_p.add(c)));
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(s1_p.add(c)),
+                        _mm256_loadu_ps(w1_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm256_fmadd_ps(bx, _mm256_loadu_ps(w2_p.add(c)), acc);
+                    _mm256_storeu_ps(o_ptr.add(c), _mm256_mul_ps(cv, acc));
+                    _mm256_storeu_ps(s0_p.add(c), bx);
+                    c += 8;
+                }
+                while c < c_end {
+                    let bx = *b_ptr.add(c) * *x_ptr.add(c);
+                    let acc = *s0_p.add(c) * *w0_p.add(c)
+                        + *s1_p.add(c) * *w1_p.add(c)
+                        + bx * *w2_p.add(c);
+                    *o_ptr.add(c) = *c_ptr.add(c) * acc;
+                    *s0_p.add(c) = bx;
+                    c += 1;
+                }
+            } else {
+                let oldest_p = buf_ptr.add(head * hs);
+                let w0_p = conv_wt_ptr;
+                let wd_p = conv_wt_ptr.add(d_conv * hs);
+                let mut c = c_start;
+                while c + 8 <= c_end {
+                    let bx =
+                        _mm256_mul_ps(_mm256_loadu_ps(b_ptr.add(c)), _mm256_loadu_ps(x_ptr.add(c)));
+                    let cv = _mm256_loadu_ps(c_ptr.add(c));
+                    let mut acc = _mm256_mul_ps(
+                        _mm256_loadu_ps(oldest_p.add(c)),
+                        _mm256_loadu_ps(w0_p.add(c)),
+                    );
+                    for t in 1..d_conv {
+                        let st = (head + t) % d_conv;
+                        acc = _mm256_fmadd_ps(
+                            _mm256_loadu_ps(buf_ptr.add(st * hs + c)),
+                            _mm256_loadu_ps(conv_wt_ptr.add(t * hs + c)),
+                            acc,
+                        );
+                    }
+                    acc = _mm256_fmadd_ps(bx, _mm256_loadu_ps(wd_p.add(c)), acc);
+                    _mm256_storeu_ps(o_ptr.add(c), _mm256_mul_ps(cv, acc));
+                    _mm256_storeu_ps(oldest_p.add(c), bx);
+                    c += 8;
+                }
+                while c < c_end {
+                    let bx = *b_ptr.add(c) * *x_ptr.add(c);
+                    let mut acc = *oldest_p.add(c) * *w0_p.add(c);
+                    for t in 1..d_conv {
+                        let st = (head + t) % d_conv;
+                        acc += *buf_ptr.add(st * hs + c) * *conv_wt_ptr.add(t * hs + c);
+                    }
+                    *o_ptr.add(c) = *c_ptr.add(c) * (acc + bx * *wd_p.add(c));
+                    *oldest_p.add(c) = bx;
+                    c += 1;
+                }
+            }
+
+            head += 1;
+            if head == d_conv {
+                head = 0;
+            }
+            if !snap_ptr.is_null() && j >= first_kept {
+                copy_ring_snapshot(buf_ptr, snap_ptr, snap_slot, head, d_conv, hs);
+                snap_slot += 1;
+                if snap_slot == conv_cap {
+                    snap_slot = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Unit-stride `j`-outer AVX-512 causal short-convolution over channel slice `[c_start..c_end)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn shortconv_causal_ring_avx512_range(
+    proj_ptr: *const f32,
+    conv_wt_ptr: *const f32,
+    buf_ptr: *mut f32,
+    out_ptr: *mut f32,
+    snap_ptr: *mut f32,
+    first_kept: usize,
+    ring_start: usize,
+    conv_cap: usize,
+    n: usize,
+    hs: usize,
+    d_conv: usize,
+    c_start: usize,
+    c_end: usize,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut head = 0usize;
+        let mut snap_slot = ring_start % conv_cap.max(1);
+        let stride_p = 3 * hs;
+
+        for j in 0..n {
+            let p = proj_ptr.add(j * stride_p);
+            let b_ptr = p;
+            let c_ptr = p.add(hs);
+            let x_ptr = p.add(2 * hs);
+            let o_ptr = out_ptr.add(j * hs);
+
+            if d_conv == 6 {
+                let i0 = head;
+                let i1 = if i0 + 1 < 6 { i0 + 1 } else { i0 + 1 - 6 };
+                let i2 = if i0 + 2 < 6 { i0 + 2 } else { i0 + 2 - 6 };
+                let i3 = if i0 + 3 < 6 { i0 + 3 } else { i0 + 3 - 6 };
+                let i4 = if i0 + 4 < 6 { i0 + 4 } else { i0 + 4 - 6 };
+                let i5 = if i0 + 5 < 6 { i0 + 5 } else { i0 + 5 - 6 };
+                let s0_p = buf_ptr.add(i0 * hs);
+                let s1_p = buf_ptr.add(i1 * hs);
+                let s2_p = buf_ptr.add(i2 * hs);
+                let s3_p = buf_ptr.add(i3 * hs);
+                let s4_p = buf_ptr.add(i4 * hs);
+                let s5_p = buf_ptr.add(i5 * hs);
+                let w0_p = conv_wt_ptr;
+                let w1_p = conv_wt_ptr.add(hs);
+                let w2_p = conv_wt_ptr.add(2 * hs);
+                let w3_p = conv_wt_ptr.add(3 * hs);
+                let w4_p = conv_wt_ptr.add(4 * hs);
+                let w5_p = conv_wt_ptr.add(5 * hs);
+                let w6_p = conv_wt_ptr.add(6 * hs);
+
+                let mut c = c_start;
+                while c + 16 <= c_end {
+                    let bx =
+                        _mm512_mul_ps(_mm512_loadu_ps(b_ptr.add(c)), _mm512_loadu_ps(x_ptr.add(c)));
+                    let cv = _mm512_loadu_ps(c_ptr.add(c));
+                    let mut acc =
+                        _mm512_mul_ps(_mm512_loadu_ps(s0_p.add(c)), _mm512_loadu_ps(w0_p.add(c)));
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(s1_p.add(c)),
+                        _mm512_loadu_ps(w1_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(s2_p.add(c)),
+                        _mm512_loadu_ps(w2_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(s3_p.add(c)),
+                        _mm512_loadu_ps(w3_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(s4_p.add(c)),
+                        _mm512_loadu_ps(w4_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(s5_p.add(c)),
+                        _mm512_loadu_ps(w5_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm512_fmadd_ps(bx, _mm512_loadu_ps(w6_p.add(c)), acc);
+                    _mm512_storeu_ps(o_ptr.add(c), _mm512_mul_ps(cv, acc));
+                    _mm512_storeu_ps(s0_p.add(c), bx);
+                    c += 16;
+                }
+                while c < c_end {
+                    let bx = *b_ptr.add(c) * *x_ptr.add(c);
+                    let mut acc = *s0_p.add(c) * *w0_p.add(c);
+                    acc += *s1_p.add(c) * *w1_p.add(c);
+                    acc += *s2_p.add(c) * *w2_p.add(c);
+                    acc += *s3_p.add(c) * *w3_p.add(c);
+                    acc += *s4_p.add(c) * *w4_p.add(c);
+                    acc += *s5_p.add(c) * *w5_p.add(c);
+                    acc += bx * *w6_p.add(c);
+                    *o_ptr.add(c) = *c_ptr.add(c) * acc;
+                    *s0_p.add(c) = bx;
+                    c += 1;
+                }
+            } else if d_conv == 2 {
+                let s0_p = buf_ptr.add(head * hs);
+                let s1_p = buf_ptr.add((1 - head) * hs);
+                let w0_p = conv_wt_ptr;
+                let w1_p = conv_wt_ptr.add(hs);
+                let w2_p = conv_wt_ptr.add(2 * hs);
+
+                let mut c = c_start;
+                while c + 16 <= c_end {
+                    let bx =
+                        _mm512_mul_ps(_mm512_loadu_ps(b_ptr.add(c)), _mm512_loadu_ps(x_ptr.add(c)));
+                    let cv = _mm512_loadu_ps(c_ptr.add(c));
+                    let mut acc =
+                        _mm512_mul_ps(_mm512_loadu_ps(s0_p.add(c)), _mm512_loadu_ps(w0_p.add(c)));
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(s1_p.add(c)),
+                        _mm512_loadu_ps(w1_p.add(c)),
+                        acc,
+                    );
+                    acc = _mm512_fmadd_ps(bx, _mm512_loadu_ps(w2_p.add(c)), acc);
+                    _mm512_storeu_ps(o_ptr.add(c), _mm512_mul_ps(cv, acc));
+                    _mm512_storeu_ps(s0_p.add(c), bx);
+                    c += 16;
+                }
+                while c < c_end {
+                    let bx = *b_ptr.add(c) * *x_ptr.add(c);
+                    let acc = *s0_p.add(c) * *w0_p.add(c)
+                        + *s1_p.add(c) * *w1_p.add(c)
+                        + bx * *w2_p.add(c);
+                    *o_ptr.add(c) = *c_ptr.add(c) * acc;
+                    *s0_p.add(c) = bx;
+                    c += 1;
+                }
+            } else {
+                let oldest_p = buf_ptr.add(head * hs);
+                let w0_p = conv_wt_ptr;
+                let wd_p = conv_wt_ptr.add(d_conv * hs);
+                let mut c = c_start;
+                while c + 16 <= c_end {
+                    let bx =
+                        _mm512_mul_ps(_mm512_loadu_ps(b_ptr.add(c)), _mm512_loadu_ps(x_ptr.add(c)));
+                    let cv = _mm512_loadu_ps(c_ptr.add(c));
+                    let mut acc = _mm512_mul_ps(
+                        _mm512_loadu_ps(oldest_p.add(c)),
+                        _mm512_loadu_ps(w0_p.add(c)),
+                    );
+                    for t in 1..d_conv {
+                        let st = (head + t) % d_conv;
+                        acc = _mm512_fmadd_ps(
+                            _mm512_loadu_ps(buf_ptr.add(st * hs + c)),
+                            _mm512_loadu_ps(conv_wt_ptr.add(t * hs + c)),
+                            acc,
+                        );
+                    }
+                    acc = _mm512_fmadd_ps(bx, _mm512_loadu_ps(wd_p.add(c)), acc);
+                    _mm512_storeu_ps(o_ptr.add(c), _mm512_mul_ps(cv, acc));
+                    _mm512_storeu_ps(oldest_p.add(c), bx);
+                    c += 16;
+                }
+                while c < c_end {
+                    let bx = *b_ptr.add(c) * *x_ptr.add(c);
+                    let mut acc = *oldest_p.add(c) * *w0_p.add(c);
+                    for t in 1..d_conv {
+                        let st = (head + t) % d_conv;
+                        acc += *buf_ptr.add(st * hs + c) * *conv_wt_ptr.add(t * hs + c);
+                    }
+                    *o_ptr.add(c) = *c_ptr.add(c) * (acc + bx * *wd_p.add(c));
+                    *oldest_p.add(c) = bx;
+                    c += 1;
+                }
+            }
+
+            head += 1;
+            if head == d_conv {
+                head = 0;
+            }
+            if !snap_ptr.is_null() && j >= first_kept {
+                copy_ring_snapshot_range(
+                    buf_ptr, snap_ptr, snap_slot, head, d_conv, hs, c_start, c_end,
+                );
+                snap_slot += 1;
+                if snap_slot == conv_cap {
+                    snap_slot = 0;
+                }
+            }
+        }
     }
 }
 
@@ -12256,7 +14625,10 @@ mod tests {
             Vec<i8>,
             Vec<f32>,
         ) {
-            let (packed, scales, bs, bq, out) = repacked_guard_base_args();
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+            let (mut packed, scales, bs, bq, out) = repacked_guard_base_args();
+            #[cfg(target_arch = "x86_64")]
+            packed.truncate(128);
             (packed.clone(), scales.clone(), packed, scales, bs, bq, out)
         }
 
@@ -14799,9 +17171,9 @@ mod tests {
         assert!(!flash_attention_range_supported(3));
         assert!(!flash_attention_range_supported(62));
         assert!(!flash_attention_range_supported(63));
-        // Greater than 128 is unsupported.
+        // Non-multiple-of-16 dimensions (on AVX-512) and > 256 are unsupported everywhere.
         assert!(!flash_attention_range_supported(132));
-        assert!(!flash_attention_range_supported(256));
+        assert!(!flash_attention_range_supported(272));
 
         // Verify env parsing with whitespace and disabled switch across 0, false, off.
         assert!(!parse_attn_tiled_env(Some("0")));
@@ -14818,6 +17190,7 @@ mod tests {
 
         #[cfg(target_arch = "aarch64")]
         {
+            assert!(!flash_attention_range_supported(256));
             assert!(flash_attention_range_supported(4));
             assert!(flash_attention_range_supported(20));
             assert!(flash_attention_range_supported(40));
@@ -14825,86 +17198,155 @@ mod tests {
             assert!(flash_attention_range_supported(128));
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if is_x86_feature_detected!("avx512f") && attn_tiled_enabled() {
+            assert!(!flash_attention_range_supported(4));
+            assert!(!flash_attention_range_supported(20));
+            assert!(flash_attention_range_supported(64));
+            assert!(flash_attention_range_supported(128));
+            assert!(flash_attention_range_supported(256));
+        }
+
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(target_arch = "x86_64", feature = "avx512")
+        )))]
         {
             assert!(!flash_attention_range_supported(64));
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    /// Verifies `f` panics with `expected` when tiled range attention is supported at runtime.
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
+    fn assert_flash_range_panics<F: FnOnce()>(expected: &str, f: F) {
+        if !flash_attention_range_supported(64) {
+            return;
+        }
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("expected flash_attention_gqa_cpu_opt_range to panic");
+        let msg = if let Some(s) = err.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = err.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            msg.contains(expected),
+            "panic message {msg:?} did not contain {expected:?}"
+        );
+    }
+
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
     #[test]
-    #[should_panic(expected = "bad query range")]
     fn flash_range_panics_on_inverted_range() {
         let mut out = [0.0f32; 64];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 1, 0,
-        );
+        assert_flash_range_panics("bad query range", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 1, 0,
+            );
+        });
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
     #[test]
-    #[should_panic(expected = "bad query range")]
     fn flash_range_panics_on_q_hi_out_of_bounds() {
         let mut out = [0.0f32; 64];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 2,
-        );
+        assert_flash_range_panics("bad query range", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 2,
+            );
+        });
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
     #[test]
-    #[should_panic(expected = "out buffer too small")]
     fn flash_range_panics_on_undersized_output() {
         let mut out = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("out buffer too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
     #[test]
-    #[should_panic(expected = "q_mat too small")]
     fn flash_range_panics_on_undersized_q_mat() {
         let mut out = [0.0f32; 64];
         let short_q = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &short_q, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("q_mat too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &short_q, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
     #[test]
-    #[should_panic(expected = "k_cache too small")]
     fn flash_range_panics_on_undersized_k_cache() {
         let mut out = [0.0f32; 64];
         let short_k = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &short_k, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("k_cache too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &short_k, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    ))]
     #[test]
-    #[should_panic(expected = "v_cache too small")]
     fn flash_range_panics_on_undersized_v_cache() {
         let mut out = [0.0f32; 64];
         let short_v = [0.0f32; 32];
         let dummy = [0.0f32; 64];
-        flash_attention_gqa_cpu_opt_range(
-            &dummy, &dummy, &short_v, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
-        );
+        assert_flash_range_panics("v_cache too small", || {
+            flash_attention_gqa_cpu_opt_range(
+                &dummy, &dummy, &short_v, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+            );
+        });
     }
 
     /// `flash_attention_prefill_items` must match `flash_attention_gqa_cpu_opt_range` bit for bit,
     /// covering multi-head scheduling, head_dim 64 and 128, non-uniform vectors, and ragged tail query blocks.
-    #[cfg(all(target_arch = "aarch64", feature = "parallel"))]
+    #[cfg(all(
+        feature = "parallel",
+        any(
+            target_arch = "aarch64",
+            all(target_arch = "x86_64", feature = "avx512")
+        )
+    ))]
     #[test]
     fn flash_attention_prefill_items_matches_opt_range() {
+        if !flash_attention_range_supported(64) {
+            return;
+        }
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut rnd = |len: usize| -> Vec<f32> {
             (0..len)
@@ -15002,6 +17444,90 @@ mod tests {
             true,
             1,
         ));
+    }
+
+    /// Token-major `flash_attention_prefill_token_major` must match the transposed
+    /// `flash_attention_prefill_items` reference bit-for-bit across causal and
+    /// non-causal ragged GQA shapes.
+    #[test]
+    fn flash_attention_prefill_token_major_matches_head_major() {
+        let mut seed = 0x55AA_1234u64;
+        let mut next = || -> f32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as i32 as f32 / 16777216.0) - 0.5
+        };
+
+        for &(head_dim, n_heads, group_size) in &[(64usize, 32usize, 4usize), (128, 16, 4)] {
+            let hs = n_heads * head_dim;
+            let kv_dim = (n_heads / group_size) * head_dim;
+            for &(n, start_pos, is_causal) in
+                &[(19usize, 0usize, true), (70, 32, true), (35, 16, false)]
+            {
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let q_tok: Vec<f32> = (0..n * hs).map(|_| next()).collect();
+                let k_cache: Vec<f32> = (0..(start_pos + n) * kv_dim).map(|_| next()).collect();
+                let v_cache: Vec<f32> = (0..(start_pos + n) * kv_dim).map(|_| next()).collect();
+
+                let mut out_tok = vec![0.0f32; n * hs];
+                if !flash_attention_prefill_token_major(
+                    &q_tok,
+                    &k_cache,
+                    &v_cache,
+                    &mut out_tok,
+                    n_heads,
+                    group_size,
+                    n,
+                    kv_dim,
+                    head_dim,
+                    scale,
+                    start_pos,
+                    is_causal,
+                    4,
+                ) {
+                    continue;
+                }
+
+                let mut q_head = vec![0.0f32; n * hs];
+                for j in 0..n {
+                    for h in 0..n_heads {
+                        for d in 0..head_dim {
+                            q_head[(h * head_dim + d) * n + j] = q_tok[j * hs + h * head_dim + d];
+                        }
+                    }
+                }
+                let mut out_head = vec![0.0f32; n * hs];
+                assert!(flash_attention_prefill_items(
+                    &q_head,
+                    &k_cache,
+                    &v_cache,
+                    &mut out_head,
+                    n_heads,
+                    group_size,
+                    n,
+                    kv_dim,
+                    head_dim,
+                    scale,
+                    start_pos,
+                    is_causal,
+                    4,
+                ));
+                for j in 0..n {
+                    for h in 0..n_heads {
+                        for d in 0..head_dim {
+                            let got = out_tok[j * hs + h * head_dim + d];
+                            let want = out_head[h * n * head_dim + j * head_dim + d];
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "hd={head_dim} n={n} pos={start_pos} causal={is_causal} ({j},{h},{d}): got {got} want {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Single-thread cost of one decode attention head over an f16 KV cache (scores, softmax, values) at several
@@ -16196,5 +18722,170 @@ mod q8_activation_quantizer_tests {
         let mut y = [0.0f32; 16];
         super::par_rows_n_active(&mut y[..0], 0, 1, 4, |_| panic!("must not be called"));
         super::par_rows_n_active(&mut y, 0, 1, 4, |_| panic!("must not be called"));
+    }
+
+    #[test]
+    fn shortconv_causal_prefill_matches_scalar_and_history() {
+        use crate::kv_cache::{CONV_HISTORY_CAPACITY, ConvHistory};
+
+        let mut st = 42u32;
+        let mut next = || -> f32 {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((st >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        };
+
+        for &(d_conv, hs, n, start_pos) in &[
+            (6usize, 73usize, 100usize, 5usize),
+            (2, 64, 80, 0),
+            (4, 19, 32, 2),
+            (6, 2048, 80, 5),
+            (2, 1029, 32, 0),
+        ] {
+            let proj_mat: Vec<f32> = (0..n * 3 * hs).map(|_| next()).collect();
+            let conv_wt: Vec<f32> = (0..(d_conv + 1) * hs).map(|_| next()).collect();
+            let init_buf: Vec<f32> = (0..d_conv * hs).map(|_| next()).collect();
+
+            // Scalar reference
+            let mut ref_buf = init_buf.clone();
+            let mut ref_out = vec![0.0f32; n * hs];
+            let mut ref_hist = ConvHistory::new(d_conv * hs);
+            let mut bx = vec![0.0f32; hs];
+            for j in 0..n {
+                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                let (b, c, x) = (&proj[..hs], &proj[hs..2 * hs], &proj[2 * hs..3 * hs]);
+                for i in 0..hs {
+                    bx[i] = b[i] * x[i];
+                    let mut acc = ref_buf[i] * conv_wt[i];
+                    for t in 1..d_conv {
+                        acc += ref_buf[t * hs + i] * conv_wt[t * hs + i];
+                    }
+                    ref_out[j * hs + i] = c[i] * (acc + bx[i] * conv_wt[d_conv * hs + i]);
+                }
+                ref_buf.copy_within(hs.., 0);
+                ref_buf[(d_conv - 1) * hs..].copy_from_slice(&bx);
+                ref_hist.push(start_pos + j + 1, &ref_buf);
+            }
+
+            // Fast path
+            let mut fast_buf = init_buf.clone();
+            let mut fast_out = vec![0.0f32; n * hs];
+            let mut fast_hist = ConvHistory::new(d_conv * hs);
+            let (first_kept, ring_start, snapshots) = fast_hist.reserve_batch(start_pos, n);
+            super::shortconv_causal_prefill(
+                &proj_mat,
+                &conv_wt,
+                &mut fast_buf,
+                &mut fast_out,
+                Some(snapshots),
+                first_kept,
+                ring_start,
+                CONV_HISTORY_CAPACITY,
+                n,
+                hs,
+                d_conv,
+            );
+
+            for (idx, (&a, &b)) in fast_out.iter().zip(&ref_out).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "d_conv={d_conv} hs={hs} out[{idx}]: {a} vs {b}"
+                );
+            }
+            for (idx, (&a, &b)) in fast_buf.iter().zip(&ref_buf).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "d_conv={d_conv} hs={hs} buf[{idx}]: {a} vs {b}"
+                );
+            }
+            let oldest_kept = start_pos + 1 + n.saturating_sub(CONV_HISTORY_CAPACITY);
+            for rollback_pos in [start_pos + n, start_pos + n - 1, oldest_kept] {
+                assert_eq!(
+                    fast_hist.has_pos(rollback_pos),
+                    ref_hist.has_pos(rollback_pos)
+                );
+                let mut r_state = vec![0.0f32; d_conv * hs];
+                let mut f_state = vec![0.0f32; d_conv * hs];
+                assert!(ref_hist.rollback_to(rollback_pos, &mut r_state));
+                assert!(fast_hist.rollback_to(rollback_pos, &mut f_state));
+                assert_eq!(
+                    f_state, r_state,
+                    "rollback state mismatch at pos={rollback_pos}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemv_active_tests {
+    use super::*;
+    use crate::quant::{BlockQ4_0, BlockQ6K};
+    use crate::tensor::DType;
+
+    #[test]
+    fn gemv_dispatch_active_honors_cap_and_matches_unbounded() {
+        let m = gemv_par_threshold().max(512);
+        let k = 256;
+        let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.125).collect();
+        let f32_weights: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.0625)
+            .collect();
+        let f32_bytes: Vec<u8> = f32_weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let q4_bytes = vec![0x23u8; m * (k / 32) * size_of::<BlockQ4_0>()];
+        let q6_bytes = vec![0x11u8; m * (k / 256) * size_of::<BlockQ6K>()];
+
+        for (dtype, weights) in [
+            (DType::F32, f32_bytes.as_slice()),
+            (DType::Q4_0, q4_bytes.as_slice()),
+            (DType::Q6K, q6_bytes.as_slice()),
+        ] {
+            let mut expected = vec![0.0f32; m];
+            let mut capped1 = vec![0.0f32; m];
+            let mut capped2 = vec![0.0f32; m];
+            gemv_dispatch(dtype, weights, &x, &mut expected, m, k, None);
+            gemv_dispatch_active(1, dtype, weights, &x, &mut capped1, m, k, None);
+            gemv_dispatch_active(2, dtype, weights, &x, &mut capped2, m, k, None);
+            for (i, (&a, &b)) in capped1.iter().zip(&expected).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4,
+                    "{dtype:?} max_active=1[{i}]: {a} vs {b}"
+                );
+            }
+            for (i, (&a, &b)) in capped2.iter().zip(&expected).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4,
+                    "{dtype:?} max_active=2[{i}]: {a} vs {b}"
+                );
+            }
+        }
+
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use std::collections::HashSet;
+            use std::sync::Mutex;
+            let caller = std::thread::current().id();
+            let mut y = vec![0.0f32; m];
+            with_gemv_max_active(1, || {
+                let seen = Mutex::new(HashSet::new());
+                par_rows(&mut y, 1, |_| {
+                    seen.lock().unwrap().insert(std::thread::current().id());
+                });
+                let s = seen.into_inner().unwrap();
+                assert_eq!(s.len(), 1);
+                assert!(s.contains(&caller));
+
+                let seen_chunk = Mutex::new(HashSet::new());
+                par_rows_n_chunked_decode(&mut y, 4, 1, 1, |_| {
+                    seen_chunk
+                        .lock()
+                        .unwrap()
+                        .insert(std::thread::current().id());
+                });
+                let sc = seen_chunk.into_inner().unwrap();
+                assert_eq!(sc.len(), 1);
+                assert!(sc.contains(&caller));
+            });
+            assert_eq!(current_gemv_max_active(), 0);
+        }
     }
 }

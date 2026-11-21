@@ -8,6 +8,12 @@
 //
 // NR=2 rows per WG, 32 threads. Dispatch: ceil(m/2).
 
+#ifdef SUBGROUP
+#ifdef WEBGPU_SUBGROUPS
+enable subgroups;
+#endif
+#endif
+
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
@@ -19,10 +25,18 @@
 
 const QK_K: u32 = 256u;
 const Q6K_BYTES: u32 = 210u;
+#ifdef SUBGROUP
+const NR: u32 = 2u;
+const WG_SIZE: u32 = 32u;
+const MAX_SUBGROUPS: u32 = 32u;
+
+var<workgroup> sg_sums: array<f32, NR * MAX_SUBGROUPS>;
+#else
 const NR: u32 = 2u;
 const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, 64>;
+#endif
 
 fn rb(off: u32) -> u32 {
     return (a[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
@@ -80,6 +94,129 @@ fn rf16(off: u32) -> f32 {
     return unpack2x16float(lo | (hi << 8u)).x;
 }
 
+fn block_d(d_off: u32) -> f32 {
+    let word = a[d_off >> 2u];
+    let bits = select(word & 0xFFFFu, word >> 16u, (d_off & 2u) != 0u);
+    return unpack2x16float(bits).x;
+}
+
+#ifdef SUBGROUP
+fn q6k_row_dot(
+    bb: u32,
+    q_offset_l: u32,
+    q_offset_h: u32,
+    is_off: u32,
+    ylv0: vec4<f32>,
+    ylv1: vec4<f32>,
+    ylv2: vec4<f32>,
+    ylv3: vec4<f32>,
+) -> f32 {
+    let ql1 = bb + q_offset_l;
+    let ql2 = ql1 + 32u;
+    let qh = bb + 128u + q_offset_h;
+    let sc = bb + 192u + is_off;
+    let d_off = bb + 208u;
+
+    let w1 = rw(ql1);
+    let w2 = rw(ql2);
+    let wh = rw(qh);
+
+    var sums = vec4<f32>(0.0);
+    sums += q6_lane(w1 & 0xFFu, w2 & 0xFFu, wh & 0xFFu) * ylv0;
+    sums += q6_lane((w1 >> 8u) & 0xFFu, (w2 >> 8u) & 0xFFu, (wh >> 8u) & 0xFFu) * ylv1;
+    sums += q6_lane((w1 >> 16u) & 0xFFu, (w2 >> 16u) & 0xFFu, (wh >> 16u) & 0xFFu) * ylv2;
+    sums += q6_lane(w1 >> 24u, w2 >> 24u, wh >> 24u) * ylv3;
+
+    let dblk = block_d(d_off);
+    let s0 = f32(ri8(sc));
+    let s2 = f32(ri8(sc + 2u));
+    let s4 = f32(ri8(sc + 4u));
+    let s6 = f32(ri8(sc + 6u));
+    return dblk * (sums[0] * s0 + sums[1] * s2 + sums[2] * s4 + sums[3] * s6);
+}
+
+@compute @workgroup_size(32, 1, 1)
+fn gemv_q6_k(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
+) {
+    let m = params.x;
+    let k = params.y;
+    let first_row = get_wid(wid) * NR;
+    if first_row >= m {
+        return;
+    }
+
+    let nb = k / QK_K;
+    let row_bytes = nb * Q6K_BYTES;
+    let tiisg = lid.x;
+
+    let tid_l = tiisg / 2u;
+    let ix = tiisg & 1u;
+    let ip = tid_l >> 3u;
+    let il = tid_l & 7u;
+    let l0 = 4u * il;
+    let is_off = 8u * ip + l0 / 16u;
+
+    let y_offset = 128u * ip + l0;
+    let q_offset_l = 64u * ip + l0;
+    let q_offset_h = 32u * ip + l0;
+
+    let row0 = first_row * row_bytes;
+    let row1 = min(first_row + 1u, m - 1u) * row_bytes;
+
+    var sumf0: f32 = 0.0;
+    var sumf1: f32 = 0.0;
+    var b = ix;
+    while b < nb {
+        let yb = b * QK_K + y_offset;
+        let ylv0 = vec4<f32>(x[yb + 0u], x[yb + 32u], x[yb + 64u], x[yb + 96u]);
+        let ylv1 = vec4<f32>(x[yb + 1u], x[yb + 33u], x[yb + 65u], x[yb + 97u]);
+        let ylv2 = vec4<f32>(x[yb + 2u], x[yb + 34u], x[yb + 66u], x[yb + 98u]);
+        let ylv3 = vec4<f32>(x[yb + 3u], x[yb + 35u], x[yb + 67u], x[yb + 99u]);
+
+        let b_off = b * Q6K_BYTES;
+        sumf0 += q6k_row_dot(row0 + b_off, q_offset_l, q_offset_h, is_off, ylv0, ylv1, ylv2, ylv3);
+        sumf1 += q6k_row_dot(row1 + b_off, q_offset_l, q_offset_h, is_off, ylv0, ylv1, ylv2, ylv3);
+        b += 2u;
+    }
+
+    let s0 = subgroupAdd(sumf0);
+    let s1 = subgroupAdd(sumf1);
+    let nsg = (WG_SIZE + sg_size - 1u) / sg_size;
+    if nsg == 1u {
+        if tiisg == 0u {
+            y[first_row] = s0;
+            if first_row + 1u < m {
+                y[first_row + 1u] = s1;
+            }
+        }
+        return;
+    }
+
+    let sgid = tiisg / sg_size;
+    if sg_lane == 0u {
+        sg_sums[0u * MAX_SUBGROUPS + sgid] = s0;
+        sg_sums[1u * MAX_SUBGROUPS + sgid] = s1;
+    }
+    workgroupBarrier();
+
+    if tiisg == 0u {
+        var total0: f32 = 0.0;
+        var total1: f32 = 0.0;
+        for (var sg = 0u; sg < nsg; sg += 1u) {
+            total0 += sg_sums[0u * MAX_SUBGROUPS + sg];
+            total1 += sg_sums[1u * MAX_SUBGROUPS + sg];
+        }
+        y[first_row] = total0;
+        if first_row + 1u < m {
+            y[first_row + 1u] = total1;
+        }
+    }
+}
+#else
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q6_k(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -184,3 +321,4 @@ fn gemv_q6_k(
         if first_row + 1u < m { y[first_row + 1u] = partials[1u * WG_SIZE]; }
     }
 }
+#endif
