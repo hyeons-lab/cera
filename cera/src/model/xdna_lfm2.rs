@@ -26,7 +26,7 @@ use crate::backend::xdna::kernels::{
     Q4PREFILL_LFM2_PHASE_A_INSTS, Q4PREFILL_LFM2_XCLBIN, init_lfm2_bo_y_norms,
     init_lfm2_prefill_bo_y_norms, inst_words, read_le_f32_slice, select_lfm3_kv_bucket,
     write_le_f32_slice, write_lfm2_prefill_ext_params, write_lfm2_prefill_step_params,
-    write_lfm3_ext_params, write_lfm3_step_params,
+    write_lfm3_params_at, write_lfm3_step_params,
 };
 use crate::backend::xdna::repack::{f32_to_bf16, pack_q4_0_stage_k1024};
 use crate::gguf::GgufFile;
@@ -442,7 +442,7 @@ struct Lfm2DecodeBuffers {
     bo_yn: XdnaBo,
     conv_kv_in_kvo: bool,
     bucket_plans: [Vec<Option<Lfm2DecodeBucketPlan>>; 2],
-    ext_runs: Option<Lfm2ExtRunCache>,
+    ext_plans: [Vec<(usize, usize, Lfm2DecodeBucketPlan)>; 2],
 }
 
 const LFM2_ATTN_DEC_KVO_BYTES: usize = 8 * 1024;
@@ -456,6 +456,7 @@ struct XdnaLfm2State {
     pending_kv: HybridPendingSlot,
     synced_len: usize,
     force_conv_sync: bool,
+    head_q8_scratch: (Vec<f32>, Vec<i8>),
 }
 
 unsafe impl Send for XdnaLfm2State {}
@@ -635,7 +636,11 @@ impl XdnaLfm2Model {
             pending_kv: HybridPendingSlot::default(),
             synced_len: 0,
             force_conv_sync: false,
+            head_q8_scratch: (Vec::new(), Vec::new()),
         };
+
+        let warm_guard = crate::backend::acquire_prefill_warm_spin();
+        crate::backend::warm_prefill_pool(LfmModel::xdna_head_threads());
 
         Ok(Self {
             cpu,
@@ -645,7 +650,7 @@ impl XdnaLfm2Model {
             state_torn: AtomicBool::new(false),
             session_gate: ModelSessionGate::default(),
             profile_decode: crate::backend::cpu_features::profile_decode_enabled(),
-            _prefill_warm_guard: crate::backend::acquire_prefill_warm_spin(),
+            _prefill_warm_guard: warm_guard,
         })
     }
 
@@ -803,7 +808,7 @@ impl XdnaLfm2Model {
             bo_yn,
             conv_kv_in_kvo: false,
             bucket_plans: [make_dec_empty(), make_dec_empty()],
-            ext_runs: None,
+            ext_plans: [Vec::new(), Vec::new()],
         })
     }
 
@@ -877,6 +882,98 @@ impl XdnaLfm2Model {
             runlist
                 .add(run)
                 .map_err(|e| format!("dec runlist add layer {l}: {e}"))?;
+        }
+        Ok(Lfm2DecodeBucketPlan {
+            _runs: runs,
+            runlist,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_decode_ext_plan(
+        kernels: &mut Lfm2Kernels,
+        layers: &[Lfm2LayerStatic],
+        layer_bo_w: &[XdnaBo],
+        layer_kv_blocks: &[Vec<XdnaBo>],
+        dec: &Lfm2DecodeBuffers,
+        cur_blk: usize,
+        fin_bidx: usize,
+        conv_kv_in_kvo: bool,
+    ) -> Result<Lfm2DecodeBucketPlan, String> {
+        kernels.dec_phase_a()?;
+        kernels.dec_fa_part()?;
+        kernels.dec_fa_fin(fin_bidx)?;
+        let n_layers = layers.len();
+        let mut runs = Vec::new();
+        for (l, layer) in layers.iter().enumerate() {
+            let y_next = if l + 1 < n_layers {
+                &dec.layer_bo_y[l + 1]
+            } else {
+                &dec.bo_yn
+            };
+            if layer.is_conv {
+                let (kv_in, kv_out) = if conv_kv_in_kvo {
+                    (&dec.layer_bo_kvo[l], &layer_kv_blocks[l][0])
+                } else {
+                    (&layer_kv_blocks[l][0], &dec.layer_bo_kvo[l])
+                };
+                runs.push(
+                    kernels
+                        .dec_conv
+                        .create_run(&[&layer_bo_w[l], &dec.layer_bo_y[l], y_next, kv_in, kv_out])
+                        .map_err(|e| format!("layer {l} ext dec conv create_run: {e}"))?,
+                );
+            } else {
+                runs.push(
+                    kernels
+                        .dec_phase_a()?
+                        .create_run(&[
+                            &layer_bo_w[l],
+                            &dec.layer_bo_y[l],
+                            y_next,
+                            &layer_kv_blocks[l][0],
+                            &dec.layer_bo_kvo[l],
+                        ])
+                        .map_err(|e| format!("layer {l} ext dec phase A create_run: {e}"))?,
+                );
+                let k_part = kernels.dec_fa_part()?;
+                for (blk, layer_kv) in layer_kv_blocks[l].iter().enumerate().take(cur_blk) {
+                    runs.push(
+                        k_part
+                            .create_run(&[
+                                &layer_bo_w[l],
+                                &dec.layer_bo_y[l],
+                                y_next,
+                                layer_kv,
+                                &dec.layer_bo_kvo[l],
+                            ])
+                            .map_err(|e| {
+                                format!("layer {l} blk {blk} ext dec fa_part create_run: {e}")
+                            })?,
+                    );
+                }
+                runs.push(
+                    kernels
+                        .dec_fa_fin(fin_bidx)?
+                        .create_run(&[
+                            &layer_bo_w[l],
+                            &dec.layer_bo_y[l],
+                            y_next,
+                            &layer_kv_blocks[l][cur_blk],
+                            &dec.layer_bo_kvo[l],
+                        ])
+                        .map_err(|e| format!("layer {l} ext dec fa_fin create_run: {e}"))?,
+                );
+            }
+        }
+        let mut runlist = kernels
+            .dec_conv
+            .create_runlist()
+            .map_err(|e| format!("ext dec create_runlist: {e}"))?;
+        for (idx, run) in runs.iter().enumerate() {
+            runlist
+                .add(run)
+                .map_err(|e| format!("ext dec runlist add step {idx}: {e}"))?;
         }
         Ok(Lfm2DecodeBucketPlan {
             _runs: runs,
@@ -1303,51 +1400,6 @@ impl XdnaLfm2Model {
         Ok(())
     }
 
-    fn save_attn_dec_kvo_to_kv_and_state(
-        kernels: &Lfm2Kernels,
-        kvo: &XdnaBo,
-        kv_blocks: &mut Vec<XdnaBo>,
-        layer_state: &mut LayerState,
-        pos: usize,
-        layer: usize,
-        use_f16: bool,
-    ) -> Result<(), String> {
-        Self::save_attn_dec_kvo_to_npu(kernels, kvo, kv_blocks, pos, layer)?;
-        let row_bytes = LFM2_HEAD_DIM * 2;
-        let kvo_bytes = kvo.as_slice();
-
-        if let LayerState::Attention {
-            key_cache,
-            value_cache,
-            key_cache_f16,
-            value_cache_f16,
-            ..
-        } = layer_state
-        {
-            let total_elems = LFM2_N_KV_HEADS * LFM2_HEAD_DIM;
-            if use_f16 {
-                key_cache_f16.reserve(total_elems);
-                value_cache_f16.reserve(total_elems);
-            } else {
-                key_cache.reserve(total_elems);
-                value_cache.reserve(total_elems);
-            }
-            for kvh in 0..LFM2_N_KV_HEADS {
-                let src_base = kvh * 1024;
-                Self::append_bf16_kv_row(
-                    &kvo_bytes[src_base + 512..src_base + 512 + row_bytes],
-                    &kvo_bytes[src_base + 768..src_base + 768 + row_bytes],
-                    key_cache,
-                    value_cache,
-                    key_cache_f16,
-                    value_cache_f16,
-                    use_f16,
-                );
-            }
-        }
-        Ok(())
-    }
-
     fn flush_dec_conv_pingpong(&self, npu: &mut XdnaLfm2State) -> Result<(), String> {
         let Some(dec) = npu.decode.as_mut() else {
             return Ok(());
@@ -1407,9 +1459,20 @@ impl XdnaLfm2Model {
         state: &mut InferenceState,
         logits_out: &mut [f32],
     ) -> Result<(), String> {
+        self.run_npu_decode_embedding_step_inner(npu, embedding, pos, state, true, logits_out)
+    }
+
+    fn run_npu_decode_embedding_step_inner(
+        &self,
+        npu: &mut XdnaLfm2State,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+        need_logits: bool,
+        logits_out: &mut [f32],
+    ) -> Result<(), String> {
         let cfg = self.cpu.config();
         let eps = cfg.rms_norm_eps;
-        let use_f16 = state.kv_f16;
         let prof = self.profile_decode;
         let t_prep0 = prof.then(crate::time::Instant::now);
 
@@ -1421,355 +1484,148 @@ impl XdnaLfm2Model {
         }
 
         let is_ext = pos >= LFM2_BLOCK_TOKENS;
-        let n_layers = self.layers.len();
         let conv_kv_in_kvo = npu.decode.as_ref().expect("dec").conv_kv_in_kvo;
         let parity_idx = usize::from(conv_kv_in_kvo);
         let cur_blk = pos / LFM2_BLOCK_TOKENS;
-        let attn_kv_cap;
-
-        if !is_ext {
-            let attn_bucket_caps: Vec<usize> =
-                Q4LAYER_LFM2_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
-            let (attn_bidx, cap) = if pos == 0 {
-                (0, 0)
-            } else {
-                select_lfm3_kv_bucket(&attn_bucket_caps, pos.div_ceil(LFM2_KV_CHUNK_T))
-            };
-            attn_kv_cap = cap;
-
-            let XdnaLfm2State {
-                ref mut kernels,
-                ref layer_bo_w,
-                ref mut layer_kv_blocks,
-                ref mut decode,
-                ref mut pending_kv,
-                ..
-            } = *npu;
-            let dec = decode.as_mut().expect("initialized decode buffers");
-            if dec.bucket_plans[parity_idx][attn_bidx].is_none() {
-                let plan = Self::build_decode_bucket_plan(
-                    kernels,
-                    &self.layers,
-                    layer_bo_w,
-                    layer_kv_blocks,
-                    dec,
-                    attn_bidx,
-                    conv_kv_in_kvo,
-                )?;
-                dec.bucket_plans[parity_idx][attn_bidx] = Some(plan);
-            }
-
-            write_le_f32_slice(dec.layer_bo_y[0].as_mut_slice(), 0, embedding);
-            dec.layer_bo_y[0]
-                .sync_range_to_device(LFM2_DEC_YN_BYTES, 0)
-                .map_err(|e| format!("decode bo_y[0] hidden sync: {e}"))?;
-
-            for (l, layer) in self.layers.iter().enumerate() {
-                let yb = dec.layer_bo_y[l].as_mut_slice();
-                if layer.is_conv {
-                    write_lfm3_step_params(
-                        yb,
-                        LFM2_DEC_SLOT_NORM_0,
-                        None,
-                        pos,
-                        1,
-                        0,
-                        0,
-                        true,
-                        0,
-                        0,
-                        eps,
-                        None,
-                    );
-                    dec.layer_bo_y[l]
-                        .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
-                        .map_err(|e| format!("layer {l} dec conv params sync: {e}"))?;
-                } else {
-                    let cs = compute_lfm2_rope_cs(pos, layer.rope_theta);
-                    write_lfm3_step_params(
-                        yb,
-                        LFM2_DEC_SLOT_NORM_0,
-                        Some(LFM2_DEC_SLOT_NORM_0 + 4112),
-                        pos,
-                        1,
-                        attn_kv_cap,
-                        pos,
-                        true,
-                        0,
-                        1,
-                        eps,
-                        Some(&cs),
-                    );
-                    dec.layer_bo_y[l]
-                        .sync_range_to_device(
-                            (16 + LFM2_HEAD_DIM) * 4,
-                            (LFM2_DEC_SLOT_NORM_0 + 4096) * 4,
-                        )
-                        .map_err(|e| format!("layer {l} dec attn params+rope sync: {e}"))?;
-                }
-            }
-            let t_prep_us = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-
-            let t_npu0 = prof.then(crate::time::Instant::now);
-            let mut pending_next = {
-                let plan = dec.bucket_plans[parity_idx][attn_bidx]
-                    .as_ref()
-                    .expect("initialized decode bucket plan");
-                plan.runlist
-                    .execute()
-                    .map_err(|e| format!("dec runlist execute: {e}"))?;
-                let pending_next = pending_kv.prepare(pos, LFM2_D_CONV, LFM2_H, LFM2_KV_DIM);
-                pending_kv.flush_into(state);
-                plan.runlist
-                    .wait(0)
-                    .map_err(|e| format!("dec runlist wait: {e}"))?;
-                pending_next
-            };
-            let t_npu_us = t_npu0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-
-            let t_kv0 = prof.then(crate::time::Instant::now);
-            dec.bo_yn
-                .sync_range_from_device(LFM2_DEC_YN_BYTES, 0)
-                .map_err(|e| format!("decode bo_yn readback: {e}"))?;
-            let mut hidden_out = [0.0f32; LFM2_H];
-            read_le_f32_slice(dec.bo_yn.as_slice(), 0, &mut hidden_out);
-
-            for (l, layer) in self.layers.iter().enumerate() {
-                if layer.is_conv {
-                    let kvo_written = if conv_kv_in_kvo {
-                        &mut layer_kv_blocks[l][0]
-                    } else {
-                        &mut dec.layer_bo_kvo[l]
-                    };
-                    kvo_written
-                        .sync_range_from_device(CONV_SYNC_BYTES, 0)
-                        .map_err(|e| format!("layer {l} dec conv kvo readback: {e}"))?;
-                    pending_next.push_conv_from_kvo(l, &kvo_written.as_slice()[..CONV_SYNC_BYTES]);
-                } else {
-                    dec.layer_bo_kvo[l]
-                        .sync_range_from_device(LFM2_ATTN_DEC_KVO_BYTES, 0)
-                        .map_err(|e| format!("layer {l} dec attn kvo readback: {e}"))?;
-                    Self::save_attn_dec_kvo_to_npu(
-                        kernels,
-                        &dec.layer_bo_kvo[l],
-                        &mut layer_kv_blocks[l],
-                        pos,
-                        l,
-                    )?;
-                    pending_next.push_attn_bf16(
-                        l,
-                        dec.layer_bo_kvo[l].as_slice(),
-                        LFM2_N_KV_HEADS,
-                        LFM2_HEAD_DIM,
-                        1024,
-                    );
-                }
-            }
-            dec.conv_kv_in_kvo = !conv_kv_in_kvo;
-
-            pending_kv.commit(pending_next);
-            state.seq_len = pos + 1;
-            npu.synced_len = pos + 1;
-            if pos + 1 >= cfg.max_seq_len.min(LFM2_MAX_TOKENS) {
-                npu.pending_kv.flush_into(state);
-            }
-            let t_kv_us = t_kv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-
-            let t_head0 = prof.then(crate::time::Instant::now);
-            self.cpu.xdna_project_logits_into(&hidden_out, logits_out);
-            let t_head_us = t_head0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-            if prof {
-                eprintln!(
-                    "lfm2 decode pos={pos} bucket={attn_kv_cap}: prep={t_prep_us:.0}us npu={t_npu_us:.0}us kv={t_kv_us:.0}us head={t_head_us:.0}us"
-                );
-            }
-            return Ok(());
-        }
-
-        // >8K paged decode path (Mode 2 Phase A + Mode 3 c=256 + Mode 4 final + batched Conv)
-        npu.pending_kv.flush_into(state);
-        let fin_caps: Vec<usize> = Q4LAYER_LFM2_FA_FIN_BUCKETS
-            .iter()
-            .map(|&(c, _)| c)
-            .collect();
-        let past_chunks_total = pos.div_ceil(LFM2_KV_CHUNK_T);
-        let fin_past_chunks = past_chunks_total.saturating_sub(cur_blk * LFM2_MAX_KV_CHUNKS);
-        let (fin_bidx, fin_cap) = select_lfm3_kv_bucket(&fin_caps, fin_past_chunks);
-        attn_kv_cap = cur_blk * LFM2_MAX_KV_CHUNKS + fin_cap;
 
         let XdnaLfm2State {
             ref mut kernels,
             ref layer_bo_w,
             ref mut layer_kv_blocks,
             ref mut decode,
+            ref mut pending_kv,
+            ref mut head_q8_scratch,
             ..
         } = *npu;
         let dec = decode.as_mut().expect("initialized decode buffers");
-        let n_fin_buckets = fin_caps.len();
-        if dec.ext_runs.is_none() {
-            dec.ext_runs = Some(Lfm2ExtRunCache::new(n_layers, n_fin_buckets));
-        }
-        for (l, layer) in self.layers.iter().enumerate() {
-            if !layer.is_conv {
-                Self::ensure_paged_block(kernels, &mut layer_kv_blocks[l], cur_blk, l)?;
+
+        let (attn_kv_cap, ext_key, attn_bidx) = if !is_ext {
+            let attn_bucket_caps: Vec<usize> =
+                Q4LAYER_LFM2_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+            let (bidx, cap) = if pos == 0 {
+                (0, 0)
+            } else {
+                select_lfm3_kv_bucket(&attn_bucket_caps, pos.div_ceil(LFM2_KV_CHUNK_T))
+            };
+            if dec.bucket_plans[parity_idx][bidx].is_none() {
+                let plan = Self::build_decode_bucket_plan(
+                    kernels,
+                    &self.layers,
+                    layer_bo_w,
+                    layer_kv_blocks,
+                    dec,
+                    bidx,
+                    conv_kv_in_kvo,
+                )?;
+                dec.bucket_plans[parity_idx][bidx] = Some(plan);
             }
-        }
+            (cap, None, bidx)
+        } else {
+            let fin_caps: Vec<usize> = Q4LAYER_LFM2_FA_FIN_BUCKETS
+                .iter()
+                .map(|&(c, _)| c)
+                .collect();
+            let past_chunks_total = pos.div_ceil(LFM2_KV_CHUNK_T);
+            let fin_past_chunks = past_chunks_total.saturating_sub(cur_blk * LFM2_MAX_KV_CHUNKS);
+            let (fin_bidx, fin_cap) = select_lfm3_kv_bucket(&fin_caps, fin_past_chunks);
+            for (l, layer) in self.layers.iter().enumerate() {
+                if !layer.is_conv {
+                    Self::ensure_paged_block(kernels, &mut layer_kv_blocks[l], cur_blk, l)?;
+                }
+            }
+            if !dec.ext_plans[parity_idx]
+                .iter()
+                .any(|(b, f, _)| *b == cur_blk && *f == fin_bidx)
+            {
+                let plan = Self::build_decode_ext_plan(
+                    kernels,
+                    &self.layers,
+                    layer_bo_w,
+                    layer_kv_blocks,
+                    dec,
+                    cur_blk,
+                    fin_bidx,
+                    conv_kv_in_kvo,
+                )?;
+                dec.ext_plans[parity_idx].push((cur_blk, fin_bidx, plan));
+            }
+            (
+                cur_blk * LFM2_MAX_KV_CHUNKS + fin_cap,
+                Some((cur_blk, fin_bidx)),
+                0,
+            )
+        };
 
         write_le_f32_slice(dec.layer_bo_y[0].as_mut_slice(), 0, embedding);
         dec.layer_bo_y[0]
             .sync_range_to_device(LFM2_DEC_YN_BYTES, 0)
             .map_err(|e| format!("decode bo_y[0] hidden sync: {e}"))?;
 
-        let t_prep_us = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-        let t_npu0 = prof.then(crate::time::Instant::now);
-        let mut t_kv_ms = 0.0f64;
-
-        let mut l = 0usize;
-        while l < n_layers {
-            if self.layers[l].is_conv {
-                let start_l = l;
-                let mut end_l = l + 1;
-                while end_l < n_layers && self.layers[end_l].is_conv {
-                    end_l += 1;
-                }
-                for cl in start_l..end_l {
-                    let yb = dec.layer_bo_y[cl].as_mut_slice();
-                    write_lfm3_step_params(
-                        yb,
-                        LFM2_DEC_SLOT_NORM_0,
-                        None,
-                        pos,
-                        1,
-                        0,
-                        0,
-                        true,
-                        0,
-                        0,
-                        eps,
-                        None,
-                    );
-                    dec.layer_bo_y[cl]
-                        .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
-                        .map_err(|e| format!("layer {cl} dec conv params sync: {e}"))?;
-                }
-                let ext = dec.ext_runs.as_mut().expect("ext cache");
-                if ext.conv_groups[parity_idx][start_l].is_none() {
-                    let mut runs = Vec::with_capacity(end_l - start_l);
-                    for cl in start_l..end_l {
-                        let y_next = if cl + 1 < n_layers {
-                            &dec.layer_bo_y[cl + 1]
-                        } else {
-                            &dec.bo_yn
-                        };
-                        let (kv_in, kv_out) = if conv_kv_in_kvo {
-                            (&dec.layer_bo_kvo[cl], &layer_kv_blocks[cl][0])
-                        } else {
-                            (&layer_kv_blocks[cl][0], &dec.layer_bo_kvo[cl])
-                        };
-                        let run = kernels
-                            .dec_conv
-                            .create_run(&[
-                                &layer_bo_w[cl],
-                                &dec.layer_bo_y[cl],
-                                y_next,
-                                kv_in,
-                                kv_out,
-                            ])
-                            .map_err(|e| format!("layer {cl} ext dec conv create_run: {e}"))?;
-                        runs.push(run);
-                    }
-                    let mut rl = kernels
-                        .dec_conv
-                        .create_runlist()
-                        .map_err(|e| format!("layer {start_l} ext dec conv runlist: {e}"))?;
-                    for run in &runs {
-                        rl.add(run).map_err(|e| {
-                            format!("layer {start_l} ext dec conv runlist add: {e}")
-                        })?;
-                    }
-                    ext.conv_groups[parity_idx][start_l] = Some(Lfm2PrefillChain {
-                        _runs: runs,
-                        runlist: rl,
-                    });
-                }
-                let grp = ext.conv_groups[parity_idx][start_l]
-                    .as_ref()
-                    .expect("populated conv group");
-                grp.runlist
-                    .execute()
-                    .and_then(|()| grp.runlist.wait(0))
-                    .map_err(|e| format!("layer {start_l}..{end_l} ext dec conv runlist: {e}"))?;
-                l = end_l;
-                continue;
-            }
-
-            let cs = compute_lfm2_rope_cs(pos, self.layers[l].rope_theta);
-            write_lfm3_step_params(
-                dec.layer_bo_y[l].as_mut_slice(),
-                LFM2_DEC_SLOT_NORM_0,
-                Some(LFM2_DEC_SLOT_NORM_0 + 4112),
-                pos,
-                1,
-                0,
-                pos,
-                true,
-                0,
-                2,
-                eps,
-                Some(&cs),
-            );
-            dec.layer_bo_y[l]
-                .sync_range_to_device((16 + LFM2_HEAD_DIM) * 4, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
-                .map_err(|e| format!("layer {l} ext dec phase A params+rope sync: {e}"))?;
-            {
-                let ext = dec.ext_runs.as_mut().expect("ext cache");
-                if ext.phase_a_runs[l].is_none() {
-                    let y_next = if l + 1 < n_layers {
-                        &dec.layer_bo_y[l + 1]
-                    } else {
-                        &dec.bo_yn
-                    };
-                    let k = kernels.dec_phase_a()?;
-                    let run = k
-                        .create_run(&[
-                            &layer_bo_w[l],
-                            &dec.layer_bo_y[l],
-                            y_next,
-                            &layer_kv_blocks[l][0],
-                            &dec.layer_bo_kvo[l],
-                        ])
-                        .map_err(|e| format!("layer {l} ext dec phase A create_run: {e}"))?;
-                    ext.phase_a_runs[l] = Some(run);
-                }
-                let run = ext.phase_a_runs[l].as_ref().expect("phase_a run");
-                run.start()
-                    .and_then(|()| run.wait(0).map(|_| ()))
-                    .map_err(|e| format!("layer {l} ext dec phase A exec: {e}"))?;
-            }
-
-            let tkv = prof.then(crate::time::Instant::now);
-            dec.layer_bo_kvo[l]
-                .sync_range_from_device(LFM2_ATTN_DEC_KVO_BYTES, 0)
-                .map_err(|e| format!("layer {l} ext dec attn kvo readback: {e}"))?;
-            Self::save_attn_dec_kvo_to_kv_and_state(
-                kernels,
-                &dec.layer_bo_kvo[l],
-                &mut layer_kv_blocks[l],
-                &mut state.layers[l],
-                pos,
-                l,
-                use_f16,
-            )?;
-            if let Some(t) = tkv {
-                t_kv_ms += t.elapsed().as_secs_f64() * 1e3;
-            }
-
-            for (b, layer_kv) in layer_kv_blocks[l].iter().enumerate().take(cur_blk) {
-                let yb = dec.layer_bo_y[l].as_mut_slice();
+        for (l, layer) in self.layers.iter().enumerate() {
+            let yb = dec.layer_bo_y[l].as_mut_slice();
+            if layer.is_conv {
                 write_lfm3_step_params(
                     yb,
                     LFM2_DEC_SLOT_NORM_0,
                     None,
+                    pos,
+                    1,
+                    0,
+                    0,
+                    true,
+                    0,
+                    0,
+                    eps,
+                    None,
+                );
+                dec.layer_bo_y[l]
+                    .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
+                    .map_err(|e| format!("layer {l} dec conv params sync: {e}"))?;
+            } else if !is_ext {
+                let cs = compute_lfm2_rope_cs(pos, layer.rope_theta);
+                write_lfm3_step_params(
+                    yb,
+                    LFM2_DEC_SLOT_NORM_0,
+                    Some(LFM2_DEC_SLOT_NORM_0 + 4112),
+                    pos,
+                    1,
+                    attn_kv_cap,
+                    pos,
+                    true,
+                    0,
+                    1,
+                    eps,
+                    Some(&cs),
+                );
+                dec.layer_bo_y[l]
+                    .sync_range_to_device(
+                        (16 + LFM2_HEAD_DIM) * 4,
+                        (LFM2_DEC_SLOT_NORM_0 + 4096) * 4,
+                    )
+                    .map_err(|e| format!("layer {l} dec attn params+rope sync: {e}"))?;
+            } else {
+                let (_, fin_bidx) = ext_key.expect("ext key");
+                let fin_cap = Q4LAYER_LFM2_FA_FIN_BUCKETS[fin_bidx].0;
+                let cs = compute_lfm2_rope_cs(pos, layer.rope_theta);
+                // Mode 2 (Phase A) reads SLOT_NORM_0; Mode 3 (fa_part) reads SLOT_NORM_1;
+                // Mode 4 (fa_fin) reads SLOT_ROPE_PKT.
+                write_lfm3_step_params(
+                    yb,
+                    LFM2_DEC_SLOT_NORM_0,
+                    Some(LFM2_DEC_SLOT_NORM_0 + 4112),
+                    pos,
+                    1,
+                    0,
+                    pos,
+                    true,
+                    0,
+                    2,
+                    eps,
+                    Some(&cs),
+                );
+                write_lfm3_params_at(
+                    yb,
+                    LFM2_DEC_SLOT_NORM_1 + 4096,
                     pos,
                     1,
                     LFM2_MAX_KV_CHUNKS,
@@ -1778,43 +1634,13 @@ impl XdnaLfm2Model {
                     0,
                     3,
                     eps,
-                    None,
-                );
-                write_lfm3_ext_params(
-                    yb,
-                    LFM2_DEC_SLOT_NORM_0,
-                    b * LFM2_MAX_KV_CHUNKS,
-                    b > 0,
+                    0,
+                    true,
                     true,
                 );
-                dec.layer_bo_y[l]
-                    .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
-                    .map_err(|e| format!("layer {l} blk {b} ext dec fa_part params sync: {e}"))?;
-                let ext = dec.ext_runs.as_mut().expect("ext cache");
-                let layer_w = &layer_bo_w[l];
-                let layer_y = &dec.layer_bo_y[l];
-                let y_next = if l + 1 < n_layers {
-                    &dec.layer_bo_y[l + 1]
-                } else {
-                    &dec.bo_yn
-                };
-                let layer_kvo = &dec.layer_bo_kvo[l];
-                let run = ext.ensure_fa_part(l, b, || {
-                    let k = kernels.dec_fa_part()?;
-                    k.create_run(&[layer_w, layer_y, y_next, layer_kv, layer_kvo])
-                        .map_err(|e| format!("layer {l} blk {b} ext dec fa_part create_run: {e}"))
-                })?;
-                run.start()
-                    .and_then(|()| run.wait(0).map(|_| ()))
-                    .map_err(|e| format!("layer {l} blk {b} ext dec fa_part exec: {e}"))?;
-            }
-
-            {
-                let yb = dec.layer_bo_y[l].as_mut_slice();
-                write_lfm3_step_params(
+                write_lfm3_params_at(
                     yb,
-                    LFM2_DEC_SLOT_NORM_0,
-                    None,
+                    LFM2_DEC_SLOT_ROPE_PKT + 4096,
                     pos,
                     1,
                     fin_cap,
@@ -1823,47 +1649,59 @@ impl XdnaLfm2Model {
                     0,
                     4,
                     eps,
-                    None,
-                );
-                write_lfm3_ext_params(
-                    yb,
-                    LFM2_DEC_SLOT_NORM_0,
                     cur_blk * LFM2_MAX_KV_CHUNKS,
                     true,
                     false,
                 );
                 dec.layer_bo_y[l]
-                    .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_0 + 4096) * 4)
+                    .sync_range_to_device(
+                        (16 + LFM2_HEAD_DIM) * 4,
+                        (LFM2_DEC_SLOT_NORM_0 + 4096) * 4,
+                    )
+                    .map_err(|e| format!("layer {l} ext dec phase A params+rope sync: {e}"))?;
+                dec.layer_bo_y[l]
+                    .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_1 + 4096) * 4)
+                    .map_err(|e| format!("layer {l} ext dec fa_part params sync: {e}"))?;
+                dec.layer_bo_y[l]
+                    .sync_range_to_device(64, (LFM2_DEC_SLOT_ROPE_PKT + 4096) * 4)
                     .map_err(|e| format!("layer {l} ext dec fa_fin params sync: {e}"))?;
-                let ext = dec.ext_runs.as_mut().expect("ext cache");
-                let layer_w = &layer_bo_w[l];
-                let layer_y = &dec.layer_bo_y[l];
-                let y_next = if l + 1 < n_layers {
-                    &dec.layer_bo_y[l + 1]
-                } else {
-                    &dec.bo_yn
-                };
-                let layer_kv = &layer_kv_blocks[l][cur_blk];
-                let layer_kvo = &dec.layer_bo_kvo[l];
-                let run = ext.ensure_fa_fin(l, cur_blk, fin_bidx, || {
-                    let k = kernels.dec_fa_fin(fin_bidx)?;
-                    k.create_run(&[layer_w, layer_y, y_next, layer_kv, layer_kvo])
-                        .map_err(|e| format!("layer {l} ext dec fa_fin create_run: {e}"))
-                })?;
-                run.start()
-                    .and_then(|()| run.wait(0).map(|_| ()))
-                    .map_err(|e| format!("layer {l} ext dec fa_fin exec: {e}"))?;
             }
-            l += 1;
         }
-        let t_npu_ms = t_npu0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3) - t_kv_ms;
+        let t_prep_us = t_prep0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+
+        let t_npu0 = prof.then(crate::time::Instant::now);
+        let mut pending_next = {
+            let plan = if let Some((blk, fin_bidx)) = ext_key {
+                dec.ext_plans[parity_idx]
+                    .iter()
+                    .find(|(b, f, _)| *b == blk && *f == fin_bidx)
+                    .map(|(_, _, p)| p)
+                    .expect("initialized decode ext plan")
+            } else {
+                dec.bucket_plans[parity_idx][attn_bidx]
+                    .as_ref()
+                    .expect("initialized decode bucket plan")
+            };
+            plan.runlist
+                .execute()
+                .map_err(|e| format!("dec runlist execute: {e}"))?;
+            let pending_next = pending_kv.prepare(pos, LFM2_D_CONV, LFM2_H, LFM2_KV_DIM);
+            pending_kv.flush_into(state);
+            plan.runlist
+                .wait(0)
+                .map_err(|e| format!("dec runlist wait: {e}"))?;
+            pending_next
+        };
+        let t_npu_us = t_npu0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
         let t_kv0 = prof.then(crate::time::Instant::now);
-        dec.bo_yn
-            .sync_range_from_device(LFM2_DEC_YN_BYTES, 0)
-            .map_err(|e| format!("decode bo_yn readback: {e}"))?;
         let mut hidden_out = [0.0f32; LFM2_H];
-        read_le_f32_slice(dec.bo_yn.as_slice(), 0, &mut hidden_out);
+        if need_logits {
+            dec.bo_yn
+                .sync_range_from_device(LFM2_DEC_YN_BYTES, 0)
+                .map_err(|e| format!("decode bo_yn readback: {e}"))?;
+            read_le_f32_slice(dec.bo_yn.as_slice(), 0, &mut hidden_out);
+        }
 
         for (l, layer) in self.layers.iter().enumerate() {
             if layer.is_conv {
@@ -1874,23 +1712,51 @@ impl XdnaLfm2Model {
                 };
                 kvo_written
                     .sync_range_from_device(CONV_SYNC_BYTES, 0)
-                    .map_err(|e| format!("layer {l} ext dec conv kvo readback: {e}"))?;
-                Self::save_conv_kvo_to_state(kvo_written, &mut state.layers[l], pos + 1, true);
+                    .map_err(|e| format!("layer {l} dec conv kvo readback: {e}"))?;
+                pending_next.push_conv_from_kvo(l, &kvo_written.as_slice()[..CONV_SYNC_BYTES]);
+            } else {
+                dec.layer_bo_kvo[l]
+                    .sync_range_from_device(LFM2_ATTN_DEC_KVO_BYTES, 0)
+                    .map_err(|e| format!("layer {l} dec attn kvo readback: {e}"))?;
+                Self::save_attn_dec_kvo_to_npu(
+                    kernels,
+                    &dec.layer_bo_kvo[l],
+                    &mut layer_kv_blocks[l],
+                    pos,
+                    l,
+                )?;
+                pending_next.push_attn_bf16(
+                    l,
+                    dec.layer_bo_kvo[l].as_slice(),
+                    LFM2_N_KV_HEADS,
+                    LFM2_HEAD_DIM,
+                    1024,
+                );
             }
         }
         dec.conv_kv_in_kvo = !conv_kv_in_kvo;
+
+        pending_kv.commit(pending_next);
         state.seq_len = pos + 1;
         npu.synced_len = pos + 1;
-        let t_kv_total_ms = t_kv_ms + t_kv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
+        if pos + 1 >= cfg.max_seq_len.min(LFM2_MAX_TOKENS) {
+            npu.pending_kv.flush_into(state);
+        }
+        let t_kv_us = t_kv0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
         let t_head0 = prof.then(crate::time::Instant::now);
-        self.cpu.xdna_project_logits_into(&hidden_out, logits_out);
+        if need_logits {
+            self.cpu.xdna_project_logits_into_with_scratch(
+                &hidden_out,
+                logits_out,
+                Some((&mut head_q8_scratch.0, &mut head_q8_scratch.1)),
+            );
+        }
         let t_head_us = t_head0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
         if prof {
+            let tag = if is_ext { " >8K" } else { "" };
             eprintln!(
-                "lfm2 decode >8K pos={pos} bucket={attn_kv_cap}: prep={t_prep_us:.0}us npu={:.0}us kv={:.0}us head={t_head_us:.0}us",
-                t_npu_ms * 1e3,
-                t_kv_total_ms * 1e3
+                "lfm2 decode{tag} pos={pos} bucket={attn_kv_cap}: prep={t_prep_us:.0}us npu={t_npu_us:.0}us kv={t_kv_us:.0}us head={t_head_us:.0}us"
             );
         }
         Ok(())
@@ -1951,22 +1817,32 @@ impl XdnaLfm2Model {
             return self.reject_input(e, out_len);
         }
 
-        // Unaligned causal continuations (e.g. start_pos % 32 != 0): execute token-by-token on NPU decode
-        // so chunk-aligned bo_kv slots and conv rolling buffers remain bit-exact without partial-chunk shifting.
-        if !start_pos.is_multiple_of(LFM2_KV_CHUNK_T) {
-            let mut last_logits = Vec::new();
+        // Unaligned causal continuations (start_pos % 32 != 0) and tiny 1..=3 token prompts/continuations:
+        // execute via B=1 NPU decode (skipping intermediate logits) instead of a padded B=64 prefill dispatch.
+        if !start_pos.is_multiple_of(LFM2_KV_CHUNK_T) || n_tokens <= 3 {
+            if let Err(e) = self.flush_prefill_conv_pingpong(&mut npu) {
+                return self.record_device_fault(e, out_len);
+            }
+            let mut last_logits = if need_logits {
+                vec![0.0f32; vocab_size]
+            } else {
+                Vec::new()
+            };
             for i in 0..n_tokens {
                 let emb = &embeddings[i * LFM2_H..(i + 1) * LFM2_H];
-                match self.run_npu_decode_embedding_step(&mut npu, emb, start_pos + i, state) {
-                    Ok(logits) => {
-                        if i + 1 == n_tokens {
-                            last_logits = logits;
-                        }
-                    }
-                    Err(e) => return self.record_device_fault(e, out_len),
+                let step_need_logits = need_logits && (i + 1 == n_tokens);
+                if let Err(e) = self.run_npu_decode_embedding_step_inner(
+                    &mut npu,
+                    emb,
+                    start_pos + i,
+                    state,
+                    step_need_logits,
+                    &mut last_logits,
+                ) {
+                    return self.record_device_fault(e, out_len);
                 }
             }
-            return if need_logits { last_logits } else { Vec::new() };
+            return last_logits;
         }
 
         if npu.prefill.is_none() {
@@ -2080,27 +1956,18 @@ impl XdnaLfm2Model {
                                     out_len,
                                 );
                             }
-                            let n0 = n_valid.min(LFM2_KV_CHUNK_T);
-                            if let Err(e) = pre.layer_bo_y[l].sync_range_to_device(
-                                n0 * LFM2_HEAD_DIM * 4,
-                                LFM2_PREFILL_SLOT_ROPE_PKT_0 * 4,
-                            ) {
+                            let rope_bytes = if n_valid > LFM2_KV_CHUNK_T {
+                                (2304 + (n_valid - LFM2_KV_CHUNK_T) * LFM2_HEAD_DIM) * 4
+                            } else {
+                                n_valid * LFM2_HEAD_DIM * 4
+                            };
+                            if let Err(e) = pre.layer_bo_y[l]
+                                .sync_range_to_device(rope_bytes, LFM2_PREFILL_SLOT_ROPE_PKT_0 * 4)
+                            {
                                 return self.record_device_fault(
-                                    format!("prefill c={c} layer {l} rope_cs sub0 sync: {e}"),
+                                    format!("prefill c={c} layer {l} rope_cs sync: {e}"),
                                     out_len,
                                 );
-                            }
-                            if n_valid > LFM2_KV_CHUNK_T {
-                                let n1 = n_valid - LFM2_KV_CHUNK_T;
-                                if let Err(e) = pre.layer_bo_y[l].sync_range_to_device(
-                                    n1 * LFM2_HEAD_DIM * 4,
-                                    LFM2_PREFILL_SLOT_ROPE_PKT_1 * 4,
-                                ) {
-                                    return self.record_device_fault(
-                                        format!("prefill c={c} layer {l} rope_cs sub1 sync: {e}"),
-                                        out_len,
-                                    );
-                                }
                             }
                         }
                     }
@@ -2604,7 +2471,11 @@ impl XdnaLfm2Model {
         if !need_logits {
             return Vec::new();
         }
-        self.cpu.xdna_project_logits_from_hidden(&last_hidden)
+        let head_scratch = &mut npu.head_q8_scratch;
+        self.cpu.xdna_project_logits_from_hidden_with_scratch(
+            &last_hidden,
+            Some((&mut head_scratch.0, &mut head_scratch.1)),
+        )
     }
 
     fn run_single_embedding_forward(

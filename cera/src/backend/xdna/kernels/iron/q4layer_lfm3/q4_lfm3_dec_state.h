@@ -30,6 +30,10 @@ struct DecState {
   union {
     alignas(64) float xq_buf[4 * X_ELEMS];
     struct {
+      alignas(64) float _xq0_ffn[X_ELEMS];
+      alignas(64) float ffn_gates_hi[3][4][16];
+    };
+    struct {
       alignas(64) float _xq0[X_ELEMS];
       alignas(64) float conv_wt[7][64];
       alignas(64) float conv_state[6][64];

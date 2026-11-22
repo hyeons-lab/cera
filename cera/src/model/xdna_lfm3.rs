@@ -748,6 +748,7 @@ struct XdnaLfm3State {
     pending_kv: HybridPendingSlot,
     synced_len: usize,
     force_conv_sync: bool,
+    head_q8_scratch: (Vec<f32>, Vec<i8>),
 }
 
 // SAFETY: Every field in `XdnaLfm3State` (including `XdnaBo`/`XdnaKernel` raw XRT handles)
@@ -915,12 +916,19 @@ impl XdnaLfm3Model {
                 pending_kv: HybridPendingSlot::default(),
                 synced_len: 0,
                 force_conv_sync: false,
+                head_q8_scratch: (Vec::new(), Vec::new()),
             }),
             state_torn: AtomicBool::new(false),
             decode_error: Mutex::new(None),
             session_gate: ModelSessionGate::default(),
             profile_decode: crate::backend::cpu_features::profile_decode_enabled(),
-            _prefill_warm_guard: is_causal.then(crate::backend::acquire_prefill_warm_spin),
+            _prefill_warm_guard: {
+                let g = is_causal.then(crate::backend::acquire_prefill_warm_spin);
+                if is_causal {
+                    crate::backend::warm_prefill_pool(LfmModel::xdna_head_threads());
+                }
+                g
+            },
         })
     }
 
@@ -2126,6 +2134,18 @@ impl XdnaLfm3Model {
         state: &mut InferenceState,
         logits_out: &mut [f32],
     ) -> Result<(), String> {
+        self.run_npu_decode_embedding_step_inner(npu, embedding, pos, state, true, logits_out)
+    }
+
+    fn run_npu_decode_embedding_step_inner(
+        &self,
+        npu: &mut XdnaLfm3State,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+        need_logits: bool,
+        logits_out: &mut [f32],
+    ) -> Result<(), String> {
         let cfg = self.cpu.config();
         let eps = cfg.rms_norm_eps;
         let is_causal = cfg.is_causal;
@@ -2166,6 +2186,7 @@ impl XdnaLfm3Model {
             ref mut swa_base_chunk,
             ref mut decode,
             ref mut pending_kv,
+            ref mut head_q8_scratch,
             ..
         } = *npu;
         let dec = decode.as_mut().expect("initialized decode buffers");
@@ -2391,10 +2412,12 @@ impl XdnaLfm3Model {
         dec.conv_kv_in_kvo = !parity;
 
         let t_kv0 = prof.then(crate::time::Instant::now);
-        dec.bo_yn
-            .sync_range_from_device(LFM3_DEC_YN_BYTES, 0)
-            .map_err(|e| format!("dec_bo_yn sync_from_device: {e}"))?;
-        read_le_f32_slice(dec.bo_yn.as_slice(), 0, &mut hidden);
+        if need_logits {
+            dec.bo_yn
+                .sync_range_from_device(LFM3_DEC_YN_BYTES, 0)
+                .map_err(|e| format!("dec_bo_yn sync_from_device: {e}"))?;
+            read_le_f32_slice(dec.bo_yn.as_slice(), 0, &mut hidden);
+        }
 
         for (l, layer) in self.layers.iter().enumerate() {
             if layer.is_conv {
@@ -2441,7 +2464,13 @@ impl XdnaLfm3Model {
         }
 
         let t_head0 = prof.then(crate::time::Instant::now);
-        self.cpu.xdna_project_logits_into(&hidden, logits_out);
+        if need_logits {
+            self.cpu.xdna_project_logits_into_with_scratch(
+                &hidden,
+                logits_out,
+                Some((&mut head_q8_scratch.0, &mut head_q8_scratch.1)),
+            );
+        }
         let t_head_us = t_head0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
         if prof {
             tracing::info!(
@@ -2511,26 +2540,48 @@ impl XdnaLfm3Model {
             return self.reject_input(e, out_len);
         }
 
-        // For causal continuation at an unaligned start_pos, step single-token decode until pos % 32 == 0.
+        // For causal continuation at an unaligned start_pos, step single-token decode until pos % 32 == 0,
+        // and bypass B=64 prefill altogether when <= 3 tokens remain (cheaper on latency, zero prefill padding).
         let mut cur_start = 0usize;
-        if cfg.is_causal && !start_pos.is_multiple_of(LFM3_KV_CHUNK_T) {
-            let align_rem = LFM3_KV_CHUNK_T - (start_pos % LFM3_KV_CHUNK_T);
-            let step_count = align_rem.min(n_tokens);
-            let mut last_logits = Vec::new();
+        if cfg.is_causal && (!start_pos.is_multiple_of(LFM3_KV_CHUNK_T) || n_tokens <= 3) {
+            let align_rem = if start_pos.is_multiple_of(LFM3_KV_CHUNK_T) {
+                0
+            } else {
+                LFM3_KV_CHUNK_T - (start_pos % LFM3_KV_CHUNK_T)
+            };
+            let step_count = if n_tokens <= 3 || n_tokens.saturating_sub(align_rem) <= 3 {
+                n_tokens
+            } else {
+                align_rem.min(n_tokens)
+            };
+            let mut last_logits = if need_logits && step_count == n_tokens {
+                vec![0.0f32; vocab_size]
+            } else {
+                Vec::new()
+            };
             for i in 0..step_count {
                 let gpos = start_pos + i;
-                if let Err(e) = self.sync_cpu_state_to_npu(&mut npu, state, gpos) {
+                if i == 0
+                    && let Err(e) = self.sync_cpu_state_to_npu(&mut npu, state, gpos)
+                {
                     return self.reject_input(e, out_len);
                 }
                 let slice = &embeddings[i * LFM3_H..(i + 1) * LFM3_H];
-                match self.run_npu_decode_embedding_step(&mut npu, slice, gpos, state) {
-                    Ok(l) => last_logits = l,
-                    Err(e) => return self.record_device_fault(e, out_len),
+                let step_need_logits = need_logits && (i + 1 == n_tokens);
+                if let Err(e) = self.run_npu_decode_embedding_step_inner(
+                    &mut npu,
+                    slice,
+                    gpos,
+                    state,
+                    step_need_logits,
+                    &mut last_logits,
+                ) {
+                    return self.record_device_fault(e, out_len);
                 }
             }
             cur_start = step_count;
             if cur_start == n_tokens {
-                return if need_logits { last_logits } else { Vec::new() };
+                return last_logits;
             }
         }
 
@@ -2887,39 +2938,41 @@ impl XdnaLfm3Model {
                 let tkv_start = prof.then(crate::time::Instant::now);
                 for (l, layer) in self.layers.iter().enumerate() {
                     if layer.is_conv {
-                        let tck0 = prof.then(crate::time::Instant::now);
-                        let conv_out_bo = if parity {
-                            &mut layer_kv_blocks[l][0]
-                        } else {
-                            &mut pre_bo_kvo_layers[l]
-                        };
-                        if let Err(e) = conv_out_bo.sync_range_from_device(LFM3_KVO_BYTES, 0) {
-                            return self.record_device_fault(
-                                format!("prefill c={c} layer {l} conv kvo sync: {e}"),
-                                out_len,
-                            );
-                        }
-                        Self::save_conv_kvo_to_state(
-                            conv_out_bo,
-                            &mut state.layers[l],
-                            pos0 + n_valid,
-                            true,
-                        );
-                        if is_last_chunk && *pre_conv_kv_in_kvo {
-                            let src = &pre_bo_kvo_layers[l].as_slice()[..LFM3_KVO_BYTES];
-                            layer_kv_blocks[l][0].as_mut_slice()[..LFM3_KVO_BYTES]
-                                .copy_from_slice(src);
-                            if let Err(e) =
-                                layer_kv_blocks[l][0].sync_range_to_device(LFM3_KVO_BYTES, 0)
-                            {
+                        if is_last_chunk {
+                            let tck0 = prof.then(crate::time::Instant::now);
+                            let conv_out_bo = if parity {
+                                &mut layer_kv_blocks[l][0]
+                            } else {
+                                &mut pre_bo_kvo_layers[l]
+                            };
+                            if let Err(e) = conv_out_bo.sync_range_from_device(LFM3_KVO_BYTES, 0) {
                                 return self.record_device_fault(
-                                    format!("prefill layer {l} final conv bo_kv sync: {e}"),
+                                    format!("prefill c={c} layer {l} conv kvo sync: {e}"),
                                     out_len,
                                 );
                             }
-                        }
-                        if let Some(t) = tck0 {
-                            t_conv_kv_us += t.elapsed().as_secs_f64() * 1e6;
+                            Self::save_conv_kvo_to_state(
+                                conv_out_bo,
+                                &mut state.layers[l],
+                                pos0 + n_valid,
+                                true,
+                            );
+                            if *pre_conv_kv_in_kvo {
+                                let src = &pre_bo_kvo_layers[l].as_slice()[..LFM3_KVO_BYTES];
+                                layer_kv_blocks[l][0].as_mut_slice()[..LFM3_KVO_BYTES]
+                                    .copy_from_slice(src);
+                                if let Err(e) =
+                                    layer_kv_blocks[l][0].sync_range_to_device(LFM3_KVO_BYTES, 0)
+                                {
+                                    return self.record_device_fault(
+                                        format!("prefill layer {l} final conv bo_kv sync: {e}"),
+                                        out_len,
+                                    );
+                                }
+                            }
+                            if let Some(t) = tck0 {
+                                t_conv_kv_us += t.elapsed().as_secs_f64() * 1e6;
+                            }
                         }
                     } else {
                         let tak0 = prof.then(crate::time::Instant::now);
@@ -2979,7 +3032,11 @@ impl XdnaLfm3Model {
             npu.synced_len = total_tokens;
             let t_head0 = prof.then(crate::time::Instant::now);
             let out_logits = if need_logits {
-                self.cpu.xdna_project_logits_from_hidden(&last_hidden)
+                let head_scratch = &mut npu.head_q8_scratch;
+                self.cpu.xdna_project_logits_from_hidden_with_scratch(
+                    &last_hidden,
+                    Some((&mut head_scratch.0, &mut head_scratch.1)),
+                )
             } else {
                 Vec::new()
             };
@@ -3590,7 +3647,11 @@ impl XdnaLfm3Model {
             return Vec::new();
         }
         let last_hidden = &hidden_all[(rem_tokens - 1) * LFM3_H..rem_tokens * LFM3_H];
-        self.cpu.xdna_project_logits_from_hidden(last_hidden)
+        let head_scratch = &mut npu.head_q8_scratch;
+        self.cpu.xdna_project_logits_from_hidden_with_scratch(
+            last_hidden,
+            Some((&mut head_scratch.0, &mut head_scratch.1)),
+        )
     }
 
     fn run_single_embedding_forward(

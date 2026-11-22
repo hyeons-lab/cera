@@ -16,6 +16,7 @@ extern "C" void q4_lfm2_dec_gemm_op(
   aie::vector<int8, 64> a3 = aie::zeros<int8, 64>();
 
   const int32_t x_slot = (flags >> 3) & 3;
+  const int32_t g_slot = (flags >> 5) & 3;
   const uint8_t *__restrict x_blk = (const uint8_t *)(g_dec.xq_buf + x_slot * X_ELEMS);
   const uint8_t *__restrict bp = w_tile;
 #pragma clang loop unroll(disable)
@@ -60,7 +61,7 @@ extern "C" void q4_lfm2_dec_gemm_op(
   aie::vector<float, 16> fv = facc.template to_vector<float>();
   float *__restrict dst =
       (dst_sel == 0) ? &g_dec.y_gemm[out_idx][0] :
-      (dst_sel == 1) ? &g_dec.ffn_gate[out_idx][0] :
+      (dst_sel == 1) ? ((g_slot == 0) ? &g_dec.ffn_gate[out_idx][0] : &g_dec.ffn_gates_hi[g_slot - 1][out_idx][0]) :
                        (g_dec.conv_c + out_idx * 16);
   if (add_prev) {
     fv = aie::add(fv, aie::load_v<16>(dst));

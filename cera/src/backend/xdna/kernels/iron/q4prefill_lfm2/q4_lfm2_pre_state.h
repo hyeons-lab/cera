@@ -18,6 +18,7 @@ constexpr int D_CONV = 2;
 constexpr int L_CACHE = 3;
 constexpr float LOG2E = 1.4426950408889634f;
 constexpr float ATTN_SCALE = 0.125f;  // 1.0f / sqrtf(64.0f)
+constexpr float ATTN_SCALE_LOG2E = 0.125f * 1.4426950408889634f;
 
 // Shared L1 scratch union across mutually exclusive stages (~14.1 KiB max, no separate ModeBuf)
 union ScratchUnion {
@@ -38,17 +39,19 @@ union ScratchUnion {
     alignas(64) bfloat16 v_buf[B_SUB][HEAD_DIM];  // 1024 B
     alignas(64) float q_norm_w[HEAD_DIM];         //  256 B
     alignas(64) float k_norm_w[HEAD_DIM];         //  256 B
-    uint8_t _pad_after_rope[9984 - 4608];         // reserve up to q_bf16
+    uint8_t _pad_after_rope[10496 - 4608];         // reserve up to q_bf16 (align with attn.q_bf16)
     alignas(64) bfloat16 q_bf16[GQA_Q_HEADS * (HEAD_DIM / 8) * B_SUB * 8];  // 4096 B (disjoint from attn fields!)
-  } rope;                                         // 14080 B
+  } rope;                                         // 14592 B
   struct {
     alignas(64) float o_acc[GQA_Q_HEADS][B_SUB][HEAD_DIM];  // 8192 B
     alignas(64) float row_l[GQA_Q_HEADS][B_SUB];            //  128 B (contiguous directly after o_acc)
     alignas(64) float row_m[GQA_Q_HEADS][B_SUB];            //  128 B
-    alignas(64) float scores[B_SUB][KV_CHUNK_T];            // 1024 B
-    alignas(64) bfloat16 p_bf16[4 * 64];                    //  512 B
+    union {
+      alignas(64) float scores[2][B_SUB][KV_CHUNK_T];       // 2048 B
+      alignas(64) bfloat16 p_bf16[2 * 4 * 64];              // 1024 B
+    };
     alignas(64) bfloat16 q_bf16[GQA_Q_HEADS * (HEAD_DIM / 8) * B_SUB * 8];  // 4096 B
-  } attn;                                                   // 14080 B
+  } attn;                                                   // 14592 B
   struct {
     alignas(64) float state[D_CONV][64];  //  512 B (contiguous directly before bx!)
     alignas(64) float bx[32][64];         // 8192 B
@@ -67,6 +70,9 @@ aie::vector<float, 16> q4_inv_16(aie::vector<float, 16> v);
 aie::vector<float, 16> q4_exp2f_16(aie::vector<float, 16> x);
 void q4_scale_f32_16(float *__restrict dst, const float *__restrict src, float s, int n);
 void q4_fill_f32_16(float *__restrict dst, float val, int n);
+void q4_fa_qk_dual(const bfloat16 *__restrict q0_base, const bfloat16 *__restrict q1_base, const bfloat16 *__restrict kv_mat, int32_t kb_max);
+void q4_fa_pv_d16(const bfloat16 *__restrict kv_mat, int32_t kb_max, int32_t h_base);
+float q4_fa_exp2_row32(const float *__restrict sc, float m_val, bfloat16 *__restrict p_col);
 
 /// 2-limb BF16-emulated f32 vector multiply (~15-bit mantissa) for softmax/exp2f without 4-limb spills.
 static inline __attribute__((always_inline)) aie::vector<float, 16> q4_fast_fmul2_16(

@@ -1,61 +1,73 @@
 #include "q4_lfm2_dec_state.h"
 
 namespace {
-constexpr float kScale = 0.125f;  // 1 / sqrt(64)
-constexpr float kLog2e = 1.4426950408889634f;
-
-#define fa_vmul_16 dec_fmul_16
-
-__attribute__((always_inline)) static inline float fa_fmul_s(float a, float b) {
-  return fa_vmul_16(aie::broadcast<float, 16>(a), aie::broadcast<float, 16>(b)).get(0);
-}
-
-__attribute__((always_inline)) static inline float fa_max_s(float a, float b) {
-  return aie::max(aie::broadcast<float, 16>(a), aie::broadcast<float, 16>(b)).get(0);
-}
-
-__attribute__((always_inline)) static inline bool fa_nz_f32(float x) {
-  uint32_t b;
-  __builtin_memcpy(&b, &x, 4);
-  return (b & 0x7FFFFFFFu) != 0;
-}
-
 __attribute__((noinline)) static float fa_exp2_scalar(float x) {
   return dec_exp2f_16(aie::broadcast<float, 16>(x)).get(0);
 }
 
-__attribute__((noinline)) static void fa_qk_chunk(const bfloat16 *__restrict k_base) {
-  aie::vector<bfloat16, 16> q0 = aie::load_v<16>(g_dec.q_bf16 + 0);
-  aie::vector<bfloat16, 16> q1 = aie::load_v<16>(g_dec.q_bf16 + 16);
-  aie::vector<bfloat16, 16> q2 = aie::load_v<16>(g_dec.q_bf16 + 32);
-  aie::vector<bfloat16, 16> q3 = aie::load_v<16>(g_dec.q_bf16 + 48);
-  for (int kt = 0; kt < KV_CHUNK_T; ++kt) chess_prepare_for_pipelining {
+__attribute__((noinline)) static float fa_qk_chunk(
+    const bfloat16 *__restrict k_base,
+    int32_t t0,
+    int32_t t1) {
+  aie::vector<bfloat16, 32> q0 = aie::load_v<32>(g_dec.q_bf16 + 0);
+  aie::vector<bfloat16, 32> q1 = aie::load_v<32>(g_dec.q_bf16 + 32);
+
+#pragma clang loop unroll(disable)
+  for (int kt = t0; kt < t1; ++kt) chess_prepare_for_pipelining {
     const bfloat16 *__restrict kp = k_base + kt * HEAD_DIM;
-    aie::accum<accfloat, 16> acc = aie::mul(q0, aie::load_v<16>(kp + 0));
-    acc = aie::mac(acc, q1, aie::load_v<16>(kp + 16));
-    acc = aie::mac(acc, q2, aie::load_v<16>(kp + 32));
-    acc = aie::mac(acc, q3, aie::load_v<16>(kp + 48));
+    aie::vector<bfloat16, 32> k0 = aie::load_v<32>(kp + 0);
+    aie::vector<bfloat16, 32> k1 = aie::load_v<32>(kp + 32);
+    aie::accum<accfloat, 16> acc = aie::mul(q0.template extract<16>(0), k0.template extract<16>(0));
+    acc = aie::mac(acc, q0.template extract<16>(1), k0.template extract<16>(1));
+    acc = aie::mac(acc, q1.template extract<16>(0), k1.template extract<16>(0));
+    acc = aie::mac(acc, q1.template extract<16>(1), k1.template extract<16>(1));
     g_dec.scores[kt] = aie::reduce_add(acc.template to_vector<float>());
+  }
+
+  float m_chk = aie::reduce_max(aie::load_v<16>(g_dec.scores));
+  if (t1 > 16) {
+    float hm = aie::reduce_max(aie::load_v<16>(g_dec.scores + 16));
+    if (hm > m_chk) m_chk = hm;
+  }
+  return m_chk;
+}
+
+__attribute__((noinline)) static void fa_scale_o(float alpha) {
+  aie::vector<float, 16> va = aie::broadcast<float, 16>(alpha);
+#pragma clang loop unroll(disable)
+  for (int d = 0; d < HEAD_DIM; d += 16) {
+    aie::store_v(g_dec.o_acc + d, dec_fmul_16(aie::load_v<16>(g_dec.o_acc + d), va));
   }
 }
 
 __attribute__((noinline)) static void fa_pv_chunk(
     const bfloat16 *__restrict v_base,
-    float alpha,
+    const bfloat16 *__restrict p_bf,
     int32_t t0,
-    int32_t t1) {
-  aie::vector<float, 16> va = aie::broadcast<float, 16>(alpha);
-  aie::accum<accfloat, 16> o0(dec_fmul_16(aie::load_v<16>(g_dec.o_acc + 0), va));
-  aie::accum<accfloat, 16> o1(dec_fmul_16(aie::load_v<16>(g_dec.o_acc + 16), va));
-  aie::accum<accfloat, 16> o2(dec_fmul_16(aie::load_v<16>(g_dec.o_acc + 32), va));
-  aie::accum<accfloat, 16> o3(dec_fmul_16(aie::load_v<16>(g_dec.o_acc + 48), va));
+    int32_t t1,
+    int32_t add_prev) {
+  aie::accum<accfloat, 16> o0, o1, o2, o3;
+  if (add_prev) {
+    o0.from_vector(aie::load_v<16>(g_dec.o_acc + 0));
+    o1.from_vector(aie::load_v<16>(g_dec.o_acc + 16));
+    o2.from_vector(aie::load_v<16>(g_dec.o_acc + 32));
+    o3.from_vector(aie::load_v<16>(g_dec.o_acc + 48));
+  } else {
+    o0 = aie::zeros<accfloat, 16>();
+    o1 = aie::zeros<accfloat, 16>();
+    o2 = aie::zeros<accfloat, 16>();
+    o3 = aie::zeros<accfloat, 16>();
+  }
+#pragma clang loop unroll(disable)
   for (int kt = t0; kt < t1; ++kt) chess_prepare_for_pipelining {
+    aie::vector<bfloat16, 16> pv = aie::broadcast<bfloat16, 16>(p_bf[kt]);
     const bfloat16 *__restrict vp = v_base + kt * HEAD_DIM;
-    aie::vector<bfloat16, 16> vpk = dec_f32_to_bf16_16(aie::broadcast<float, 16>(g_dec.scores[kt]));
-    o0 = aie::mac(o0, aie::load_v<16>(vp + 0), vpk);
-    o1 = aie::mac(o1, aie::load_v<16>(vp + 16), vpk);
-    o2 = aie::mac(o2, aie::load_v<16>(vp + 32), vpk);
-    o3 = aie::mac(o3, aie::load_v<16>(vp + 48), vpk);
+    aie::vector<bfloat16, 32> v0 = aie::load_v<32>(vp + 0);
+    aie::vector<bfloat16, 32> v1 = aie::load_v<32>(vp + 32);
+    o0 = aie::mac(o0, pv, v0.template extract<16>(0));
+    o1 = aie::mac(o1, pv, v0.template extract<16>(1));
+    o2 = aie::mac(o2, pv, v1.template extract<16>(0));
+    o3 = aie::mac(o3, pv, v1.template extract<16>(1));
   }
   aie::store_v(g_dec.o_acc + 0, o0.template to_vector<float>());
   aie::store_v(g_dec.o_acc + 16, o1.template to_vector<float>());
@@ -69,8 +81,8 @@ extern "C" __attribute__((minsize)) void q4_lfm2_dec_fa_op(
     int32_t _row,
     int32_t chunk_idx,
     int32_t mode) {
+  aie::tile::current().set_rounding(aie::rounding_mode::conv_even);
   const int32_t is_cur_kv = mode & 1;
-  if (is_cur_kv && g_dec.params[10]) return;
   const int32_t is_first = ((mode >> 1) & 1) && ((g_dec.params[6] <= 2) || !g_dec.params[9]);
 
   if (is_first) {
@@ -80,88 +92,58 @@ extern "C" __attribute__((minsize)) void q4_lfm2_dec_fa_op(
     g_dec.row_m = -1e30f;
     g_dec.row_l = 0.0f;
   }
+  if (is_cur_kv && g_dec.params[10]) return;
 
+  int32_t t0 = 0;
+  int32_t t1 = 1;
+  const bfloat16 *__restrict k_base;
+  const bfloat16 *__restrict v_base;
   if (is_cur_kv) {
-    const bfloat16 *__restrict kc = (const bfloat16 *)(w_pkt + 128 * 4);
-    const bfloat16 *__restrict vc = (const bfloat16 *)(w_pkt + 192 * 4);
-    float s;
-    {
-      aie::accum<accfloat, 16> acc = aie::mul(aie::load_v<16>(g_dec.q_bf16 + 0), aie::load_v<16>(kc + 0));
-      acc = aie::mac(acc, aie::load_v<16>(g_dec.q_bf16 + 16), aie::load_v<16>(kc + 16));
-      acc = aie::mac(acc, aie::load_v<16>(g_dec.q_bf16 + 32), aie::load_v<16>(kc + 32));
-      acc = aie::mac(acc, aie::load_v<16>(g_dec.q_bf16 + 48), aie::load_v<16>(kc + 48));
-      s = fa_fmul_s(aie::reduce_add(acc.template to_vector<float>()), kScale);
-    }
-    float old_m = g_dec.row_m;
-    float new_m = fa_max_s(s, old_m);
-    float alpha = fa_nz_f32(g_dec.row_l) ? fa_exp2_scalar(fa_fmul_s(old_m - new_m, kLog2e)) : 0.0f;
-    float p = fa_exp2_scalar(fa_fmul_s(s - new_m, kLog2e));
-    g_dec.scores[0] = p;
-    fa_pv_chunk(vc, alpha, 0, 1);
-    g_dec.row_l = fa_fmul_s(g_dec.row_l, alpha) + p;
-    g_dec.row_m = new_m;
-    return;
+    k_base = (const bfloat16 *)(w_pkt + 128 * 4);
+    v_base = (const bfloat16 *)(w_pkt + 192 * 4);
+  } else {
+    const int32_t pos = g_dec.params[0];
+    const int32_t n_past = g_dec.params[3];
+    const int32_t swa = g_dec.params[5];
+    const int32_t lo = (swa > 0 && (pos + 1) > swa) ? (pos + 1 - swa) : 0;
+    const int32_t t_base = (g_dec.params[8] + chunk_idx) * KV_CHUNK_T;
+    t0 = (lo > t_base) ? (lo - t_base) : 0;
+    const int32_t avail = n_past - t_base;
+    t1 = (avail < KV_CHUNK_T) ? avail : KV_CHUNK_T;
+    if (t0 >= t1) return;
+    k_base = (const bfloat16 *)w_pkt;
+    v_base = (const bfloat16 *)(w_pkt + 2304 * 4);
   }
 
-  const int32_t pos = g_dec.params[0];
-  const int32_t n_past = g_dec.params[3];
-  const int32_t swa = g_dec.params[5];
-  const int32_t lo = (swa > 0 && (pos + 1) > swa) ? (pos + 1 - swa) : 0;
-  const int32_t t_base = (g_dec.params[8] + chunk_idx) * KV_CHUNK_T;
-  const int32_t t0 = (lo > t_base) ? (lo - t_base) : 0;
-  const int32_t avail = n_past - t_base;
-  const int32_t t1 = (avail < KV_CHUNK_T) ? avail : KV_CHUNK_T;
-  if (t0 >= t1) return;
-
-  const bfloat16 *__restrict k_base = (const bfloat16 *)w_pkt;
-  const bfloat16 *__restrict v_base = (const bfloat16 *)(w_pkt + 2304 * 4);
-
-  fa_qk_chunk(k_base);
-
-  float m_chk;
-  const bool partial = (t0 > 0) || (t1 < KV_CHUNK_T);
-  {
-    aie::vector<float, 16> vscale = aie::broadcast<float, 16>(kScale);
-    aie::vector<float, 16> s0 = fa_vmul_16(aie::load_v<16>(g_dec.scores + 0), vscale);
-    aie::vector<float, 16> s1 = fa_vmul_16(aie::load_v<16>(g_dec.scores + 16), vscale);
-    aie::store_v(g_dec.scores + 0, s0);
-    aie::store_v(g_dec.scores + 16, s1);
-    if (partial) {
-#pragma clang loop unroll(disable)
-      for (int kt = 0; kt < t0; ++kt) g_dec.scores[kt] = -1e30f;
-#pragma clang loop unroll(disable)
-      for (int kt = t1; kt < KV_CHUNK_T; ++kt) g_dec.scores[kt] = -1e30f;
-      s0 = aie::load_v<16>(g_dec.scores + 0);
-      s1 = aie::load_v<16>(g_dec.scores + 16);
-    }
-    m_chk = aie::reduce_max(aie::max(s0, s1));
+  if (t0 > 0 || t1 < KV_CHUNK_T) {
+    aie::vector<float, 16> vminf = aie::broadcast<float, 16>(-1e30f);
+    aie::store_v(g_dec.scores, vminf);
+    aie::store_v(g_dec.scores + 16, vminf);
   }
 
+  float m_chk = fa_qk_chunk(k_base, t0, t1);
   float old_m = g_dec.row_m;
-  float new_m = fa_max_s(m_chk, old_m);
-  float alpha = fa_nz_f32(g_dec.row_l) ? fa_exp2_scalar(fa_fmul_s(old_m - new_m, kLog2e)) : 0.0f;
+  int32_t has_prev = (g_dec.row_l > 0.0f);
+  float new_m = (m_chk > old_m || !has_prev) ? m_chk : old_m;
+  int32_t need_scale = has_prev && (m_chk > old_m);
+  float alpha = need_scale ? fa_exp2_scalar(old_m - new_m) : 1.0f;
 
-  float sum_p;
-  {
-    aie::vector<float, 16> vn = aie::broadcast<float, 16>(new_m);
-    aie::vector<float, 16> vl2e = aie::broadcast<float, 16>(kLog2e);
-    aie::vector<float, 16> p0 = dec_exp2f_16(fa_vmul_16(aie::sub(aie::load_v<16>(g_dec.scores + 0), vn), vl2e));
-    aie::vector<float, 16> p1 = dec_exp2f_16(fa_vmul_16(aie::sub(aie::load_v<16>(g_dec.scores + 16), vn), vl2e));
-    aie::store_v(g_dec.scores + 0, p0);
-    aie::store_v(g_dec.scores + 16, p1);
-    if (partial) {
+  aie::vector<float, 16> vn = aie::broadcast<float, 16>(new_m);
+  alignas(64) bfloat16 p_bf[32];
+  float sum_p = 0.0f;
+  const int n_halves = (t1 > 16) ? 2 : 1;
 #pragma clang loop unroll(disable)
-      for (int kt = 0; kt < t0; ++kt) g_dec.scores[kt] = 0.0f;
-#pragma clang loop unroll(disable)
-      for (int kt = t1; kt < KV_CHUNK_T; ++kt) g_dec.scores[kt] = 0.0f;
-      p0 = aie::load_v<16>(g_dec.scores + 0);
-      p1 = aie::load_v<16>(g_dec.scores + 16);
-    }
-    sum_p = aie::reduce_add(aie::add(p0, p1));
+  for (int h = 0; h < n_halves; ++h) {
+    aie::vector<float, 16> p = dec_exp2f_16(aie::sub(aie::load_v<16>(g_dec.scores + h * 16), vn));
+    sum_p += aie::reduce_add(p);
+    aie::store_v(p_bf + h * 16, dec_f32_to_bf16_16(p));
   }
 
-  fa_pv_chunk(v_base, alpha, t0, t1);
+  if (need_scale) fa_scale_o(alpha);
+  fa_pv_chunk(v_base, p_bf, t0, t1, has_prev);
 
-  g_dec.row_l = fa_fmul_s(g_dec.row_l, alpha) + sum_p;
+  g_dec.row_l = (need_scale
+      ? dec_fmul_16(aie::broadcast<float, 16>(g_dec.row_l), aie::broadcast<float, 16>(alpha)).get(0)
+      : g_dec.row_l) + sum_p;
   g_dec.row_m = new_m;
 }

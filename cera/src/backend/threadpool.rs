@@ -1269,6 +1269,101 @@ pub fn set_macos_thread_qos_interactive() {
     }
 }
 
+/// Opt the process and hot pool threads out of Windows EcoQoS/timer throttling
+/// and raise thread priority above background work so decode barriers and hybrid
+/// NPU->CPU handoffs do not stall for multi-millisecond OS scheduler quanta.
+#[cfg(target_os = "windows")]
+pub(crate) fn set_windows_thread_interactive() {
+    const THREAD_PRIORITY_HIGHEST: i32 = 2;
+    const THREAD_POWER_THROTTLING: u32 = 3;
+    const THREAD_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const THREAD_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    const PROCESS_POWER_THROTTLING: u32 = 4;
+    const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    const PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION: u32 = 0x4;
+
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetCurrentThread() -> isize;
+        fn SetProcessInformation(
+            process: isize,
+            process_information_class: u32,
+            process_information: *const std::ffi::c_void,
+            process_information_size: u32,
+        ) -> i32;
+        fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        fn SetThreadInformation(
+            thread: isize,
+            thread_information_class: u32,
+            thread_information: *const std::ffi::c_void,
+            thread_information_size: u32,
+        ) -> i32;
+    }
+
+    static PROCESS_QOS_INIT: std::sync::Once = std::sync::Once::new();
+    PROCESS_QOS_INIT.call_once(|| {
+        let full = PowerThrottlingState {
+            version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            state_mask: 0,
+        };
+        // SAFETY: `GetCurrentProcess()` returns a valid pseudo-handle and `full` is an
+        // initialized `PROCESS_POWER_THROTTLING_STATE`.
+        let ok = unsafe {
+            SetProcessInformation(
+                GetCurrentProcess(),
+                PROCESS_POWER_THROTTLING,
+                (&full as *const PowerThrottlingState).cast(),
+                std::mem::size_of::<PowerThrottlingState>() as u32,
+            )
+        };
+        if ok == 0 {
+            let speed_only = PowerThrottlingState {
+                version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                state_mask: 0,
+            };
+            // SAFETY: same as above, falling back to `EXECUTION_SPEED` on older Windows builds.
+            unsafe {
+                let _ = SetProcessInformation(
+                    GetCurrentProcess(),
+                    PROCESS_POWER_THROTTLING,
+                    (&speed_only as *const PowerThrottlingState).cast(),
+                    std::mem::size_of::<PowerThrottlingState>() as u32,
+                );
+            }
+        }
+    });
+
+    let state = PowerThrottlingState {
+        version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        control_mask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        state_mask: 0,
+    };
+    // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread
+    // and `state` points to a valid initialized `THREAD_POWER_THROTTLING_STATE`.
+    unsafe {
+        let thread = GetCurrentThread();
+        let _ = SetThreadInformation(
+            thread,
+            THREAD_POWER_THROTTLING,
+            (&state as *const PowerThrottlingState).cast(),
+            std::mem::size_of::<PowerThrottlingState>() as u32,
+        );
+        let _ = SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST);
+    }
+}
+
 /// Caller-pin claim, process-wide: at most one thread holds it (see
 /// `pin_caller_once`). `OWNER` is the claiming thread's tid (`-1` = none)
 /// and `CORE` the core it was pinned to. The allowance probe reads these to
@@ -1568,6 +1663,23 @@ impl RowPool {
         PrefillWarmGuard { _private: () }
     }
 
+    /// Build, pin, and wake up to `max_active` threads in [`RowPool::prefill`] once
+    /// up front so the first hybrid XDNA logits projection avoids cold
+    /// thread-creation and OS priority-setup latency without spinning excess idle workers.
+    #[cfg(feature = "xdna")]
+    pub(crate) fn warm_prefill(max_active: usize) {
+        #[cfg(not(miri))]
+        {
+            let pool = RowPool::prefill();
+            let active = max_active.min(pool.num_threads());
+            if active > 1 {
+                pool.dispatch_range_active(active, 1, active, |_, _| {});
+            } else {
+                pool.pin_caller_once();
+            }
+        }
+    }
+
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
     /// every host thread that ever dispatches would be permanently pinned to
@@ -1596,6 +1708,17 @@ impl RowPool {
         QOS_SET.with(|q| {
             if !q.get() {
                 set_macos_thread_qos_interactive();
+                q.set(true);
+            }
+        });
+        #[cfg(target_os = "windows")]
+        thread_local! {
+            static WIN_QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        #[cfg(target_os = "windows")]
+        WIN_QOS_SET.with(|q| {
+            if !q.get() {
+                set_windows_thread_interactive();
                 q.set(true);
             }
         });
@@ -2282,6 +2405,18 @@ fn worker_loop(
             }
         });
     }
+    #[cfg(target_os = "windows")]
+    {
+        thread_local! {
+            static WIN_WORKER_QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        WIN_WORKER_QOS_SET.with(|q| {
+            if !q.get() {
+                set_windows_thread_interactive();
+                q.set(true);
+            }
+        });
+    }
 
     if let Some(core) = pin_core {
         let _ = pin_current_thread_to_core(core);
@@ -2323,6 +2458,7 @@ fn worker_loop(
     };
 
     let mut last_state = 0u64;
+    let mut skip_spin = false;
     loop {
         // Wait for a new dispatch (or shutdown). Every dispatch changes the
         // `state` word — the active-sized barrier bumps the epoch in the high bits
@@ -2346,7 +2482,7 @@ fn worker_loop(
             // builds — a panic here would wedge the pool (`pending` never hits
             // 0). Matches the `DrainGuard` counter.
             spins = spins.saturating_add(1);
-            if spins < shared.spin_limit.load(Ordering::Relaxed) {
+            if !skip_spin && spins < shared.spin_limit.load(Ordering::Relaxed) {
                 std::hint::spin_loop();
             } else {
                 let _guard = ParkedGuard::enter(&shared.parked_count);
@@ -2383,16 +2519,19 @@ fn worker_loop(
             // Active-sized barrier: `active` rides the same atomic as the epoch
             // (see [`pack_state`]), so it can't name a newer dispatch whose `job`
             // the dispatcher has retired. An idle worker (`id >= active`) skips
-            // *entirely* — no `job` read, no `pending` touch — so its `fetch_sub`
-            // never bounces the barrier line across the CCD fabric.
+            // *entirely* — no `job` read, no `pending` touch, and no spin reset —
+            // so it parks immediately instead of burning cycles across NPU gaps.
             if worker_id >= state_active(state) {
+                skip_spin = true;
                 continue;
             }
+            skip_spin = false;
             if let Some(job) = unsafe { *shared.job.get() } {
                 run_job(&shared, &job);
             }
             shared.pending.fetch_sub(1, Ordering::Release);
         } else {
+            skip_spin = false;
             // Full barrier: byte-identical to the pre-active-barrier pool. Every
             // worker reads `job`, runs iff `id < job.active`, and decrements — so
             // the dispatcher's `pending == num_threads - 1` wait covers every

@@ -54,6 +54,8 @@ __attribute__((noinline)) aie::vector<float, 16> dec_exp2f_16(aie::vector<float,
 
 namespace {
 
+static constexpr float kQScaleLog2e = 0.125f * 1.4426950408889634f;
+
 __attribute__((minsize)) static inline aie::vector<float, 16> dec_invsqrt_16(aie::vector<float, 16> v) {
   return aie::invsqrt(v);
 }
@@ -88,10 +90,12 @@ __attribute__((noinline, minsize)) static void apply_rmsnorm_n(
     float ss,
     float inv_len,
     float eps,
+    float post_scale,
     int n,
     float *__restrict dst) {
   aie::vector<float, 16> mean = dec_fmul_16(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(inv_len));
   aie::vector<float, 16> inv_r = dec_invsqrt_16(aie::add(mean, aie::broadcast<float, 16>(eps)));
+  inv_r = dec_fmul_16(inv_r, aie::broadcast<float, 16>(post_scale));
 #pragma clang loop unroll(disable)
   for (int i = 0; i < n; i += 16) {
     aie::vector<float, 16> v = dec_fmul_16(aie::load_v<16>(src + i), inv_r);
@@ -139,11 +143,12 @@ __attribute__((noinline, minsize)) static void apply_rmsnorm_neox_rope_64(
     const float *__restrict in_h,
     const float *__restrict norm_w,
     float eps,
+    float post_scale,
     const float *__restrict cs,
     bfloat16 *__restrict out_h) {
   alignas(64) float tmp_n[HEAD_DIM];
   float ss = sum_sq_f32(in_h, HEAD_DIM);
-  apply_rmsnorm_n(in_h, norm_w, ss, 1.0f / (float)HEAD_DIM, eps, HEAD_DIM, tmp_n);
+  apply_rmsnorm_n(in_h, norm_w, ss, 1.0f / (float)HEAD_DIM, eps, post_scale, HEAD_DIM, tmp_n);
   const float *__restrict c = cs;
   const float *__restrict s = cs + 32;
 #pragma clang loop unroll(disable)
@@ -178,7 +183,7 @@ __attribute__((noinline, minsize)) static void q4_dec_rms_q8_step(
     }
   }
   if (!skip_norm) {
-    apply_rmsnorm_n(g_dec.x_slice, g_dec.norm_w, ss, 1.0f / (float)CHUNK_K, read_eps(), 64, g_dec.x_slice);
+    apply_rmsnorm_n(g_dec.x_slice, g_dec.norm_w, ss, 1.0f / (float)CHUNK_K, read_eps(), 1.0f, 64, g_dec.x_slice);
   }
   quantize_q8_block32_x2(g_dec.x_slice, g_dec.xq_out, g_dec.xd_out);
 }
@@ -203,9 +208,9 @@ __attribute__((noinline, minsize)) static void q4_dec_rope_step(
     return;
   }
   const float eps = read_eps();
-  apply_rmsnorm_neox_rope_64(w_pkt + core_id * HEAD_DIM, g_dec.q_norm_w, eps, g_dec.rope_cs, g_dec.q_bf16);
+  apply_rmsnorm_neox_rope_64(w_pkt + core_id * HEAD_DIM, g_dec.q_norm_w, eps, kQScaleLog2e, g_dec.rope_cs, g_dec.q_bf16);
   if (r == 2) {
-    apply_rmsnorm_neox_rope_64(w_pkt + 2560 + c * HEAD_DIM, g_dec.k_norm_w, eps, g_dec.rope_cs, g_dec.kv_bf16);
+    apply_rmsnorm_neox_rope_64(w_pkt + 2560 + c * HEAD_DIM, g_dec.k_norm_w, eps, 1.0f, g_dec.rope_cs, g_dec.kv_bf16);
   } else if (r == 3) {
     f32_to_bf16_n(g_dec.kv_bf16, w_pkt + 3072 + c * HEAD_DIM, HEAD_DIM);
   }
@@ -227,10 +232,12 @@ __attribute__((noinline, minsize)) static void q4_dec_conv_step() {
   copy_f32_16(&g_dec.conv_state[1][0], g_dec.conv_bx, 64);
 }
 
-__attribute__((noinline, minsize)) static void q4_dec_silu_mul_step(int32_t n_passes) {
+__attribute__((noinline, minsize)) static void q4_dec_silu_mul_step(int32_t g_slot) {
+  const float *__restrict gp =
+      (g_slot == 0) ? &g_dec.ffn_gate[0][0] : &g_dec.ffn_gates_hi[g_slot - 1][0][0];
 #pragma clang loop unroll(disable)
-  for (int p = 0; p < n_passes; ++p) {
-    aie::vector<float, 16> gv = aie::load_v<16>(&g_dec.ffn_gate[p][0]);
+  for (int p = 0; p < 4; ++p) {
+    aie::vector<float, 16> gv = aie::load_v<16>(gp + p * 16);
     aie::vector<float, 16> uv = aie::load_v<16>(&g_dec.y_gemm[p][0]);
     aie::store_v(&g_dec.y_gemm[p][0], dec_fmul_16(dec_fmul_16(gv, dec_sigmoid_16(gv)), uv));
   }
@@ -299,7 +306,7 @@ __attribute__((noinline, minsize)) static void drain_q8_y_out(float *__restrict 
 __attribute__((minsize)) void q4_lfm2_dec_y_op(float *__restrict y_out, int32_t op, int32_t arg) {
   if (op == 0 || op == 6 || op == 7) {
     if (op == 6) {
-      q4_dec_silu_mul_step(4);
+      q4_dec_silu_mul_step(arg);
       quantize_q8_block32_x2(&g_dec.y_gemm[0][0], g_dec.xq_out, g_dec.xd_out);
     } else if (op == 7) {
       q4_dec_conv_step();
@@ -317,6 +324,13 @@ __attribute__((minsize)) void q4_lfm2_dec_y_op(float *__restrict y_out, int32_t 
     drain_q8_y_out(y_out);
   } else if (op == 9) {
     if (arg == 0) {
+      if (g_dec.params[6] == 2) {
+        aie::vector<float, 16> zf = aie::zeros<float, 16>();
+#pragma clang loop unroll(disable)
+        for (int d = 0; d < HEAD_DIM; d += 16) aie::store_v(g_dec.o_acc + d, zf);
+        g_dec.row_m = -1e30f;
+        g_dec.row_l = 0.0f;
+      }
       copy_f32_16(y_out, g_dec.o_acc, 64);
     } else {
       y_out[0] = g_dec.row_m;

@@ -829,15 +829,18 @@ pub(crate) fn gemv(gguf: &GgufFile, wref: &WeightRef, x: &[f32], y: &mut [f32]) 
 }
 
 #[cfg(feature = "xdna")]
-pub(crate) fn gemv_active(
+pub(crate) fn gemv_active_with_scratch(
     max_active: usize,
     gguf: &GgufFile,
     wref: &WeightRef,
     x: &[f32],
     y: &mut [f32],
+    q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
 ) {
     let data = weight_data(gguf, wref);
-    cpu::gemv_dispatch_active(max_active, wref.dtype, data, x, y, wref.m, wref.k, None);
+    cpu::gemv_dispatch_active(
+        max_active, wref.dtype, data, x, y, wref.m, wref.k, q8_scratch,
+    );
 }
 
 /// GEMV with pre-quantized Q8_0 input (skips re-quantizing x for each weight

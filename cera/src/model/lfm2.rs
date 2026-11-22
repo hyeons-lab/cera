@@ -2386,9 +2386,9 @@ impl LfmModel {
             })
     }
 
+    /// Cap the CPU Q6_K LM-head below SMT siblings while leaving physical cores free for the NPU driver.
     #[cfg(feature = "xdna")]
-    pub(crate) fn xdna_project_logits_into(&self, hidden: &[f32], logits: &mut [f32]) {
-        /// Cap the CPU Q6_K head below SMT siblings while leaving physical cores free for the NPU driver.
+    pub(crate) fn xdna_head_threads() -> usize {
         fn default_xdna_head_threads() -> usize {
             let cores = crate::backend::cpu_features::physical_core_count().unwrap_or_else(|| {
                 std::thread::available_parallelism()
@@ -2402,12 +2402,22 @@ impl LfmModel {
             }
         }
         static HEAD_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max_active = *HEAD_THREADS.get_or_init(|| {
+        *HEAD_THREADS.get_or_init(|| {
             std::env::var("CERA_NPU_HEAD_THREADS")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or_else(default_xdna_head_threads)
-        });
+        })
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_project_logits_into_with_scratch(
+        &self,
+        hidden: &[f32],
+        logits: &mut [f32],
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) {
+        let max_active = Self::xdna_head_threads();
         let mut normed = [0.0f32; 2048];
         let normed_slice = if hidden.len() <= normed.len() {
             let s = &mut normed[..hidden.len()];
@@ -2418,19 +2428,24 @@ impl LfmModel {
             logits[..self.config.vocab_size].fill(0.0);
             return;
         };
-        transformer::gemv_active(
+        transformer::gemv_active_with_scratch(
             max_active,
             &self.gguf,
             &self.logits_ref,
             normed_slice,
             &mut logits[..self.config.vocab_size],
+            q8_scratch,
         );
     }
 
     #[cfg(feature = "xdna")]
-    pub(crate) fn xdna_project_logits_from_hidden(&self, hidden: &[f32]) -> Vec<f32> {
+    pub(crate) fn xdna_project_logits_from_hidden_with_scratch(
+        &self,
+        hidden: &[f32],
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) -> Vec<f32> {
         let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.xdna_project_logits_into(hidden, &mut logits);
+        self.xdna_project_logits_into_with_scratch(hidden, &mut logits, q8_scratch);
         logits
     }
 

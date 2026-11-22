@@ -255,10 +255,12 @@ __attribute__((noinline)) static void q4_dec_conv_step() {
   copy_f32_16(&g_dec.conv_state[5][0], g_dec.conv_bx, 64);
 }
 
-__attribute__((noinline)) static void q4_dec_silu_mul_step(int32_t n_passes) {
+__attribute__((noinline)) static void q4_dec_silu_mul_step(int32_t n_passes, int32_t g_slot) {
+  const float *__restrict gp =
+      (g_slot == 0) ? &g_dec.ffn_gate[0][0] : &g_dec.ffn_gates_hi[g_slot - 1][0][0];
 #pragma clang loop unroll(disable)
   for (int p = 0; p < n_passes; ++p) {
-    aie::vector<float, 16> gv = aie::load_v<16>(&g_dec.ffn_gate[p][0]);
+    aie::vector<float, 16> gv = aie::load_v<16>(gp + p * 16);
     aie::vector<float, 16> uv = aie::load_v<16>(&g_dec.y_gemm[p][0]);
     aie::store_v(&g_dec.y_gemm[p][0], dec_fmul_16(dec_fmul_16(gv, dec_sigmoid_16(gv)), uv));
   }
@@ -352,13 +354,13 @@ void q4_lfm3_dec_y_op(float *__restrict y_out, int32_t op, int32_t arg) {
       y_out[1] = g_dec.row_l;
     }
   } else if (op == 9 || op == 6) {
-    if (op == 6) q4_dec_silu_mul_step(arg);
+    if (op == 6) q4_dec_silu_mul_step(4, arg);
     else q4_dec_conv_step();
     const float *__restrict q_src = (op == 6) ? &g_dec.y_gemm[0][0] : g_dec.x_slice;
     quantize_q8_block32_x2(q_src, g_dec.xq_out, g_dec.xd_out);
     drain_q8_y_out(y_out);
   } else {
-    if (op == 10) q4_dec_silu_mul_step(arg);
+    if (op == 10) q4_dec_silu_mul_step(3, arg);
     const float *__restrict src =
         (op == 1 || op == 10) ? &g_dec.y_gemm[0][0] :
         (op == 2) ? g_dec.x_slice :

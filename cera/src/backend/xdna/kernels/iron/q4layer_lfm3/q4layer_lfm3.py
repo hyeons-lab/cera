@@ -238,11 +238,15 @@ def q4layer_lfm3(
         emit_post_res(1, M014)
         emit_rms(1, 0, 0, M014)
 
-        for kc, npass in enumerate([4, 4, 4, 3]):
-            load_x = 1 if kc == 0 else 0
-            pt_outer = 1 if npass == 4 else 0
-            q8_bit = 1 if npass == 4 else 0
-            emit_gemm(npass, 1, (1 << 2) | (load_x << 1) | pt_outer, 2 | (q8_bit << 2), M014)
+        for g_slot in range(3):
+            load_x = 1 if g_slot == 0 else 0
+            # Gate chunks 0..2 cached across dead xq_buf[1..4]: pt_outer=1, dst_gate=1, do_drain=0
+            emit_gemm(4, 1, (load_x << 1) | 1, 1 | (g_slot << 3), M014)
+        for g_slot in range(3):
+            # Up chunks 0..2 + SiLU*Gate + Q8 drain: pt_outer=1, do_drain=1, drain_q8=1, do_silu=1
+            emit_gemm(4, 1, 1, 2 | 4 | (g_slot << 3) | 32, M014)
+        emit_gemm(3, 1, 0, 1, M014)            # trailing Gate chunk 3 -> ffn_gate
+        emit_gemm(3, 1, 0, 2 | 32, M014)       # trailing Up chunk 3 -> SiLU*Gate f32 drain -> SLOT_SW+3*2048
         emit_rms(-1, 0, 2, M014)
 
         emit_gemm(4, 4, 0b0010, 2, M014)      # FFN_DOWN (4 passes x 4 K-chunks, load_x per kc)
@@ -283,6 +287,7 @@ def q4layer_lfm3(
             i32_5 = arith.constant(i32_ty, 5)
             i32_6 = arith.constant(i32_ty, 6)
             i32_10 = arith.constant(i32_ty, 10)
+            i32_32 = arith.constant(i32_ty, 32)
             my_r = arith.constant(i32_ty, r)
             half_r = arith.constant(i32_ty, half_r_val)
             is_w0 = arith.constant(i32_ty, is_w0_val)
@@ -335,14 +340,15 @@ def q4layer_lfm3(
                                 pt_outer = arith.cmpi(arith.CmpIPredicate.ne, arith.andi(op, i32_1), i32_0)
                                 load_x = arith.cmpi(arith.CmpIPredicate.ne, arith.andi(op, i32_2), i32_0)
                                 mode_sel = arith.shrui(op, i32_2)
-                                is_fg = arith.cmpi(arith.CmpIPredicate.eq, mode_sel, i32_1)
                                 is_bcx = arith.cmpi(arith.CmpIPredicate.eq, mode_sel, i32_2)
-                                n_ghalf = arith.select(is_bcx, idx3, arith.select(is_fg, idx2, idx1))
+                                n_ghalf = arith.select(is_bcx, idx3, idx1)
                                 dst_gate = arith.andi(a2, i32_1)
                                 do_drain = arith.cmpi(arith.CmpIPredicate.ne, arith.andi(a2, i32_2), i32_0)
                                 drain_q8 = arith.cmpi(arith.CmpIPredicate.ne, arith.andi(a2, i32_4), i32_0)
-                                y_drain_op = arith.select(is_fg, arith.select(drain_q8, i32_6, i32_10), i32_1)
-                                y_drain_arg = arith.select(is_fg, a0, i32_0)
+                                g_slot = arith.andi(arith.shrui(a2, i32_3), i32_3)
+                                do_silu = arith.cmpi(arith.CmpIPredicate.ne, arith.andi(a2, i32_32), i32_0)
+                                y_drain_op = arith.select(do_silu, arith.select(drain_q8, i32_6, i32_10), i32_1)
+                                y_drain_arg = arith.select(do_silu, g_slot, i32_0)
                                 n_outer = arith.select(pt_outer, idx2, arith.index_cast(idx_ty, a0))
                                 n_inner = arith.select(pt_outer, arith.index_cast(idx_ty, a0), idx2)
                                 packed_xq = arith.cmpi(arith.CmpIPredicate.sgt, a1, i32_1)
@@ -351,12 +357,12 @@ def q4layer_lfm3(
                                     xp = w_fifo.acquire(1)
                                     q4_w_fn(xp, i32_5, i32_0, xq_a1, i32_0)
                                     w_fifo.release(1)
+                                g_slot_shift = arith.shli(g_slot, i32_5)
                                 for gh in range_(n_ghalf):
                                     is_gh0 = arith.cmpi(arith.CmpIPredicate.eq, gh, idx0)
                                     is_gh1 = arith.cmpi(arith.CmpIPredicate.eq, gh, idx1)
-                                    gh_fg = arith.select(is_gh0, i32_1, i32_0)
                                     gh_bcx = arith.select(is_gh0, i32_1, arith.select(is_gh1, i32_2, i32_0))
-                                    gh_dst = arith.select(is_bcx, gh_bcx, arith.select(is_fg, gh_fg, dst_gate))
+                                    gh_dst = arith.select(is_bcx, gh_bcx, dst_gate)
                                     dst_shift = arith.shli(gh_dst, i32_1)
                                     for oi in range_(n_outer):
                                         for ii in range_(n_inner):
@@ -366,7 +372,9 @@ def q4layer_lfm3(
                                                 is_sub = arith.cmpi(arith.CmpIPredicate.ne, kc, idx0)
                                                 add_bit = arith.select(is_sub, i32_1, i32_0)
                                                 x_slot = arith.shli(i32(kc), i32_3)
-                                                gflags = arith.ori(add_bit, arith.ori(dst_shift, x_slot))
+                                                gflags = arith.ori(
+                                                    add_bit, arith.ori(dst_shift, arith.ori(x_slot, g_slot_shift))
+                                                )
                                                 wp = w_fifo.acquire(1)
                                                 is_mine = arith.cmpi(arith.CmpIPredicate.eq, cur_pt, half_r)
                                                 with if_(is_mine, hasElse=False):
@@ -663,12 +671,12 @@ def q4layer_lfm3(
         # Shared tail (Modes 0, 1, 4): res1 (using SLOT_NORM_0.post_norm_w) -> SLOT_NORM_1 + rms1 -> FFN -> down -> res2
         if layer_mode in (0, 1, 4):
             tg_res1 = TaskGroup()
-            fill_bcast(y_buf, [ACT_TOTAL], SLOT_RES_TMP, tg_res1, wait=True)
-            drain_linear(y_buf, [ACT_TOTAL], SLOT_H1, tg_res1)
+            fill_bcast(y_buf, [ACT_TOTAL], SLOT_RES_TMP, tg_res1, wait=False)
+            drain_linear(y_buf, [ACT_TOTAL], SLOT_H1, tg_res1, wait=True)
+            fill_bcast(y_buf, [ACT_TOTAL], SLOT_NORM_1, tg_res1, wait=True)
             tg_res1.finish()
 
             tg_rms1 = TaskGroup()
-            fill_bcast(y_buf, [ACT_TOTAL], SLOT_NORM_1, tg_rms1)
             fill_bcast(y_buf, [ACT_TOTAL], SLOT_H1, tg_rms1, wait=True)
             drain_linear(y_buf, [ACT_TOTAL], SLOT_XQ, tg_rms1)
             tg_rms1.finish()
@@ -677,30 +685,61 @@ def q4layer_lfm3(
             ffn_u_base = W_CONV_FFN_UP if layer_mode == 0 else W_ATTN_FFN_UP
             ffn_d_base = W_CONV_FFN_DOWN if layer_mode == 0 else W_ATTN_FFN_DOWN
 
-            # kc=0 (XQ + Gate0 + Up0 -> FFN_XQ+0)
-            tg_f0 = TaskGroup()
-            fill_bcast(y_buf, [ACT_TOTAL], SLOT_XQ, tg_f0)
-            fill_w_pair_1d(w_buf, [W_TOTAL], [ffn_g_base + c * 16 * W_ELEMS for c in range(N_COLS)], [ffn_g_base + (c * 16 + 8) * W_ELEMS for c in range(N_COLS)], 8 * W_ELEMS, tg_f0)
-            fill_w_pair_1d(w_buf, [W_TOTAL], [ffn_u_base + c * 16 * W_ELEMS for c in range(N_COLS)], [ffn_u_base + (c * 16 + 8) * W_ELEMS for c in range(N_COLS)], 8 * W_ELEMS, tg_f0, wait=True)
-            drain_linear(y_buf, [ACT_TOTAL], SLOT_FFN_XQ, tg_f0)
-            tg_f0.finish()
-
-            # kc=1,2 fused (4 MM2S BDs, 2 S2MM BDs)
-            tg_f12 = TaskGroup()
-            for kc in (1, 2):
-                off = kc * 128
-                fill_w_pair_1d(w_buf, [W_TOTAL], [ffn_g_base + (off + c * 16) * W_ELEMS for c in range(N_COLS)], [ffn_g_base + (off + c * 16 + 8) * W_ELEMS for c in range(N_COLS)], 8 * W_ELEMS, tg_f12)
-                fill_w_pair_1d(w_buf, [W_TOTAL], [ffn_u_base + (off + c * 16) * W_ELEMS for c in range(N_COLS)], [ffn_u_base + (off + c * 16 + 8) * W_ELEMS for c in range(N_COLS)], 8 * W_ELEMS, tg_f12, wait=(kc == 2))
-                drain_linear(y_buf, [ACT_TOTAL], SLOT_FFN_XQ + kc * 2560, tg_f12, wait=(kc == 2))
-            tg_f12.finish()
-
-            # kc=3 (npass=3 trailing 1536 -> SLOT_SW + 3*2048 -> 1-pkt Q8 -> SLOT_FFN_XQ + 3*2560)
+            # Unified FFN Gate+Up across kc=0..3 in 1 TaskGroup: G0..G2 + U0..U2 (Q8) + G3 + U3 (f32 repack)
             off3 = 3 * 128
-            tg_f3 = TaskGroup()
-            fill_w_pair_tap(w_buf, [W_TOTAL], [ffn_g_base + (off3 + c * 4) * W_ELEMS for c in range(N_COLS)], [ffn_g_base + (off3 + c * 4 + 2) * W_ELEMS for c in range(N_COLS)], [3, 18, 512], [32 * W_ELEMS, 512, 1], tg_f3)
-            fill_w_pair_tap(w_buf, [W_TOTAL], [ffn_u_base + (off3 + c * 4) * W_ELEMS for c in range(N_COLS)], [ffn_u_base + (off3 + c * 4 + 2) * W_ELEMS for c in range(N_COLS)], [3, 18, 512], [32 * W_ELEMS, 512, 1], tg_f3, wait=True)
-            drain_strided(SLOT_SW + 3 * 2048, tg_f3)
-            tg_f3.finish()
+            tg_ffn = TaskGroup()
+            fill_bcast(y_buf, [ACT_TOTAL], SLOT_XQ, tg_ffn)
+            fill_w_pair_tap(
+                w_buf,
+                [W_TOTAL],
+                [ffn_g_base + c * 16 * W_ELEMS for c in range(N_COLS)],
+                [ffn_g_base + (c * 16 + 8) * W_ELEMS for c in range(N_COLS)],
+                [3, 144, 256],
+                [128 * W_ELEMS, 256, 1],
+                tg_ffn,
+            )
+            fill_w_pair_tap(
+                w_buf,
+                [W_TOTAL],
+                [ffn_u_base + c * 16 * W_ELEMS for c in range(N_COLS)],
+                [ffn_u_base + (c * 16 + 8) * W_ELEMS for c in range(N_COLS)],
+                [3, 144, 256],
+                [128 * W_ELEMS, 256, 1],
+                tg_ffn,
+            )
+            fill_w_pair_tap(
+                w_buf,
+                [W_TOTAL],
+                [ffn_g_base + (off3 + c * 4) * W_ELEMS for c in range(N_COLS)],
+                [ffn_g_base + (off3 + c * 4 + 2) * W_ELEMS for c in range(N_COLS)],
+                [3, 18, 512],
+                [32 * W_ELEMS, 512, 1],
+                tg_ffn,
+            )
+            fill_w_pair_tap(
+                w_buf,
+                [W_TOTAL],
+                [ffn_u_base + (off3 + c * 4) * W_ELEMS for c in range(N_COLS)],
+                [ffn_u_base + (off3 + c * 4 + 2) * W_ELEMS for c in range(N_COLS)],
+                [3, 18, 512],
+                [32 * W_ELEMS, 512, 1],
+                tg_ffn,
+                wait=True,
+            )
+            for c in range(N_COLS):
+                yc_h[c].drain(
+                    y_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=[ACT_TOTAL],
+                        offset=SLOT_FFN_XQ + c * 256,
+                        sizes=[3, 256],
+                        strides=[2560, 1],
+                    ),
+                    wait=False,
+                    group=tg_ffn,
+                )
+            drain_strided(SLOT_SW + 3 * 2048, tg_ffn)
+            tg_ffn.finish()
 
             tg_q3 = TaskGroup()
             fill_bcast(y_buf, [ACT_TOTAL], SLOT_SW + 3 * 2048, tg_q3, wait=True)

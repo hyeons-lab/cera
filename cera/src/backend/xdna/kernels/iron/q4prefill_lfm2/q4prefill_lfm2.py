@@ -115,10 +115,10 @@ def q4prefill_lfm2(
     y_core_ty = np.ndarray[(Y_CORE_ELEMS,), np.dtype[np.float32]]
     y_col_ty = np.ndarray[(Y_COL_ELEMS,), np.dtype[np.float32]]
 
-    gemm_flags = ["-I", str(here), "-I", str(cxx_inc), "-Os"]
-    fa_flags = ["-I", str(here), "-I", str(cxx_inc), "-Os", "-fno-unroll-loops", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1"]
-    core_flags = ["-I", str(here), "-I", str(cxx_inc), "-O2", "-fno-unroll-loops"]
     oz_flags = ["-I", str(here), "-I", str(cxx_inc), "-Oz", "-fno-unroll-loops"]
+    fa_flags = oz_flags + ["-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1"]
+    gemm_flags = oz_flags
+    core_flags = oz_flags
     q4_gemm_fn = ExternalFunction(
         "q4_lfm2_pre_gemm_op",
         source_file=str(here / "q4_lfm2_gemm_op.cc"),
@@ -402,7 +402,7 @@ def q4prefill_lfm2(
                 q4_y_fn,
             ],
             tile=Tile(c, 2 + r),
-            stack_size=2240,
+            stack_size=2880,
             while_true=True,
         )
         for c in range(N_COLS)
