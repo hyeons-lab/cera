@@ -89,6 +89,36 @@ impl Gen {
         }
     }
 
+    fn f16(&mut self, name: &str, dims: &[usize], scale: f32, base: f32) -> Tensor {
+        let n: usize = dims.iter().product();
+        Tensor {
+            name: name.into(),
+            dims: dims.to_vec(),
+            ggml_type: 1,
+            data: (0..n)
+                .flat_map(|_| {
+                    crate::quant::f32_to_f16(base + self.next() * 2.0 * scale).to_le_bytes()
+                })
+                .collect(),
+        }
+    }
+
+    fn bf16(&mut self, name: &str, dims: &[usize], scale: f32, base: f32) -> Tensor {
+        let n: usize = dims.iter().product();
+        Tensor {
+            name: name.into(),
+            dims: dims.to_vec(),
+            ggml_type: 30,
+            data: (0..n)
+                .flat_map(|_| {
+                    half::bf16::from_f32(base + self.next() * 2.0 * scale)
+                        .to_bits()
+                        .to_le_bytes()
+                })
+                .collect(),
+        }
+    }
+
     /// Q4_0 blocks: a finite f16 scale followed by random nibbles.
     fn q4_0(&mut self, name: &str, dims: &[usize]) -> Tensor {
         let blocks: usize = dims.iter().product::<usize>() / 32;
@@ -2859,4 +2889,436 @@ fn lfm3_d1_all_backends_match_cpu() {
             &got_long_decode,
         );
     }
+}
+
+fn encode_dense_tensor(
+    rng: &mut Gen,
+    ggml_type: u32,
+    name: &str,
+    dims: &[usize],
+    scale: f32,
+) -> Tensor {
+    if ggml_type == 1 {
+        rng.f16(name, dims, scale, 0.0)
+    } else {
+        rng.bf16(name, dims, scale, 0.0)
+    }
+}
+
+/// Generative LFM2 models carrying F16 or BF16 weights (including
+/// `shortconv.in_proj.weight`, which some Q4_0 GGUFs retain unquantized) load
+/// through `from_gguf_on` as Q8_0 and run prefill/decode without refusing F16.
+#[test]
+fn lfm2_shortconv_in_proj_f16_and_bf16_load_on_hexagon() {
+    for (label, ggml_type) in [("f16", 1u32), ("bf16", 30u32)] {
+        let mut g = Gen(0x9e37_79b9 + u64::from(ggml_type));
+        let q_dim = N_HEADS * HEAD_DIM;
+        let t = vec![
+            encode_dense_tensor(&mut g, ggml_type, "token_embd.weight", &[HS, VOCAB], 0.3),
+            g.f32("token_embd_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.attn_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.ffn_norm.weight", &[HS], 0.1, 1.0),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.shortconv.in_proj.weight",
+                &[HS, 3 * HS],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.shortconv.out_proj.weight",
+                &[HS, HS],
+                0.3,
+            ),
+            g.f32("blk.0.shortconv.conv.weight", &[3, HS], 0.3, 0.0),
+            g.q4_0("blk.0.ffn_gate.weight", &[HS, INTER]),
+            g.q4_0("blk.0.ffn_up.weight", &[HS, INTER]),
+            g.q4_0("blk.0.ffn_down.weight", &[INTER, HS]),
+            g.f32("blk.1.attn_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.1.ffn_norm.weight", &[HS], 0.1, 1.0),
+            encode_dense_tensor(&mut g, ggml_type, "blk.1.attn_q.weight", &[HS, q_dim], 0.3),
+            g.q4_0("blk.1.attn_k.weight", &[HS, HEAD_DIM]),
+            g.q4_0("blk.1.attn_v.weight", &[HS, HEAD_DIM]),
+            g.q4_0("blk.1.attn_output.weight", &[q_dim, HS]),
+            g.f32("blk.1.attn_q_norm.weight", &[HEAD_DIM], 0.1, 1.0),
+            g.f32("blk.1.attn_k_norm.weight", &[HEAD_DIM], 0.1, 1.0),
+            g.q4_0("blk.1.ffn_gate.weight", &[HS, INTER]),
+            g.q4_0("blk.1.ffn_up.weight", &[HS, INTER]),
+            g.q4_0("blk.1.ffn_down.weight", &[INTER, HS]),
+        ];
+        let kv = vec![
+            ("general.architecture".into(), KvValue::Str("lfm2".into())),
+            u32kv("block_count", "lfm2", 2),
+            u32kv("embedding_length", "lfm2", HS as u32),
+            u32kv("feed_forward_length", "lfm2", INTER as u32),
+            u32kv("attention.head_count", "lfm2", N_HEADS as u32),
+            (
+                "lfm2.attention.head_count_kv".into(),
+                KvValue::I32Array(vec![0, 1]),
+            ),
+            u32kv("shortconv.l_cache", "lfm2", 3),
+            (
+                "lfm2.attention.layer_norm_rms_epsilon".into(),
+                KvValue::F32(1e-5),
+            ),
+            ("lfm2.rope.freq_base".into(), KvValue::F32(10_000.0)),
+            u32kv("context_length", "lfm2", 64),
+            u32kv("vocab_size", "lfm2", VOCAB as u32),
+        ];
+        let model = HexagonLfmModel::from_gguf_on(backend(), gguf(kv, t), 64)
+            .unwrap_or_else(|e| panic!("{label} lfm2 failed to load: {e}"));
+        let HexagonLayer::Conv(conv) = &model.layers[0] else {
+            panic!("layer 0 must be Conv");
+        };
+        assert_eq!(conv.in_proj.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(conv.out_proj.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(model.lm_head.wire_dtype, HtpDataType::Q8_0, "{label}");
+        let mut state =
+            InferenceState::from_config_capped(&model.config, &KvCompression::None, 64).unwrap();
+        model
+            .try_forward_input(DecodeInput::Token(1), DecodeOutput::Logits, 0, &mut state)
+            .unwrap();
+    }
+}
+
+/// Stacked MoE experts in F16 or BF16 plan and repack to Q8_0 across `GgufSource`.
+#[test]
+fn moe_stacked_experts_f16_and_bf16_load_on_hexagon() {
+    for (label, ggml_type) in [("f16", 1u32), ("bf16", 30u32)] {
+        let mut g = Gen(0x7155_aa00 + u64::from(ggml_type));
+        let q_dim = N_HEADS * HEAD_DIM;
+        let t = vec![
+            g.f32("token_embd.weight", &[HS, VOCAB], 1.0, 0.0),
+            g.f32("token_embd_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.attn_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.ffn_norm.weight", &[HS], 0.1, 1.0),
+            g.q4_0("blk.0.attn_q.weight", &[HS, q_dim]),
+            g.q4_0("blk.0.attn_k.weight", &[HS, HEAD_DIM]),
+            g.q4_0("blk.0.attn_v.weight", &[HS, HEAD_DIM]),
+            g.q4_0("blk.0.attn_output.weight", &[q_dim, HS]),
+            g.f32("blk.0.attn_q_norm.weight", &[HEAD_DIM], 0.1, 1.0),
+            g.f32("blk.0.attn_k_norm.weight", &[HEAD_DIM], 0.1, 1.0),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_gate_inp.weight",
+                &[HS, N_EXPERT],
+                0.25,
+            ),
+            g.f32("blk.0.exp_probs_b.bias", &[N_EXPERT], 0.05, 0.0),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_gate_exps.weight",
+                &[HS, EXPERT_FF, N_EXPERT],
+                0.25,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_up_exps.weight",
+                &[HS, EXPERT_FF, N_EXPERT],
+                0.25,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_down_exps.weight",
+                &[EXPERT_FF, HS, N_EXPERT],
+                0.25,
+            ),
+        ];
+        let kv = vec![
+            (
+                "general.architecture".into(),
+                KvValue::Str("lfm2moe".into()),
+            ),
+            u32kv("block_count", "lfm2moe", 1),
+            u32kv("embedding_length", "lfm2moe", HS as u32),
+            u32kv("feed_forward_length", "lfm2moe", INTER as u32),
+            u32kv("attention.head_count", "lfm2moe", N_HEADS as u32),
+            (
+                "lfm2moe.attention.head_count_kv".into(),
+                KvValue::I32Array(vec![1]),
+            ),
+            (
+                "lfm2moe.attention.layer_norm_rms_epsilon".into(),
+                KvValue::F32(1e-5),
+            ),
+            ("lfm2moe.rope.freq_base".into(), KvValue::F32(10_000.0)),
+            u32kv("context_length", "lfm2moe", 64),
+            u32kv("vocab_size", "lfm2moe", VOCAB as u32),
+            u32kv("expert_gating_func", "lfm2moe", 2),
+            u32kv("expert_count", "lfm2moe", N_EXPERT as u32),
+            u32kv("expert_used_count", "lfm2moe", N_USED as u32),
+            u32kv("expert_feed_forward_length", "lfm2moe", EXPERT_FF as u32),
+        ];
+        let model = HexagonLfmModel::from_gguf_on(backend(), gguf(kv, t), 64)
+            .unwrap_or_else(|e| panic!("{label} moe failed to load: {e}"));
+        let m = moe_of(&model.layers[0]).expect("MoE FFN");
+        assert_eq!(m.router.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(m.gate.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(m.up.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(m.down.wire_dtype, HtpDataType::Q8_0, "{label}");
+        let mut state =
+            InferenceState::from_config_capped(&model.config, &KvCompression::None, 64).unwrap();
+        model
+            .try_forward_input(DecodeInput::Token(2), DecodeOutput::Logits, 0, &mut state)
+            .unwrap();
+    }
+}
+
+/// `DenseSource` and `Qwen35Source` requantize F16 and BF16 weights to Q8_0
+/// through `copy_weight_f16` and `repack_weight`.
+#[test]
+fn dense_and_qwen35_f16_and_bf16_load_on_hexagon() {
+    for (label, ggml_type) in [("f16", 1u32), ("bf16", 30u32)] {
+        let mut g = Gen(0x3344_5566 + u64::from(ggml_type));
+        let q_dim = N_HEADS * HEAD_DIM;
+        let dense_t = vec![
+            encode_dense_tensor(&mut g, ggml_type, "token_embd.weight", &[HS, VOCAB], 0.3),
+            g.f32("output_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.attn_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.ffn_norm.weight", &[HS], 0.1, 1.0),
+            encode_dense_tensor(&mut g, ggml_type, "blk.0.attn_q.weight", &[HS, q_dim], 0.3),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.attn_k.weight",
+                &[HS, HEAD_DIM],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.attn_v.weight",
+                &[HS, HEAD_DIM],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.attn_output.weight",
+                &[q_dim, HS],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_gate.weight",
+                &[HS, INTER],
+                0.3,
+            ),
+            encode_dense_tensor(&mut g, ggml_type, "blk.0.ffn_up.weight", &[HS, INTER], 0.3),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_down.weight",
+                &[INTER, HS],
+                0.3,
+            ),
+        ];
+        let dense_kv = vec![
+            ("general.architecture".into(), KvValue::Str("llama".into())),
+            u32kv("block_count", "llama", 1),
+            u32kv("embedding_length", "llama", HS as u32),
+            u32kv("feed_forward_length", "llama", INTER as u32),
+            u32kv("attention.head_count", "llama", N_HEADS as u32),
+            u32kv("attention.head_count_kv", "llama", 1),
+            (
+                "llama.attention.layer_norm_rms_epsilon".into(),
+                KvValue::F32(1e-6),
+            ),
+            ("llama.rope.freq_base".into(), KvValue::F32(10_000.0)),
+            u32kv("context_length", "llama", 64),
+            u32kv("vocab_size", "llama", VOCAB as u32),
+        ];
+        let dense = HexagonLfmModel::from_llama_on(backend(), gguf(dense_kv, dense_t), None, 64)
+            .unwrap_or_else(|e| panic!("{label} dense failed to load: {e}"));
+        let HexagonLayer::Attention(a) = &dense.layers[0] else {
+            panic!("dense layer 0 must be Attention");
+        };
+        assert_eq!(a.attn_q.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(dense.lm_head.wire_dtype, HtpDataType::Q8_0, "{label}");
+        let mut dense_state =
+            InferenceState::from_config_capped(&dense.config, &KvCompression::None, 64).unwrap();
+        dense
+            .try_forward_input(
+                DecodeInput::Token(1),
+                DecodeOutput::Logits,
+                0,
+                &mut dense_state,
+            )
+            .unwrap();
+
+        const DN_GROUP: usize = 2;
+        const DN_STATE: usize = 16;
+        const DN_RANK: usize = 4;
+        const DN_CONV_K: usize = 4;
+        const CONV_DIM: usize = 2 * DN_GROUP * DN_STATE + DN_RANK * DN_STATE;
+        const VALUE_DIM: usize = DN_RANK * DN_STATE;
+        let qwen_t = vec![
+            encode_dense_tensor(&mut g, ggml_type, "token_embd.weight", &[HS, VOCAB], 0.3),
+            g.f32("output_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.attn_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.0.attn_post_norm.weight", &[HS], 0.1, 1.0),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_gate.weight",
+                &[HS, INTER],
+                0.3,
+            ),
+            encode_dense_tensor(&mut g, ggml_type, "blk.0.ffn_up.weight", &[HS, INTER], 0.3),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ffn_down.weight",
+                &[INTER, HS],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.attn_qkv.weight",
+                &[HS, CONV_DIM],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.attn_gate.weight",
+                &[HS, VALUE_DIM],
+                0.3,
+            ),
+            g.f32("blk.0.ssm_conv1d.weight", &[DN_CONV_K, CONV_DIM], 0.2, 0.0),
+            g.f32("blk.0.ssm_conv1d.bias", &[CONV_DIM], 0.05, 0.0),
+            g.f32("blk.0.ssm_dt.bias", &[DN_RANK], 0.1, 0.5),
+            g.f32("blk.0.ssm_a", &[DN_RANK], 0.1, -0.5),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ssm_beta.weight",
+                &[HS, DN_RANK],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ssm_alpha.weight",
+                &[HS, DN_RANK],
+                0.3,
+            ),
+            g.f32("blk.0.ssm_norm.weight", &[DN_STATE], 0.1, 1.0),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.0.ssm_out.weight",
+                &[VALUE_DIM, HS],
+                0.3,
+            ),
+            g.f32("blk.1.attn_norm.weight", &[HS], 0.1, 1.0),
+            g.f32("blk.1.attn_post_norm.weight", &[HS], 0.1, 1.0),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.1.ffn_gate.weight",
+                &[HS, INTER],
+                0.3,
+            ),
+            encode_dense_tensor(&mut g, ggml_type, "blk.1.ffn_up.weight", &[HS, INTER], 0.3),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.1.ffn_down.weight",
+                &[INTER, HS],
+                0.3,
+            ),
+            encode_dense_tensor(&mut g, ggml_type, "blk.1.attn_q.weight", &[HS, q_dim], 0.3),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.1.attn_k.weight",
+                &[HS, HEAD_DIM],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.1.attn_v.weight",
+                &[HS, HEAD_DIM],
+                0.3,
+            ),
+            encode_dense_tensor(
+                &mut g,
+                ggml_type,
+                "blk.1.attn_output.weight",
+                &[q_dim, HS],
+                0.3,
+            ),
+            g.f32("blk.1.attn_q_norm.weight", &[HEAD_DIM], 0.1, 1.0),
+            g.f32("blk.1.attn_k_norm.weight", &[HEAD_DIM], 0.1, 1.0),
+        ];
+        let p = "qwen35";
+        let qwen_kv = vec![
+            ("general.architecture".into(), KvValue::Str("qwen35".into())),
+            u32kv("block_count", p, 2),
+            u32kv("embedding_length", p, HS as u32),
+            u32kv("feed_forward_length", p, INTER as u32),
+            u32kv("attention.head_count", p, N_HEADS as u32),
+            u32kv("attention.head_count_kv", p, 1),
+            u32kv("attention.key_length", p, HEAD_DIM as u32),
+            (
+                format!("{p}.attention.layer_norm_rms_epsilon"),
+                KvValue::F32(1e-6),
+            ),
+            (format!("{p}.rope.freq_base"), KvValue::F32(10_000.0)),
+            u32kv("rope.dimension_count", p, 16),
+            u32kv("ssm.conv_kernel", p, DN_CONV_K as u32),
+            u32kv("ssm.state_size", p, DN_STATE as u32),
+            u32kv("ssm.time_step_rank", p, DN_RANK as u32),
+            u32kv("ssm.group_count", p, DN_GROUP as u32),
+            u32kv("ssm.inner_size", p, VALUE_DIM as u32),
+            u32kv("full_attention_interval", p, 2),
+            u32kv("context_length", p, 64),
+            u32kv("vocab_size", p, VOCAB as u32),
+        ];
+        let cpu = crate::model::qwen35::Qwen35Model::from_gguf(gguf(qwen_kv, qwen_t), 64).unwrap();
+        let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64)
+            .unwrap_or_else(|e| panic!("{label} qwen35 failed to load: {e}"));
+        let HexagonLayer::DeltaNet(dn) = &qwen35.layers[0] else {
+            panic!("qwen35 layer 0 must be DeltaNet");
+        };
+        assert_eq!(dn.wqkv.wire_dtype, HtpDataType::Q8_0, "{label}");
+        assert_eq!(qwen35.lm_head.wire_dtype, HtpDataType::Q8_0, "{label}");
+        let mut qwen_state =
+            InferenceState::from_config_capped(&qwen35.config, &KvCompression::None, 64).unwrap();
+        qwen35
+            .try_forward_input(
+                DecodeInput::Token(1),
+                DecodeOutput::Logits,
+                0,
+                &mut qwen_state,
+            )
+            .unwrap();
+    }
+}
+
+/// Real `LFM2.5-Audio-1.5B-Q4_0.gguf` builds through `from_gguf_on` on the fake device.
+/// Skips without the fixture; fails under `CERA_REQUIRE_MODEL`.
+#[cfg(feature = "mmap")]
+#[test]
+fn real_lfm25_audio_1_5b_gguf_builds_on_the_fake_device() {
+    let home = std::env::var("HOME").expect("HOME unset");
+    let path = std::path::PathBuf::from(home)
+        .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !crate::model::transformer::require_model_or_skip(&path) {
+        return;
+    }
+    let model = HexagonLfmModel::from_gguf_on(backend(), GgufFile::open(&path).unwrap(), 64)
+        .expect("LFM2.5-Audio-1.5B-Q4_0.gguf must load on Hexagon");
+    assert_eq!(model.config.architecture, "lfm2");
+    assert!(!model.layers.is_empty());
 }
