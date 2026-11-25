@@ -1839,14 +1839,14 @@ impl HexagonLfmModel {
         if paged && !paging.allow_paged {
             return Err(paging_refused(gguf_bytes, kv_bytes, &paging));
         }
-        // A decision or d1 model's trunk may be an F16 file: its encoder passes run those
-        // matmuls on the HMX from the file's own bytes (any other model refuses an F16 matmul
-        // tensor).
+        // A decision or d1 model's trunk may run its encoder F16 matmuls on the HMX
+        // from the file's own bytes; generative models include single-token decode
+        // (no HMX F16 kernel), so F16 weights are requantized to Q8_0 at load time.
         let f16_policy = if crate::model::is_encoder_trunk(&gguf) {
             let threads = device.queue_session_mut().dsp_threads();
             decision_f16_policy(knobs.use_hmx, knobs.decision_f16, device.hw_info(), threads)
         } else {
-            F16Weights::Refuse
+            F16Weights::Q8
         };
         let mut plan = WeightPlanner::new(&src)
             .with_paged_experts(paged)
@@ -2218,7 +2218,7 @@ impl HexagonLfmModel {
         } = ModelBuffers::alloc(driver, &scratch_offsets, max_seq_len * 2, false)?;
 
         let src = Qwen35Source { cpu };
-        let mut plan = WeightPlanner::new(&src);
+        let mut plan = WeightPlanner::new(&src).with_f16(F16Weights::Q8);
         let mut kv = KvPlanner::new(kv_dtype, max_seq_len);
 
         let mut layers = Vec::with_capacity(n_layers);
@@ -2497,7 +2497,7 @@ impl HexagonLfmModel {
         )?;
 
         let src_tensors = DenseSource { src, extras };
-        let mut plan = WeightPlanner::new(&src_tensors);
+        let mut plan = WeightPlanner::new(&src_tensors).with_f16(F16Weights::Q8);
         let mut kv = KvPlanner::new(kv_dtype, max_seq_len);
         let moe_dims = |i: usize| {
             src.moe_refs(i).map(|m| MoeDims {

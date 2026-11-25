@@ -9,10 +9,10 @@ use super::{
 };
 use crate::backend::hexagon::{
     HMX_MM_MIN_NROWS, HtpDataType, RpcmemBuffer, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K,
-    TILE_SIZE_Q8_0, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q4_1, repack_q4_k,
-    repack_q6_k, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q4_1,
-    repacked_matrix_size_q4_k, repacked_matrix_size_q6_k, repacked_matrix_size_q8_0,
-    requant_q5_k_to_q8_0,
+    TILE_SIZE_Q8_0, hexagon_warn, repack_bf16_to_q8_0, repack_f16_to_q8_0, repack_f32_to_q8_0,
+    repack_q4_0, repack_q4_1, repack_q4_k, repack_q6_k, repack_q8_0, repacked_matrix_size_q4_0,
+    repacked_matrix_size_q4_1, repacked_matrix_size_q4_k, repacked_matrix_size_q6_k,
+    repacked_matrix_size_q8_0, requant_q5_k_to_q8_0,
 };
 use crate::gguf::GgufFile;
 use crate::model::ModelConfig;
@@ -72,38 +72,33 @@ pub(super) trait TensorSource {
         sw: &HexagonStackedWeight,
         buf: &mut RpcmemBuffer,
     ) -> Result<(), CeraError>;
-    /// Copy the F16 weight `name` into `buf` at `offset` as the planner chose (see
-    /// [`F16Weights`]): `plain` keeps the file's bytes, otherwise Q8_0 wire bytes. Only the
-    /// GGUF source carries F16 weights.
+    /// Copy the plain F16 weight `name` into `buf` at `offset` verbatim for the HMX.
     fn copy_weight_f16(
         &self,
         name: &str,
         _offset: usize,
-        _plain: bool,
         _buf: &mut RpcmemBuffer,
     ) -> Result<(), CeraError> {
         Err(CeraError::Backend(format!(
-            "unsupported quant format F16 for Hexagon weight {name}"
+            "unsupported plain F16 copy for Hexagon weight {name}"
         )))
     }
 }
 
-/// How the planner takes an F16 matmul tensor.
+/// How the planner lays out an F16 matmul tensor.
 ///
 /// The DSP's quantized matmuls cannot read F16 and the generative engine has no F16 matmul
-/// path, so the default refuses it (an F16 generative GGUF is unsupported, as before). The
-/// decision model's encoder passes run F16 matmuls on the HMX from the file's own bytes, the
-/// precision its reference is defined at.
+/// path, so F16 weights default to [`F16Weights::Q8`] (requantized to Q8_0 at load time). The
+/// decision model's encoder passes may opt into [`F16Weights::Plain`] to run F16 matmuls on the
+/// HMX from the file's own bytes, the precision its reference is defined at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum F16Weights {
-    /// An F16 matmul tensor is an error.
+    /// Q8_0 for every F16 tensor: generative models, a device without the HMX, or the opt-out.
     #[default]
-    Refuse,
-    /// Plain row-major F16 on the HMX where the tensor has a plan for every row count of a
-    /// chunk, Q8_0 (requantized through f32, one warning) where it has none.
-    Plain { vtcm_budget: usize, threads: u32 },
-    /// Q8_0 for every F16 tensor: a device without the HMX, or the opt-out.
     Q8,
+    /// Plain row-major F16 on the HMX where the tensor has a plan for every row count of a
+    /// chunk, Q8_0 (requantized to Q8_0 at load time, one warning) where it has none.
+    Plain { vtcm_budget: usize, threads: u32 },
 }
 
 /// Whether the HMX F16 matmul has a plan for a `[rows, cols]` weight at every row count a
@@ -170,12 +165,8 @@ pub(super) struct MoeDims {
 pub(super) enum CopyOp {
     /// Repack the 2D weight `name` at `offset`.
     Weight { name: String, offset: usize },
-    /// Copy the F16 weight `name` at `offset`: its own bytes when `plain`, Q8_0 otherwise.
-    WeightF16 {
-        name: String,
-        offset: usize,
-        plain: bool,
-    },
+    /// Copy the plain row-major F16 weight `name` at `offset` for the HMX.
+    WeightF16 { name: String, offset: usize },
     /// Copy the F32 vector `name` verbatim at `offset`; `len` is the reserved
     /// slot length in elements.
     Vector {
@@ -216,7 +207,7 @@ pub(super) struct WeightPlanner<'a> {
     /// can be paged through the DSP mapping (see `pager`).
     paged_experts: bool,
     pub(super) groups: Vec<ExpertGroup>,
-    /// What an F16 matmul tensor becomes (a refusal unless the constructor says otherwise).
+    /// How eligible encoder F16 matmul tensors are laid out (Q8_0 unless HMX plain F16 applies).
     f16: F16Weights,
 }
 
@@ -236,11 +227,11 @@ impl<'a> WeightPlanner<'a> {
             copies: Vec::new(),
             paged_experts: false,
             groups: Vec::new(),
-            f16: F16Weights::Refuse,
+            f16: F16Weights::Q8,
         }
     }
 
-    /// Take F16 matmul tensors as `policy` says instead of refusing them.
+    /// Set how F16 matmul tensors are laid out (defaults to [`F16Weights::Q8`]).
     pub(super) fn with_f16(mut self, policy: F16Weights) -> Self {
         self.f16 = policy;
         self
@@ -321,59 +312,32 @@ impl<'a> WeightPlanner<'a> {
                 "{name} is [{ne0}, {ne1}], expected [{in_dim}, at least {out_dim}]"
             )));
         }
-        if dtype == crate::tensor::DType::F16 && self.f16 != F16Weights::Refuse {
-            return self.weight_f16(name, ne0, ne1, in_dim, out_dim);
-        }
-        let w = plan_weight(&mut self.total, dtype, ne0, ne1, name, in_dim, out_dim)?;
-        self.copies.push(CopyOp::Weight {
-            name: name.to_string(),
-            offset: w.offset,
-        });
-        Ok(w)
-    }
-
-    /// Plan the F16 weight `name` per [`F16Weights`]: plain F16 for the HMX when its shape and
-    /// every chunk's row count have a plan, Q8_0 wire bytes otherwise.
-    fn weight_f16(
-        &mut self,
-        name: &str,
-        ne0: usize,
-        ne1: usize,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> Result<HexagonWeight, CeraError> {
-        let plain = match self.f16 {
-            F16Weights::Plain {
+        if dtype == crate::tensor::DType::F16
+            && let F16Weights::Plain {
                 vtcm_budget,
                 threads,
-            } => f16_matmul_plans_exist(out_dim, in_dim, threads, vtcm_budget),
-            _ => false,
-        };
-        let w = if plain {
+            } = self.f16
+            && f16_matmul_plans_exist(out_dim, in_dim, threads, vtcm_budget)
+        {
             let (size, wire_dtype, block_bytes, tile_size) = f16_plain_plan(ne0, ne1);
-            HexagonWeight {
+            let w = HexagonWeight {
                 offset: plan_offset(&mut self.total, size),
                 in_dim,
                 out_dim,
                 wire_dtype,
                 block_bytes,
                 tile_size,
-            }
-        } else {
-            plan_weight(
-                &mut self.total,
-                crate::tensor::DType::Q8_0,
-                ne0,
-                ne1,
-                name,
-                in_dim,
-                out_dim,
-            )?
-        };
-        self.copies.push(CopyOp::WeightF16 {
+            };
+            self.copies.push(CopyOp::WeightF16 {
+                name: name.to_string(),
+                offset: w.offset,
+            });
+            return Ok(w);
+        }
+        let w = plan_weight(&mut self.total, dtype, ne0, ne1, name, in_dim, out_dim)?;
+        self.copies.push(CopyOp::Weight {
             name: name.to_string(),
             offset: w.offset,
-            plain,
         });
         Ok(w)
     }
@@ -643,11 +607,7 @@ fn run_copies(
     for op in copies {
         match op {
             CopyOp::Weight { name, offset } => src.copy_weight(name, *offset, buf)?,
-            CopyOp::WeightF16 {
-                name,
-                offset,
-                plain,
-            } => src.copy_weight_f16(name, *offset, *plain, buf)?,
+            CopyOp::WeightF16 { name, offset } => src.copy_weight_f16(name, *offset, buf)?,
             CopyOp::Vector { name, offset, len } => {
                 let v = src.vector(name)?;
                 // `<=`: LFM2 q/k norm slots are q_dim / kv_dim wide while
@@ -734,23 +694,7 @@ impl TensorSource for GgufSource<'_> {
             .tensors
             .get(name)
             .ok_or_else(|| CeraError::Backend(format!("missing tensor {name}")))?;
-        match t.dtype {
-            crate::tensor::DType::Q4_0 => Ok((
-                repacked_matrix_size_q4_0(in_dim, out_dim)?,
-                HtpDataType::Q4_0,
-                18,
-                TILE_SIZE_Q4_0,
-            )),
-            crate::tensor::DType::Q8_0 => Ok((
-                repacked_matrix_size_q8_0(in_dim, out_dim)?,
-                HtpDataType::Q8_0,
-                34,
-                TILE_SIZE_Q8_0,
-            )),
-            other => Err(CeraError::Backend(format!(
-                "unsupported quant format {other:?} for Hexagon stacked weight {name}"
-            ))),
-        }
+        wire_plan(t.dtype, in_dim, out_dim, name)
     }
 
     fn vector(&self, name: &str) -> Result<std::borrow::Cow<'_, [f32]>, CeraError> {
@@ -786,7 +730,6 @@ impl TensorSource for GgufSource<'_> {
         &self,
         name: &str,
         offset: usize,
-        plain: bool,
         buf: &mut RpcmemBuffer,
     ) -> Result<(), CeraError> {
         let (dtype, ne0, ne1) = self.weight_shape(name)?;
@@ -799,14 +742,7 @@ impl TensorSource for GgufSource<'_> {
             .gguf
             .tensor_data(name)
             .map_err(|e| CeraError::Backend(e.to_string()))?;
-        copy_f16_weight(
-            raw,
-            ne0,
-            ne1,
-            plain,
-            &mut buf.as_mut_slice()[offset..],
-            name,
-        )
+        copy_f16_weight(raw, ne0, ne1, &mut buf.as_mut_slice()[offset..], name)
     }
 
     fn copy_stacked(
@@ -839,21 +775,14 @@ impl TensorSource for GgufSource<'_> {
                 ))
             })?;
             let dst_slice = &mut buf.as_mut_slice()[dst_range];
-            match dtype {
-                crate::tensor::DType::Q4_0 => {
-                    repack_q4_0(raw_data, cols, rows, dst_slice)
-                        .map_err(|err| CeraError::Backend(format!("{name} expert {e}: {err}")))?;
-                }
-                crate::tensor::DType::Q8_0 => {
-                    repack_q8_0(raw_data, cols, rows, dst_slice)
-                        .map_err(|err| CeraError::Backend(format!("{name} expert {e}: {err}")))?;
-                }
-                other => {
-                    return Err(CeraError::Backend(format!(
-                        "unsupported quant format {other:?} for Hexagon stacked weight {name}"
-                    )));
-                }
-            }
+            repack_weight(
+                dtype,
+                raw_data,
+                cols,
+                rows,
+                dst_slice,
+                &format!("{name} expert {e}"),
+            )?;
         }
         Ok(())
     }
@@ -1166,12 +1095,10 @@ fn stacked_expert_dst_range(
             sw.in_dim, sw.out_dim
         )));
     }
-    let planned = match dtype {
-        crate::tensor::DType::Q4_0 => Some(HtpDataType::Q4_0),
-        crate::tensor::DType::Q8_0 => Some(HtpDataType::Q8_0),
-        _ => None,
-    };
-    if planned != Some(sw.wire_dtype) {
+    let planned = wire_plan(dtype, cols, rows, name)
+        .ok()
+        .map(|(_, wire_dtype, block_bytes, _)| (wire_dtype, block_bytes));
+    if planned != Some((sw.wire_dtype, sw.block_bytes)) {
         return Err(CeraError::Backend(format!(
             "{name} expert {e}: dtype {dtype:?} does not match the planned wire dtype {:?}",
             sw.wire_dtype
@@ -1194,8 +1121,9 @@ fn stacked_expert_dst_range(
 }
 
 /// Wire layout planned for one 2D weight matrix: `(repacked byte size, wire
-/// dtype, nb0 block bytes, tile size)`. Q5_K and F32 have no wire format and
-/// plan Q8_0 bytes; [`repack_weight`] requantizes them before the repack.
+/// dtype, nb0 block bytes, tile size)`. Q5_K, F32, F16, and BF16 have no tiled
+/// quantized wire format and plan Q8_0 bytes; [`repack_weight`] requantizes
+/// them into the tiled Q8_0 layout at load time.
 ///
 /// Q4_1 rides the `Q4K` wire type (the 640-byte tile layout Q4_1 and Q4_K
 /// share) but keeps its own 20-byte GGML block size in `nb0`, while real Q4_K
@@ -1241,7 +1169,7 @@ pub(super) fn wire_plan(
             210,
             TILE_SIZE_Q6_K,
         ),
-        DType::Q5KM | DType::F32 => (
+        DType::Q5KM | DType::F32 | DType::F16 | DType::BF16 => (
             repacked_matrix_size_q8_0(ne0, ne1)?,
             HtpDataType::Q8_0,
             34,
@@ -1339,17 +1267,19 @@ fn repack_weight(
             repack_q8_0(&q8, ne0, ne1, dst).map_err(ctx)
         }
         DType::F32 => {
+            repack_f32_to_q8_0(raw, ne0, ne1, dst).map_err(ctx)?;
             warn_f32_requant(name);
-            // The mmap slice carries no alignment guarantee, so decode by
-            // value instead of casting.
-            let f32_vals: Vec<f32> = raw
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect();
-            let q8 = quantize_f32_to_q8_0(&f32_vals, ne0, ne1).map_err(ctx)?;
-            repack_q8_0(&q8, ne0, ne1, dst).map_err(ctx)
+            Ok(())
+        }
+        DType::F16 => {
+            repack_f16_to_q8_0(raw, ne0, ne1, dst).map_err(ctx)?;
+            warn_f16_requant(name);
+            Ok(())
+        }
+        DType::BF16 => {
+            repack_bf16_to_q8_0(raw, ne0, ne1, dst).map_err(ctx)?;
+            warn_bf16_requant(name);
+            Ok(())
         }
         other => Err(CeraError::Backend(format!(
             "unsupported quant format {other:?} for Hexagon weight {name}"
@@ -1408,48 +1338,47 @@ fn copy_f32_into(
     Ok(())
 }
 
-/// Write the F16 weight `raw` (`[ne1, ne0]` row-major, the GGUF layout) into `dst` as
-/// [`WeightPlanner`] planned it: the file's bytes unchanged when `plain` (the HMX reads the
-/// row-major matrix itself), else Q8_0 wire bytes quantized from the widened values.
+/// Copy the plain row-major F16 weight `raw` (`[ne1, ne0]`, GGUF layout) verbatim into `dst`
+/// for the HMX.
 pub(super) fn copy_f16_weight(
     raw: &[u8],
     ne0: usize,
     ne1: usize,
-    plain: bool,
     dst: &mut [u8],
     name: &str,
 ) -> Result<(), CeraError> {
-    let want = ne0 * ne1 * 2;
+    let want = ne0
+        .checked_mul(ne1)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| CeraError::Backend(format!("{name}: F16 matrix size overflows usize")))?;
     if raw.len() != want {
         return Err(CeraError::Backend(format!(
             "{name}: {} F16 bytes for a {ne1}x{ne0} matrix ({want} expected)",
             raw.len()
         )));
     }
-    if plain {
-        let dst = dst.get_mut(..want).ok_or_else(|| {
-            CeraError::Backend(format!("{name}: destination is shorter than {want} bytes"))
-        })?;
-        dst.copy_from_slice(raw);
-        return Ok(());
-    }
-    warn_f16_requant(name);
-    let vals: Vec<f32> = raw
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| half::f16::from_le_bytes(*c).to_f32())
-        .collect();
-    let q8 = quantize_f32_to_q8_0(&vals, ne0, ne1)?;
-    repack_q8_0(&q8, ne0, ne1, dst).map_err(|e| CeraError::Backend(format!("{name}: {e}")))
+    let dst = dst.get_mut(..want).ok_or_else(|| {
+        CeraError::Backend(format!("{name}: destination is shorter than {want} bytes"))
+    })?;
+    dst.copy_from_slice(raw);
+    Ok(())
 }
 
 fn warn_f16_requant(name: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         hexagon_warn!(
-            "F16 matmul weight {name} (and any other) requantized to Q8_0 at load time: \
-             no HMX F16 matmul on this device or plan for its shape"
+            "requantizing F16 tensor {name} (and any other F16 weight) to Q8_0 at load time: \
+             no HMX F16 matmul path for this model, device, or shape"
+        );
+    }
+}
+
+fn warn_bf16_requant(name: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        hexagon_warn!(
+            "no BF16 matmul weight format; requantizing BF16 tensor {name} (and any other BF16 weight) to Q8_0 at load time"
         );
     }
 }
@@ -1473,6 +1402,7 @@ fn warn_f32_requant(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::hexagon::quantize_f32_to_q8_0;
     use crate::model::hexagon_lfm2::EmbeddingTable;
     use crate::model::hexagon_lfm2::test_support::embd_gguf;
 
@@ -1655,13 +1585,79 @@ mod tests {
         assert_eq!((dt, bb, tile), (HtpDataType::Q4K, 144, TILE_SIZE_Q4_K));
         let (_, dt, bb, tile) = plan(DType::Q6K);
         assert_eq!((dt, bb, tile), (HtpDataType::Q6K, 210, TILE_SIZE_Q6_K));
-        // No wire format for Q5_K / F32: planned (and later repacked) as Q8_0.
-        for d in [DType::Q5KM, DType::F32] {
+        // No wire format for Q5_K / F32 / F16 / BF16: planned (and later repacked) as Q8_0.
+        for d in [DType::Q5KM, DType::F32, DType::F16, DType::BF16] {
             let (sz, dt, bb, tile) = plan(d);
             assert_eq!((dt, bb, tile), (HtpDataType::Q8_0, 34, TILE_SIZE_Q8_0));
             assert_eq!(sz, repacked_matrix_size_q8_0(64, 32).unwrap());
         }
-        assert!(wire_plan(DType::F16, 64, 32, "w").is_err());
+        assert!(wire_plan(DType::I32, 64, 32, "w").is_err());
+    }
+
+    #[test]
+    fn test_stacked_expert_dst_range_accepts_f16_and_bf16_when_planned_q8_0() {
+        use crate::tensor::DType;
+        let mut sw = stacked_fixture();
+        sw.wire_dtype = HtpDataType::Q8_0;
+        sw.block_bytes = 34;
+        for dt in [DType::Q8_0, DType::F16, DType::BF16] {
+            let r = stacked_expert_dst_range("w", 1, &sw, 32, 64, dt).unwrap();
+            assert_eq!(r, 1536..2048);
+        }
+        assert!(stacked_expert_dst_range("w", 0, &sw, 32, 64, DType::Q4_0).is_err());
+    }
+
+    #[test]
+    fn test_repack_weight_f16_and_bf16_match_q8_0_and_tolerate_unaligned() {
+        use crate::tensor::DType;
+        let (ne0, ne1) = (64usize, 32usize);
+        let vals: Vec<f32> = (0..ne0 * ne1)
+            .map(|i| ((i * 7) % 31) as f32 * 0.05 - 0.6)
+            .collect();
+        let size = repacked_matrix_size_q8_0(ne0, ne1).unwrap();
+
+        let f16_bits: Vec<u16> = vals.iter().map(|&v| crate::quant::f32_to_f16(v)).collect();
+        let f16_vals: Vec<f32> = f16_bits
+            .iter()
+            .map(|&b| crate::quant::f16_to_f32(b))
+            .collect();
+        let q8 = quantize_f32_to_q8_0(&f16_vals, ne0, ne1).unwrap();
+        let mut want_f16 = vec![0u8; size];
+        repack_q8_0(&q8, ne0, ne1, &mut want_f16).unwrap();
+
+        let f16_bytes: Vec<u8> = f16_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut shifted_f16 = vec![0u8];
+        shifted_f16.extend_from_slice(&f16_bytes);
+        let mut got_f16 = vec![0u8; size];
+        repack_weight(DType::F16, &shifted_f16[1..], ne0, ne1, &mut got_f16, "w").unwrap();
+        assert_eq!(got_f16, want_f16);
+
+        let bf16_bits: Vec<u16> = vals
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let bf16_vals: Vec<f32> = bf16_bits
+            .iter()
+            .map(|&b| crate::quant::bf16_to_f32(b))
+            .collect();
+        let q8_bf16 = quantize_f32_to_q8_0(&bf16_vals, ne0, ne1).unwrap();
+        let mut want_bf16 = vec![0u8; size];
+        repack_q8_0(&q8_bf16, ne0, ne1, &mut want_bf16).unwrap();
+
+        let bf16_bytes: Vec<u8> = bf16_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut shifted_bf16 = vec![0u8];
+        shifted_bf16.extend_from_slice(&bf16_bytes);
+        let mut got_bf16 = vec![0u8; size];
+        repack_weight(
+            DType::BF16,
+            &shifted_bf16[1..],
+            ne0,
+            ne1,
+            &mut got_bf16,
+            "w",
+        )
+        .unwrap();
+        assert_eq!(got_bf16, want_bf16);
     }
 
     /// An F32 matrix requantizes to the same bytes as the Q8_0 path, including

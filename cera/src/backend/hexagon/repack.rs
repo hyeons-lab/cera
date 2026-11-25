@@ -14,8 +14,8 @@ use crate::par::{IndexedParallelIterator, ParallelSliceMut};
 #[cfg(feature = "parallel")]
 use crate::par::ParallelIterator;
 use crate::quant::{
-    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, decode_q4km_scales,
-    dequantize_q5_k_block, f16_to_f32, f32_to_f16,
+    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, bf16_to_f32,
+    decode_q4km_scales, dequantize_q5_k_block, f16_to_f32, f32_to_f16,
 };
 use crate::session::CeraError;
 
@@ -648,6 +648,118 @@ pub fn requant_q5_k_to_q8_0(
     Ok(out)
 }
 
+/// Quantize and repack a linear row-major dense matrix (`ne0` = K, `ne1` = rows)
+/// into HTP 32x32 tiled Q8_0 layout one 32-element block at a time on the stack,
+/// avoiding full-matrix intermediate `f32` and `Q8_0` heap allocations.
+fn repack_dense_to_q8_0<const ELEM_BYTES: usize>(
+    src_bytes: &[u8],
+    ne0: usize,
+    ne1: usize,
+    dst: &mut [u8],
+    what: &str,
+    decode: impl Fn(&[u8; ELEM_BYTES]) -> f32 + Sync,
+) -> Result<(), CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "{what}: dimensions must be non-zero (ne0={ne0}, ne1={ne1})"
+        )));
+    }
+    if !ne0.is_multiple_of(32) {
+        return Err(CeraError::Backend(format!(
+            "{what}: ne0 ({ne0}) must be a multiple of 32"
+        )));
+    }
+    let total_src_bytes = checked_src_bytes(ne1, ne0, ELEM_BYTES, what)?;
+    if src_bytes.len() < total_src_bytes {
+        return Err(CeraError::Backend(format!(
+            "{what}: source buffer too short (expected {total_src_bytes} bytes, got {})",
+            src_bytes.len()
+        )));
+    }
+
+    let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q8_0, what)?;
+    let n_k_tiles = ne0 / 32;
+    if dst.len() < matrix_size {
+        return Err(CeraError::Backend(format!(
+            "{what}: destination buffer too short (expected {matrix_size} bytes, got {})",
+            dst.len()
+        )));
+    }
+    dst[..matrix_size].fill(0);
+
+    let col_tile_bytes = n_k_tiles * TILE_SIZE_Q8_0;
+    let row_bytes = ne0 * ELEM_BYTES;
+    let block_bytes = 32 * ELEM_BYTES;
+    dst[..matrix_size]
+        .par_chunks_mut(col_tile_bytes)
+        .enumerate()
+        .for_each(|(ct, ct_dst)| {
+            for kt in 0..n_k_tiles {
+                let tile_dst = &mut ct_dst[kt * TILE_SIZE_Q8_0..][..TILE_SIZE_Q8_0];
+                let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q8_0);
+                for row in 0..32 {
+                    let r = ct * 32 + row;
+                    if r >= ne1 {
+                        break;
+                    }
+                    let blk_off = r * row_bytes + kt * block_bytes;
+                    let raw_blk = &src_bytes[blk_off..blk_off + block_bytes];
+                    let mut vals = [0.0f32; 32];
+                    for (v, chunk) in vals.iter_mut().zip(raw_blk.as_chunks::<ELEM_BYTES>().0) {
+                        *v = decode(chunk);
+                    }
+                    let q = quantize_q8_0_block(&vals);
+                    tile_scales[row * 2..row * 2 + 2].copy_from_slice(&q.delta.to_le_bytes());
+                    for cp in 0..16 {
+                        tile_quants[cp * 64 + 2 * row] = q.quants[2 * cp] as u8;
+                        tile_quants[cp * 64 + 2 * row + 1] = q.quants[2 * cp + 1] as u8;
+                    }
+                }
+            }
+        });
+
+    Ok(())
+}
+
+/// Quantize and repack a linear row-major F32 matrix (`ne0` = K, `ne1` = rows)
+/// directly into HTP 32x32 tiled Q8_0 layout without full-tensor heap buffers.
+pub fn repack_f32_to_q8_0(
+    src_bytes: &[u8],
+    ne0: usize,
+    ne1: usize,
+    dst: &mut [u8],
+) -> Result<(), CeraError> {
+    repack_dense_to_q8_0::<4>(src_bytes, ne0, ne1, dst, "repack_f32_to_q8_0", |c| {
+        f32::from_le_bytes(*c)
+    })
+}
+
+/// Quantize and repack a linear row-major IEEE F16 matrix (`ne0` = K, `ne1` = rows)
+/// directly into HTP 32x32 tiled Q8_0 layout without full-tensor heap buffers.
+pub fn repack_f16_to_q8_0(
+    src_bytes: &[u8],
+    ne0: usize,
+    ne1: usize,
+    dst: &mut [u8],
+) -> Result<(), CeraError> {
+    repack_dense_to_q8_0::<2>(src_bytes, ne0, ne1, dst, "repack_f16_to_q8_0", |c| {
+        f16_to_f32(u16::from_le_bytes(*c))
+    })
+}
+
+/// Quantize and repack a linear row-major BF16 matrix (`ne0` = K, `ne1` = rows)
+/// directly into HTP 32x32 tiled Q8_0 layout without full-tensor heap buffers.
+pub fn repack_bf16_to_q8_0(
+    src_bytes: &[u8],
+    ne0: usize,
+    ne1: usize,
+    dst: &mut [u8],
+) -> Result<(), CeraError> {
+    repack_dense_to_q8_0::<2>(src_bytes, ne0, ne1, dst, "repack_bf16_to_q8_0", |c| {
+        bf16_to_f32(u16::from_le_bytes(*c))
+    })
+}
+
 /// Quantize an f32 matrix of shape `[rows, cols]` into linear GGUF Q8_0 blocks.
 ///
 /// `cols` must be a multiple of 32. Output contains `rows * (cols / 32) * 34` bytes.
@@ -1043,11 +1155,17 @@ mod tests {
         // an alignment-passing partner dimension (32) to isolate the zero check.
         for (ne0, ne1) in [(0, 32), (32, 0), (0, usize::MAX), (usize::MAX, 0)] {
             assert!(repack_q8_0(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_f32_to_q8_0(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_f16_to_q8_0(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_bf16_to_q8_0(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_0(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_1(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_k(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q6_k(empty, ne0, ne1, &mut dst).is_err());
         }
+        assert!(repack_f32_to_q8_0(empty, huge, huge, &mut dst).is_err());
+        assert!(repack_f16_to_q8_0(empty, huge, huge, &mut dst).is_err());
+        assert!(repack_bf16_to_q8_0(empty, huge, huge, &mut dst).is_err());
         // Requant shares the checked-src-size contract (`ne0 = 256` keeps
         // `sb_per_row = 1`, so the overflow trips checked math rather than
         // the `% 256` gate) and the degenerate-dims rejection. Each zero
@@ -1090,5 +1208,73 @@ mod tests {
         let mut repacked = vec![0u8; sz];
         repack_q8_0(&q8_bytes, cols, rows, &mut repacked).unwrap();
         assert_eq!(repacked.len(), sz);
+    }
+
+    #[test]
+    fn repack_dense_to_q8_0_matches_quantize_and_repack() {
+        let (cols, rows) = (64usize, 37usize);
+        let f32_vals: Vec<f32> = (0..cols * rows)
+            .map(|i| ((i * 13) % 41) as f32 * 0.05 - 1.0)
+            .collect();
+        let sz = repacked_matrix_size_q8_0(cols, rows).unwrap();
+
+        let f32_bytes: Vec<u8> = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_q8 = quantize_f32_to_q8_0(&f32_vals, cols, rows).unwrap();
+        let mut want_f32 = vec![0xAAu8; sz];
+        repack_q8_0(&f32_q8, cols, rows, &mut want_f32).unwrap();
+        let mut got_f32 = vec![0x55u8; sz];
+        repack_f32_to_q8_0(&f32_bytes, cols, rows, &mut got_f32).unwrap();
+        assert_eq!(got_f32, want_f32);
+
+        let f16_bits: Vec<u16> = f32_vals.iter().map(|&v| f32_to_f16(v)).collect();
+        let f16_widened: Vec<f32> = f16_bits.iter().map(|&b| f16_to_f32(b)).collect();
+        let f16_bytes: Vec<u8> = f16_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let f16_q8 = quantize_f32_to_q8_0(&f16_widened, cols, rows).unwrap();
+        let mut want_f16 = vec![0u8; sz];
+        repack_q8_0(&f16_q8, cols, rows, &mut want_f16).unwrap();
+        let mut got_f16 = vec![0u8; sz];
+        repack_f16_to_q8_0(&f16_bytes, cols, rows, &mut got_f16).unwrap();
+        assert_eq!(got_f16, want_f16);
+
+        let bf16_bits: Vec<u16> = f32_vals
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let bf16_widened: Vec<f32> = bf16_bits.iter().map(|&b| bf16_to_f32(b)).collect();
+        let bf16_bytes: Vec<u8> = bf16_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let bf16_q8 = quantize_f32_to_q8_0(&bf16_widened, cols, rows).unwrap();
+        let mut want_bf16 = vec![0u8; sz];
+        repack_q8_0(&bf16_q8, cols, rows, &mut want_bf16).unwrap();
+        let mut got_bf16 = vec![0u8; sz];
+        repack_bf16_to_q8_0(&bf16_bytes, cols, rows, &mut got_bf16).unwrap();
+        assert_eq!(got_bf16, want_bf16);
+
+        type RepackFn = fn(&[u8], usize, usize, &mut [u8]) -> Result<(), CeraError>;
+        let checks: &[(&str, RepackFn, usize, &[u8])] = &[
+            ("f32", repack_f32_to_q8_0, 4, &f32_bytes),
+            ("f16", repack_f16_to_q8_0, 2, &f16_bytes),
+            ("bf16", repack_bf16_to_q8_0, 2, &bf16_bytes),
+        ];
+        let mut scratch = vec![0u8; sz * 2];
+        let bad_cols_src = vec![0u8; (cols + 1) * rows * 4];
+        for &(label, f, elem_bytes, good_src) in checks {
+            let err = f(
+                &bad_cols_src[..(cols + 1) * rows * elem_bytes],
+                cols + 1,
+                rows,
+                &mut scratch,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("multiple of 32"), "{label}: {err}");
+            assert!(
+                f(&good_src[..good_src.len() - 1], cols, rows, &mut got_bf16).is_err(),
+                "{label} short src"
+            );
+            assert!(
+                f(good_src, cols, rows, &mut got_bf16[..sz - 1]).is_err(),
+                "{label} short dst"
+            );
+        }
     }
 }
