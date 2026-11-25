@@ -2978,7 +2978,10 @@ fn lfm2_shortconv_in_proj_f16_and_bf16_load_on_hexagon() {
         let mut state =
             InferenceState::from_config_capped(&model.config, &KvCompression::None, 64).unwrap();
         model
-            .try_forward_input(DecodeInput::Token(1), DecodeOutput::Logits, 0, &mut state)
+            .try_forward_prefill_chunk(&[1, 2, 3, 4], 0, &mut state)
+            .unwrap();
+        model
+            .try_forward_input(DecodeInput::Token(5), DecodeOutput::Logits, 4, &mut state)
             .unwrap();
     }
 }
@@ -3071,7 +3074,7 @@ fn moe_stacked_experts_f16_and_bf16_load_on_hexagon() {
 }
 
 /// `DenseSource` and `Qwen35Source` requantize F16 and BF16 weights to Q8_0
-/// through `copy_weight_f16` and `repack_weight`.
+/// through `CopyOp::Weight` and `repack_weight`.
 #[test]
 fn dense_and_qwen35_f16_and_bf16_load_on_hexagon() {
     for (label, ggml_type) in [("f16", 1u32), ("bf16", 30u32)] {

@@ -1248,5 +1248,33 @@ mod tests {
         let mut got_bf16 = vec![0u8; sz];
         repack_bf16_to_q8_0(&bf16_bytes, cols, rows, &mut got_bf16).unwrap();
         assert_eq!(got_bf16, want_bf16);
+
+        type RepackFn = fn(&[u8], usize, usize, &mut [u8]) -> Result<(), CeraError>;
+        let checks: &[(&str, RepackFn, usize, &[u8])] = &[
+            ("f32", repack_f32_to_q8_0, 4, &f32_bytes),
+            ("f16", repack_f16_to_q8_0, 2, &f16_bytes),
+            ("bf16", repack_bf16_to_q8_0, 2, &bf16_bytes),
+        ];
+        let mut scratch = vec![0u8; sz * 2];
+        let bad_cols_src = vec![0u8; (cols + 1) * rows * 4];
+        for &(label, f, elem_bytes, good_src) in checks {
+            let err = f(
+                &bad_cols_src[..(cols + 1) * rows * elem_bytes],
+                cols + 1,
+                rows,
+                &mut scratch,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("multiple of 32"), "{label}: {err}");
+            assert!(
+                f(&good_src[..good_src.len() - 1], cols, rows, &mut got_bf16).is_err(),
+                "{label} short src"
+            );
+            assert!(
+                f(good_src, cols, rows, &mut got_bf16[..sz - 1]).is_err(),
+                "{label} short dst"
+            );
+        }
     }
 }
