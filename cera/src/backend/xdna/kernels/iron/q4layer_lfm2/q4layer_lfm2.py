@@ -2,6 +2,12 @@
 # Modes via g_params[6]:
 #   0 = ShortConv (d_conv=2) + FFN (8192) decode
 #   1 = GQA (32 Q heads, 8 KV heads, head_dim=64) + QK-norm + NeoX RoPE + FFN (8192) decode
+#   2 = Attn Phase A (>32K: RMS + QKV + RoPE -> kvo_buf + q_bf16 + zero fa_state in SLOT_SW)
+#   3 = Attn FA Partial (>32K: Reload q_bf16 + fa_state -> FA -> Drain fa_state)
+#   4 = Attn FA Final (>32K: Reload hidden + q_bf16 + fa_state -> FA + cur_kv -> O + FFN)
+#   5 = ShortConv without FFN (ends at CONV_OUT + residual -> yn_buf)
+#   6 = GQA without FFN (ends at O + residual -> yn_buf)
+#   7 = Attn FA Final without FFN (ends at O + residual -> yn_buf)
 
 import argparse
 import sys
@@ -103,7 +109,7 @@ def _validate_compile_params(layer_mode: int, kv_chunks: int) -> None:
         kv_chunks,
         valid_modes=VALID_MODES,
         nonzero_kv_modes=(3,),
-        max_kv_chunks=MAX_KV_CHUNKS,
+        max_kv_chunks=MAX_KV_PKTS,
     )
 
 

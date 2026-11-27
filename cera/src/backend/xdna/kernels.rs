@@ -204,7 +204,7 @@ pub const Q4PREFILL_LFM3_BIDIR_B_BUCKETS: [(usize, &[u8]); 15] = [
     (256, Q4PREFILL_LFM3_BIDIR_B_INSTS_C256),
 ];
 
-/// Mode-4 (FA partial, first block `blk == 0`, reading `SLOT_NORM_1`) prefill instruction stream.
+/// Mode-6 (FA partial, first block `blk == 0`, reading `SLOT_NORM_1` and skipping `SLOT_FA_STATE` preload) prefill instruction stream.
 pub const Q4PREFILL_LFM3_FA_PART0_C256_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm3_pre_fa_part0_c256.bin");
 /// Mode-4 (FA partial, subsequent blocks `blk >= 1`, reading `SLOT_NORM_2`) prefill instruction stream over one full `256`-chunk KV block.
@@ -445,20 +445,24 @@ pub const Q4LAYER_LFM3_FA_FIN_BUCKETS: [(usize, &[u8]); 15] = [
     (255, Q4LAYER_LFM3_FA_FIN_INSTS_C255),
 ];
 
-/// Unified fused B=32 Q4 LFM2 / LFM2.5 prefill layer (`ShortConv` mode 0 + `GQA` mode 1).
+/// Unified fused B=64 Q4 LFM2 / LFM2.5 prefill layer (`ShortConv` modes 0/5 + `GQA` modes 1/6).
 pub const Q4PREFILL_LFM2_XCLBIN: &[u8] = include_bytes!("kernels/q4prefill_lfm2.xclbin");
-/// Extended (>16K/32K Modes 2/4/5) LFM2 prefill XCLBIN.
+/// Unified `B=64` LFM2 / LFM2.5 `>32K` paged prefill XCLBIN (Modes 0/2/3/4/5/6/7).
 pub const Q4PREFILL_LFM2_EXT_XCLBIN: &[u8] = include_bytes!("kernels/q4prefill_lfm2_ext.xclbin");
-/// Mode-0 (ShortConv + FFN) prefill instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
+
+/// Define an ascending `(kv_chunks_or_pkts, inst_bytes)` bucket table for LFM2 kernels.
 macro_rules! lfm2_insts_buckets {
-    ($name:ident, $len:expr, $prefix:literal, [$($k:literal),+ $(,)?]) => {
+    ($(#[$meta:meta])* $name:ident, $len:expr, $prefix:literal, [$($k:literal),+ $(,)?]) => {
+        $(#[$meta])*
         pub const $name: [(usize, &[u8]); $len] = [
             $(($k, include_bytes!(concat!("kernels/", $prefix, "_c", stringify!($k), ".bin"))),)+
         ];
     };
 }
 
+/// Mode-0 (ShortConv + FFN) prefill instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
 pub const Q4PREFILL_LFM2_CONV_INSTS: &[u8] = include_bytes!("kernels/insts_lfm2_pre_conv.bin");
+/// Mode-5 (ShortConv without FFN) prefill instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
 pub const Q4PREFILL_LFM2_CONV_NO_FFN_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_conv_no_ffn.bin");
 
@@ -692,6 +696,7 @@ pub const Q4PREFILL_LFM2_ATTN_BUCKETS: [(usize, &[u8]); 56] = [
 ];
 
 lfm2_insts_buckets!(
+    /// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 Mode-6 causal prefill without FFN.
     Q4PREFILL_LFM2_ATTN_NO_FFN_BUCKETS,
     56,
     "insts_lfm2_pre_attn_no_ffn",
@@ -708,10 +713,10 @@ pub const Q4PREFILL_LFM2_EXT_CONV_INSTS: &[u8] =
 /// Mode-7 (ext-prefill shortconv without FFN, param slot 0) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
 pub const Q4PREFILL_LFM2_EXT_CONV_NO_FFN_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_ext_conv_no_ffn.bin");
-/// Mode-2 (Phase A for `>16K` prefill, param slot 0) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
+/// Mode-2 (Phase A for `>32K` prefill, param slot 0) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
 pub const Q4PREFILL_LFM2_PHASE_A_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_phase_a.bin");
-/// Mode-4 (first FA partial over KV block 0, param slot 1) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
+/// Mode-3 (first FA partial over KV block 0, param slot 1) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
 pub const Q4PREFILL_LFM2_FA_PART0_C1024_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_fa_part0_c1024.bin");
 /// Mode-4 (FA partial over one full `1024`-chunk KV block `>=1`, param slot 2) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
@@ -793,7 +798,7 @@ pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C896: &[u8] =
 pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C1023: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_fa_fin_c1023.bin");
 
-/// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>16K` Mode-5 final-block prefill.
+/// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-5 final-block prefill.
 pub const Q4PREFILL_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 25] = [
     (0, Q4PREFILL_LFM2_FA_FIN_INSTS_C0),
     (1, Q4PREFILL_LFM2_FA_FIN_INSTS_C1),
@@ -823,6 +828,7 @@ pub const Q4PREFILL_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 25] = [
 ];
 
 lfm2_insts_buckets!(
+    /// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-6 final-block prefill without FFN.
     Q4PREFILL_LFM2_FA_FIN_NO_FFN_BUCKETS,
     25,
     "insts_lfm2_pre_fa_fin_no_ffn",
@@ -836,6 +842,7 @@ lfm2_insts_buckets!(
 pub const Q4LAYER_LFM2_XCLBIN: &[u8] = include_bytes!("kernels/q4layer_lfm2.xclbin");
 /// Mode-0 (ShortConv + FFN) decode instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
 pub const Q4LAYER_LFM2_CONV_INSTS: &[u8] = include_bytes!("kernels/insts_lfm2_dec_conv.bin");
+/// Mode-5 (ShortConv without FFN) decode instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
 pub const Q4LAYER_LFM2_CONV_NO_FFN_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_conv_no_ffn.bin");
 /// Mode-1 (Attention + FFN) decode instruction stream with `0` past KV chunks.
@@ -939,6 +946,7 @@ pub const Q4LAYER_LFM2_KV_BUCKETS: [(usize, &[u8]); 25] = [
 ];
 
 lfm2_insts_buckets!(
+    /// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 Mode-6 single-token attention decode without FFN.
     Q4LAYER_LFM2_ATTN_NO_FFN_BUCKETS,
     25,
     "insts_lfm2_dec_attn_no_ffn",
@@ -948,7 +956,7 @@ lfm2_insts_buckets!(
     ]
 );
 
-/// Mode-2 (Phase A for `>16K` decode) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
+/// Mode-2 (Phase A for `>32K` decode) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
 pub const Q4LAYER_LFM2_PHASE_A_INSTS: &[u8] = include_bytes!("kernels/insts_lfm2_dec_phase_a.bin");
 /// Mode-3 (FA partial over one full `512`-packet / `1024`-chunk KV block) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
 pub const Q4LAYER_LFM2_FA_PART_C512_INSTS: &[u8] =
@@ -1029,7 +1037,7 @@ pub const Q4LAYER_LFM2_FA_FIN_INSTS_C511: &[u8] =
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C512: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c512.bin");
 
-/// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 `>16K` Mode-4 final-block decode.
+/// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-4 final-block decode.
 pub const Q4LAYER_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 25] = [
     (0, Q4LAYER_LFM2_FA_FIN_INSTS_C0),
     (1, Q4LAYER_LFM2_FA_FIN_INSTS_C1),
@@ -1059,6 +1067,7 @@ pub const Q4LAYER_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 25] = [
 ];
 
 lfm2_insts_buckets!(
+    /// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-7 final-block decode without FFN.
     Q4LAYER_LFM2_FA_FIN_NO_FFN_BUCKETS,
     25,
     "insts_lfm2_dec_fa_fin_no_ffn",
@@ -1556,7 +1565,7 @@ pub fn write_lfm2_prefill_step_params(
     }
 }
 
-/// Write `g_params[8..11]` (`kv_start_chunk`, `has_fa_state`, `skip_cur_kv`) for paged `>8K` LFM2 prefill.
+/// Write `g_params[8..11]` (`kv_start_chunk`, `has_fa_state`, `skip_cur_kv`) for paged `>32K` LFM2 prefill.
 #[inline]
 pub fn write_lfm2_prefill_ext_params(
     buf: &mut [u8],

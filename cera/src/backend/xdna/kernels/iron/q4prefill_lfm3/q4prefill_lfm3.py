@@ -7,6 +7,7 @@
 #   3 = Bidir Global Phase B (Single-Pass: Reload q0/q1 + Gate -> FA -> O -> FFN tail)
 #   4 = FA Partial (Reload q0/q1 + SLOT_FA_STATE -> FA -> Drain SLOT_FA_STATE)
 #   5 = FA Final (Reload q0/q1 + SLOT_FA_STATE + Gate -> FA + cur_kv -> O -> FFN tail)
+#   6 = FA Partial blk==0 (Reload q0/q1 only, skip SLOT_FA_STATE preload -> FA -> Drain SLOT_FA_STATE)
 
 import argparse
 import sys

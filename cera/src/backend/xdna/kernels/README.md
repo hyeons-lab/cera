@@ -25,7 +25,7 @@ LFM2/LFM2.5-1.2B, and LFM3-1.7B / d1-2B prefill and decode:
   Mode 0 ShortConv (`insts_lfm3_pre_conv.bin`), Mode 1 causal/SWA attention
   (`insts_lfm3_pre_attn_c0..c255.bin`), Modes 2–3 global bidirectional attention
   (`insts_lfm3_pre_phase_a.bin`, `insts_lfm3_pre_bidir_b_c1..c256.bin`), and
-  Modes 4–5 >8K paged online-softmax attention
+  Modes 4–6 >8K paged online-softmax attention
   (`insts_lfm3_pre_fa_part0_c256.bin`, `insts_lfm3_pre_fa_part_c256.bin`,
   `insts_lfm3_pre_fa_fin_c0..c255.bin`) under `q4prefill_lfm3.xclbin`. (Legacy
   `B=32` `q4prefill_lfm3_conv` / `q4prefill_lfm3_attn` sources remain in `iron/`.)
@@ -36,8 +36,9 @@ LFM2/LFM2.5-1.2B, and LFM3-1.7B / d1-2B prefill and decode:
   `insts_lfm3_dec_fa_fin_c0..c255.bin`) sharing `q4layer_lfm3.xclbin`
   (single `SLOT_NORM_0` parameter+RoPE packet, merged `Q+K+V+ATTN_GATE`
   broadcasts, packed 4-chunk `FFN_DOWN` activations, and overlaid `DecState`).
-- `q4prefill_lfm2` / `q4layer_lfm2`: unified LFM2/LFM2.5 prefill (`B=64`) and
-  decode (`B=1`) kernels covering ShortConv, SWA/causal attention, and >8K
+- `q4prefill_lfm2` / `q4layer_lfm2`: unified LFM2/LFM2.5 prefill (`B=64`,
+  Modes 0/1/5/6) and decode (`B=1`, Modes 0–7) kernels covering ShortConv,
+  SWA/causal attention, and (in `q4layer_lfm2` and `q4prefill_lfm2_ext`) >32K
   paged online-softmax modes (`q4prefill_lfm2.xclbin` + `insts_lfm2_pre_*.bin`,
   `q4layer_lfm2.xclbin` + `insts_lfm2_dec_*.bin` with merged `SLOT_NORM_0`
   parameter+RoPE packet, merged `Q+K+V` broadcasts, packed 4-chunk `FFN_DOWN`

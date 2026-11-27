@@ -3,6 +3,8 @@
 # Modes via g_params[6]:
 #   0 = ShortConv (d_conv=2) + SwiGLU FFN (8192)
 #   1 = Causal GQA (32 Q heads, 8 KV heads, head_dim=64) + QK-norm + NeoX RoPE + SwiGLU FFN (8192)
+#   5 = ShortConv (d_conv=2) without FFN (ends at CONV_OUT + residual -> yn_buf)
+#   6 = Causal GQA without FFN (ends at ATTN_O + residual -> yn_buf)
 
 import argparse
 import sys
@@ -98,7 +100,7 @@ KV_TOTAL = MAX_KV_CHUNKS * N_KV_HEADS * KV_CHUNK_F32
 KV_OUT_TOTAL = 2 * N_KV_HEADS * W_ELEMS
 
 
-VALID_MODES = (0, 1, 2, 4, 5, 6)
+VALID_MODES = (0, 1, 5, 6)
 
 
 def _validate_compile_params(layer_mode: int, kv_chunks: int) -> None:
@@ -106,7 +108,7 @@ def _validate_compile_params(layer_mode: int, kv_chunks: int) -> None:
         layer_mode,
         kv_chunks,
         valid_modes=VALID_MODES,
-        nonzero_kv_modes=(4,),
+        nonzero_kv_modes=(),
         max_kv_chunks=MAX_KV_CHUNKS,
     )
 
@@ -881,88 +883,39 @@ def q4prefill_lfm2(
             fill_w_broadcast(y_buf, [ACT_TOTAL], SLOT_ROPE_PKT_0, tg_q, wait=True)
             tg_q.finish()
 
-            if False:
-                for sub in range(2):
-                    tg_qd = TaskGroup()
-                    for c in range(N_COLS):
-                        yc_h[c].drain(
-                            y_buf,
-                            tap=TensorAccessPattern(
-                                tensor_dims=[ACT_TOTAL],
-                                offset=SLOT_FA_Q + sub * (2 * N_ROWS * X_ELEMS) + (c // 4) * (N_ROWS * X_ELEMS) + (c & 3) * 1024,
-                                sizes=[16, N_ROWS, Y_CORE_ELEMS],
-                                strides=[Y_CORE_ELEMS, X_ELEMS, 1],
-                            ),
-                            wait=True,
-                            group=tg_qd,
-                        )
-                    tg_qd.finish()
+            if kv_chunks == 0:
+                tg_fa = TaskGroup()
+                for c in range(N_COLS):
+                    wp_h[c].fill(kvo_buf, tap=TensorAccessPattern(tensor_dims=[KV_OUT_TOTAL], offset=c * W_ELEMS, sizes=[2, 9, 256], strides=[N_COLS * W_ELEMS, 256, 1]), wait=True, group=tg_fa)
+                drain_xq_sub(tg_fa, 0, wait_last=False, do_finish=False)
+                drain_xq_sub(tg_fa, 1, wait_last=True, do_finish=False)
+                tg_fa.finish()
             else:
-                if kv_chunks == 0:
-                    tg_fa = TaskGroup()
-                    for c in range(N_COLS):
-                        wp_h[c].fill(kvo_buf, tap=TensorAccessPattern(tensor_dims=[KV_OUT_TOTAL], offset=c * W_ELEMS, sizes=[2, 9, 256], strides=[N_COLS * W_ELEMS, 256, 1]), wait=True, group=tg_fa)
-                    drain_xq_sub(tg_fa, 0, wait_last=False, do_finish=False)
-                    drain_xq_sub(tg_fa, 1, wait_last=True, do_finish=False)
-                    tg_fa.finish()
-                else:
-                    w_tasks = []
-                    n128 = kv_chunks // 128
-                    rem = kv_chunks % 128
-                    if n128 > 0:
-                        w_tasks.append((kv_buf, [KV_TOTAL], lambda c: (c * MAX_KV_CHUNKS) * KV_CHUNK_F32, [n128, 128, 9, 256], [128 * KV_CHUNK_F32, KV_CHUNK_F32, 256, 1]))
-                    if rem > 0:
-                        w_tasks.append((kv_buf, [KV_TOTAL], lambda c, s=n128 * 128: (c * MAX_KV_CHUNKS + s) * KV_CHUNK_F32, [rem, 9, 256], [KV_CHUNK_F32, 256, 1]))
-                    w_tasks.append((kvo_buf, [KV_OUT_TOTAL], lambda c: c * W_ELEMS, [2, 9, 256], [N_COLS * W_ELEMS, 256, 1]))
-                    for b0 in range(0, len(w_tasks), 4):
-                        b1 = min(b0 + 4, len(w_tasks))
-                        is_last_b = b1 == len(w_tasks)
-                        cur_tg = TaskGroup()
-                        for wi in range(b0, b1):
-                            buf, tdims, off_fn, sz, st = w_tasks[wi]
-                            do_wait = wi == b1 - 1
-                            for c in range(N_COLS):
-                                wp_h[c].fill(buf, tap=TensorAccessPattern(tensor_dims=tdims, offset=off_fn(c), sizes=sz, strides=st), wait=do_wait, group=cur_tg)
-                        if is_last_b:
-                            drain_xq_sub(cur_tg, 0, wait_last=False, do_finish=False)
-                            drain_xq_sub(cur_tg, 1, wait_last=True, do_finish=False)
-                        cur_tg.finish()
-                if layer_mode == 6:
-                    run_gemm_and_res(W_ATTN_O, 2, yn_buf, [YN_TOTAL], 0, fa_perm=True)
-                else:
-                    run_gemm_and_res(W_ATTN_O, 2, y_buf, [ACT_TOTAL], SLOT_HIDDEN_IN, fa_perm=True)
-        else:
-            # Modes 4 & 5 preserved
-            for sub in range(2):
-                tg_rq = TaskGroup()
-                for half in range(2):
-                    for x in range(N_X_SHIMS):
-                        xp_h[x].fill(y_buf, tap=TensorAccessPattern(tensor_dims=[ACT_TOTAL], offset=SLOT_FA_Q + sub * (2 * N_ROWS * X_ELEMS) + half * (N_ROWS * X_ELEMS), sizes=[1, N_ROWS * X_ELEMS], strides=[0, 1]), wait=(half == 1), group=tg_rq)
-                for cp in range(4):
-                    for x in range(N_X_SHIMS):
-                        xp_h[x].fill(y_buf, tap=TensorAccessPattern(tensor_dims=[ACT_TOTAL], offset=SLOT_FA_STATE + sub * (4 * N_ROWS * X_ELEMS) + cp * (N_ROWS * X_ELEMS), sizes=[1, N_ROWS * X_ELEMS], strides=[0, 1]), wait=(cp == 3), group=tg_rq)
-                tg_rq.finish()
-                for chk0 in range(0, kv_chunks, 128):
-                    cnt = min(128, kv_chunks - chk0)
-                    is_last_chunk_blk = (chk0 + cnt) == kv_chunks and layer_mode == 4
-                    tg_fa = TaskGroup()
-                    for c in range(N_COLS):
-                        wp_h[c].fill(kv_buf, tap=TensorAccessPattern(tensor_dims=[KV_TOTAL], offset=(c * MAX_KV_CHUNKS + chk0) * KV_CHUNK_F32, sizes=[cnt, 9, 256], strides=[KV_CHUNK_F32, 256, 1]), wait=not is_last_chunk_blk, group=tg_fa)
-                    if is_last_chunk_blk:
+                w_tasks = []
+                n128 = kv_chunks // 128
+                rem = kv_chunks % 128
+                if n128 > 0:
+                    w_tasks.append((kv_buf, [KV_TOTAL], lambda c: (c * MAX_KV_CHUNKS) * KV_CHUNK_F32, [n128, 128, 9, 256], [128 * KV_CHUNK_F32, KV_CHUNK_F32, 256, 1]))
+                if rem > 0:
+                    w_tasks.append((kv_buf, [KV_TOTAL], lambda c, s=n128 * 128: (c * MAX_KV_CHUNKS + s) * KV_CHUNK_F32, [rem, 9, 256], [KV_CHUNK_F32, 256, 1]))
+                w_tasks.append((kvo_buf, [KV_OUT_TOTAL], lambda c: c * W_ELEMS, [2, 9, 256], [N_COLS * W_ELEMS, 256, 1]))
+                for b0 in range(0, len(w_tasks), 4):
+                    b1 = min(b0 + 4, len(w_tasks))
+                    is_last_b = b1 == len(w_tasks)
+                    cur_tg = TaskGroup()
+                    for wi in range(b0, b1):
+                        buf, tdims, off_fn, sz, st = w_tasks[wi]
+                        do_wait = wi == b1 - 1
                         for c in range(N_COLS):
-                            yc_h[c].drain(y_buf, tap=TensorAccessPattern(tensor_dims=[ACT_TOTAL], offset=SLOT_FA_STATE + sub * (4 * N_ROWS * X_ELEMS) + (c // 2) * (N_ROWS * X_ELEMS) + (c & 1) * 2176, sizes=[34, N_ROWS, Y_CORE_ELEMS], strides=[Y_CORE_ELEMS, X_ELEMS, 1]), wait=True, group=tg_fa)
-                    tg_fa.finish()
-                if False:
-                    tg_cur = TaskGroup()
-                    n_cur = 1 if sub == 0 else 2
-                    for c in range(N_COLS):
-                        wp_h[c].fill(kvo_buf, tap=TensorAccessPattern(tensor_dims=[KV_OUT_TOTAL], offset=c * W_ELEMS, sizes=[n_cur, 9, 256], strides=[N_COLS * W_ELEMS, 256, 1]), wait=True, group=tg_cur)
-                    drain_xq_sub(tg_cur, sub)
-            if False:
-                if layer_mode == 6:
-                    run_gemm_and_res(W_ATTN_O, 2, yn_buf, [YN_TOTAL], 0, fa_perm=True)
-                else:
-                    run_gemm_and_res(W_ATTN_O, 2, y_buf, [ACT_TOTAL], SLOT_HIDDEN_IN, fa_perm=True)
+                            wp_h[c].fill(buf, tap=TensorAccessPattern(tensor_dims=tdims, offset=off_fn(c), sizes=sz, strides=st), wait=do_wait, group=cur_tg)
+                    if is_last_b:
+                        drain_xq_sub(cur_tg, 0, wait_last=False, do_finish=False)
+                        drain_xq_sub(cur_tg, 1, wait_last=True, do_finish=False)
+                    cur_tg.finish()
+            if layer_mode == 6:
+                run_gemm_and_res(W_ATTN_O, 2, yn_buf, [YN_TOTAL], 0, fa_perm=True)
+            else:
+                run_gemm_and_res(W_ATTN_O, 2, y_buf, [ACT_TOTAL], SLOT_HIDDEN_IN, fa_perm=True)
 
         if layer_mode not in (0, 1):
             return

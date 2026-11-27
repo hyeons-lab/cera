@@ -6,6 +6,7 @@
 //   3 = Bidir Global Phase B (Single-Pass: Reload q0/q1 + Gate -> FA -> O -> FFN tail)
 //   4 = FA Partial (Reload q0/q1 + SLOT_FA_STATE -> FA -> Drain SLOT_FA_STATE)
 //   5 = FA Final (Reload q0/q1 + SLOT_FA_STATE + Gate -> FA + cur_kv -> O -> FFN tail)
+//   6 = FA Partial blk==0 (Reload q0/q1 only, skip SLOT_FA_STATE preload -> FA -> Drain SLOT_FA_STATE)
 
 #include "q4_lfm3_pre_state.h"
 
@@ -290,7 +291,14 @@ static void q4_conv1d_w_step_impl(
       if (stage == 16) {
         int32_t n_v = read_n_valid_clamped();
         int32_t si = (n_v <= 32) ? (n_v - D_CONV) : (32 - D_CONV);
-        copy_f32_16(&g_scratch.conv.state[0][0], &g_scratch.conv.bx[si][0], D_CONV * 64);
+        // Shift ascending so when idx < 0, D_CONV + idx = n_v + k > k (disjoint rows).
+#pragma clang loop unroll(disable)
+        for (int k = 0; k < D_CONV; ++k) {
+          int32_t idx = si + k;
+          const float *src = (idx < 0) ? &g_scratch.conv.state[D_CONV + idx][0]
+                                       : &g_scratch.conv.bx[idx][0];
+          copy_f32_16(&g_scratch.conv.state[k][0], src, 64);
+        }
       }
       stage -= 15;
     }
@@ -319,9 +327,12 @@ static void q4_conv1d_w_step_impl(
           aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
 #pragma clang loop unroll(disable)
           for (int k = 0; k < L_CACHE; ++k) {
+            int32_t src_ti = ti + k - D_CONV;
+            const float *sp = (src_ti < 0) ? &g_scratch.conv.state[D_CONV + src_ti][i]
+                                           : &g_scratch.conv.bx[src_ti][i];
             acc = aie::mac(
                 acc,
-                aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.bx[ti + k - D_CONV][i])).template to_vector<bfloat16>(),
+                aie::accum<accfloat, 16>(aie::load_v<16>(sp)).template to_vector<bfloat16>(),
                 aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.wt[k][i])).template to_vector<bfloat16>());
           }
           aie::store_v(op + i, acc.template to_vector<float>());
@@ -432,6 +443,7 @@ __attribute__((minsize)) void q4_lfm3_fa_op_impl(
   const bfloat16 *__restrict kv_mat = (const bfloat16 *)kv_pkt;
   if (!is_v) {
     g_scratch.attn.fa_mask16 = 0;
+    if (chunk_iter >= kv_ch && g_params[10]) return;
     const int32_t cur_off = (chunk_iter - kv_ch) * 32;
     const int32_t chunk_gpos0 =
         (chunk_iter < kv_ch) ? ((kv_start_chunk + chunk_iter) * KV_CHUNK_T) : (pos0 + cur_off);
@@ -558,8 +570,13 @@ __attribute__((minsize)) void q4_lfm3_pre_y_op(float *__restrict y_out, int32_t 
     src = g_scratch.conv.conv_out + arg * 64;
     if (arg >= 8) {
       int32_t n_v = read_n_valid_clamped();
-      const float *st = (n_v > 32) ? &g_scratch.conv.bx[n_v - 32 - D_CONV][0] : &g_scratch.conv.state[0][0];
-      src = st + (arg - 8) * 64;
+      int32_t k = arg - 8;
+      if (n_v > 32) {
+        int32_t idx = (n_v - 32) - D_CONV + k;
+        src = (idx < 0) ? &g_scratch.conv.state[D_CONV + idx][0] : &g_scratch.conv.bx[idx][0];
+      } else {
+        src = &g_scratch.conv.state[k][0];
+      }
     }
   } else if (op == 1) {
     int32_t p4 = arg >> 4;

@@ -111,7 +111,7 @@ def _validate_compile_params(layer_mode: int, kv_chunks: int) -> None:
         kv_chunks,
         valid_modes=VALID_MODES,
         nonzero_kv_modes=(3,),
-        max_kv_chunks=MAX_KV_CHUNKS,
+        max_kv_chunks=(2 * MAX_KV_CHUNKS if layer_mode == 1 else MAX_KV_CHUNKS),
     )
 
 

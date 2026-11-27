@@ -1,6 +1,9 @@
-// Unified Fused B=64 LFM2 / LFM2.5 Q4_0 Prefill Core (32 cores: 4 rows x 8 cols, npu2).
-// Mode 0 (g_params[6]==0): ShortConv (d_conv=2) + SwiGLU FFN (8192).
-// Mode 1 (g_params[6]==1): GQA (32 Q heads, 8 KV heads, head_dim=64) + QK-norm + NeoX RoPE + SwiGLU FFN.
+// Unified Fused B=64 LFM2 / LFM2.5 >32K Q4_0 Prefill Core (32 cores: 4 rows x 8 cols, npu2).
+// Mode 0 (g_params[6]==0): ShortConv (d_conv=2, param-slot) + SwiGLU FFN (8192).
+// Mode 2 (g_params[6]==2): Phase A (QKV + QK-norm + NeoX RoPE -> SLOT_FA_Q + kvo_buf).
+// Modes 3/4 (g_params[6]==3/4): FA Partial (blk==0 / blk>=1) -> Drain SLOT_FA_STATE + SLOT_FA_LM.
+// Modes 5/6 (g_params[6]==5/6): FA Final (+ cur_kv -> O) with FFN (Mode 5) or without FFN (Mode 6).
+// Mode 7 (g_params[6]==7): ShortConv (d_conv=2, param-slot) without FFN.
 
 #include "q4_lfm2_pre_state.h"
 void q4_fa_pack_v(const bfloat16 *, int32_t);
@@ -269,8 +272,15 @@ __attribute__((minsize)) static void q4_conv1d_w_step_impl(
   } else {
     if (stage == 16) {
       int32_t n_v = read_n_valid_clamped();
-      int32_t si = (n_v <= 32) ? (n_v - 2) : 30;
-      copy_f32_16(&g_scratch.conv.state[0][0], &g_scratch.conv.bx[si][0], D_CONV * 64);
+      int32_t si = (n_v <= 32) ? (n_v - D_CONV) : (32 - D_CONV);
+      // Shift ascending so when idx < 0, D_CONV + idx = n_v + k > k (disjoint rows).
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < D_CONV; ++k) {
+        int32_t idx = si + k;
+        const float *src = (idx < 0) ? &g_scratch.conv.state[D_CONV + idx][0]
+                                     : &g_scratch.conv.bx[idx][0];
+        copy_f32_16(&g_scratch.conv.state[k][0], src, 64);
+      }
       stage = 1;
     }
     if (stage <= 8) {
@@ -292,8 +302,10 @@ __attribute__((minsize)) static void q4_conv1d_w_step_impl(
       for (int i = 0; i < 64; i += 16) {
         const float *__restrict wp = &g_scratch.conv.wt[0][i];
         const float *__restrict bp = &g_scratch.conv.bx[t_base][i];
+        const float *p_m2 = (t_base >= 2) ? (bp - 128) : &g_scratch.conv.state[D_CONV + t_base - 2][i];
+        const float *p_m1 = (t_base >= 1) ? (bp - 64) : &g_scratch.conv.state[D_CONV + t_base - 1][i];
         aie::vector<bfloat16, 16> w0 = bf16(wp), w1 = bf16(wp + 64), w2 = bf16(wp + 128);
-        aie::vector<bfloat16, 16> x_m2 = bf16(bp - 128), x_m1 = bf16(bp - 64);
+        aie::vector<bfloat16, 16> x_m2 = bf16(p_m2), x_m1 = bf16(p_m1);
         for (int t = 0; t < 8; ++t, bp += 64) chess_prepare_for_pipelining chess_loop_count(8) {
           aie::vector<bfloat16, 16> x_0 = bf16(bp);
           aie::accum<accfloat, 16> acc = aie::mul<accfloat>(x_m2, w0);
@@ -502,8 +514,13 @@ __attribute__((minsize)) void q4_lfm2_pre_y_op(float *__restrict y_out, int32_t 
     valid_f32 = 32;
   } else if (op == 8) {
     int32_t n_v = read_n_valid_clamped();
-    const float *st = (n_v > 32) ? &g_scratch.conv.bx[n_v - 32 - D_CONV][0] : &g_scratch.conv.state[0][0];
-    src = st + (arg - 8) * 64;
+    int32_t k = arg - 8;
+    if (n_v > 32) {
+      int32_t idx = (n_v - 32) - D_CONV + k;
+      src = (idx < 0) ? &g_scratch.conv.state[D_CONV + idx][0] : &g_scratch.conv.bx[idx][0];
+    } else {
+      src = &g_scratch.conv.state[k][0];
+    }
   } else if (op == 1) {
     int32_t p4 = arg >> 4;
     int32_t tok = arg & 15;

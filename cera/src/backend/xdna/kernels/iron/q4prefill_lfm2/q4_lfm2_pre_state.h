@@ -20,7 +20,7 @@ constexpr float LOG2E = 1.4426950408889634f;
 constexpr float ATTN_SCALE = 0.125f;
 constexpr float ATTN_SCALE_LOG2E = 0.125f * 1.4426950408889634f;
 
-// Shared L1 scratch (20480 B -> data_size = 21504)
+// Shared L1 scratch (24576 B -> data_size = 24704)
 union ScratchUnion {
   struct {
     alignas(64) float x_slice[B_SUB][256];
