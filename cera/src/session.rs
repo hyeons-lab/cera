@@ -3035,7 +3035,7 @@ impl Session {
         let gpu = self
             .gpu_vision_encoder
             .as_ref()
-            .filter(|_| grid_tokens <= crate::model::vision_encoder_gpu::MAX_VIT_TOKENS);
+            .filter(|g| grid_tokens <= g.max_tokens());
         let tower_start = Instant::now();
         let img_tokens = if let Some(gpu) = gpu {
             match gpu.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {

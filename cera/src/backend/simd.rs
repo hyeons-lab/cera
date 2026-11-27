@@ -18384,111 +18384,10 @@ pub(crate) mod avx512_vnni {
         _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy)
     }
 
-    /// Pack two 256-bit float vectors into one 512-bit ZMM vector.
-    #[inline]
-    #[target_feature(enable = "avx512f,avx2")]
-    unsafe fn pack_256x2_ps(lo: __m256, hi: __m256) -> __m512 {
-        _mm512_castsi512_ps(_mm512_inserti64x4(
-            _mm512_castsi256_si512(_mm256_castps_si256(lo)),
-            _mm256_castps_si256(hi),
-            1,
-        ))
-    }
-
-    /// Compute one Q6_K row dot product using AVX-512 VNNI.
-    #[inline]
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn q6k_n1_row_512(
-        row_ptr: *const u8,
-        b_scales: &[f32],
-        b_quants: &[i8],
-        xs32_sx: &[f32],
-        sb: usize,
-    ) -> f32 {
+    /// Horizontal sum of `(facc0 + facc1) - macc` for Q6_K AVX-512 dot accumulators.
+    #[inline(always)]
+    unsafe fn q6k_reduce_512(facc0: __m512, facc1: __m512, macc: __m128) -> f32 {
         unsafe {
-            let mask_0f = _mm512_set1_epi8(0x0F);
-            let mask_03 = _mm512_set1_epi8(0x03);
-            let perm_sc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
-            let zero512 = _mm512_setzero_si512();
-            let bsz = size_of::<crate::quant::BlockQ6K>();
-
-            let mut facc0 = _mm512_setzero_ps();
-            let mut facc1 = _mm512_setzero_ps();
-            let mut macc = _mm_setzero_ps();
-
-            for bi in 0..sb {
-                let blk = &*(row_ptr.add(bi * bsz) as *const crate::quant::BlockQ6K);
-                let dv = _mm_set1_ps(crate::quant::f16_to_f32(blk.d));
-
-                for nh in 0..2usize {
-                    let xb0 = bi * 8 + nh * 4;
-                    let x01 = _mm512_loadu_si512(b_quants.as_ptr().add(xb0 * 32) as *const __m512i);
-                    let x23 =
-                        _mm512_loadu_si512(b_quants.as_ptr().add((xb0 + 2) * 32) as *const __m512i);
-                    let xs01 = pack_256x2_ps(
-                        _mm256_set1_ps(*b_scales.get_unchecked(xb0)),
-                        _mm256_set1_ps(*b_scales.get_unchecked(xb0 + 1)),
-                    );
-                    let xs23 = pack_256x2_ps(
-                        _mm256_set1_ps(*b_scales.get_unchecked(xb0 + 2)),
-                        _mm256_set1_ps(*b_scales.get_unchecked(xb0 + 3)),
-                    );
-                    let mxs01 = _mm_loadu_ps(xs32_sx.as_ptr().add(xb0 * 2));
-                    let mxs23 = _mm_loadu_ps(xs32_sx.as_ptr().add((xb0 + 2) * 2));
-
-                    let ql_vec = _mm512_loadu_si512(blk.ql.as_ptr().add(nh * 64) as *const __m512i);
-                    let qhb = _mm256_loadu_si256(blk.qh.as_ptr().add(nh * 32) as *const __m256i);
-
-                    let l4_01 = _mm512_and_si512(ql_vec, mask_0f);
-                    let l4_23 = _mm512_and_si512(_mm512_srli_epi32(ql_vec, 4), mask_0f);
-                    let qh01 = _mm512_and_si512(
-                        _mm512_inserti64x4(
-                            _mm512_castsi256_si512(qhb),
-                            _mm256_srli_epi16(qhb, 2),
-                            1,
-                        ),
-                        mask_03,
-                    );
-                    let qh23 = _mm512_and_si512(
-                        _mm512_inserti64x4(
-                            _mm512_castsi256_si512(_mm256_srli_epi16(qhb, 4)),
-                            _mm256_srli_epi16(qhb, 6),
-                            1,
-                        ),
-                        mask_03,
-                    );
-                    let w01 = _mm512_or_si512(l4_01, _mm512_slli_epi32(qh01, 4));
-                    let w23 = _mm512_or_si512(l4_23, _mm512_slli_epi32(qh23, 4));
-
-                    let sc01_raw = _mm_cvtsi32_si128(core::ptr::read_unaligned(
-                        blk.scales.as_ptr().add(nh * 8) as *const i32,
-                    ));
-                    let sc23_raw = _mm_cvtsi32_si128(core::ptr::read_unaligned(
-                        blk.scales.as_ptr().add(nh * 8 + 4) as *const i32,
-                    ));
-                    let sc01_d = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(sc01_raw)), dv);
-                    let sc23_d = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(sc23_raw)), dv);
-
-                    macc = _mm_fmadd_ps(sc01_d, mxs01, macc);
-                    macc = _mm_fmadd_ps(sc23_d, mxs23, macc);
-
-                    let s01 = _mm512_mul_ps(
-                        _mm512_permutexvar_ps(perm_sc, _mm512_castps128_ps512(sc01_d)),
-                        xs01,
-                    );
-                    let s23 = _mm512_mul_ps(
-                        _mm512_permutexvar_ps(perm_sc, _mm512_castps128_ps512(sc23_d)),
-                        xs23,
-                    );
-
-                    let d01 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero512, w01, x01));
-                    let d23 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero512, w23, x23));
-
-                    facc0 = _mm512_fmadd_ps(d01, s01, facc0);
-                    facc1 = _mm512_fmadd_ps(d23, s23, facc1);
-                }
-            }
-
             let f = _mm512_add_ps(facc0, facc1);
             let lo = _mm512_castps512_ps256(f);
             let hi = _mm256_castsi256_ps(_mm512_extracti64x4_epi64::<1>(_mm512_castps_si512(f)));
@@ -18501,9 +18400,338 @@ pub(crate) mod avx512_vnni {
         }
     }
 
-    /// Inner Q6_K GEMV (`n = 1`) AVX-512 VNNI driver with optional active-worker cap.
+    /// Accumulate one 128-element half of a `BlockQ6K` into `(facc0, facc1, macc)`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn q6k_half_accum_512(
+        blk: &crate::quant::BlockQ6K,
+        nh: usize,
+        dv: __m128,
+        x01: __m512i,
+        x23: __m512i,
+        xs4_01: __m128,
+        xs4_23: __m128,
+        mxs01: __m128,
+        mxs23: __m128,
+        mask_0f: __m512i,
+        mask_30: __m512i,
+        perm_sc: __m512i,
+        zero512: __m512i,
+        facc0: &mut __m512,
+        facc1: &mut __m512,
+        macc: &mut __m128,
+    ) {
+        unsafe {
+            let ql_vec = _mm512_loadu_si512(blk.ql.as_ptr().add(nh * 64) as *const __m512i);
+            let qhb = _mm256_loadu_si256(blk.qh.as_ptr().add(nh * 32) as *const __m256i);
+
+            let l4_01 = _mm512_and_si512(ql_vec, mask_0f);
+            let l4_23 = _mm512_and_si512(_mm512_srli_epi32(ql_vec, 4), mask_0f);
+            let qh01 = _mm512_and_si512(
+                _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_slli_epi16(qhb, 4)),
+                    _mm256_slli_epi16(qhb, 2),
+                    1,
+                ),
+                mask_30,
+            );
+            let qh23 = _mm512_and_si512(
+                _mm512_inserti64x4(_mm512_castsi256_si512(qhb), _mm256_srli_epi16(qhb, 2), 1),
+                mask_30,
+            );
+            let w01 = _mm512_or_si512(l4_01, qh01);
+            let w23 = _mm512_or_si512(l4_23, qh23);
+
+            let sc01_raw = _mm_cvtsi32_si128(core::ptr::read_unaligned(
+                blk.scales.as_ptr().add(nh * 8) as *const i32,
+            ));
+            let sc23_raw = _mm_cvtsi32_si128(core::ptr::read_unaligned(
+                blk.scales.as_ptr().add(nh * 8 + 4) as *const i32,
+            ));
+            let sc01_d = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(sc01_raw)), dv);
+            let sc23_d = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(sc23_raw)), dv);
+
+            *macc = _mm_fmadd_ps(sc01_d, mxs01, *macc);
+            *macc = _mm_fmadd_ps(sc23_d, mxs23, *macc);
+
+            let sc01_s = _mm_mul_ps(sc01_d, xs4_01);
+            let sc23_s = _mm_mul_ps(sc23_d, xs4_23);
+
+            let s01 = _mm512_permutexvar_ps(perm_sc, _mm512_castps128_ps512(sc01_s));
+            let s23 = _mm512_permutexvar_ps(perm_sc, _mm512_castps128_ps512(sc23_s));
+
+            let d01 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero512, w01, x01));
+            let d23 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero512, w23, x23));
+
+            *facc0 = _mm512_fmadd_ps(d01, s01, *facc0);
+            *facc1 = _mm512_fmadd_ps(d23, s23, *facc1);
+        }
+    }
+
+    /// Compute one Q6_K row dot product using AVX-512 VNNI.
+    #[inline(always)]
+    unsafe fn q6k_n1_row_body_512(
+        row_ptr: *const u8,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+        cvt_d: impl Fn(u16) -> __m128,
+    ) -> f32 {
+        unsafe {
+            let mask_0f = _mm512_set1_epi8(0x0F);
+            let mask_30 = _mm512_set1_epi8(0x30);
+            let perm_sc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+            let zero512 = _mm512_setzero_si512();
+            let bsz = size_of::<crate::quant::BlockQ6K>();
+
+            let mut facc0 = _mm512_setzero_ps();
+            let mut facc1 = _mm512_setzero_ps();
+            let mut macc = _mm_setzero_ps();
+
+            for bi in 0..sb {
+                let blk = &*(row_ptr.add(bi * bsz) as *const crate::quant::BlockQ6K);
+                let dv = cvt_d(blk.d);
+
+                for nh in 0..2usize {
+                    let xb0 = bi * 8 + nh * 4;
+                    let x01 = _mm512_loadu_si512(b_quants.as_ptr().add(xb0 * 32) as *const __m512i);
+                    let x23 =
+                        _mm512_loadu_si512(b_quants.as_ptr().add((xb0 + 2) * 32) as *const __m512i);
+                    let s4 = _mm_loadu_ps(b_scales.as_ptr().add(xb0));
+                    let xs4_01 = _mm_permute_ps::<0x50>(s4);
+                    let xs4_23 = _mm_permute_ps::<0xFA>(s4);
+                    let mxs01 = _mm_loadu_ps(xs32_sx.as_ptr().add(xb0 * 2));
+                    let mxs23 = _mm_loadu_ps(xs32_sx.as_ptr().add((xb0 + 2) * 2));
+
+                    q6k_half_accum_512(
+                        blk, nh, dv, x01, x23, xs4_01, xs4_23, mxs01, mxs23, mask_0f, mask_30,
+                        perm_sc, zero512, &mut facc0, &mut facc1, &mut macc,
+                    );
+                }
+            }
+
+            q6k_reduce_512(facc0, facc1, macc)
+        }
+    }
+
+    /// Compute 4 consecutive Q6_K row dot products sharing activation loads using AVX-512 VNNI.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn q6k_n1_4rows_body_512(
+        row_ptr: *const u8,
+        row_bytes: usize,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+        cvt_d: impl Fn(u16) -> __m128,
+    ) -> [f32; 4] {
+        unsafe {
+            let mask_0f = _mm512_set1_epi8(0x0F);
+            let mask_30 = _mm512_set1_epi8(0x30);
+            let perm_sc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+            let zero512 = _mm512_setzero_si512();
+            let bsz = size_of::<crate::quant::BlockQ6K>();
+
+            let rp0 = row_ptr;
+            let rp1 = row_ptr.add(row_bytes);
+            let rp2 = row_ptr.add(2 * row_bytes);
+            let rp3 = row_ptr.add(3 * row_bytes);
+
+            let mut facc0_0 = _mm512_setzero_ps();
+            let mut facc0_1 = _mm512_setzero_ps();
+            let mut macc0 = _mm_setzero_ps();
+            let mut facc1_0 = _mm512_setzero_ps();
+            let mut facc1_1 = _mm512_setzero_ps();
+            let mut macc1 = _mm_setzero_ps();
+            let mut facc2_0 = _mm512_setzero_ps();
+            let mut facc2_1 = _mm512_setzero_ps();
+            let mut macc2 = _mm_setzero_ps();
+            let mut facc3_0 = _mm512_setzero_ps();
+            let mut facc3_1 = _mm512_setzero_ps();
+            let mut macc3 = _mm_setzero_ps();
+
+            for bi in 0..sb {
+                let b_off = bi * bsz;
+                let blk0 = &*(rp0.add(b_off) as *const crate::quant::BlockQ6K);
+                let blk1 = &*(rp1.add(b_off) as *const crate::quant::BlockQ6K);
+                let blk2 = &*(rp2.add(b_off) as *const crate::quant::BlockQ6K);
+                let blk3 = &*(rp3.add(b_off) as *const crate::quant::BlockQ6K);
+                let dv0 = cvt_d(blk0.d);
+                let dv1 = cvt_d(blk1.d);
+                let dv2 = cvt_d(blk2.d);
+                let dv3 = cvt_d(blk3.d);
+
+                for nh in 0..2usize {
+                    let xb0 = bi * 8 + nh * 4;
+                    let x01 = _mm512_loadu_si512(b_quants.as_ptr().add(xb0 * 32) as *const __m512i);
+                    let x23 =
+                        _mm512_loadu_si512(b_quants.as_ptr().add((xb0 + 2) * 32) as *const __m512i);
+                    let s4 = _mm_loadu_ps(b_scales.as_ptr().add(xb0));
+                    let xs4_01 = _mm_permute_ps::<0x50>(s4);
+                    let xs4_23 = _mm_permute_ps::<0xFA>(s4);
+                    let mxs01 = _mm_loadu_ps(xs32_sx.as_ptr().add(xb0 * 2));
+                    let mxs23 = _mm_loadu_ps(xs32_sx.as_ptr().add((xb0 + 2) * 2));
+
+                    q6k_half_accum_512(
+                        blk0,
+                        nh,
+                        dv0,
+                        x01,
+                        x23,
+                        xs4_01,
+                        xs4_23,
+                        mxs01,
+                        mxs23,
+                        mask_0f,
+                        mask_30,
+                        perm_sc,
+                        zero512,
+                        &mut facc0_0,
+                        &mut facc0_1,
+                        &mut macc0,
+                    );
+                    q6k_half_accum_512(
+                        blk1,
+                        nh,
+                        dv1,
+                        x01,
+                        x23,
+                        xs4_01,
+                        xs4_23,
+                        mxs01,
+                        mxs23,
+                        mask_0f,
+                        mask_30,
+                        perm_sc,
+                        zero512,
+                        &mut facc1_0,
+                        &mut facc1_1,
+                        &mut macc1,
+                    );
+                    q6k_half_accum_512(
+                        blk2,
+                        nh,
+                        dv2,
+                        x01,
+                        x23,
+                        xs4_01,
+                        xs4_23,
+                        mxs01,
+                        mxs23,
+                        mask_0f,
+                        mask_30,
+                        perm_sc,
+                        zero512,
+                        &mut facc2_0,
+                        &mut facc2_1,
+                        &mut macc2,
+                    );
+                    q6k_half_accum_512(
+                        blk3,
+                        nh,
+                        dv3,
+                        x01,
+                        x23,
+                        xs4_01,
+                        xs4_23,
+                        mxs01,
+                        mxs23,
+                        mask_0f,
+                        mask_30,
+                        perm_sc,
+                        zero512,
+                        &mut facc3_0,
+                        &mut facc3_1,
+                        &mut macc3,
+                    );
+                }
+            }
+
+            [
+                q6k_reduce_512(facc0_0, facc0_1, macc0),
+                q6k_reduce_512(facc1_0, facc1_1, macc1),
+                q6k_reduce_512(facc2_0, facc2_1, macc2),
+                q6k_reduce_512(facc3_0, facc3_1, macc3),
+            ]
+        }
+    }
+
+    /// Compute 4 consecutive Q6_K row dot products using AVX-512 VNNI + software `f16_to_f32`.
+    #[inline]
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn gemm_q6_k_n1_512_inner(
+    unsafe fn q6k_n1_4rows_512(
+        row_ptr: *const u8,
+        row_bytes: usize,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+    ) -> [f32; 4] {
+        unsafe {
+            q6k_n1_4rows_body_512(row_ptr, row_bytes, b_scales, b_quants, xs32_sx, sb, |d| {
+                _mm_set1_ps(crate::quant::f16_to_f32(d))
+            })
+        }
+    }
+
+    /// Compute 4 consecutive Q6_K row dot products using AVX-512 VNNI + F16C `_mm_cvtph_ps`.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
+    unsafe fn q6k_n1_4rows_512_f16c(
+        row_ptr: *const u8,
+        row_bytes: usize,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+    ) -> [f32; 4] {
+        unsafe {
+            q6k_n1_4rows_body_512(row_ptr, row_bytes, b_scales, b_quants, xs32_sx, sb, |d| {
+                _mm_permute_ps::<0x00>(_mm_cvtph_ps(_mm_cvtsi32_si128(d as i32)))
+            })
+        }
+    }
+
+    /// Compute one Q6_K row dot product using AVX-512 VNNI + software `f16_to_f32`.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q6k_n1_row_512(
+        row_ptr: *const u8,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+    ) -> f32 {
+        unsafe {
+            q6k_n1_row_body_512(row_ptr, b_scales, b_quants, xs32_sx, sb, |d| {
+                _mm_set1_ps(crate::quant::f16_to_f32(d))
+            })
+        }
+    }
+
+    /// Compute one Q6_K row dot product using AVX-512 VNNI + F16C `_mm_cvtph_ps`.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
+    unsafe fn q6k_n1_row_512_f16c(
+        row_ptr: *const u8,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        xs32_sx: &[f32],
+        sb: usize,
+    ) -> f32 {
+        unsafe {
+            q6k_n1_row_body_512(row_ptr, b_scales, b_quants, xs32_sx, sb, |d| {
+                _mm_permute_ps::<0x00>(_mm_cvtph_ps(_mm_cvtsi32_si128(d as i32)))
+            })
+        }
+    }
+
+    /// Precompute per-half-block `(xs * 32) * sum(x_q)` and drive 4-row unrolled Q6_K GEMV.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn gemm_q6_k_n1_drive_512(
         a_quant: &[u8],
         b_scales: &[f32],
         b_quants: &[i8],
@@ -18511,6 +18739,8 @@ pub(crate) mod avx512_vnni {
         m: usize,
         k: usize,
         max_active: usize,
+        rows4_fn: impl Fn(*const u8, usize, &[f32], &[i8], &[f32], usize) -> [f32; 4] + Sync + Send,
+        row_fn: impl Fn(*const u8, &[f32], &[i8], &[f32], usize) -> f32 + Sync + Send,
     ) {
         let sb = k / 256;
         let nb32 = k / 32;
@@ -18541,29 +18771,129 @@ pub(crate) mod avx512_vnni {
 
         let base = a_quant.as_ptr() as usize;
         let xs_ref: &[f32] = xs32_sx;
-        let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
-            let rp = (base as *const u8).add(i * row_bytes);
-            if i + 1 < m {
-                _mm_prefetch::<_MM_HINT_T0>(rp.add(row_bytes) as *const i8);
+        let compute_slice = |(start_row, slice): (usize, &mut [f32])| unsafe {
+            let mut rp = (base as *const u8).add(start_row * row_bytes);
+            let mut idx = 0usize;
+            while idx + 4 <= slice.len() {
+                if start_row + idx + 7 < m {
+                    let pf = rp.add(4 * row_bytes);
+                    _mm_prefetch::<_MM_HINT_T0>(pf as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes) as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes) as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes) as *const i8);
+                    if row_bytes >= 1024 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(512) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes + 512) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes + 512) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes + 512) as *const i8);
+                    }
+                    if row_bytes >= 1536 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(1024) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes + 1024) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes + 1024) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes + 1024) as *const i8);
+                    }
+                }
+                let y4 = rows4_fn(rp, row_bytes, b_scales, b_quants, xs_ref, sb);
+                slice[idx..idx + 4].copy_from_slice(&y4);
+                rp = rp.add(4 * row_bytes);
+                idx += 4;
             }
-            *yi = q6k_n1_row_512(rp, b_scales, b_quants, xs_ref, sb);
+            while idx < slice.len() {
+                if start_row + idx + 1 < m {
+                    _mm_prefetch::<_MM_HINT_T0>(rp.add(row_bytes) as *const i8);
+                }
+                slice[idx] = row_fn(rp, b_scales, b_quants, xs_ref, sb);
+                rp = rp.add(row_bytes);
+                idx += 1;
+            }
         };
 
         if m < crate::backend::cpu::gemv_par_threshold() {
-            out.iter_mut().enumerate().for_each(compute_row);
+            compute_slice((0, out));
         } else if max_active > 0 {
             crate::backend::cpu::par_rows_slice_active(
                 max_active,
                 out,
                 crate::backend::cpu::gemv_min_rows(),
-                |(start_row, slice)| {
-                    for (idx, yi) in slice.iter_mut().enumerate() {
-                        compute_row((start_row + idx, yi));
-                    }
-                },
+                compute_slice,
             );
         } else {
-            crate::backend::cpu::par_rows(out, crate::backend::cpu::gemv_min_rows(), compute_row);
+            crate::backend::cpu::par_rows_slice(
+                out,
+                crate::backend::cpu::gemv_min_rows(),
+                compute_slice,
+            );
+        }
+    }
+
+    /// F16C-enabled AVX-512 VNNI entrypoint for Q6_K GEMV (`n = 1`).
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
+    unsafe fn gemm_q6_k_n1_512_f16c(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        max_active: usize,
+    ) {
+        unsafe {
+            gemm_q6_k_n1_drive_512(
+                a_quant,
+                b_scales,
+                b_quants,
+                out,
+                m,
+                k,
+                max_active,
+                |rp, rb, bs, bq, xs, sb| q6k_n1_4rows_512_f16c(rp, rb, bs, bq, xs, sb),
+                |rp, bs, bq, xs, sb| q6k_n1_row_512_f16c(rp, bs, bq, xs, sb),
+            );
+        }
+    }
+
+    /// Non-F16C AVX-512 VNNI entrypoint for Q6_K GEMV (`n = 1`).
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn gemm_q6_k_n1_512_base(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        max_active: usize,
+    ) {
+        unsafe {
+            gemm_q6_k_n1_drive_512(
+                a_quant,
+                b_scales,
+                b_quants,
+                out,
+                m,
+                k,
+                max_active,
+                |rp, rb, bs, bq, xs, sb| q6k_n1_4rows_512(rp, rb, bs, bq, xs, sb),
+                |rp, bs, bq, xs, sb| q6k_n1_row_512(rp, bs, bq, xs, sb),
+            );
+        }
+    }
+
+    /// Inner Q6_K GEMV (`n = 1`) AVX-512 VNNI driver with optional active-worker cap.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn gemm_q6_k_n1_512_inner(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        max_active: usize,
+    ) {
+        if is_x86_feature_detected!("f16c") {
+            unsafe { gemm_q6_k_n1_512_f16c(a_quant, b_scales, b_quants, out, m, k, max_active) };
+        } else {
+            unsafe { gemm_q6_k_n1_512_base(a_quant, b_scales, b_quants, out, m, k, max_active) };
         }
     }
 
@@ -21237,6 +21567,74 @@ pub(crate) mod avx512_vnni {
                     assert!(
                         (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
                         "[{i},{j}]: got {g} want {want}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn gemm_q6_k_n1_large_matches_dequant_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            // Cross `gemv_par_threshold()` with non-multiple-of-4 `m` and `k=2048` so both
+            // `par_rows_slice` (`max_active == 0`) and `par_rows_slice_active` (`max_active = 12`)
+            // plus the F16C/base row helpers are exercised end-to-end.
+            let (m, k) = (519usize, 2048usize);
+            let sb = k / 256;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            let mut st = 0x9e37_79b9_7f4a_7c15u64;
+            let mut a = vec![0u8; m * row_bytes];
+            for (bi, chunk) in a
+                .chunks_mut(size_of::<crate::quant::BlockQ6K>())
+                .enumerate()
+            {
+                for b in chunk[..208].iter_mut() {
+                    *b = (lcg01(&mut st) * 255.0) as u8;
+                }
+                let d = half::f16::from_f32(0.005 + 0.003 * (bi % 9) as f32);
+                chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+            }
+
+            let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+            let (xs, xq) = ref_quantize(&x);
+            let mut q8_scales = Vec::new();
+            let mut q8_quants = Vec::new();
+
+            let mut got_par = vec![0.0f32; m];
+            let mut got_active = vec![0.0f32; m];
+            let mut got_base = vec![0.0f32; m];
+            unsafe {
+                gemm_q6_k_q8_0(&a, &xs, &xq, &mut got_par, m, 1, k);
+                gemv_q6k_f32_active(
+                    &a,
+                    &x,
+                    &mut got_active,
+                    m,
+                    k,
+                    &mut q8_scales,
+                    &mut q8_quants,
+                    12,
+                );
+                gemm_q6_k_n1_512_base(&a, &q8_scales, &q8_quants, &mut got_base, m, k, 12);
+            }
+
+            let mut w = vec![0.0f32; k];
+            for i in 0..m {
+                crate::quant::dequantize_q6_k_row(&a[i * row_bytes..(i + 1) * row_bytes], &mut w);
+                let mut want = 0.0f64;
+                for e in 0..k {
+                    let xa = q8_scales[e / 32] * q8_quants[e] as f32;
+                    want += (w[e] * xa) as f64;
+                }
+                for (tag, g) in [
+                    ("gemm_n1", got_par[i] as f64),
+                    ("active", got_active[i] as f64),
+                    ("base", got_base[i] as f64),
+                ] {
+                    assert!(
+                        (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                        "{tag} row {i}: got {g} want {want}"
                     );
                 }
             }

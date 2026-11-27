@@ -887,7 +887,7 @@ impl CeraEngine {
         });
         let (eager_audio_decoder, eager_detok_weights, eager_audio_accelerator) =
             if path.is_some() && aux.audio_decoder.is_none() {
-                try_load_audio_decoder_and_detok(&manifest, cfg.backend)
+                try_load_audio_decoder_and_detok(&manifest, vision_backend)
             } else {
                 (aux.audio_decoder, aux.detok_weights, aux.audio_accelerator)
             };
@@ -2642,7 +2642,7 @@ fn load_text_model_auto(
     path: Option<&Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
-    // Metal -> Hexagon -> wgpu -> CPU.
+    // Metal -> Hexagon -> XDNA -> wgpu -> CPU.
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
         let gguf_for_metal = gguf.clone();
@@ -2673,6 +2673,20 @@ fn load_text_model_auto(
                 // (unsupported arch or quant, or a DSP probe failure) is an
                 // ordinary fallthrough logged at debug.
                 tracing::debug!("cera::engine: Hexagon unavailable ({e}); trying next backend");
+            }
+        }
+    }
+
+    #[cfg(feature = "xdna")]
+    {
+        let gguf_for_xdna = gguf.clone();
+        match model::load_model_xdna(gguf_for_xdna, path, context_size) {
+            Ok(m) => {
+                tracing::debug!("cera::engine: using AMD XDNA2 NPU backend (auto)");
+                return Ok(m);
+            }
+            Err(e) => {
+                tracing::debug!("cera::engine: XDNA unavailable ({e}); trying next backend");
             }
         }
     }

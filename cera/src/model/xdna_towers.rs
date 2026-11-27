@@ -15,15 +15,16 @@
 //! fallible boundary (`build`, `encode_image`, `encode_pcm`, `encode_mel`, `run`,
 //! `run_projector`), matching the Metal/wgpu fault discipline.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 
 use crate::backend::cpu::{
-    add_inplace, axpy_inplace, dot_f32, gelu_erf_inplace, gelu_inplace, glu_split,
-    layer_norm_inplace, relu_inplace, silu_inplace, softmax_inplace,
+    add_inplace, axpy_inplace, conv1d, dot_f32, gelu_erf_inplace, gelu_inplace, glu_split,
+    layer_norm_inplace, par_rows_n, relu_inplace, rmsnorm, rmsnorm_into, sigmoid_inplace,
+    silu_inplace, silu_mul_inplace, softmax_inplace,
 };
 use crate::backend::xdna::device::{XdnaBo, XdnaDevice, XdnaKernel, XdnaRun};
 use crate::backend::xdna::kernels::{
@@ -33,17 +34,20 @@ use crate::backend::xdna::repack::{
     f32_to_bf16, gemm_bf16_bucket_chunks, pack_gemm_bf16_f32_slice, pack_gemm_bf16_weight_slice,
 };
 use crate::model::audio_encoder::{
-    AudioEncoderWeights, HOP_LEN, LOG_MEL_EPS, N_FFT, NORM_VAR_EPS, PREEMPH,
+    AudioEncoderWeights, ConvLayerWeights, HOP_LEN, LOG_MEL_EPS, N_FFT, NORM_VAR_EPS, PREEMPH,
+    apply_rope_neox_head, conv_stem_lfm3a_features,
 };
 use crate::model::audio_encoder_gpu::{
     AudioEncoderGpuOps, AudioGpuEncode, Conv2dSpec, GpuAudioWeights, encode_audio_mel_gpu,
     encode_audio_pcm_gpu,
 };
 use crate::model::audio_preprocessor::N_FFT_BINS;
-use crate::model::vision_encoder::VisionEncoderWeights;
+use crate::model::vision_encoder::{
+    VisionEncoderWeights, apply_2d_vision_mrope_qk, depthwise_conv2d_same_into, vit_attention_gqa,
+};
 use crate::model::vision_encoder_gpu::{
-    GpuStack, GpuVitWeights, LONG_STACK_ROWS, MAX_VIT_TOKENS, VisionGpuEncode, VitGpuOps, VitStack,
-    VitStackSpec, encode_image_gpu, warn_stack_unavailable,
+    GpuStack, GpuVitWeights, VisionGpuEncode, VitGpuOps, VitStack, VitStackSpec, encode_image_gpu,
+    warn_stack_unavailable,
 };
 use crate::model::weights::MmapWeight;
 
@@ -160,6 +164,43 @@ impl XdnaGemmRunner {
             inner: Arc::new(Mutex::new(XdnaGemmInner { buckets, device })),
             last_err: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Open or reuse a process-wide shared `XdnaDevice` + `gemm_bf16` kernel context so
+    /// multiple encoders (e.g. LFM3-Omni vision + audio) share one XRT hardware context
+    /// reservation, while each caller owns its own error slot.
+    pub fn open_shared() -> Result<Self> {
+        #[cfg(test)]
+        if crate::backend::xdna::sys::fake::active_shim().is_some() {
+            thread_local! {
+                static TEST_SHARED: Mutex<Weak<Mutex<XdnaGemmInner>>> =
+                    const { Mutex::new(Weak::new()) };
+            }
+            return TEST_SHARED.with(|slot| {
+                let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(inner) = guard.upgrade() {
+                    return Ok(Self {
+                        inner,
+                        last_err: Arc::new(Mutex::new(None)),
+                    });
+                }
+                let fresh = Self::open()?;
+                *guard = Arc::downgrade(&fresh.inner);
+                Ok(fresh)
+            });
+        }
+        static SHARED: OnceLock<Mutex<Weak<Mutex<XdnaGemmInner>>>> = OnceLock::new();
+        let slot = SHARED.get_or_init(|| Mutex::new(Weak::new()));
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(inner) = guard.upgrade() {
+            return Ok(Self {
+                inner,
+                last_err: Arc::new(Mutex::new(None)),
+            });
+        }
+        let fresh = Self::open()?;
+        *guard = Arc::downgrade(&fresh.inner);
+        Ok(fresh)
     }
 
     fn record_err(&self, err: anyhow::Error) {
@@ -545,7 +586,7 @@ impl XdnaVitOps {
     pub fn new(runner: XdnaGemmRunner) -> Self {
         Self {
             runner,
-            attn_limit: LONG_STACK_ROWS.max(MAX_VIT_TOKENS),
+            attn_limit: usize::MAX,
         }
     }
 
@@ -765,6 +806,131 @@ impl VitGpuOps for XdnaVitOps {
         let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
         add_inplace(&mut d[..len], &s[..len]);
     }
+
+    fn supports_lfm3(&self) -> bool {
+        true
+    }
+
+    fn rmsnorm(
+        &self,
+        src: &Self::Buf,
+        weight: &Self::Buf,
+        eps: f32,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buf {
+        let x = src.0.lock().unwrap_or_else(|e| e.into_inner());
+        let w = weight.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = vec![0.0f32; rows * dim];
+        let x_rows = &x[..rows * dim];
+        let w_row = &w[..dim];
+        par_rows_n(&mut out, dim, 8, |(r, dst_row)| {
+            rmsnorm_into(&x_rows[r * dim..(r + 1) * dim], dst_row, w_row, eps);
+        });
+        XdnaBuf::from_vec(out)
+    }
+
+    fn silu_mul(&self, gate: &Self::Buf, up: &Self::Buf, len: usize) {
+        let mut g = gate.0.lock().unwrap_or_else(|e| e.into_inner());
+        let u = up.0.lock().unwrap_or_else(|e| e.into_inner());
+        silu_mul_inplace(&mut g[..len], &u[..len]);
+    }
+
+    fn lfm3_conv_spatial(
+        &self,
+        proj: &Self::Buf,
+        proj_rows: usize,
+        depthwise_w: &[f32],
+        depthwise_b: Option<&[f32]>,
+        grid_w: usize,
+        grid_h: usize,
+        d: usize,
+        kernel_size: usize,
+    ) -> Self::Buf {
+        let n_tokens = grid_w * grid_h;
+        let proj_guard = proj.0.lock().unwrap_or_else(|e| e.into_inner());
+        let proj_slice = &proj_guard[..n_tokens * proj_rows];
+
+        let mut gated = vec![0.0f32; n_tokens * d];
+        if proj_rows == 3 * d {
+            par_rows_n(&mut gated, d, 8, |(t, dst)| {
+                let row = &proj_slice[t * 3 * d..(t + 1) * 3 * d];
+                let first = &row[0..d];
+                let third = &row[2 * d..3 * d];
+                for c in 0..d {
+                    dst[c] = first[c] * third[c];
+                }
+            });
+        } else {
+            par_rows_n(&mut gated, d, 8, |(t, dst)| {
+                let row = &proj_slice[t * 2 * d..(t + 1) * 2 * d];
+                let b_part = &row[0..d];
+                let c_part = &row[d..2 * d];
+                for c in 0..d {
+                    dst[c] = b_part[c] * c_part[c];
+                }
+            });
+        }
+
+        let mut out = vec![0.0f32; n_tokens * d];
+        depthwise_conv2d_same_into(
+            &gated,
+            depthwise_w,
+            depthwise_b,
+            grid_w,
+            grid_h,
+            d,
+            kernel_size,
+            &mut out,
+        );
+        if proj_rows == 3 * d {
+            par_rows_n(&mut out, d, 8, |(t, dst)| {
+                let middle = &proj_slice[t * 3 * d + d..t * 3 * d + 2 * d];
+                for c in 0..d {
+                    dst[c] *= middle[c];
+                }
+            });
+        }
+        XdnaBuf::from_vec(out)
+    }
+
+    fn lfm3_gqa_mrope_attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        grid_w: usize,
+        grid_h: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        rope_theta: f32,
+    ) -> Self::Buf {
+        let tokens = grid_w * grid_h;
+        let q_dim = n_head * head_dim;
+        let kv_dim = n_head_kv * head_dim;
+        if tokens == 0 || q_dim == 0 || kv_dim == 0 {
+            return XdnaBuf::zeroed(tokens * q_dim);
+        }
+        let mut q_vec = q.read_clone(tokens * q_dim);
+        let mut k_vec = k.read_clone(tokens * kv_dim);
+        let v_vec = v.read_clone(tokens * kv_dim);
+
+        apply_2d_vision_mrope_qk(
+            &mut q_vec, &mut k_vec, grid_w, grid_h, n_head, n_head_kv, head_dim, rope_theta,
+        );
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let chunk_q = q_dim.saturating_sub(1).clamp(1, 32);
+        let padded = tokens.next_multiple_of(chunk_q);
+        let mut heads = vec![0.0f32; n_head * padded * head_dim];
+        let mut out = vec![0.0f32; tokens * q_dim];
+        vit_attention_gqa(
+            &q_vec, &k_vec, &v_vec, &mut out, &mut heads, tokens, n_head, n_head_kv, head_dim,
+            scale,
+        );
+        XdnaBuf::from_vec(out)
+    }
 }
 
 /// XDNA implementation of [`VitStack::run`], forwarding through [`GpuStack<XdnaVitOps>`].
@@ -904,6 +1070,10 @@ impl VisionGpuEncode for XdnaVisionEncoder {
         "xdna"
     }
 
+    fn max_tokens(&self) -> usize {
+        self.ops.attn_limit
+    }
+
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ops.take_err();
@@ -952,10 +1122,7 @@ pub(crate) fn try_xdna_vit_stack(
 pub(crate) fn try_xdna_vision_encoder(
     weights: &VisionEncoderWeights,
 ) -> Option<Arc<dyn VisionGpuEncode>> {
-    if weights.config.projector_type.is_lfm3() {
-        return None;
-    }
-    let runner = match XdnaGemmRunner::open() {
+    let runner = match XdnaGemmRunner::open_shared() {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("vision encoder: XDNA backend unavailable ({e:#}); falling back");
@@ -1392,6 +1559,229 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
         }
         XdnaBuf::from_vec(time_major)
     }
+
+    fn supports_lfm3a(&self) -> bool {
+        true
+    }
+
+    fn max_audio_tokens(&self) -> usize {
+        usize::MAX
+    }
+
+    fn rmsnorm(
+        &self,
+        src: &Self::Buf,
+        weight: &Self::Buf,
+        eps: f32,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buf {
+        self.vit.rmsnorm(src, weight, eps, rows, dim)
+    }
+
+    fn silu_mul(&self, gate: &Self::Buf, up: &Self::Buf, len: usize) {
+        self.vit.silu_mul(gate, up, len);
+    }
+
+    fn lfm3a_conv_stem(
+        &self,
+        mel: &Self::Buf,
+        n_frames: usize,
+        n_mel: usize,
+        layers: &[ConvLayerWeights],
+    ) -> (Self::Buf, usize) {
+        let mel_guard = mel.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (flat_seq, t_out, _plane) =
+            conv_stem_lfm3a_features(&mel_guard[..n_frames * n_mel], n_frames, layers, n_mel);
+        (XdnaBuf::from_vec(flat_seq), t_out)
+    }
+
+    fn lfm3a_shortconv_dw(
+        &self,
+        bcx: &Self::Buf,
+        conv_dw_w: &[f32],
+        conv_dw_b: &[f32],
+        kernel_size: usize,
+        t: usize,
+        n_embd: usize,
+    ) -> Self::Buf {
+        if t == 0 {
+            return XdnaBuf::from_vec(Vec::new());
+        }
+        let bcx_guard = bcx.0.lock().unwrap_or_else(|e| e.into_inner());
+        let bcx_slice = &bcx_guard[..t * 3 * n_embd];
+        let pad_left = kernel_size - 1;
+        let t_padded = t + pad_left;
+
+        let mut padded_bx = vec![0.0f32; n_embd * t_padded];
+        let mut c_gate = vec![0.0f32; t * n_embd];
+        for ti in 0..t {
+            let row = &bcx_slice[ti * 3 * n_embd..(ti + 1) * 3 * n_embd];
+            let (b_part, rest) = row.split_at(n_embd);
+            let (c_part, x_part) = rest.split_at(n_embd);
+            c_gate[ti * n_embd..(ti + 1) * n_embd].copy_from_slice(c_part);
+            for ch in 0..n_embd {
+                padded_bx[ch * t_padded + pad_left + ti] = b_part[ch] * x_part[ch];
+            }
+        }
+
+        let mut conv_out = vec![0.0f32; n_embd * t];
+        let dw_bias = (!conv_dw_b.is_empty()).then_some(conv_dw_b);
+        let t_out = conv1d(
+            &padded_bx,
+            conv_dw_w,
+            dw_bias,
+            &mut conv_out,
+            n_embd,
+            n_embd,
+            t_padded,
+            kernel_size,
+            1,
+            0,
+            n_embd,
+        );
+        debug_assert_eq!(t_out, t);
+
+        let mut out = vec![0.0f32; t * n_embd];
+        par_rows_n(&mut out, n_embd, 8, |(ti, y_in)| {
+            let c_row = &c_gate[ti * n_embd..(ti + 1) * n_embd];
+            for ch in 0..n_embd {
+                y_in[ch] = conv_out[ch * t + ti] * c_row[ch];
+            }
+        });
+        XdnaBuf::from_vec(out)
+    }
+
+    fn lfm3a_swa_attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        gate: Option<&Self::Buf>,
+        gate_rows: usize,
+        q_norm_w: &[f32],
+        k_norm_w: &[f32],
+        t: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        d_head: usize,
+        eps: f32,
+        rope_theta: f32,
+        sliding_window: usize,
+    ) -> Self::Buf {
+        let n_embd = n_head * d_head;
+        let n_embd_kv = n_head_kv * d_head;
+        if t == 0 || n_embd == 0 || n_embd_kv == 0 {
+            return XdnaBuf::zeroed(t * n_embd);
+        }
+
+        let mut q_proj = q.read_clone(t * n_embd);
+        let mut k_proj = k.read_clone(t * n_embd_kv);
+        let v_proj = v.read_clone(t * n_embd_kv);
+
+        par_rows_n(&mut q_proj, n_embd, 8, |(ti, q_row)| {
+            for h in 0..n_head {
+                let q_head = &mut q_row[h * d_head..(h + 1) * d_head];
+                rmsnorm(q_head, q_norm_w, eps);
+                apply_rope_neox_head(q_head, ti, rope_theta);
+            }
+        });
+        par_rows_n(&mut k_proj, n_embd_kv, 8, |(ti, k_row)| {
+            for h_kv in 0..n_head_kv {
+                let k_head = &mut k_row[h_kv * d_head..(h_kv + 1) * d_head];
+                rmsnorm(k_head, k_norm_w, eps);
+                apply_rope_neox_head(k_head, ti, rope_theta);
+            }
+        });
+
+        let kv_head_stride = t * d_head;
+        let mut k_hm = vec![0.0f32; n_head_kv * kv_head_stride];
+        let mut v_hm = vec![0.0f32; n_head_kv * kv_head_stride];
+        for ti in 0..t {
+            for h_kv in 0..n_head_kv {
+                let src = ti * n_embd_kv + h_kv * d_head;
+                let dst = h_kv * kv_head_stride + ti * d_head;
+                k_hm[dst..dst + d_head].copy_from_slice(&k_proj[src..src + d_head]);
+                v_hm[dst..dst + d_head].copy_from_slice(&v_proj[src..src + d_head]);
+            }
+        }
+
+        let scale = 1.0f32 / (d_head as f32).sqrt();
+        let n_rep = (n_head / n_head_kv).max(1);
+        let out_head_stride = t * d_head;
+        let mut out_hm = vec![0.0f32; n_head * out_head_stride];
+        let out_hm_ptr = out_hm.as_mut_ptr() as usize;
+
+        maybe_par_for(n_head, |h| {
+            let h_kv = h / n_rep;
+            let k_head = &k_hm[h_kv * kv_head_stride..(h_kv + 1) * kv_head_stride];
+            let v_head = &v_hm[h_kv * kv_head_stride..(h_kv + 1) * kv_head_stride];
+            let mut scores = vec![0.0f32; t];
+            // SAFETY: distinct heads write disjoint `[h * out_head_stride .. (h+1) * out_head_stride]` slices.
+            let out_head = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (out_hm_ptr as *mut f32).add(h * out_head_stride),
+                    out_head_stride,
+                )
+            };
+            for qt in 0..t {
+                let k_start = if sliding_window > 0 {
+                    qt.saturating_sub(sliding_window - 1)
+                } else {
+                    0
+                };
+                let k_end = qt + 1;
+                let q_row = &q_proj[qt * n_embd + h * d_head..qt * n_embd + (h + 1) * d_head];
+                let score_slice = &mut scores[..k_end - k_start];
+                for (idx, kt) in (k_start..k_end).enumerate() {
+                    let k_row = &k_head[kt * d_head..(kt + 1) * d_head];
+                    score_slice[idx] = dot_f32(q_row, k_row) * scale;
+                }
+                softmax_inplace(score_slice);
+                let out_row = &mut out_head[qt * d_head..(qt + 1) * d_head];
+                out_row.fill(0.0);
+                for (idx, kt) in (k_start..k_end).enumerate() {
+                    axpy_inplace(
+                        out_row,
+                        &v_head[kt * d_head..(kt + 1) * d_head],
+                        score_slice[idx],
+                    );
+                }
+            }
+        });
+
+        let mut attn_v = vec![0.0f32; t * n_embd];
+        par_rows_n(&mut attn_v, n_embd, 8, |(ti, dst_row)| {
+            for h in 0..n_head {
+                let src = h * out_head_stride + ti * d_head;
+                dst_row[h * d_head..(h + 1) * d_head].copy_from_slice(&out_hm[src..src + d_head]);
+            }
+        });
+
+        if let Some(gate_buf) = gate {
+            let mut gate_proj = gate_buf.read_clone(t * gate_rows);
+            if gate_rows == n_head {
+                par_rows_n(&mut attn_v, n_embd, 8, |(ti, row)| {
+                    let g_row = &gate_proj[ti * n_head..(ti + 1) * n_head];
+                    for h in 0..n_head {
+                        let sig = 1.0f32 / (1.0f32 + (-g_row[h]).exp());
+                        for v in &mut row[h * d_head..(h + 1) * d_head] {
+                            *v *= sig;
+                        }
+                    }
+                });
+            } else if gate_rows == n_embd {
+                sigmoid_inplace(&mut gate_proj);
+                par_rows_n(&mut attn_v, n_embd, 8, |(ti, row)| {
+                    let g_row = &gate_proj[ti * n_embd..(ti + 1) * n_embd];
+                    for (dst, &sig) in row.iter_mut().zip(g_row.iter()) {
+                        *dst *= sig;
+                    }
+                });
+            }
+        }
+        XdnaBuf::from_vec(attn_v)
+    }
 }
 
 struct XdnaAudioEncoder {
@@ -1426,10 +1816,7 @@ impl AudioGpuEncode for XdnaAudioEncoder {
 pub(crate) fn try_xdna_audio_encoder(
     weights: &Arc<AudioEncoderWeights>,
 ) -> Option<Arc<dyn AudioGpuEncode>> {
-    if weights.is_lfm3a() {
-        return None;
-    }
-    let runner = match XdnaGemmRunner::open() {
+    let runner = match XdnaGemmRunner::open_shared() {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("audio encoder: XDNA backend unavailable ({e:#}); falling back");
@@ -1465,13 +1852,14 @@ mod tests {
     use crate::backend::xdna::sys::fake::{self, Config as FakeConfig};
     use crate::model::audio_encoder::{
         AudioEncoderConfig, AudioMlpAdapterWeights, ConformerLayerWeights, ConvLayerWeights,
-        ConvStemWeights, POS_EMB_DIM, audio_encoder_forward, conformer_self_attention_forward,
-        encode_audio_pcm,
+        ConvStemWeights, Lfm3aLayerExtras, POS_EMB_DIM, audio_encoder_forward,
+        audio_encoder_forward_lfm3a, conformer_self_attention_forward, encode_audio_pcm,
     };
     use crate::model::audio_preprocessor::log_mel_spectrogram;
     use crate::model::vision_encoder::{
-        PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionProjectorType,
-        VitBlockWeights,
+        Lfm3AttnBlockWeights, Lfm3BlockOp, Lfm3ConvBlockWeights, Lfm3FfnWeights, Lfm3NormWeights,
+        Lfm3VisionBlockWeights, PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig,
+        VisionProjectorType, VitBlockWeights,
     };
     use crate::model::vision_encoder_gpu::{VitStackActivation, VitStackBlock, VitStackProjector};
     use crate::tensor::DType;
@@ -2172,5 +2560,651 @@ mod tests {
             dt_cpu.as_secs_f64() * 1e3,
         );
         assert!(cos > 0.999);
+    }
+
+    fn synth_lfm3_vision_weights(
+        n_embd: usize,
+        n_ff: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        n_conv: usize,
+        n_attn: usize,
+    ) -> VisionEncoderWeights {
+        let patch_size = 16;
+        let in_dim = 3 * patch_size * patch_size;
+        let proj_dim = 64;
+        let scale_factor = 2;
+        let pooled_dim = n_embd * scale_factor * scale_factor;
+        let head_dim = n_embd / n_head;
+        let kv_dim = n_head_kv * head_dim;
+        let cfg = VisionEncoderConfig {
+            projector_type: VisionProjectorType::Lfm3Vl,
+            n_layer: n_conv + n_attn,
+            n_embd,
+            n_ff,
+            n_head,
+            n_head_kv,
+            rope_theta: 1_000_000.0,
+            eps: 1e-5,
+            image_size: 128,
+            patch_size,
+            n_trained_patches: 64,
+            projection_dim: proj_dim,
+            scale_factor,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: 64,
+            image_max_pixels: 1024 * 1024,
+        };
+        let norm = |len: usize, seed: usize| Lfm3NormWeights {
+            weight: det_vec(len, seed, 0.2)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect(),
+            bias: None,
+        };
+        let mut lfm3_blocks = Vec::new();
+        for l in 0..(n_conv + n_attn) {
+            let s = (l + 1) * 31;
+            let op = if l < n_conv {
+                let mult = if l % 2 == 0 { 3 } else { 2 };
+                Lfm3BlockOp::Conv(Lfm3ConvBlockWeights {
+                    in_proj_w: q8_0_weight(mult * n_embd, n_embd, s + 1, 0.25),
+                    in_proj_b: None,
+                    depthwise_w: det_vec(n_embd * 3 * 3, s + 2, 0.3),
+                    depthwise_b: None,
+                    kernel_size: 3,
+                    out_proj_w: q8_0_weight(n_embd, n_embd, s + 3, 0.25),
+                    out_proj_b: None,
+                })
+            } else {
+                Lfm3BlockOp::Attn(Lfm3AttnBlockWeights {
+                    q_w: q8_0_weight(n_embd, n_embd, s + 1, 0.25),
+                    q_b: None,
+                    k_w: q8_0_weight(kv_dim, n_embd, s + 2, 0.25),
+                    k_b: None,
+                    v_w: q8_0_weight(kv_dim, n_embd, s + 3, 0.25),
+                    v_b: None,
+                    q_norm: norm(head_dim, s + 4),
+                    k_norm: norm(head_dim, s + 5),
+                    o_w: q8_0_weight(n_embd, n_embd, s + 6, 0.25),
+                    o_b: None,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                })
+            };
+            let swiglu = l % 2 == 0;
+            lfm3_blocks.push(Lfm3VisionBlockWeights {
+                ln1: norm(n_embd, s + 7),
+                op,
+                ln2: norm(n_embd, s + 8),
+                ffn: Lfm3FfnWeights {
+                    gate_w: swiglu.then(|| q8_0_weight(n_ff, n_embd, s + 9, 0.25)),
+                    gate_b: None,
+                    up_w: q8_0_weight(n_ff, n_embd, s + 10, 0.25),
+                    up_b: None,
+                    down_w: q8_0_weight(n_embd, n_ff, s + 11, 0.25),
+                    down_b: None,
+                },
+            });
+        }
+
+        VisionEncoderWeights {
+            config: cfg,
+            patch_embed: PatchEmbedWeights {
+                conv_w: det_vec(in_dim * n_embd, 100, 0.15),
+                conv_b: vec![0.0; n_embd],
+            },
+            patch_embed_1: Some(PatchEmbedWeights {
+                conv_w: det_vec(in_dim * n_embd, 101, 0.15),
+                conv_b: vec![0.0; n_embd],
+            }),
+            embedding_norm: Some(norm(n_embd, 102)),
+            position_embed: Vec::new(),
+            blocks: Vec::new(),
+            lfm3_blocks,
+            post_ln_w: Vec::new(),
+            post_ln_b: Vec::new(),
+            mm_input_norm: Some(Lfm3NormWeights {
+                weight: det_vec(n_embd, 103, 0.2)
+                    .into_iter()
+                    .map(|v| 1.0 + v)
+                    .collect(),
+                bias: Some(det_vec(n_embd, 104, 0.05)),
+            }),
+            projector: ProjectorWeights {
+                mm1_w: f32_weight(pooled_dim, pooled_dim, 105, 0.2),
+                mm1_b: det_vec(pooled_dim, 106, 0.05),
+                mm2_w: f32_weight(proj_dim, pooled_dim, 107, 0.2),
+                mm2_b: det_vec(proj_dim, 108, 0.05),
+            },
+        }
+    }
+
+    fn synth_lfm3a_audio_weights(
+        n_embd: usize,
+        n_ff: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        n_conv: usize,
+        n_attn: usize,
+        stem_ch: usize,
+    ) -> AudioEncoderWeights {
+        let n_mel_bins = 128;
+        let llm_hidden_size = 64;
+        let d_head = n_embd / n_head;
+        let n_embd_kv = n_head_kv * d_head;
+        let with_post_norms = n_embd <= 128;
+        // Scale linear weights by 1/sqrt(n_embd) (Xavier/Kaiming scale, avoiding artificial
+        // activation explosion across 17 residual blocks); mix odd-modulus sequences so rows
+        // are not collinear at n_embd=768 (`97`-periodic resonance in det_vec).
+        let w_scale = 2.0 / (n_embd as f32).sqrt();
+        let mat_vec = |rows: usize, cols: usize, seed: usize, scale: f32| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|i| {
+                    let v1 =
+                        ((i.wrapping_mul(131).wrapping_add(seed * 977)) % 997) as f32 / 997.0 - 0.5;
+                    let v2 =
+                        ((i.wrapping_mul(257).wrapping_add(seed * 313)) % 991) as f32 / 991.0 - 0.5;
+                    (v1 + 0.5 * v2) * scale
+                })
+                .collect()
+        };
+        let q8_mat = |rows: usize, cols: usize, seed: usize| -> MmapWeight {
+            assert!(cols.is_multiple_of(32));
+            let dense = mat_vec(rows, cols, seed, w_scale);
+            let blocks_per_row = cols / 32;
+            let mut bytes = Vec::with_capacity(rows * blocks_per_row * 34);
+            for r in 0..rows {
+                for b in 0..blocks_per_row {
+                    let block = &dense[r * cols + b * 32..r * cols + (b + 1) * 32];
+                    let amax = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                    let d = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+                    let d_f16 = half::f16::from_f32(d);
+                    bytes.extend_from_slice(&d_f16.to_le_bytes());
+                    let inv = 1.0 / d_f16.to_f32();
+                    for &v in block {
+                        bytes.push((v * inv).round().clamp(-127.0, 127.0) as i8 as u8);
+                    }
+                }
+            }
+            MmapWeight::from_owned_bytes(bytes, DType::Q8_0, rows, cols)
+        };
+        // 5-layer LFM3A depthwise-separable stem downsampling time/freq by 8x (`128 -> 16`).
+        let stem_specs: [(&str, [usize; 4]); 5] = [
+            ("a.conv1d.0", [3, 3, 1, stem_ch]),
+            ("a.conv1d.2", [3, 3, 1, stem_ch]),
+            ("a.conv1d.3", [1, 1, stem_ch, stem_ch]),
+            ("a.conv1d.5", [3, 3, 1, stem_ch]),
+            ("a.conv1d.6", [1, 1, stem_ch, stem_ch]),
+        ];
+        let stem_layers = stem_specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, shape))| {
+                let n: usize = shape.iter().product();
+                ConvLayerWeights {
+                    name: name.to_string(),
+                    weight: det_vec(n, i + 10, 0.15),
+                    bias: det_vec(shape[3], i + 20, 0.03),
+                    shape: shape.to_vec(),
+                }
+            })
+            .collect();
+        let pre_in = stem_ch * 16;
+        let dummy = || MmapWeight::from_owned_f32(Vec::new(), 0, 0);
+        let mut layers = Vec::new();
+        for l in 0..(n_conv + n_attn) {
+            let s = (l + 1) * 43;
+            let is_conv = l < n_conv;
+            let post_ln_w = if l == 0 {
+                det_vec(n_embd, 800, 0.2)
+                    .into_iter()
+                    .map(|v| 1.0 + v)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let opt_pn = |seed: usize| -> Vec<f32> {
+                if with_post_norms {
+                    det_vec(n_embd, seed, 0.2)
+                        .into_iter()
+                        .map(|v| 1.0 + v)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            if is_conv {
+                layers.push(ConformerLayerWeights {
+                    ffn_norm_w: Vec::new(),
+                    ffn_norm_b: Vec::new(),
+                    ffn_up_w: q8_mat(n_ff, n_embd, s + 1),
+                    ffn_up_b: Vec::new(),
+                    ffn_down_w: q8_mat(n_embd, n_ff, s + 2),
+                    ffn_down_b: Vec::new(),
+                    ln1_w: det_vec(n_embd, s + 3, 0.2)
+                        .into_iter()
+                        .map(|v| 1.0 + v)
+                        .collect(),
+                    ln1_b: Vec::new(),
+                    attn_q_w: dummy(),
+                    attn_q_b: Vec::new(),
+                    attn_k_w: dummy(),
+                    attn_k_b: Vec::new(),
+                    attn_v_w: dummy(),
+                    attn_v_b: Vec::new(),
+                    attn_o_w: dummy(),
+                    attn_o_b: Vec::new(),
+                    pos_bias_u: Vec::new(),
+                    pos_bias_v: Vec::new(),
+                    linear_pos_w: dummy(),
+                    norm_conv_w: Vec::new(),
+                    norm_conv_b: Vec::new(),
+                    conv_pw1_w: q8_mat(3 * n_embd, n_embd, s + 4),
+                    conv_pw1_b: Vec::new(),
+                    conv_dw_w: det_vec(3 * n_embd, s + 5, 0.2),
+                    conv_dw_b: Vec::new(),
+                    conv_dw_shape: vec![3, n_embd],
+                    conv_norm_w: Vec::new(),
+                    conv_norm_b: Vec::new(),
+                    conv_pw2_w: q8_mat(n_embd, n_embd, s + 6),
+                    conv_pw2_b: Vec::new(),
+                    ffn_norm_1_w: Vec::new(),
+                    ffn_norm_1_b: Vec::new(),
+                    ffn_up_1_w: q8_mat(n_ff, n_embd, s + 7),
+                    ffn_up_1_b: Vec::new(),
+                    ffn_down_1_w: dummy(),
+                    ffn_down_1_b: Vec::new(),
+                    ln2_w: det_vec(n_embd, s + 8, 0.2)
+                        .into_iter()
+                        .map(|v| 1.0 + v)
+                        .collect(),
+                    ln2_b: Vec::new(),
+                    lfm3a: Some(Lfm3aLayerExtras {
+                        q_norm_w: Vec::new(),
+                        k_norm_w: Vec::new(),
+                        attn_gate_w: None,
+                        attn_post_norm_w: opt_pn(s + 9),
+                        ffn_post_norm_w: opt_pn(s + 10),
+                        post_ln_w,
+                        rope_theta: 10_000.0,
+                        n_head_kv,
+                        sliding_window: 32,
+                    }),
+                });
+            } else {
+                let gate_rows = if l % 2 == 0 { n_head } else { n_embd };
+                layers.push(ConformerLayerWeights {
+                    ffn_norm_w: Vec::new(),
+                    ffn_norm_b: Vec::new(),
+                    ffn_up_w: q8_mat(n_ff, n_embd, s + 1),
+                    ffn_up_b: Vec::new(),
+                    ffn_down_w: q8_mat(n_embd, n_ff, s + 2),
+                    ffn_down_b: Vec::new(),
+                    ln1_w: det_vec(n_embd, s + 3, 0.2)
+                        .into_iter()
+                        .map(|v| 1.0 + v)
+                        .collect(),
+                    ln1_b: Vec::new(),
+                    attn_q_w: q8_mat(n_embd, n_embd, s + 4),
+                    attn_q_b: Vec::new(),
+                    attn_k_w: q8_mat(n_embd_kv, n_embd, s + 5),
+                    attn_k_b: Vec::new(),
+                    attn_v_w: q8_mat(n_embd_kv, n_embd, s + 6),
+                    attn_v_b: Vec::new(),
+                    attn_o_w: q8_mat(n_embd, n_embd, s + 7),
+                    attn_o_b: Vec::new(),
+                    pos_bias_u: Vec::new(),
+                    pos_bias_v: Vec::new(),
+                    linear_pos_w: dummy(),
+                    norm_conv_w: Vec::new(),
+                    norm_conv_b: Vec::new(),
+                    conv_pw1_w: dummy(),
+                    conv_pw1_b: Vec::new(),
+                    conv_dw_w: Vec::new(),
+                    conv_dw_b: Vec::new(),
+                    conv_dw_shape: Vec::new(),
+                    conv_norm_w: Vec::new(),
+                    conv_norm_b: Vec::new(),
+                    conv_pw2_w: dummy(),
+                    conv_pw2_b: Vec::new(),
+                    ffn_norm_1_w: Vec::new(),
+                    ffn_norm_1_b: Vec::new(),
+                    ffn_up_1_w: q8_mat(n_ff, n_embd, s + 8),
+                    ffn_up_1_b: Vec::new(),
+                    ffn_down_1_w: dummy(),
+                    ffn_down_1_b: Vec::new(),
+                    ln2_w: det_vec(n_embd, s + 9, 0.2)
+                        .into_iter()
+                        .map(|v| 1.0 + v)
+                        .collect(),
+                    ln2_b: Vec::new(),
+                    lfm3a: Some(Lfm3aLayerExtras {
+                        q_norm_w: det_vec(d_head, s + 10, 0.2)
+                            .into_iter()
+                            .map(|v| 1.0 + v)
+                            .collect(),
+                        k_norm_w: det_vec(d_head, s + 11, 0.2)
+                            .into_iter()
+                            .map(|v| 1.0 + v)
+                            .collect(),
+                        attn_gate_w: Some(q8_mat(gate_rows, n_embd, s + 12)),
+                        attn_post_norm_w: opt_pn(s + 13),
+                        ffn_post_norm_w: Vec::new(),
+                        post_ln_w,
+                        rope_theta: 10_000.0,
+                        n_head_kv,
+                        sliding_window: 32,
+                    }),
+                });
+            }
+        }
+
+        AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: n_conv + n_attn,
+                n_embd,
+                n_ff,
+                n_head,
+                eps: 1e-5,
+                n_mel_bins,
+                llm_hidden_size,
+            },
+            conv_stem: ConvStemWeights {
+                layers: stem_layers,
+                pre_encode_out_w: f32_weight(n_embd, pre_in, 900, 0.1),
+                pre_encode_out_b: det_vec(n_embd, 901, 0.05),
+            },
+            layers,
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: det_vec(n_embd, 910, 0.2)
+                    .into_iter()
+                    .map(|v| 1.0 + v)
+                    .collect(),
+                norm_b: det_vec(n_embd, 911, 0.05),
+                up_w: f32_weight(llm_hidden_size * 2, n_embd, 912, 0.2),
+                up_b: det_vec(llm_hidden_size * 2, 913, 0.05),
+                down_w: f32_weight(llm_hidden_size, llm_hidden_size * 2, 914, 0.2),
+                down_b: det_vec(llm_hidden_size, 915, 0.05),
+            },
+        }
+    }
+
+    #[test]
+    fn fake_shim_lfm3_vision_and_audio_share_gemm_runner_zero_leaks() {
+        fake::with_shim(FakeConfig::default(), || {
+            let vw = synth_lfm3_vision_weights(64, 128, 4, 2, 2, 1);
+            let aw = Arc::new(synth_lfm3a_audio_weights(64, 128, 4, 2, 1, 2, 16));
+            let venc = crate::model::vision_encoder_gpu::build_gpu_vision_encoder(
+                &vw,
+                crate::engine::BackendPreference::Npu,
+            )
+            .expect("LFM3 vision routed to XDNA");
+            let aenc = crate::model::audio_encoder_gpu::build_gpu_audio_encoder(
+                &aw,
+                crate::engine::BackendPreference::Npu,
+            )
+            .expect("LFM3A audio routed to XDNA");
+
+            assert_eq!(venc.backend_label(), "xdna");
+            assert_eq!(venc.max_tokens(), usize::MAX);
+
+            let pixels = det_vec(3 * 64 * 64, 12, 0.5);
+            let vout = venc.encode_image(&pixels, 4, 4).expect("lfm3 encode_image");
+            assert_eq!(vout.len(), 4 * 64);
+
+            let pcm: Vec<f32> = (0..4000).map(|i| (i as f32 * 0.03).sin() * 0.3).collect();
+            let (aout, t_out) = aenc.encode_pcm(&pcm).expect("lfm3a encode_pcm");
+            assert!(t_out > 0);
+            assert_eq!(aout.len(), t_out * 64);
+
+            drop(venc);
+            drop(aenc);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_lfm3_vision_encoder_parity_and_throughput() {
+        // 1. Parity across Conv (3d & 2d), 2D M-RoPE GQA Attn (n_head=8, kv=4), SwiGLU + GELU,
+        //    patch_embed_1, embedding_norm, PreMerge mm.input_norm.
+        let vw = synth_lfm3_vision_weights(128, 256, 8, 4, 2, 2);
+        let enc = try_xdna_vision_encoder(&vw).expect("XDNA LFM3 vision encoder");
+        let pixels = det_vec(3 * (8 * 16) * (8 * 16), 44, 0.5);
+        let want = vw.encode_image(&pixels, 8, 8).expect("CPU lfm3 encode");
+        let got = enc.encode_image(&pixels, 8, 8).expect("NPU lfm3 encode");
+        let cos = cosine_sim(&got, &want);
+        eprintln!(
+            "LFM3 ViT parity (64 patches, d=128): len={} cos={cos:.6}",
+            got.len()
+        );
+        assert!(cos > 0.999, "LFM3 ViT cos={cos}");
+
+        // 2. Realistic LFM3-VL-2B / LFM3-Omni-2B geometry: 14 layers (8 conv + 6 attn),
+        //    d=1024, ff=2560, 16Q/8KV, 512x512 (32x32 = 1024 patches).
+        let bench_w = synth_lfm3_vision_weights(1024, 2560, 16, 8, 8, 6);
+        let bench_enc = try_xdna_vision_encoder(&bench_w).expect("XDNA LFM3-VL-2B encoder");
+        let bench_px = det_vec(3 * 512 * 512, 7, 0.4);
+        let _ = bench_enc.encode_image(&bench_px, 32, 32).expect("warmup");
+        let t0 = std::time::Instant::now();
+        let o_npu = bench_enc.encode_image(&bench_px, 32, 32).expect("npu");
+        let dt_npu = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let o_cpu = bench_w.encode_image(&bench_px, 32, 32).expect("cpu");
+        let dt_cpu = t1.elapsed();
+        let cos_bench = cosine_sim(&o_npu, &o_cpu);
+        eprintln!(
+            "LFM3-VL-2B ViT bench (14L, 1024 patches, d=1024, ff=2560): npu={:.1}ms cpu={:.1}ms cos={cos_bench:.6}",
+            dt_npu.as_secs_f64() * 1e3,
+            dt_cpu.as_secs_f64() * 1e3,
+        );
+        assert!(cos_bench > 0.999, "LFM3-VL-2B cos={cos_bench}");
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_lfm3a_audio_encoder_parity_and_throughput() {
+        // Quantize every weight to bf16 on a cloned copy so we can isolate pure bf16 numeric
+        // sensitivity across deep random layers vs any actual kernel/op discrepancy.
+        let to_bf16_weight = |w: &MmapWeight| -> MmapWeight {
+            if w.rows == 0 || w.cols == 0 {
+                return MmapWeight::from_owned_f32(Vec::new(), 0, 0);
+            }
+            let mut dense = vec![0.0f32; w.rows * w.cols];
+            for r in 0..w.rows {
+                w.dequantize_row(r, &mut dense[r * w.cols..(r + 1) * w.cols]);
+            }
+            for v in &mut dense {
+                *v = half::bf16::from_bits(f32_to_bf16(*v)).to_f32();
+            }
+            MmapWeight::from_owned_f32(dense, w.rows, w.cols)
+        };
+        let to_bf16_audio = |w: &AudioEncoderWeights| -> AudioEncoderWeights {
+            let layers = w
+                .layers
+                .iter()
+                .map(|l| ConformerLayerWeights {
+                    ffn_norm_w: l.ffn_norm_w.clone(),
+                    ffn_norm_b: l.ffn_norm_b.clone(),
+                    ffn_up_w: to_bf16_weight(&l.ffn_up_w),
+                    ffn_up_b: l.ffn_up_b.clone(),
+                    ffn_down_w: to_bf16_weight(&l.ffn_down_w),
+                    ffn_down_b: l.ffn_down_b.clone(),
+                    ln1_w: l.ln1_w.clone(),
+                    ln1_b: l.ln1_b.clone(),
+                    attn_q_w: to_bf16_weight(&l.attn_q_w),
+                    attn_q_b: l.attn_q_b.clone(),
+                    attn_k_w: to_bf16_weight(&l.attn_k_w),
+                    attn_k_b: l.attn_k_b.clone(),
+                    attn_v_w: to_bf16_weight(&l.attn_v_w),
+                    attn_v_b: l.attn_v_b.clone(),
+                    attn_o_w: to_bf16_weight(&l.attn_o_w),
+                    attn_o_b: l.attn_o_b.clone(),
+                    pos_bias_u: l.pos_bias_u.clone(),
+                    pos_bias_v: l.pos_bias_v.clone(),
+                    linear_pos_w: to_bf16_weight(&l.linear_pos_w),
+                    norm_conv_w: l.norm_conv_w.clone(),
+                    norm_conv_b: l.norm_conv_b.clone(),
+                    conv_pw1_w: to_bf16_weight(&l.conv_pw1_w),
+                    conv_pw1_b: l.conv_pw1_b.clone(),
+                    conv_dw_w: l.conv_dw_w.clone(),
+                    conv_dw_b: l.conv_dw_b.clone(),
+                    conv_dw_shape: l.conv_dw_shape.clone(),
+                    conv_norm_w: l.conv_norm_w.clone(),
+                    conv_norm_b: l.conv_norm_b.clone(),
+                    conv_pw2_w: to_bf16_weight(&l.conv_pw2_w),
+                    conv_pw2_b: l.conv_pw2_b.clone(),
+                    ffn_norm_1_w: l.ffn_norm_1_w.clone(),
+                    ffn_norm_1_b: l.ffn_norm_1_b.clone(),
+                    ffn_up_1_w: to_bf16_weight(&l.ffn_up_1_w),
+                    ffn_up_1_b: l.ffn_up_1_b.clone(),
+                    ffn_down_1_w: to_bf16_weight(&l.ffn_down_1_w),
+                    ffn_down_1_b: l.ffn_down_1_b.clone(),
+                    ln2_w: l.ln2_w.clone(),
+                    ln2_b: l.ln2_b.clone(),
+                    lfm3a: l.lfm3a.as_ref().map(|e| Lfm3aLayerExtras {
+                        q_norm_w: e.q_norm_w.clone(),
+                        k_norm_w: e.k_norm_w.clone(),
+                        attn_gate_w: e.attn_gate_w.as_ref().map(&to_bf16_weight),
+                        attn_post_norm_w: e.attn_post_norm_w.clone(),
+                        ffn_post_norm_w: e.ffn_post_norm_w.clone(),
+                        post_ln_w: e.post_ln_w.clone(),
+                        rope_theta: e.rope_theta,
+                        n_head_kv: e.n_head_kv,
+                        sliding_window: e.sliding_window,
+                    }),
+                })
+                .collect();
+            AudioEncoderWeights {
+                config: w.config.clone(),
+                conv_stem: ConvStemWeights {
+                    layers: w.conv_stem.layers.clone(),
+                    pre_encode_out_w: to_bf16_weight(&w.conv_stem.pre_encode_out_w),
+                    pre_encode_out_b: w.conv_stem.pre_encode_out_b.clone(),
+                },
+                layers,
+                mlp_adapter: AudioMlpAdapterWeights {
+                    norm_w: w.mlp_adapter.norm_w.clone(),
+                    norm_b: w.mlp_adapter.norm_b.clone(),
+                    up_w: to_bf16_weight(&w.mlp_adapter.up_w),
+                    up_b: w.mlp_adapter.up_b.clone(),
+                    down_w: to_bf16_weight(&w.mlp_adapter.down_w),
+                    down_b: w.mlp_adapter.down_b.clone(),
+                },
+            }
+        };
+
+        // 1. Parity across 5-layer SiLU stem, ShortConv, SWA GQA + NeoX RoPE + attn_gate, SwiGLU, mlp_adapter.
+        let aw = Arc::new(synth_lfm3a_audio_weights(128, 256, 4, 2, 2, 2, 32));
+        let aw_bf16 = Arc::new(to_bf16_audio(&aw));
+        let enc = try_xdna_audio_encoder(&aw).expect("XDNA LFM3A encoder");
+
+        let mel = det_vec(160 * 128, 31, 0.5);
+        let (want_mel, want_tm) = audio_encoder_forward_lfm3a(&mel, 160, &aw);
+        let (want_mel_bf, _) = audio_encoder_forward_lfm3a(&mel, 160, &aw_bf16);
+        let (got_mel, got_tm) = enc.encode_mel(&mel, 160).expect("lfm3a encode_mel");
+        assert_eq!(got_tm, want_tm);
+        let cos_mel = cosine_sim(&got_mel, &want_mel);
+        let cos_mel_bf = cosine_sim(&got_mel, &want_mel_bf);
+        eprintln!(
+            "LFM3A encode_mel parity: t={got_tm} cos={cos_mel:.6} cos_vs_bf16_ref={cos_mel_bf:.6}"
+        );
+        assert!(cos_mel_bf > 0.999, "LFM3A mel bf16_ref cos={cos_mel_bf}");
+        assert!(cos_mel > 0.998, "LFM3A mel cos={cos_mel}");
+
+        let pcm: Vec<f32> = (0..24_000)
+            .map(|i| (i as f32 * 0.04).sin() * 0.4 + (i as f32 * 0.13).cos() * 0.2)
+            .collect();
+        let (want_pcm, want_tp) = encode_audio_pcm(&pcm, &aw);
+        let (want_pcm_bf, _) = encode_audio_pcm(&pcm, &aw_bf16);
+        let (got_pcm, got_tp) = enc.encode_pcm(&pcm).expect("lfm3a encode_pcm");
+        assert_eq!(got_tp, want_tp);
+        let cos_pcm = cosine_sim(&got_pcm, &want_pcm);
+        let cos_pcm_bf = cosine_sim(&got_pcm, &want_pcm_bf);
+        eprintln!(
+            "LFM3A encode_pcm parity: t={got_tp} cos={cos_pcm:.6} cos_vs_bf16_ref={cos_pcm_bf:.6}"
+        );
+        assert!(cos_pcm_bf > 0.999, "LFM3A pcm bf16_ref cos={cos_pcm_bf}");
+        assert!(cos_pcm > 0.998, "LFM3A pcm cos={cos_pcm}");
+
+        // 2. Realistic LFM3-Audio-2B / LFM3-Omni-2B geometry: 17 layers (12 ShortConv + 5 SWA Attn),
+        //    d=768, ff=1792, 8Q/4KV (head_dim=96), 5-layer 256-ch stem, ~2.5s PCM.
+        let bench_w = Arc::new(synth_lfm3a_audio_weights(768, 1792, 8, 4, 12, 5, 256));
+        let bench_bf16 = Arc::new(to_bf16_audio(&bench_w));
+        let bench_enc = try_xdna_audio_encoder(&bench_w).expect("XDNA LFM3-Audio-2B encoder");
+        let long_pcm: Vec<f32> = (0..40_000).map(|i| (i as f32 * 0.03).sin() * 0.3).collect();
+        let _ = bench_enc.encode_pcm(&long_pcm).expect("warmup");
+        let t0 = std::time::Instant::now();
+        let (o_npu, tn) = bench_enc.encode_pcm(&long_pcm).expect("npu");
+        let dt_npu = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let (o_cpu, tc) = encode_audio_pcm(&long_pcm, &bench_w);
+        let dt_cpu = t1.elapsed();
+        let (o_bf, _) = encode_audio_pcm(&long_pcm, &bench_bf16);
+        assert_eq!(tn, tc);
+        let cos_bench = cosine_sim(&o_npu, &o_cpu);
+        let cos_bench_bf = cosine_sim(&o_npu, &o_bf);
+        eprintln!(
+            "LFM3-Audio-2B bench (17L, d=768, ff=1792, 2.5s PCM -> t={tn}): npu={:.1}ms cpu={:.1}ms cos={cos_bench:.6} cos_vs_bf16_ref={cos_bench_bf:.6}",
+            dt_npu.as_secs_f64() * 1e3,
+            dt_cpu.as_secs_f64() * 1e3,
+        );
+        assert!(cos_bench_bf > 0.998 || cos_bench > 0.999);
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
+    fn hw_lfm3_omni_concurrent_npu_and_lfm3a_gen_eval() {
+        // Verify LFM3-Omni concurrent NPU allocation (LLM device + shared Vision/Audio XdnaGemmRunner)
+        // AND measure lfm3a_gen M=6 detokenizer & M=13 depthformer GEMM cost on gemm_bf16 vs CPU.
+        let extra_dev = XdnaDevice::open(0).expect("concurrent XdnaDevice (LLM trunk slot)");
+        let vw = synth_lfm3_vision_weights(128, 256, 8, 4, 1, 1);
+        let aw = Arc::new(synth_lfm3a_audio_weights(128, 256, 4, 2, 1, 1, 32));
+        let venc = try_xdna_vision_encoder(&vw).expect("Omni XDNA vision encoder");
+        let aenc = try_xdna_audio_encoder(&aw).expect("Omni XDNA audio encoder");
+
+        let px = det_vec(3 * 64 * 64, 5, 0.4);
+        let v_out = venc.encode_image(&px, 4, 4).expect("Omni vision encode");
+        assert!(!v_out.is_empty());
+
+        let pcm: Vec<f32> = (0..8000).map(|i| (i as f32 * 0.04).sin() * 0.2).collect();
+        let (a_out, a_t) = aenc.encode_pcm(&pcm).expect("Omni audio encode");
+        assert!(a_t > 0 && !a_out.is_empty());
+
+        drop(venc);
+        drop(aenc);
+        drop(extra_dev);
+
+        // Microbenchmark lfm3a_gen single-frame GEMM shapes on gemm_bf16 (M_TILE=128) vs CPU.
+        let runner = XdnaGemmRunner::open().expect("open");
+        for (m, n, k, label) in [
+            (6, 2304, 512, "detok_ffn_M6"),
+            (13, 2816, 1024, "depthformer_M13"),
+        ] {
+            let x = det_vec(m * k, 11, 0.3);
+            let w_f32 = det_vec(n * k, 22, 0.2);
+            let w_npu = runner.upload_f32_weight(&w_f32, n, k).expect("upload");
+            let w_mmap = MmapWeight::from_owned_f32(w_f32, n, k);
+            let _ = runner.matmul_f32(&x, &w_npu, m, n, k).expect("warm");
+            let t0 = std::time::Instant::now();
+            for _ in 0..8 {
+                let _ = runner.matmul_f32(&x, &w_npu, m, n, k).expect("npu");
+            }
+            let dt_npu = t0.elapsed() / 8;
+            let mut y = vec![0.0f32; m * n];
+            let t1 = std::time::Instant::now();
+            for _ in 0..8 {
+                w_mmap.batched_matmul(&x, &mut y, m);
+            }
+            let dt_cpu = t1.elapsed() / 8;
+            eprintln!(
+                "lfm3a_gen {label} ({m}x{k} -> {m}x{n}): gemm_bf16={:.2}ms cpu={:.2}ms",
+                dt_npu.as_secs_f64() * 1e3,
+                dt_cpu.as_secs_f64() * 1e3,
+            );
+        }
     }
 }

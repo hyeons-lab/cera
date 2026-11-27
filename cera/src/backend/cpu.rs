@@ -12902,6 +12902,84 @@ pub fn f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
     }
 }
 
+/// Convert `n` little-endian BF16 bit patterns in `src_le` (`2 * n` bytes) to F16 in `dst`
+/// using AVX2 + F16C.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx2")]
+unsafe fn bf16_le_bytes_to_f16_f16c(src_le: *const u8, dst: *mut u16, n: usize) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let bf = _mm_loadu_si128(src_le.add(i * 2) as *const __m128i);
+            let f32_bits = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(bf));
+            let f16_bits =
+                _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_castsi256_ps(f32_bits));
+            _mm_storeu_si128(dst.add(i) as *mut __m128i, f16_bits);
+            i += 8;
+        }
+        while i < n {
+            let b = core::ptr::read_unaligned(src_le.add(i * 2) as *const u16).to_le();
+            *dst.add(i) = crate::quant::f32_to_f16(f32::from_bits((b as u32) << 16));
+            i += 1;
+        }
+    }
+}
+
+/// Convert `n` little-endian BF16 bit patterns in `src_le` (`2 * n` bytes) to f32 in `dst`
+/// using AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bf16_le_bytes_to_f32_avx2(src_le: *const u8, dst: *mut f32, n: usize) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let bf = _mm_loadu_si128(src_le.add(i * 2) as *const __m128i);
+            let f32_bits = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(bf));
+            _mm256_storeu_ps(dst.add(i), _mm256_castsi256_ps(f32_bits));
+            i += 8;
+        }
+        while i < n {
+            let b = core::ptr::read_unaligned(src_le.add(i * 2) as *const u16).to_le();
+            *dst.add(i) = f32::from_bits((b as u32) << 16);
+            i += 1;
+        }
+    }
+}
+
+/// Convert little-endian BF16 bytes (`src_le`) to IEEE-754 binary16 bit patterns (`dst`).
+#[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+pub fn bf16_le_bytes_to_f16_into(src_le: &[u8], dst: &mut [u16]) {
+    let n = (src_le.len() / 2).min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx2") {
+        // SAFETY: `f16c` + `avx2` checked; `src_le` covers `2 * n` bytes and `dst` covers `n` elements.
+        unsafe { bf16_le_bytes_to_f16_f16c(src_le.as_ptr(), dst.as_mut_ptr(), n) };
+        return;
+    }
+    for (d, pair) in dst[..n].iter_mut().zip(src_le[..n * 2].as_chunks::<2>().0) {
+        let bits = u16::from_le_bytes(*pair);
+        *d = crate::quant::f32_to_f16(f32::from_bits((bits as u32) << 16));
+    }
+}
+
+/// Convert little-endian BF16 bytes (`src_le`) to `f32` values (`dst`).
+#[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+pub fn bf16_le_bytes_to_f32_into(src_le: &[u8], dst: &mut [f32]) {
+    let n = (src_le.len() / 2).min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: `avx2` checked; `src_le` covers `2 * n` bytes and `dst` covers `n` elements.
+        unsafe { bf16_le_bytes_to_f32_avx2(src_le.as_ptr(), dst.as_mut_ptr(), n) };
+        return;
+    }
+    for (d, pair) in dst[..n].iter_mut().zip(src_le[..n * 2].as_chunks::<2>().0) {
+        let bits = u16::from_le_bytes(*pair);
+        *d = f32::from_bits((bits as u32) << 16);
+    }
+}
+
 /// Convert `src` f32 values to IEEE-754 binary16 bit patterns in `dst`, parallelized when large.
 pub fn par_f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
     let n = src.len().min(dst.len());
@@ -18591,6 +18669,35 @@ mod tests {
         eprintln!("  per-call: {:.1} µs", per_call * 1e6);
         eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
         eprintln!("  bandwidth: {:.1} GB/s", bw_large);
+    }
+}
+
+#[cfg(test)]
+mod bf16_le_tests {
+    use super::*;
+
+    #[test]
+    fn bf16_le_bytes_conversions_match_scalar() {
+        let vals = [
+            0.0f32, -0.0, 1.0, -3.5, 0.000123, 42.25, -1024.5, 1e-4, 6.5, -0.125, 19.75, 0.333,
+        ];
+        let mut src_le = Vec::with_capacity(vals.len() * 2);
+        let mut bf_u16 = Vec::with_capacity(vals.len());
+        for &v in &vals {
+            let bits = half::bf16::from_f32(v).to_bits();
+            bf_u16.push(bits);
+            src_le.extend_from_slice(&bits.to_le_bytes());
+        }
+        let mut got_f16 = vec![0u16; vals.len()];
+        let mut got_f32 = vec![0.0f32; vals.len()];
+        bf16_le_bytes_to_f16_into(&src_le, &mut got_f16);
+        bf16_le_bytes_to_f32_into(&src_le, &mut got_f32);
+        for (i, &b) in bf_u16.iter().enumerate() {
+            let want_f32 = f32::from_bits((b as u32) << 16);
+            let want_f16 = crate::quant::f32_to_f16(want_f32);
+            assert_eq!(got_f32[i].to_bits(), want_f32.to_bits(), "f32[{i}]");
+            assert_eq!(got_f16[i], want_f16, "f16[{i}]");
+        }
     }
 }
 

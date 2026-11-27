@@ -330,6 +330,103 @@ pub fn pack_f32_stage_k1024(
     pack_f32_stage_with_chunk_k(dst, src, rows, cols, 1024)
 }
 
+/// f32 weights quantized into Q4_0 blocks via fast multi-scale + least-squares MSE search
+/// aligned to the exact BF16 scale stored for the XDNA2 AIE kernel.
+struct F32MseSource<'a> {
+    src: &'a [f32],
+    cols: usize,
+}
+
+impl WeightSource for F32MseSource<'_> {
+    fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32) {
+        let slice = &self.src[row * self.cols + block * QBLK..][..QBLK];
+        let mut amax = 0.0f32;
+        let mut mx = 0.0f32;
+        for &v in slice {
+            if v.is_nan() {
+                return ([0i8; QBLK], f32::NAN);
+            }
+            let av = v.abs();
+            if av > amax {
+                amax = av;
+                mx = v;
+            }
+        }
+        if amax == 0.0 || !amax.is_finite() {
+            return ([0i8; QBLK], 0.0);
+        }
+
+        let quant_eval = |d_raw: f32| -> ([i8; QBLK], f32, f32) {
+            let d_bf = f32::from_bits((f32_to_bf16(d_raw) as u32) << 16);
+            if d_bf == 0.0 || !d_bf.is_finite() {
+                return ([0i8; QBLK], 0.0, f32::INFINITY);
+            }
+            let mut q = [0i8; QBLK];
+            let mut err = 0.0f32;
+            for (dst, &v) in q.iter_mut().zip(slice.iter()) {
+                let qi = ((v / d_bf + 8.5).floor() as i32).clamp(0, 15) - 8;
+                *dst = qi as i8;
+                let diff = v - (qi as f32) * d_bf;
+                err += diff * diff;
+            }
+            (q, d_bf, err)
+        };
+
+        let mut best = ([0i8; QBLK], 0.0f32, f32::INFINITY);
+        let d_base = mx / -8.0;
+        let candidates = [
+            d_base,
+            d_base * 0.90,
+            d_base * 0.80,
+            d_base * 0.72,
+            -d_base,
+            -d_base * 0.85,
+        ];
+        for cand in candidates {
+            let trial = quant_eval(cand);
+            if trial.2 < best.2 {
+                best = trial;
+            }
+            // One least-squares step `d = sum(x * q) / sum(q^2)` followed by re-quantization.
+            let mut num = 0.0f32;
+            let mut den = 0.0f32;
+            for (&v, &qi) in slice.iter().zip(trial.0.iter()) {
+                let qf = qi as f32;
+                num += v * qf;
+                den += qf * qf;
+            }
+            if den > 0.0 {
+                let refined = quant_eval(num / den);
+                if refined.2 < best.2 {
+                    best = refined;
+                }
+            }
+        }
+        (best.0, best.1)
+    }
+}
+
+/// Pack f32 weights (e.g. dequantized Q4_K/Q6_K/BF16 tensors) into 1024-K half-tiles
+/// using MSE-optimal BF16-aligned Q4_0 quantization.
+pub fn pack_f32_mse_stage_k1024(
+    dst: &mut [u8],
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<usize, String> {
+    check_shape(rows, cols)?;
+    let expect = rows
+        .checked_mul(cols)
+        .ok_or_else(|| format!("f32 element count overflow for {rows}x{cols}"))?;
+    if src.len() < expect {
+        return Err(format!(
+            "f32 tensor too small: need {expect} elements, have {}",
+            src.len()
+        ));
+    }
+    pack_stage_with_chunk_k(dst, &F32MseSource { src, cols }, rows, cols, 1024)
+}
+
 /// Pack f32 weights (e.g. a dequantized Q6_K head) into the stream layout,
 /// quantizing with the spike's Q4_0 rule.
 pub fn pack_f32_stage(
@@ -676,6 +773,49 @@ mod tests {
         assert!(
             f32::from_bits((scale_bits as u32) << 16).is_nan(),
             "NaN weight block must preserve NaN scale instead of zeroing: {scale_bits:#06x}"
+        );
+    }
+
+    #[test]
+    fn f32_mse_pack_reduces_outlier_block_error() {
+        let rows = 16;
+        let cols = 64;
+        let mut src = vec![0.0f32; rows * cols];
+        // One outlier (+3.1) alongside 31 values at +-0.47 (not a multiple of 3.1/8)
+        // in block 0 of row 0.
+        for (i, dst) in src.iter_mut().enumerate().take(32) {
+            *dst = if i % 2 == 0 { 0.47 } else { -0.47 };
+        }
+        src[0] = 3.1;
+
+        let mut naive = vec![0u8; stage_bytes(rows, cols).unwrap()];
+        let mut mse = vec![0u8; naive.len()];
+        pack_f32_stage_k1024(&mut naive, &src, rows, cols).unwrap();
+        pack_f32_mse_stage_k1024(&mut mse, &src, rows, cols).unwrap();
+
+        let block_err = |packed: &[u8]| -> f32 {
+            let nb_chunk = cols / QBLK;
+            let sp = nb_chunk * 256;
+            let scale_bits = u16::from_le_bytes([packed[sp], packed[sp + 1]]);
+            let d = f32::from_bits((scale_bits as u32) << 16);
+            let mut err = 0.0f32;
+            for (j, &orig) in src.iter().enumerate().take(32) {
+                let h = j / 16;
+                let kk = j % 16;
+                let e = kk * 16;
+                let b = packed[h * 128 + e / 2];
+                let nib = if e % 2 == 0 { b & 0xF } else { b >> 4 };
+                let q = if nib >= 8 { nib as i8 - 16 } else { nib as i8 };
+                let diff = orig - (q as f32) * d;
+                err += diff * diff;
+            }
+            err
+        };
+        let e_naive = block_err(&naive);
+        let e_mse = block_err(&mse);
+        assert!(
+            e_mse < e_naive * 0.6,
+            "MSE Q4_0 packing should substantially reduce outlier error: e_mse={e_mse} vs e_naive={e_naive}"
         );
     }
 

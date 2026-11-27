@@ -131,6 +131,14 @@ Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Sna
   - **Audio Synthesis & Vocoder**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D).
 
 
+### AMD XDNA NPU backend
+
+On Windows with AMD Ryzen AI Strix Halo (XDNA2 / `aie2p`), building with `--features xdna` enables the native XRT shim (`cera/src/backend/xdna/`) and compiled `mlir-aie` / IRON kernels under `--device npu` for **Llama-3.2-1B**, **LFM2 / LFM2.5-1.2B**, **LFM3-1.7B**, and bidirectional **d1-2B**. See [AMD XDNA NPU Results](docs/XDNA_PHASE0_RESULTS.md) for architecture notes, hardware verification gates, package power measurements, and full 1K–128K benchmark comparisons.
+
+- **Single-xclbin fused decode (`q4layer`, `q4layer_lfm2`, `q4layer_lfm3`)**: Chains RMSNorm, core-side Q8_0 activation quantization, RoPE, ShortConv, block online-softmax / paged >8K GQA attention, and SwiGLU FFN across all layers on the AIE2P array without hardware-context switching, using `xrt::runlist` chaining and overlapped host KV/Conv maintenance.
+- **Chunked & >8K paged `B=64` prefill (`q4prefill_lfm2`, `q4prefill_lfm2_ext`, `q4prefill_lfm3`)**: Batches prompt processing at 64 tokens per NPU call with `CHUNK_K=1024`, switching seamlessly into fused paged online-softmax attention past 8K/32K so prefill scales through 125K (`LFM2.5-1.2B`) and 128K (`LFM3-1.7B`).
+
+
 ### Quantization
 
 Weights run in **Q4_0**, **Q4_1**, **Q8_0**, **Q4_K**, **Q5_K**, and **Q6_K**,
@@ -788,6 +796,17 @@ performance cores (Tensor G5, LFM2 Q4_0, warm: CPU decode matches or beats
 llama.cpp). Thread placement and count auto-detect per device; the `CERA_*`
 override knobs are documented under
 **[*CPU threading & tuning*](cera/README.md#cpu-threading--tuning)**.
+
+On Windows with **AMD Ryzen AI Strix Halo (XDNA2 / `aie2p`, Ryzen AI Max+ 395)**, `--device npu` (`--features xdna`) beats **FastFlowLM v1.0.14** across every tested context length (`1K`–`128K`) on both `LFM2.5-1.2B` and `LFM3-1.7B` prefill and decode:
+
+| Model & engine | `1K` prefill / dec | `8K` prefill / dec | `32K` prefill / dec | `64K` prefill / dec | `128K` (or `125K`) prefill / dec |
+|---|---:|---:|---:|---:|---:|
+| **`LFM2.5-1.2B` Cera (`--device npu`)** | **2640** / **56.1** tok/s | **2669** / **59.8** tok/s | **1734** / **37.6** tok/s | **1227** / **25.3** tok/s | **813** / **20.1** tok/s (`125K`) |
+| `LFM2.5-1.2B` FastFlowLM `v1.0.14` | 1356 / 44.6 tok/s | 1826 / 40.4 tok/s | 1364 / 30.5 tok/s | 961 / 22.2 tok/s | *(errors: `iter size too big`)* |
+| **`LFM3-1.7B` Cera (`--device npu`)** | **1437** / **36.9** tok/s | **1441** / **35.7** tok/s | **1052** / **22.7** tok/s | **840** / **16.2** tok/s | **600** / **10.3** tok/s (`128K`) |
+| `LFM3-1.7B` FastFlowLM `v1.0.14` | 351 / 12.5 tok/s | 404 / 11.7 tok/s | 367 / 9.9 tok/s | 354 / 8.2 tok/s | 318 / 6.2 tok/s (`128K`) |
+
+Full `1K`–`128K` tables, environment details, power/energy telemetry, and hardware parity gate results are in [`docs/XDNA_PHASE0_RESULTS.md`](docs/XDNA_PHASE0_RESULTS.md#10-long-context-lfm25--lfm3-npu-prefill-and-fastflowlm-v1014-comparison-2026-11-26).
 
 Detailed methodology, per-model tables (decode + prefill vs llama.cpp), the
 Accelerate/AMX BLAS results, and the backend optimization notes live in

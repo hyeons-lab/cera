@@ -3,12 +3,14 @@
 // Mode 1 (g_params[6]==1): GQA (32 Q heads, 8 KV heads, head_dim=64) + QK-norm + NeoX RoPE + SwiGLU FFN.
 
 #include "q4_lfm2_pre_state.h"
+void q4_fa_pack_v(const bfloat16 *, int32_t);
 
 #define FN_SZ __attribute__((noinline, minsize))
 
 extern "C" {
 ScratchUnion g_scratch;
 alignas(64) int32_t g_params[16];
+float *g_x_ptr;
 }
 
 FN_SZ aie::vector<float, 16> q4_fmul_16(
@@ -26,55 +28,18 @@ FN_SZ aie::vector<float, 16> q4_fmul_16(
   return acc.template to_vector<float>();
 }
 
-FN_SZ aie::vector<float, 16> q4_inv_16(aie::vector<float, 16> v) {
-  return aie::inv(aie::max(v, aie::broadcast<float, 16>(1e-35f)));
-}
 
-static inline aie::vector<float, 16> q4_invsqrt_16(aie::vector<float, 16> v) {
-  return aie::invsqrt(v);
-}
-
-FN_SZ aie::vector<float, 16> q4_exp2f_16(aie::vector<float, 16> x) {
-  x = aie::max(x, aie::broadcast<float, 16>(-126.0f));
-  x = aie::min(x, aie::broadcast<float, 16>(126.0f));
-  aie::vector<float, 16> magic = aie::broadcast<float, 16>(12582912.0f);
-  aie::vector<float, 16> kf = aie::sub(aie::add(x, magic), magic);
-  aie::vector<bfloat16, 16> fb =
-      aie::accum<accfloat, 16>(aie::sub(x, kf)).template to_vector<bfloat16>();
-  aie::vector<float, 16> u = aie::add(kf, aie::broadcast<float, 16>(98431.0f));
-  aie::vector<bfloat16, 16> eab = aie::filter_even(u.template cast_to<bfloat16>(), 1);
-  aie::vector<bfloat16, 16> pb = aie::broadcast<bfloat16, 16>((bfloat16)0.0555041087f);
-  {
-    aie::accum<accfloat, 16> acc;
-    acc.from_vector(aie::broadcast<float, 16>(0.2402265069f));
-    pb = aie::mac(acc, pb, fb).template to_vector<bfloat16>();
-    acc.from_vector(aie::broadcast<float, 16>(0.6931471805f));
-    pb = aie::mac(acc, pb, fb).template to_vector<bfloat16>();
-    acc.from_vector(aie::broadcast<float, 16>(1.0f));
-    pb = aie::mac(acc, pb, fb).template to_vector<bfloat16>();
-  }
-  return aie::mul<accfloat>(pb, eab).template to_vector<float>();
-}
-
-FN_SZ static void q4_elem_mul(
+__attribute__((noinline)) void q4_elem_mul(
     float *__restrict dst,
     const float *__restrict a,
     const float *__restrict b,
     float s,
     int n) {
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < n; i += 16) {
-    aie::vector<float, 16> bv = b ? aie::load_v<16>(b + i) : aie::broadcast<float, 16>(s);
-    aie::store_v(dst + i, q4_fmul_16(aie::load_v<16>(a + i), bv));
+  aie::vector<float, 16> sv = aie::broadcast<float, 16>(s);
+  for (int i = 0; i < (n >> 4); ++i) chess_prepare_for_pipelining chess_loop_range(4, 16) {
+    aie::vector<float, 16> bv = b ? aie::load_v<16>(b + i * 16) : sv;
+    aie::store_v(dst + i * 16, q4_fast_fmul2_16(aie::load_v<16>(a + i * 16), bv));
   }
-}
-
-FN_SZ void q4_scale_f32_16(
-    float *__restrict dst,
-    const float *__restrict src,
-    float s,
-    int n) {
-  q4_elem_mul(dst, src, nullptr, s, n);
 }
 
 FN_SZ void q4_fill_f32_16(float *__restrict dst, float val, int n) {
@@ -87,9 +52,12 @@ FN_SZ void q4_fill_f32_16(float *__restrict dst, float val, int n) {
 
 namespace {
 
-#define fmul_16 q4_fmul_16
 #define inv_16 q4_inv_16
-#define exp2f_16 q4_exp2f_16
+
+FN_SZ static void gather4_128(float *__restrict dst, const float *__restrict src) {
+#pragma clang loop unroll(disable)
+  for (int tl = 0; tl < 4; ++tl) aie::store_v(dst + tl * 16, aie::load_v<16>(src + tl * 128));
+}
 
 FN_SZ static void copy_f32_16(
     float *__restrict dst,
@@ -101,118 +69,18 @@ FN_SZ static void copy_f32_16(
   }
 }
 
-FN_SZ static float sum_sq_f32(const float *__restrict p, int n) {
+__attribute__((noinline)) static float sum_sq_f32(const float *__restrict p, int n) {
   aie::accum<accfloat, 16> ssa = aie::zeros<accfloat, 16>();
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < n; i += 16) {
-    aie::vector<float, 16> v = aie::load_v<16>(p + i);
+  for (int i = 0; i < (n >> 4); ++i) chess_prepare_for_pipelining chess_loop_range(4, 128) {
+    aie::vector<bfloat16, 16> v = aie::accum<accfloat, 16>(aie::load_v<16>(p + i * 16)).template to_vector<bfloat16>();
     ssa = aie::mac(ssa, v, v);
   }
-  return aie::reduce_add(ssa.template to_vector<float>());
-}
-
-FN_SZ static void apply_rmsnorm_n(
-    const float *__restrict src,
-    const float *__restrict nw,
-    float ss,
-    float inv_len,
-    float eps,
-    float post_scale,
-    int n,
-    float *__restrict dst) {
-  aie::vector<float, 16> mean = fmul_16(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(inv_len));
-  float inv_r = fmul_16(
-      q4_invsqrt_16(aie::add(mean, aie::broadcast<float, 16>(eps))),
-      aie::broadcast<float, 16>(post_scale)).get(0);
-  q4_elem_mul(dst, src, nullptr, inv_r, n);
-  q4_elem_mul(dst, dst, nw, 0.0f, n);
-}
-
-static inline aie::vector<float, 16> q4_sigmoid_16(aie::vector<float, 16> x) {
-  aie::vector<float, 16> one_v = aie::broadcast<float, 16>(1.0f);
-  aie::vector<float, 16> ml2e = aie::broadcast<float, 16>(-LOG2E);
-  return inv_16(aie::add(one_v, exp2f_16(fmul_16(x, ml2e))));
-}
-
-FN_SZ static void f32_to_bf16_n(
-    bfloat16 *__restrict dst,
-    const float *__restrict src,
-    int n) {
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < n; i += 16) {
-    aie::accum<accfloat, 16> a;
-    a.from_vector(aie::load_v<16>(src + i));
-    aie::store_v(dst + i, a.template to_vector<bfloat16>());
-  }
-}
-
-FN_SZ static float q4_rmax_16(aie::vector<float, 16> v) {
+  aie::vector<float, 16> ss = ssa.template to_vector<float>();
 #pragma clang loop unroll(disable)
   for (int sh = 32; sh >= 4; sh >>= 1) {
-    v = aie::max(v, aie::vector<float, 16>(::shift_bytes(v, v, sh)));
+    ss = aie::add(ss, aie::vector<float, 16>(::shift_bytes(ss, ss, sh)));
   }
-  return v.get(0);
-}
-
-FN_SZ static void quantize_q8_block_8tok(
-    const float *__restrict src,
-    int32_t row_stride,
-    int32_t col2_off,
-    uint8_t *__restrict xq_out,
-    bfloat16 *__restrict xd_out) {
-#pragma clang loop unroll(disable)
-  for (int t = 0; t < B_SUB; ++t) {
-    const float *r = src + t * row_stride;
-    aie::vector<float, 16> x0 = aie::load_v<16>(r);
-    aie::vector<float, 16> x1 = aie::load_v<16>(r + col2_off);
-    aie::vector<float, 16> z = aie::zeros<float, 16>();
-    float amax = q4_rmax_16(aie::max(aie::max(x0, aie::sub(z, x0)), aie::max(x1, aie::sub(z, x1))));
-    aie::vector<float, 16> dv =
-        fmul_16(aie::broadcast<float, 16>(amax), aie::broadcast<float, 16>(1.0f / 127.0f));
-    aie::accum<accfloat, 16> da;
-    da.from_vector(dv);
-    xd_out[t] = da.template to_vector<bfloat16>().get(0);
-    aie::vector<float, 16> idv = inv_16(dv);
-    aie::vector<float, 16> s0 = fmul_16(x0, idv);
-    aie::vector<float, 16> s1 = fmul_16(x1, idv);
-    aie::vector<int8, 32> q32 = aie::to_fixed<int8>(aie::concat(s0, s1), 0);
-    int grp = t >> 2;
-    int rt = t & 3;
-    aie::store_v((int8_t *)(xq_out + grp * 128 + rt * 16), q32.template extract<16>(0));
-    aie::store_v((int8_t *)(xq_out + grp * 128 + 64 + rt * 16), q32.template extract<16>(1));
-  }
-}
-
-FN_SZ static void apply_rmsnorm_neox_rope_64(
-    const float *__restrict in_h,
-    const float *__restrict norm_w,
-    float eps,
-    float post_scale,
-    const float *__restrict cs,
-    bfloat16 *__restrict out_h,
-    int32_t stride_db) {
-  float *__restrict tmp_n = (float *)g_scratch.rope._pad_after_rope;
-  float ss = sum_sq_f32(in_h, HEAD_DIM);
-  apply_rmsnorm_n(in_h, norm_w, ss, 1.0f / (float)HEAD_DIM, eps, post_scale, HEAD_DIM, tmp_n);
-  const float *__restrict c = cs;
-  const float *__restrict s = cs + 32;
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < 32; i += 16) {
-    aie::vector<float, 16> x0 = aie::load_v<16>(tmp_n + i);
-    aie::vector<float, 16> x1 = aie::load_v<16>(tmp_n + 32 + i);
-    aie::vector<float, 16> cv = aie::load_v<16>(c + i);
-    aie::vector<float, 16> sv = aie::load_v<16>(s + i);
-    aie::accum<accfloat, 16> a0, a1;
-    a0.from_vector(aie::sub(fmul_16(x0, cv), fmul_16(x1, sv)));
-    a1.from_vector(aie::add(fmul_16(x0, sv), fmul_16(x1, cv)));
-    aie::vector<bfloat16, 16> b0 = a0.template to_vector<bfloat16>();
-    aie::vector<bfloat16, 16> b1 = a1.template to_vector<bfloat16>();
-    int db = i >> 3;
-    aie::store_v(out_h + db * stride_db, b0.template extract<8>(0));
-    aie::store_v(out_h + (db + 1) * stride_db, b0.template extract<8>(1));
-    aie::store_v(out_h + (db + 4) * stride_db, b1.template extract<8>(0));
-    aie::store_v(out_h + (db + 5) * stride_db, b1.template extract<8>(1));
-  }
+  return ss.get(0);
 }
 
 static inline float read_eps() {
@@ -221,41 +89,44 @@ static inline float read_eps() {
   return eps;
 }
 
+FN_SZ static void apply_rmsnorm_n(
+    float *__restrict buf,
+    const float *__restrict nw,
+    float ss,
+    float inv_len,
+    float post_scale,
+    int n) {
+  float mean = q4_fmul_16(aie::broadcast<float, 16>(ss), aie::broadcast<float, 16>(inv_len)).get(0);
+  float r = ::invsqrt(mean + read_eps());
+  float inv_r = q4_fmul_16(aie::broadcast<float, 16>(r), aie::broadcast<float, 16>(post_scale)).get(0);
+  q4_elem_mul(buf, buf, nullptr, inv_r, n);
+  q4_elem_mul(buf, buf, nw, 0.0f, n);
+}
 static void q4_rmsnorm_q8_pair_impl(
     const float *__restrict x_pkt,
     int32_t col,
     int32_t pair_idx,
-    int32_t flags) {
-  const int32_t skip_norm = flags & 1;
-  const int32_t f32_out = (flags >> 1) & 1;
+    int32_t) {
 #pragma clang loop unroll(disable)
   for (int local_t = 0; local_t < 2; ++local_t) {
     int t = pair_idx * 2 + local_t;
     const float *__restrict row_ptr = x_pkt + local_t * 2048;
-    if (!skip_norm) {
-      g_scratch.norm.sum_sq[t] = sum_sq_f32(row_ptr, 2048);
-    }
+    g_scratch.norm.sum_sq[t] = sum_sq_f32(row_ptr, 2048);
     copy_f32_16(&g_scratch.norm.x_slice[t][0], row_ptr + col * 256, 256);
   }
   if (pair_idx == 3) {
-    float eps = read_eps();
-    if (!skip_norm) {
 #pragma clang loop unroll(disable)
-      for (int t = 0; t < B_SUB; ++t) {
-        float *__restrict xs = &g_scratch.norm.x_slice[t][0];
-        apply_rmsnorm_n(xs, &g_scratch.norm.norm_w[0], g_scratch.norm.sum_sq[t], 1.0f / 2048.0f, eps, 1.0f, 256, xs);
-      }
+    for (int t = 0; t < B_SUB; ++t) {
+      apply_rmsnorm_n(&g_scratch.norm.x_slice[t][0], &g_scratch.norm.norm_w[0], g_scratch.norm.sum_sq[t], 1.0f / 2048.0f, 1.0f, 256);
     }
-    if (!f32_out) {
 #pragma clang loop unroll(disable)
-      for (int b = 0; b < 8; ++b) {
-        quantize_q8_block_8tok(
-            &g_scratch.norm.x_slice[0][b * 32],
-            256,
-            16,
-            g_scratch.norm.xq_out + b * 256,
-            g_scratch.norm.xd_out + b * 8);
-      }
+    for (int b = 0; b < 8; b += 2) {
+      quantize_q8_2blk_8tok(
+          &g_scratch.norm.x_slice[0][b * 32],
+          256, 16,
+          g_scratch.norm.xq_out + b * 256,
+          g_scratch.norm.xq_out + (b + 1) * 256,
+          g_scratch.norm.xd_out + b * 8);
     }
   }
 }
@@ -265,87 +136,99 @@ __attribute__((minsize)) static void q4_rope_step_impl(
     int32_t col,
     int32_t pair_idx,
     int32_t mode) {
-  if (mode == 3) {
-    if ((col >> 2) == pair_idx) {
-      copy_f32_16((float *)g_scratch.attn.q_bf16, x_pkt + (col & 3) * 1024, 1024);
-    }
-    return;
+  if (mode >= 2) return;
+  const int32_t is3 = 0;
+  const int32_t len = is3 ? 1024 : 2176;
+  if (0 && (is3 || g_params[9]) && ((col >> (1 + is3)) == pair_idx)) {
+    copy_f32_16(
+        is3 ? (float *)g_scratch.attn.q_bf16 : &g_scratch.attn.o_acc[0][0][0],
+        x_pkt + (col & (is3 ? 3 : 1)) * len,
+        len);
   }
-  if (mode == 4) {
-    if (g_params[9] && ((col >> 1) == pair_idx)) {
-      copy_f32_16(&g_scratch.attn.o_acc[0][0][0], x_pkt + (col & 1) * 2112, 2112);
-    }
-    return;
-  }
-  float eps = read_eps();
-  const int32_t is_q = (mode == 0);
-  const int32_t nh = is_q ? GQA_Q_HEADS : 1;
-  const int32_t pkt_st = is_q ? 2048 : 512;
-  const int32_t col_st = is_q ? 256 : HEAD_DIM;
-  const int32_t db_st = is_q ? (B_SUB * 8) : 8;
-  const int32_t t_st = is_q ? 8 : HEAD_DIM;
-  const float *__restrict nw = is_q ? g_scratch.rope.q_norm_w : g_scratch.rope.k_norm_w;
-  bfloat16 *__restrict base =
-      is_q ? g_scratch.rope.q_bf16 : ((mode == 1) ? &g_scratch.rope.k_buf[0][0] : &g_scratch.rope.v_buf[0][0]);
+}
 
+FN_SZ static void q4_kvq_rope_in_l1(const float *__restrict w_pkt, int32_t row, int32_t is_q, int32_t sub) {
+  const float *__restrict cs_base = w_pkt + row * (B_SUB * HEAD_DIM);
+  const float *__restrict nw = w_pkt + 2048 + (is_q ? 0 : HEAD_DIM);
+  const float pscale = is_q ? ATTN_SCALE_LOG2E : 1.0f;
+  const int32_t nh = is_q ? 4 : 1;
+  const int32_t db_st = is_q ? (B_SUB * 8) : 8;
+  float *__restrict out_sub = g_scratch.gemm.y_acc + sub * 1024;
+  bfloat16 *__restrict y_b = (bfloat16 *)out_sub;
 #pragma clang loop unroll(disable)
-  for (int local_t = 0; local_t < 2; ++local_t) {
-    int t = pair_idx * 2 + local_t;
-    const float *__restrict in_p = x_pkt + local_t * pkt_st + col * col_st;
-    if (mode == 2) {
-      f32_to_bf16_n(base + t * HEAD_DIM, in_p, HEAD_DIM);
-    } else {
-      const float *__restrict cs = &g_scratch.rope.rope_cs[t][0];
+  for (int h = 0; h < nh; ++h) {
+    const float *__restrict in_b = g_scratch.gemm.y_acc + (h >> 1) * 2048 + sub * 1024 + (h & 1) * 512;
+    bfloat16 *__restrict out_h_base = (h == 0) ? &g_scratch.rope.k_buf[0][0] : (y_b + h * 512);
 #pragma clang loop unroll(disable)
-      for (int h = 0; h < nh; ++h) {
-        apply_rmsnorm_neox_rope_64(
-            in_p + h * HEAD_DIM,
-            nw,
-            eps,
-            is_q ? ATTN_SCALE_LOG2E : 1.0f,
-            cs,
-            base + h * 512 + t * t_st,
-            db_st);
+    for (int t = 0; t < B_SUB; ++t) {
+      const float *__restrict bt = in_b + t * 16;
+      float *__restrict tn = g_scratch.rope.tmp_n;
+      gather4_128(tn, bt);
+      float ss = sum_sq_f32(tn, HEAD_DIM);
+      apply_rmsnorm_n(tn, nw, ss, 1.0f / (float)HEAD_DIM, pscale, HEAD_DIM);
+      const float *__restrict cs = cs_base + t * HEAD_DIM;
+      bfloat16 *__restrict out_h = out_h_base + t * (is_q ? 8 : HEAD_DIM);
+#pragma clang loop unroll(disable)
+      for (int i = 0; i < 32; i += 16) {
+        aie::vector<bfloat16, 16> x0 = aie::accum<accfloat, 16>(aie::load_v<16>(tn + i)).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> x1 = aie::accum<accfloat, 16>(aie::load_v<16>(tn + 32 + i)).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> c0 = aie::accum<accfloat, 16>(aie::load_v<16>(cs + i)).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> s0 = aie::accum<accfloat, 16>(aie::load_v<16>(cs + 32 + i)).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> b0 = aie::msc(aie::mul<accfloat>(x0, c0), x1, s0).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> b1 = aie::mac(aie::mul<accfloat>(x0, s0), x1, c0).template to_vector<bfloat16>();
+        int db = i >> 3;
+        aie::store_v(out_h + db * db_st, b0.template extract<8>(0));
+        aie::store_v(out_h + (db + 1) * db_st, b0.template extract<8>(1));
+        aie::store_v(out_h + (db + 4) * db_st, b1.template extract<8>(0));
+        aie::store_v(out_h + (db + 5) * db_st, b1.template extract<8>(1));
       }
     }
+    if (is_q && h == 0) copy_f32_16(out_sub, (float *)&g_scratch.rope.k_buf[0][0], 256);
+  }
+  if (is_q) copy_f32_16((float *)(sub ? g_scratch.attn.q1_bf16 : g_scratch.attn.q_bf16), out_sub, 1024);
+}
+
+__attribute__((minsize)) static void q4_conv_xd_w_impl(const float *__restrict w_pkt, int32_t row, int32_t stage) {
+  if ((row >> 1) != stage) return;
+  const bfloat16 *__restrict src_b = (const bfloat16 *)(w_pkt + (row & 1) * 16);
+#pragma clang loop unroll(disable)
+  for (int i2 = 0; i2 < 32; ++i2) {
+    const int kc = i2 >> 4;
+    const uint32_t base_off = (((i2 & 12U) << 2) | ((i2 & 3U) << 1)) * 8;
+    aie::vector<bfloat16, 32> v = aie::load_v<32>(src_b + i2 * 128);
+    aie::store_v(&g_scratch.gemm.conv_xd[kc][0][base_off], v.template extract<16>(0));
+    aie::store_v(&g_scratch.gemm.conv_xd[kc][1][base_off], v.template extract<16>(1));
   }
 }
 
-FN_SZ static void q4_res_w_impl(const float *__restrict w_pkt, int32_t row, int32_t stage) {
+__attribute__((minsize)) static void q4_res_w_impl(const float *__restrict w_pkt, int32_t row, int32_t stage) {
   if (row != (stage & 3)) return;
-  const float *__restrict src = w_pkt;
-  float *__restrict dst = &g_scratch.norm.x_slice[0][0];
-  int add = stage >> 2;
+  float *__restrict y_sub = g_scratch.gemm.y_acc + (stage >> 2) * 1024;
 #pragma clang loop unroll(disable)
   for (int t = 0; t < B_SUB; ++t) {
-    const float *__restrict s = src + t * 288;
-    float *__restrict d = dst + t * 256;
+    const float *__restrict s = w_pkt + t * 288;
+    float *__restrict d = y_sub + t * 16;
 #pragma clang loop unroll(disable)
-    for (int i = 0; i < 256; i += 16) {
-      aie::vector<float, 16> sv = aie::load_v<16>(s + i);
-      aie::store_v(d + i, add ? aie::add(aie::load_v<16>(d + i), sv) : sv);
+    for (int ti = 0; ti < 8; ++ti, s += 16, d += 128) {
+      aie::store_v(d, aie::add(aie::load_v<16>(d), aie::load_v<16>(s)));
+      aie::store_v(d + 2048, aie::add(aie::load_v<16>(d + 2048), aie::load_v<16>(s + 128)));
     }
   }
 }
 
-static void q4_silu_fused_drain_impl(float *__restrict y_out, int32_t arg) {
+__attribute__((minsize)) static void q4_silu_fused_drain_impl(float *__restrict y_out, int32_t arg) {
   const int32_t b = arg & 1;
-  const int32_t sub = (arg >> 1) & 1;
-  const int32_t j = (arg >> 2) & 1;
-  float *__restrict gp = g_scratch.gemm.y_acc + sub * (8 * B_SUB * ROWS);
+  const int32_t j = (arg >> 1) & 1;
+  const int32_t sub = (arg >> 2) & 1;
+  float *__restrict gp =
+      g_scratch.gemm.y_acc + j * (16 * B_SUB * ROWS) + sub * (8 * B_SUB * ROWS);
   if (!b) {
-#pragma clang loop unroll(disable)
-    for (int i = 0; i < 512; i += 16) {
-      aie::vector<float, 16> sv = q4_sigmoid_16(aie::load_v<16>(gp + i));
-      aie::store_v(gp + i, fmul_16(fmul_16(aie::load_v<16>(gp + i), sv), aie::load_v<16>(gp + 512 + i)));
-    }
+    q4_silu_mul_512(gp);
+    bfloat16 *xd0 = g_scratch.gemm.xd_out + sub * 32 + j * 16;
+    quantize_q8_2blk_8tok(gp, 16, 128, (uint8_t *)y_out, (uint8_t *)(gp + 512), xd0);
+  } else {
+    copy_f32_16(y_out, gp + 512, 64);
   }
-  quantize_q8_block_8tok(
-      gp + b * 256,
-      16,
-      128,
-      (uint8_t *)y_out,
-      g_scratch.gemm.xd_out + sub * 32 + (j * 2 + b) * 8);
 }
 
 static inline int32_t read_n_valid_clamped() {
@@ -355,7 +238,7 @@ static inline int32_t read_n_valid_clamped() {
   return n_v;
 }
 
-FN_SZ static void q4_conv1d_w_step_impl(
+__attribute__((minsize)) static void q4_conv1d_w_step_impl(
     const float *__restrict w_pkt,
     int32_t row,
     int32_t stage) {
@@ -389,177 +272,186 @@ FN_SZ static void q4_conv1d_w_step_impl(
       }
     } else {
       int32_t t_base = (stage - 9) * 8;
-#pragma clang loop unroll(disable)
-      for (int t = 0; t < 8; ++t) {
-        int32_t ti = t_base + t;
-        const float *__restrict cp = w_pkt + t * 288 + r_off;
-        float *__restrict op = g_scratch.conv.conv_out + t * 64;
-#pragma clang loop unroll(disable)
-        for (int i = 0; i < 64; i += 16) {
-          aie::accum<accfloat, 16> acc = aie::zeros<accfloat, 16>();
-#pragma clang loop unroll(disable)
-          for (int k = 0; k < L_CACHE; ++k) {
-            acc = aie::mac(acc, aie::load_v<16>(&g_scratch.conv.bx[ti + k - D_CONV][i]), aie::load_v<16>(&g_scratch.conv.wt[k][i]));
-          }
-          aie::store_v(op + i, acc.template to_vector<float>());
+      for (int i = 0; i < 64; i += 16) {
+        aie::vector<bfloat16, 16> w0 = aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.wt[0][i])).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> w1 = aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.wt[1][i])).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> w2 = aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.wt[2][i])).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> x_m2 = aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.bx[t_base - 2][i])).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 16> x_m1 = aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.bx[t_base - 1][i])).template to_vector<bfloat16>();
+        for (int t = 0; t < 8; ++t) chess_prepare_for_pipelining chess_loop_count(8) {
+          aie::vector<bfloat16, 16> x_0 = aie::accum<accfloat, 16>(aie::load_v<16>(&g_scratch.conv.bx[t_base + t][i])).template to_vector<bfloat16>();
+          aie::accum<accfloat, 16> acc = aie::mul<accfloat>(x_m2, w0);
+          acc = aie::mac(acc, x_m1, w1);
+          acc = aie::mac(acc, x_0, w2);
+          x_m2 = x_m1;
+          x_m1 = x_0;
+          aie::store_v(
+              g_scratch.conv.conv_out + t * 64 + i,
+              q4_fast_fmul2_16(acc.template to_vector<float>(), aie::load_v<16>(w_pkt + t * 288 + r_off + i)));
         }
-        q4_elem_mul(op, op, cp, 0.0f, 64);
+      }
+      int32_t q = stage - 9;
+      quantize_q8_2blk_8tok(
+          g_scratch.conv.conv_out, 64, 16,
+          g_scratch.conv.xq_out + q * 512,
+          g_scratch.conv.xq_out + q * 512 + 256,
+          g_scratch.conv.xd_out + q * 16);
+    }
+  }
+}
+
+__attribute__((minsize)) static void q4_flash_attn_q8_prep(int32_t sub) {
+  float *__restrict rlp = &g_scratch.attn.row_l[0][0];
+  float *__restrict tmp = (float *)g_scratch.attn.q_bf16;
+  constexpr int32_t is_sp = 1;
+  const int32_t sp_sub = sub;
+  if (!sp_sub) {
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < GQA_Q_HEADS * 2 * B_SUB; i += 16) {
+      aie::store_v(rlp + i, inv_16(aie::load_v<16>(rlp + i)));
+    }
+  }
+  constexpr int32_t r_step = 16;
+  const float *__restrict rh = rlp + sp_sub * 8;
+  const float *__restrict oa = sp_sub ? g_x_ptr : &g_scratch.attn.o_acc[0][0][0];
+  uint8_t *__restrict xqo = g_scratch.norm.xq_out;
+  bfloat16 *__restrict xdo = g_scratch.norm.xd_out;
+#pragma clang loop unroll(disable)
+  for (int h = 0; h < GQA_Q_HEADS; ++h, oa += 512, rh += r_step, xqo += 512, xdo += 16) {
+#pragma clang loop unroll(disable)
+    for (int t = 0; t < B_SUB; ++t) {
+      float *__restrict dst = tmp + t * HEAD_DIM;
+#pragma clang loop unroll(disable)
+      for (int d8 = 0; d8 < 8; ++d8) {
+        aie::store_v(dst + d8 * 8, aie::load_v<8>(oa + d8 * 64 + t * 8));
+      }
+      q4_elem_mul(dst, dst, nullptr, rh[t], HEAD_DIM);
+    }
+    quantize_q8_2blk_8tok(tmp, HEAD_DIM, 16, xqo, xqo + 256, xdo);
+  }
+}
+
+FN_SZ static uint32_t fa_mask_check_slot(
+    int32_t cur_sub,
+    int32_t row_q0,
+    int32_t chunk_gpos0,
+    int32_t chunk_valid,
+    int32_t do_mask,
+    float (*__restrict sc_mat)[16],
+    int32_t s_off,
+    int32_t is_sp,
+    int32_t &all_full) {
+  is_sp = 1;
+  const int32_t pos0 = g_params[0], n_valid = g_params[1]; constexpr int32_t is_causal = 1, swa = 0;
+  int32_t q_off = cur_sub * 32 + row_q0;
+  int32_t r_v = n_valid - q_off;
+  if (r_v > B_SUB) r_v = B_SUB;
+  int32_t vl = chunk_valid;
+  int32_t b_hi = (pos0 + q_off - chunk_gpos0) + 1;
+  if (is_causal) {
+    int32_t max_k = b_hi + r_v - 1;
+    if (max_k < vl) vl = max_k;
+  }
+  if (r_v <= 0 || vl <= 0) { all_full = 0; return 0; }
+  bool fl = (vl == KV_CHUNK_T) && (!is_causal || ((b_hi >= KV_CHUNK_T) && (swa <= 0)));
+  if (!fl || r_v != B_SUB) all_full = 0;
+  if (fl) return (1U << r_v) - 1U;
+  uint32_t am = 0;
+#pragma clang loop unroll(disable)
+  for (int t = 0; t < r_v; ++t) {
+    int32_t lo = 0, hi = vl;
+    if (is_causal) {
+      int32_t c_hi = b_hi + t;
+      if (c_hi < hi) hi = c_hi;
+      if (swa > 0 && c_hi - swa > 0) lo = c_hi - swa;
+    }
+    if (hi <= lo) continue;
+    am |= (1U << t);
+    if (do_mask) {
+      float *__restrict sc = &sc_mat[0][s_off + t];
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < KV_CHUNK_T; ++k, sc += 16) {
+        if (k < lo || k >= hi) {
+          sc[0] = -1e30f;
+          if (!is_sp) sc[8] = -1e30f;
+        }
       }
     }
   }
-}
-
-static void q4_flash_attn_q8_prep() {
-  float *__restrict rlp = &g_scratch.attn.row_l[0][0];
-  float *__restrict oa = &g_scratch.attn.o_acc[0][0][0];
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < GQA_Q_HEADS * B_SUB; i += 16) {
-    aie::store_v(rlp + i, inv_16(aie::load_v<16>(rlp + i)));
-  }
-#pragma clang loop unroll(disable)
-  for (int ht = 0; ht < GQA_Q_HEADS * B_SUB; ++ht) {
-    q4_scale_f32_16(oa + ht * HEAD_DIM, oa + ht * HEAD_DIM, rlp[ht], HEAD_DIM);
-  }
-#pragma clang loop unroll(disable)
-  for (int b = 0; b < 8; ++b) {
-    quantize_q8_block_8tok(
-        oa + (b >> 1) * (B_SUB * HEAD_DIM) + (b & 1) * 32,
-        HEAD_DIM,
-        16,
-        g_scratch.norm.xq_out + b * 256,
-        g_scratch.norm.xd_out + b * 8);
-  }
-}
-
-FN_SZ static void fa_mask_2row32(int32_t t, int32_t lo, int32_t hi) {
-  float *__restrict s0 = &g_scratch.attn.scores[0][t][0];
-  float *__restrict s1 = &g_scratch.attn.scores[1][t][0];
-#pragma clang loop unroll(disable)
-  for (int k = 0; k < KV_CHUNK_T; ++k) {
-    if (k < lo || k >= hi) {
-      s0[k] = -1e30f;
-      s1[k] = -1e30f;
-    }
-  }
-}
-
-static inline void fa_rescale_one(int32_t h, int32_t t, float old_m, float new_m) {
-  float *__restrict rl = &g_scratch.attn.row_l[h][t];
-  float rl_prev = *rl;
-  uint16_t rl_hi = 0;
-  __builtin_memcpy(&rl_hi, reinterpret_cast<const uint8_t *>(rl) + 2, 2);
-  if (rl_hi != 0) {
-    float alpha = exp2f_16(aie::broadcast<float, 16>(old_m - new_m)).get(0);
-    *rl = fmul_16(aie::broadcast<float, 16>(rl_prev), aie::broadcast<float, 16>(alpha)).get(0);
-    q4_scale_f32_16(&g_scratch.attn.o_acc[h][t][0], &g_scratch.attn.o_acc[h][t][0], alpha, HEAD_DIM);
-  }
+  return am;
 }
 
 }  // namespace
 
 extern "C" {
-__attribute__((minsize)) void q4_lfm2_fa_op(
+__attribute__((minsize)) static void q4_lfm2_fa_op(
     const float *__restrict kv_pkt,
     int32_t row_arg,
     int32_t iter_idx) {
-  aie::tile::current().set_rounding(aie::rounding_mode::conv_even);
   const int32_t pos0 = g_params[0];
   const int32_t n_valid = g_params[1];
   const int32_t kv_ch = g_params[2];
   const int32_t n_past = g_params[3];
-  const int32_t is_causal = g_params[4];
-  const int32_t swa_window = g_params[5];
-  const int32_t kv_start_chunk = g_params[8];
-  const int32_t sub = row_arg >> 2;
+  constexpr int32_t is_sp = 1;
+  constexpr int32_t kv_start_chunk = 0;
+  constexpr int32_t sub = 0;
+  const int32_t row_q0 = (row_arg & 3) * B_SUB;
 
-  const int32_t is_first = (iter_idx == 0) && ((g_params[6] <= 3) || !g_params[9]);
+  const int32_t is_first = (iter_idx == 0);
   if (is_first) {
-    q4_fill_f32_16(&g_scratch.attn.o_acc[0][0][0], 0.0f, GQA_Q_HEADS * B_SUB * (HEAD_DIM + 1));
-    q4_fill_f32_16(&g_scratch.attn.row_m[0][0], -1e30f, GQA_Q_HEADS * B_SUB);
+    q4_fill_f32_16(&g_scratch.attn.o_acc[0][0][0], 0.0f, GQA_Q_HEADS * B_SUB * (HEAD_DIM + 2));
+    q4_fill_f32_16(&g_scratch.attn.row_m[0][0], -1e30f, GQA_Q_HEADS * 2 * B_SUB);
+    if (is_sp) q4_fill_f32_16(g_x_ptr, 0.0f, GQA_Q_HEADS * B_SUB * HEAD_DIM);
   }
-  if (iter_idx >= kv_ch && g_params[10]) return;
 
-  const int32_t n_valid_sub = sub ? (n_valid - 32) : n_valid;
-  const int32_t row = row_arg & 3;
-  const int32_t row_q0 = row * B_SUB;
-  const int32_t rem_q = n_valid_sub - row_q0;
-  if (rem_q <= 0) return;
 
-  const int32_t row_valid = (rem_q < B_SUB) ? rem_q : B_SUB;
-  const int32_t pos0_sub = pos0 + sub * 32;
   const int32_t cur_off = (iter_idx - kv_ch) * 32;
   const int32_t chunk_gpos0 =
       (iter_idx < kv_ch) ? ((kv_start_chunk + iter_idx) * KV_CHUNK_T) : (pos0 + cur_off);
-  int32_t valid_len = (iter_idx < kv_ch) ? (n_past - chunk_gpos0) : (n_valid - cur_off);
-  if (valid_len <= 0) return;
-  if (valid_len > KV_CHUNK_T) valid_len = KV_CHUNK_T;
+  int32_t chunk_valid = (iter_idx < kv_ch) ? (n_past - chunk_gpos0) : (n_valid - cur_off);
+  if (chunk_valid <= 0) return;
+  if (chunk_valid > KV_CHUNK_T) chunk_valid = KV_CHUNK_T;
 
-  if (is_causal) {
-    const int32_t q_last = pos0_sub + row_q0 + row_valid - 1;
-    if (chunk_gpos0 > q_last) return;
-    if (swa_window > 0 && (chunk_gpos0 + valid_len) <= (pos0_sub + row_q0 + 1 - swa_window)) return;
-    const int32_t max_k = (q_last - chunk_gpos0) + 1;
-    if (max_k < valid_len) valid_len = max_k;
-  }
-
+  constexpr int32_t n_slots = 2;
   const bfloat16 *__restrict k_mat = (const bfloat16 *)kv_pkt;
   const bfloat16 *__restrict v_mat = (const bfloat16 *)(kv_pkt + KV_HALF_F32);
-  const int32_t kb_max = (valid_len + 7) >> 3;
-  const int32_t base_hi = (pos0_sub + row_q0 - chunk_gpos0) + 1;
+    const int32_t kb_max = (chunk_valid + 7) >> 3;
 
-#pragma clang loop unroll(disable)
-  for (int hp = 0; hp < 2; ++hp) {
-    const int32_t h0 = hp * 2;
-    const bfloat16 *__restrict q0 = g_scratch.attn.q_bf16 + h0 * (HEAD_DIM / 8) * 64;
-    q4_fa_qk_dual(q0, q0 + (HEAD_DIM / 8) * 64, k_mat, kb_max);
+  int32_t all_full = 1;
+  uint32_t mask16 = 0;
+  if (n_valid == 64 && iter_idx < kv_ch && chunk_valid == KV_CHUNK_T && (pos0 + row_q0 - chunk_gpos0) >= KV_CHUNK_T) {
+    mask16 = 0xffffU;
+  } else {
+    for (int s = 0; s < n_slots; ++s) {
+      mask16 |= (fa_mask_check_slot(is_sp ? s : sub, row_q0, chunk_gpos0, chunk_valid, 0, g_scratch.attn.scores, 0, is_sp, all_full) << (s * 8));
+    }
+    if (!mask16) return;
+  }
 
-    uint32_t active_mask = 0;
+  q4_fa_pack_v(v_mat, kb_max);
+  float (*__restrict scores1)[16] = (float (*)[16])(g_x_ptr + 3072);
 #pragma clang loop unroll(disable)
-    for (int t = 0; t < row_valid; ++t) {
-      int32_t lo = 0;
-      int32_t hi = valid_len;
-      if (is_causal) {
-        int32_t c_hi = base_hi + t;
-        if (c_hi < hi) hi = c_hi;
-        if (swa_window > 0) {
-          int32_t c_lo = c_hi - swa_window;
-          if (c_lo > lo) lo = c_lo;
+  for (int pair = 0; pair < 2; ++pair) {
+    const int32_t it0 = pair * 2;
+    const bfloat16 *__restrict q0a = g_scratch.attn.q_bf16 + (it0 << 9);
+    const bfloat16 *__restrict q1a = q0a - 2048;
+    q4_fa_qk_quad(q0a, q1a, q0a + 512, q1a + 512, k_mat, kb_max, g_scratch.attn.scores, scores1);
+    for (int sub_it = 0; sub_it < 2; ++sub_it) {
+      float (*__restrict sc_ptr)[16] = sub_it ? scores1 : g_scratch.attn.scores;
+      if (!all_full) {
+        for (int s = 0; s < n_slots; ++s) {
+          fa_mask_check_slot(s, row_q0, chunk_gpos0, chunk_valid, 1, sc_ptr, s * 8, is_sp, all_full);
         }
       }
-      if (hi <= lo) continue;
-      active_mask |= (1U << t);
-      if ((lo > 0) || (hi < KV_CHUNK_T)) fa_mask_2row32(t, lo, hi);
+      int32_t h_tag = 4 | (it0 + sub_it);
+      q4_fa_softmax_2h(h_tag, mask16, sc_ptr);
+      q4_fa_pv_d16(v_mat, kb_max, h_tag);
     }
-    if (!active_mask) return;
-
-    alignas(64) bfloat16 p0_tmp[256];
-#pragma clang loop unroll(disable)
-    for (int hh = 0; hh < 2; ++hh) {
-      const int32_t h = h0 + hh;
-      bfloat16 *__restrict p_dst = (hh == 0) ? p0_tmp : &g_scratch.attn.p_bf16[256];
-      q4_fill_f32_16((float *)p_dst, 0.0f, 128);
-      float *__restrict rm = &g_scratch.attn.row_m[h][0];
-      float *__restrict rl = &g_scratch.attn.row_l[h][0];
-#pragma clang loop unroll(disable)
-      for (int t = 0; t < B_SUB; ++t) {
-        if (!((active_mask >> t) & 1U)) continue;
-        const float *__restrict sc = &g_scratch.attn.scores[hh][t][0];
-        float m_chk = q4_rmax_16(aie::max(aie::load_v<16>(sc), aie::load_v<16>(sc + 16)));
-        float old_m = rm[t];
-        if (m_chk > old_m) {
-          rm[t] = m_chk;
-          fa_rescale_one(h, t, old_m, m_chk);
-        }
-        rl[t] += q4_fa_exp2_row32(sc, rm[t], p_dst + t * 8);
-      }
-      if (hh == 0) copy_f32_16((float *)&g_scratch.attn.p_bf16[0], (const float *)p0_tmp, 128);
-    }
-
-    q4_fa_pv_d16(v_mat, kb_max, h0);
   }
 }
 
-__attribute__((minsize)) void q4_lfm2_pre_w_op_impl(const float *__restrict w_pkt, int32_t op, int32_t a0, int32_t a1) {
+__attribute__((minsize)) void q4_lfm2_pre_w_op(const float *__restrict w_pkt, int32_t op, int32_t a0, int32_t a1) {
+  aie::tile::current().set_rounding(aie::rounding_mode::conv_even);
   if (op >= 16) {
     q4_lfm2_fa_op(w_pkt, op - 16, a1);
   } else if (op == 0 || op == 4) {
@@ -567,9 +459,10 @@ __attribute__((minsize)) void q4_lfm2_pre_w_op_impl(const float *__restrict w_pk
       copy_f32_16((float *)g_params, w_pkt + 2048, 16);
     }
     copy_f32_16(&g_scratch.norm.norm_w[0], w_pkt + a0 * 256, 256);
-  } else if (op == 1) {
-    copy_f32_16(&g_scratch.rope.rope_cs[0][0], w_pkt + a0 * (B_SUB * HEAD_DIM), B_SUB * HEAD_DIM);
-    copy_f32_16(g_scratch.rope.q_norm_w, w_pkt + 2048, 2 * HEAD_DIM);
+  } else if (op == 1 || op == 2) {
+    q4_kvq_rope_in_l1(w_pkt, a0, op == 2, a1);
+  } else if (op == 3) {
+    q4_conv_xd_w_impl(w_pkt, a0, a1);
   } else if (op == 6) {
     q4_res_w_impl(w_pkt, a0, a1);
   } else {
@@ -577,17 +470,14 @@ __attribute__((minsize)) void q4_lfm2_pre_w_op_impl(const float *__restrict w_pk
   }
 }
 
-__attribute__((minsize)) void q4_lfm2_pre_x_op_impl(
+__attribute__((minsize)) void q4_lfm2_pre_x_op(
     const float *__restrict x_pkt,
     int32_t op,
     int32_t a0,
     int32_t a1,
     int32_t a2) {
-  if (op == 0) {
-    q4_rmsnorm_q8_pair_impl(x_pkt, a0, a1, a2);
-  } else {
-    q4_rope_step_impl(x_pkt, a0, a1, a2);
-  }
+  g_x_ptr = (float *)x_pkt;
+  if (op == 0) q4_rmsnorm_q8_pair_impl(x_pkt, a0, a1, a2);
 }
 
 __attribute__((minsize)) void q4_lfm2_pre_y_op(float *__restrict y_out, int32_t op, int32_t arg) {
@@ -598,8 +488,8 @@ __attribute__((minsize)) void q4_lfm2_pre_y_op(float *__restrict y_out, int32_t 
     }
     op = 5;
   }
-  if (op == 3) {
-    if (arg == 0) q4_flash_attn_q8_prep();
+  if (op == 3 || op == 4) {
+    if (arg == 0) q4_flash_attn_q8_prep(op == 4);
     op = 0;
   }
   const float *__restrict src;
@@ -611,32 +501,33 @@ __attribute__((minsize)) void q4_lfm2_pre_y_op(float *__restrict y_out, int32_t 
     src = (const float *)g_scratch.gemm.xd_out;
     valid_f32 = 32;
   } else if (op == 8) {
-    src = g_scratch.conv.conv_out + ((arg < 8) ? arg * 64 : 0);
-    if (arg >= 8) {
-      int32_t n_v = read_n_valid_clamped();
-      const float *st = (n_v > 32) ? &g_scratch.conv.bx[n_v - 32 - D_CONV][0] : &g_scratch.conv.state[0][0];
-      src = st + (arg - 8) * 64;
-    }
+    int32_t n_v = read_n_valid_clamped();
+    const float *st = (n_v > 32) ? &g_scratch.conv.bx[n_v - 32 - D_CONV][0] : &g_scratch.conv.state[0][0];
+    src = st + (arg - 8) * 64;
   } else if (op == 1) {
     int32_t p4 = arg >> 4;
     int32_t tok = arg & 15;
     const float *__restrict base = g_scratch.gemm.y_acc +
-        (tok >> 3) * 1024 + p4 * 512 + ((tok >> 2) & 1) * 64 + (tok & 3) * 16;
+        (p4 >> 1) * 2048 + (tok >> 3) * 1024 + (p4 & 1) * 512 + ((tok >> 2) & 1) * 64 + (tok & 3) * 16;
+    gather4_128(y_out, base);
+    return;
+  } else if (op == 2 && arg >= 8) {
+    int32_t i = arg - 8;
+    const float *src_v = g_scratch.gemm.y_acc + 512 + (i >> 2) * 1024 + (i & 3) * 32;
+    bfloat16 *dst = (bfloat16 *)y_out;
 #pragma clang loop unroll(disable)
-    for (int tl = 0; tl < 4; ++tl) {
-      aie::store_v(y_out + tl * 16, aie::load_v<16>(base + tl * 128));
+    for (int p = 0; p < 8; ++p) {
+      aie::store_v(dst + p * 16, aie::accum<accfloat, 16>(aie::load_v<16>(src_v + (p >> 2) * 16 + (p & 3) * 128)).template to_vector<bfloat16>());
     }
     return;
   } else {
+
     const float *__restrict base =
-        (op == 2) ? (const float *)g_scratch.rope.k_buf :
-        (op == 7) ? (const float *)g_scratch.attn.q_bf16 :
-        (op == 10) ? &g_scratch.attn.o_acc[0][0][0] :
-                     &g_scratch.norm.x_slice[0][0];
-    src = base + arg * 64;
+        (op == 2) ? (const float *)g_scratch.attn.q1_bf16 : &g_scratch.attn.o_acc[0][0][0];
+    src = base + ((op == 2) ? (arg ^ 16) : arg) * 64;
   }
   copy_f32_16(y_out, src, valid_f32);
-  if (valid_f32 < 64) q4_fill_f32_16(y_out + valid_f32, 0.0f, 64 - valid_f32);
+  if (valid_f32 < 64) q4_fill_f32_16(y_out + 32, 0.0f, 32);
 }
 
 }  // extern "C"

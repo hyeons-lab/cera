@@ -32,24 +32,25 @@ __attribute__((noinline, minsize)) aie::vector<float, 16> dec_inv_16(aie::vector
 }
 
 __attribute__((noinline)) aie::vector<float, 16> dec_exp2f_16(aie::vector<float, 16> x) {
-  static const float kExp2C[5] = {
-      0.0096130371f,
-      0.0555038452f,
-      0.2402267456f,
-      0.6931471825f,
-      1.0f,
-  };
   x = aie::max(x, aie::broadcast<float, 16>(-126.0f));
-  aie::vector<float, 16> n = aie::to_float<float>(aie::to_fixed<int32>(x, 0));
-  aie::vector<float, 16> f = aie::sub(x, n);
-  aie::vector<float, 16> p = aie::broadcast<float, 16>(0.0013427734f);
-#pragma clang loop unroll(disable)
-  for (int i = 0; i < 5; ++i) {
-    p = aie::add(dec_fmul_16(p, f), aie::broadcast<float, 16>(kExp2C[i]));
+  x = aie::min(x, aie::broadcast<float, 16>(126.0f));
+  aie::vector<float, 16> magic = aie::broadcast<float, 16>(12582912.0f);
+  aie::vector<float, 16> kf = aie::sub(aie::add(x, magic), magic);
+  aie::vector<bfloat16, 16> fb =
+      aie::accum<accfloat, 16>(aie::sub(x, kf)).template to_vector<bfloat16>();
+  aie::vector<float, 16> u = aie::add(kf, aie::broadcast<float, 16>(98431.0f));
+  aie::vector<bfloat16, 16> eab = aie::filter_even(u.template cast_to<bfloat16>(), 1);
+  aie::vector<bfloat16, 16> pb = aie::broadcast<bfloat16, 16>((bfloat16)0.0555041087f);
+  {
+    aie::accum<accfloat, 16> acc;
+    acc.from_vector(aie::broadcast<float, 16>(0.2402265069f));
+    pb = aie::mac(acc, pb, fb).template to_vector<bfloat16>();
+    acc.from_vector(aie::broadcast<float, 16>(0.6931471805f));
+    pb = aie::mac(acc, pb, fb).template to_vector<bfloat16>();
+    acc.from_vector(aie::broadcast<float, 16>(1.0f));
+    pb = aie::mac(acc, pb, fb).template to_vector<bfloat16>();
   }
-  aie::vector<int32, 16> ni = aie::to_fixed<int32>(n, 0);
-  aie::vector<int32, 16> exp_bits = aie::upshift(aie::add(ni, aie::broadcast<int32, 16>(127)), 23);
-  return dec_fmul_16(p, aie::vector_cast<float>(exp_bits));
+  return aie::mul<accfloat>(pb, eab).template to_vector<float>();
 }
 
 namespace {
@@ -119,15 +120,18 @@ __attribute__((noinline)) static void quantize_q8_block32_x2(
     bfloat16 *__restrict xd_out) {
   aie::vector<float, 16> inv_qmax = aie::broadcast<float, 16>(1.0f / 127.0f);
   aie::vector<float, 16> tiny = aie::broadcast<float, 16>(1e-35f);
+  aie::vector<int32_t, 16> abs_mask = aie::broadcast<int32_t, 16>(0x7fffffff);
 #pragma clang loop unroll(disable)
   for (int b = 0; b < 2; ++b) {
     const float *r = src + b * 32;
-    aie::vector<float, 16> mv = aie::zeros<float, 16>();
+    aie::vector<int32_t, 16> iv = aie::max(
+        aie::bit_and(aie::load_v<16>(r).template cast_to<int32_t>(), abs_mask),
+        aie::bit_and(aie::load_v<16>(r + 16).template cast_to<int32_t>(), abs_mask));
 #pragma clang loop unroll(disable)
-    for (int h = 0; h < 2; ++h) {
-      mv = aie::max(mv, aie::abs(aie::load_v<16>(r + h * 16)));
+    for (int sh = 32; sh >= 4; sh >>= 1) {
+      iv = aie::max(iv, aie::vector<int32_t, 16>(::shift_bytes(iv, iv, sh)));
     }
-    float amax = aie::reduce_max(mv);
+    float amax = iv.template cast_to<float>().get(0);
     aie::vector<float, 16> dv = dec_fmul_16(aie::broadcast<float, 16>(amax), inv_qmax);
     xd_out[b] = dec_f32_to_bf16_16(dv).get(0);
     aie::vector<float, 16> idv = dec_inv_16(aie::max(dv, tiny));
@@ -253,6 +257,7 @@ __attribute__((minsize)) void q4_lfm2_dec_w_op_impl(
     int32_t a0,
     int32_t a1,
     int32_t a2) {
+  aie::tile::current().set_rounding(aie::rounding_mode::conv_even);
   if (op == 0) {
     copy_f32_16(g_dec.norm_w, w_pkt + a0 * 64, 64);
     if (a1) {
@@ -304,6 +309,7 @@ __attribute__((noinline, minsize)) static void drain_q8_y_out(float *__restrict 
 }
 
 __attribute__((minsize)) void q4_lfm2_dec_y_op(float *__restrict y_out, int32_t op, int32_t arg) {
+  aie::tile::current().set_rounding(aie::rounding_mode::conv_even);
   if (op == 0 || op == 6 || op == 7) {
     if (op == 6) {
       q4_dec_silu_mul_step(arg);

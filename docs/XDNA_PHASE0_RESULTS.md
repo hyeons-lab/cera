@@ -1,6 +1,6 @@
 # AMD XDNA NPU: Phase 0 and 0b results
 
-Results for the checklist in [XDNA_NPU_PHASE0.md](XDNA_NPU_PHASE0.md). Status: **Phase 0b decided and Phase 1 backend validated (section 8; LFM2/LFM3 decode in section 9).** The deciding question is answered (yes, 3c step 2), 3d evaluates the go/no-go bar against the section 2 baselines, 3e records the follow-up Q4 kernel spike and the decision taken on it, section 8 records the end-to-end `--device npu` backend results on Llama-3.2-1B, and section 9 records LFM2/LFM3 NPU decode host and IRON kernel optimizations. The remaining Phase 0 items (the 2 Windows unit-test portability fixes, CPU SIMD tier, `target-cpu=native`, and `WGPU_BACKEND=dx12` vs `vulkan`) are also closed in sections 1 and 2.
+Results for the checklist in [XDNA_NPU_PHASE0.md](XDNA_NPU_PHASE0.md). Status: **Phase 0b decided and Phase 1 backend validated (section 8; LFM2/LFM3 decode in section 9; long-context prefill and FastFlowLM v1.0.14 comparison in section 10).** The deciding question is answered (yes, 3c step 2), 3d evaluates the go/no-go bar against the section 2 baselines, 3e records the follow-up Q4 kernel spike and the decision taken on it, section 8 records the end-to-end `--device npu` backend results on Llama-3.2-1B, section 9 records LFM2/LFM3 NPU decode host and IRON kernel optimizations, and section 10 records end-to-end 1K–128K NPU benchmarks against FastFlowLM v1.0.14. The remaining Phase 0 items (the 2 Windows unit-test portability fixes, CPU SIMD tier, `target-cpu=native`, and `WGPU_BACKEND=dx12` vs `vulkan`) are also closed in sections 1 and 2.
 
 Sizes of buffers and transfers are binary (KiB, MiB); bandwidth is decimal GB/s (10^9 bytes per second); model file sizes (773 MB) are decimal. All measurements ran natively on Windows (the IRON kernels were built in WSL2; see 3c step 2). They were launched from a WSL2 shell through Windows interop, which starts the Windows executable as a normal Windows process. No measurement here ran inside the Linux VM.
 
@@ -574,3 +574,53 @@ Follow-up host and IRON kernel work extending `--device npu` to **LFM2/LFM2.5-1.
 | `LFM3-1.7B-QAD-Q4_0` (`--device npu`) | ~31.1–32.7 tok/s | **41.0 tok/s p50** (`pp=16`, p90 `41.5`) | Hybrid SWA + Conv + gated attention |
 
 All six XDNA2 hardware verification gates (`hw_verify_q4layer_lfm3`, `hw_gate_lfm2_causal_parity_and_throughput`, `hw_gate_lfm2_long_context_parity`, `hw_gate3a_lfm3_causal_parity_and_throughput`, `hw_gate3b_d1_2b_bidirectional_parity_and_decide`, `hw_gate3c_lfm3_long_context_parity`) pass.
+
+## 10. Long-context LFM2.5 / LFM3 NPU prefill and FastFlowLM v1.0.14 comparison (2026-11-26)
+
+### Environment
+| Item | Value |
+|---|---|
+| Machine | ASUS ROG Flow Z13 (`GZ302EA`), AMD Ryzen AI Max+ 395 w/ Radeon 8060S (`AVX-512 + VNNI`) |
+| OS / power plan | Windows 11 Pro `25H2` (`Build 26200.974`), active plan `PD_Turbo` (`62346f4c-22a8-45c0-adf0-24a1cb9f2739`) |
+| NPU | AMD XDNA2 (`aie2p`, `"NPU Strix Halo"`, driver `32.0.203.311`) |
+| `cera` | `--release --features xdna`, `cera.exe bench --device npu --no-cache --context-size <ctx> --prompt-tokens <ctx - 128> --max-tokens 32` |
+| `cera` models | `LFM2.5-1.2B-Instruct-Q4_0.gguf`, `LFM3-1.7B-QAD-Q4_0.gguf` (`token_embd` Q6_K) |
+| `FastFlowLM` | `FLM v1.0.14`, default `--pmode performance`, `flm bench <model_tag> --ctx-len <N> --bench-iterations 1` on `lfm2.5-it:1.2b` (`LFM2.5-1.2B-NPU2`) and `lfm3:1.7b` (`LFM3-1.7B-NPU2`) |
+
+### Kernel changes enabling 1K–128K prefill scaling
+- **`q4prefill_lfm3` (`B=64`, `CHUNK_K=1024`) >8K paged FlashAttention (`fa_part0`, `lmode = 6`).** Added a chunk-0 specialization (`insts_lfm3_pre_fa_part0_c256.bin`, `use_part0` on `blk == 0` -> `lmode = 6`) that skips dead prior-chunk rescaling (`exp2f_16` + `prev_max` reads) on the first KV pass, fixed `kc < 7` Gate/Up activation pairing (`p_half` outside `(ffn_g_base, ffn_u_base)`) for `q4_silu_mul_512`, and kept the core ELF at `.text = 16,256 B` (`<= 16,384 B`) with `-O2` preserved on FlashAttention and GEMM (`hw_gate3c_lfm3_long_context_parity` at `n = 8,224`: `cos = 0.998313`, `1303.6 tok/s`, `top1` match; all 9 `hw_gate*` NPU tests pass).
+- **`q4prefill_lfm2_ext` (`B=64`) >32K paged FlashAttention and decode `c512` coverage.** Extended LFM2/LFM2.5 prefill across `64K` and `128,000`-context (`125K`) depths (`insts_lfm2_pre_fa_part0_c1024.bin`, `insts_lfm2_pre_fa_part_c1024.bin`, `insts_lfm2_pre_fa_fin_*.bin`, and `insts_lfm2_dec_*_c512.bin`).
+
+### `LFM2.5-1.2B` (`1K`–`125K` NPU comparison vs FastFlowLM v1.0.14)
+
+`cera` runs used `--warmup 1 --runs 3` for `1K–2K` (`p50`) and sequential `--warmup 0 --runs 1` for `4K–125K` (`LFM2.5` GGUF `lfm2.context_length = 128000`). Note that `flm bench` uses `~947–980 * K` prompt tokens (`~62,054` tokens at `64k`) vs `cera`'s `K * 1024 - 128` (`65,408` tokens at `64K`).
+
+| Context | Cera prompt tok | Cera TTFT (s) | FLM TTFT (s) | Cera prefill (tok/s) | FLM prefill (tok/s) | Prefill speedup | Cera decode (tok/s) | FLM decode (tok/s) | Decode speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `1K` | `896` | **0.340** | 0.722 | **2640** | 1356.42 | **1.95x** | **56.1** | 44.60 | **1.26x** |
+| `2K` | `1920` | **0.739** | 1.237 | **2597** | 1576.64 | **1.65x** | **55.3** | 43.76 | **1.26x** |
+| `4K` | `3968` | **1.394** | 2.265 | **2847** | 1717.73 | **1.66x** | **63.9** | 42.79 | **1.49x** |
+| `8K` | `8064` | **3.021** | 4.255 | **2669** | 1826.27 | **1.46x** | **59.8** | 40.40 | **1.48x** |
+| `16K` | `16256` | **6.882** | 9.308 | **2362** | 1668.22 | **1.42x** | **45.6** | 36.47 | **1.25x** |
+| `32K` | `32640` | **18.825** | 22.760 | **1734** | 1363.66 | **1.27x** | **37.6** | 30.47 | **1.23x** |
+| `64K` | `65408` | **53.317** | 64.536 | **1227** | 961.48 | **1.28x** | **25.3** | 22.19 | **1.14x** |
+| `125K` (`128,000`) | `127872` | **157.374** | — *(error: `iter size too big`)* | **813** | — | — | **20.1** | — | — |
+
+Notes on `1K` cold vs warm and `--pmode turbo`:
+- With `LFM2.5` `1K` (`prompt = 896`), uncached `--runs 1 --warmup 0` immediately after switching processes measured `0.762 s` (`1176 tok/s` prefill, `45.5 tok/s` decode) due to initial OS mmap page-faulting, whereas warmed `runs = 3, warmup = 0` measured **`3026 tok/s` p50 prefill / `67.7 tok/s` p50 decode (`0.296 s` TTFT)** and `runs = 3, warmup = 1` measured **`2640 tok/s` / `56.1 tok/s`**.
+- Re-running `FLM v1.0.14` `lfm2.5-it:1.2b` with `--pmode turbo --ctx-len 65536 --bench-iterations 1` measured `1064.49` / `1336.02` / `1531.73` / `1160.41` / `1277.63` / `1336.25` / `970.17 tok/s` prefill and `37.92` / `37.31` / `36.46` / `24.93` / `36.92` / `27.10` / `20.86 tok/s` decode (`63.959 s` TTFT at `64k`), slower than `cera` across all seven points.
+
+### `LFM3-1.7B` (`1K`–`128K` NPU comparison vs FastFlowLM v1.0.14)
+
+`cera` runs used `--warmup 1 --runs 2` for `1K–16K` (`p50`) and sequential `--warmup 0 --runs 1` for `32K–128K`.
+
+| Context | Cera prompt tok | Cera TTFT (s) | FLM TTFT (s) | Cera prefill (tok/s) | FLM prefill (tok/s) | Prefill speedup | Cera decode (tok/s) | FLM decode (tok/s) | Decode speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `1K` | `896` | **0.624** | 2.788 | **1437** | 351.10 | **4.09x** | **36.9** | 12.53 | **2.94x** |
+| `2K` | `1920` | **1.350** | 4.771 | **1425** | 408.13 | **3.49x** | **37.0** | 12.34 | **3.00x** |
+| `4K` | `3968` | **2.863** | 9.574 | **1393** | 405.66 | **3.43x** | **35.3** | 11.57 | **3.05x** |
+| `8K` | `8064` | **6.160** | 19.220 | **1441** | 403.65 | **3.57x** | **35.7** | 11.72 | **3.05x** |
+| `16K` | `16256` | **13.411** | 38.803 | **1221** | 399.61 | **3.06x** | **29.0** | 11.02 | **2.63x** |
+| `32K` | `32640` | **31.024** | 84.500 | **1052** | 366.89 | **2.87x** | **22.7** | 9.85 | **2.30x** |
+| `64K` | `65408` | **77.889** | 175.073 | **840** | 354.09 | **2.37x** | **16.2** | 8.22 | **1.97x** |
+| `128K` | `130944` | **218.090** | 389.473 | **600** | 318.30 | **1.88x** | **10.3** | 6.19 | **1.66x** |

@@ -65,6 +65,8 @@ pub mod wgpu_audio_decoder;
 
 #[cfg(feature = "hexagon")]
 pub mod audio_decoder_hexagon;
+#[cfg(feature = "xdna")]
+pub mod audio_decoder_xdna;
 #[cfg(feature = "hexagon")]
 pub mod audio_encoder_hexagon;
 #[cfg(feature = "hexagon")]

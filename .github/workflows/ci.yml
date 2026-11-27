@@ -116,6 +116,7 @@ jobs:
             cera/src/backend/xdna/kernels/iron/q4layer_lfm3/q4layer_lfm3.py \
             cera/src/backend/xdna/kernels/iron/q4prefill_layer/q4prefill_layer.py \
             cera/src/backend/xdna/kernels/iron/q4prefill_lfm2/q4prefill_lfm2.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm2_ext/q4prefill_lfm2_ext.py \
             cera/src/backend/xdna/kernels/iron/q4prefill_lfm2_attn/q4prefill_lfm2_attn.py \
             cera/src/backend/xdna/kernels/iron/q4prefill_lfm2_conv/q4prefill_lfm2_conv.py \
             cera/src/backend/xdna/kernels/iron/q4prefill_lfm3/q4prefill_lfm3.py \

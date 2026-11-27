@@ -17,25 +17,26 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::backend::xdna::device::{XdnaBo, XdnaDevice, XdnaKernel, XdnaRun, XdnaRunList};
 use crate::backend::xdna::kernels::{
-    LFM3_CONV_TAP, LFM3_DEC_ACT_BYTES, LFM3_DEC_SLOT_FIN_NORM, LFM3_DEC_SLOT_NORM_0,
-    LFM3_DEC_SLOT_NORM_1, LFM3_DEC_YN_BYTES, LFM3_FFN_PAD, LFM3_FFN_SRC, LFM3_H, LFM3_HEAD_DIM,
-    LFM3_KV_BYTES, LFM3_KV_CHUNK_T, LFM3_KV_DIM, LFM3_KVO_BYTES, LFM3_MAX_KV_CHUNKS,
-    LFM3_MAX_TOKENS, LFM3_N_HEADS, LFM3_N_KV_HEADS, LFM3_PREFILL_ACT_BYTES, LFM3_PREFILL_B,
-    LFM3_PREFILL_SLOT_ATTN_GATE, LFM3_PREFILL_SLOT_NORM_0, LFM3_PREFILL_SLOT_NORM_1,
-    LFM3_PREFILL_SLOT_NORM_2, LFM3_PREFILL_SLOT_NORM_3, LFM3_PREFILL_SLOT_Q_BF16,
-    LFM3_PREFILL_SLOT_ROPE_PKT_0A, LFM3_PREFILL_SLOT_ROPE_PKT_0B, LFM3_PREFILL_SLOT_ROPE_PKT_1A,
-    LFM3_PREFILL_SLOT_ROPE_PKT_1B, LFM3_PREFILL_YN_BYTES, LFM3_Q_DIM, LFM3_W_BYTES,
-    Q4LAYER_LFM3_CONV_INSTS, Q4LAYER_LFM3_FA_FIN_BUCKETS, Q4LAYER_LFM3_FA_PART_C256_INSTS,
-    Q4LAYER_LFM3_KV_BUCKETS, Q4LAYER_LFM3_PHASE_A_INSTS, Q4LAYER_LFM3_XCLBIN, Q4LAYER_TILE_F32,
-    Q4PREFILL_LFM3_ATTN_BUCKETS, Q4PREFILL_LFM3_BIDIR_A_INSTS, Q4PREFILL_LFM3_BIDIR_B_BUCKETS,
-    Q4PREFILL_LFM3_CONV_INSTS, Q4PREFILL_LFM3_FA_FIN_BUCKETS, Q4PREFILL_LFM3_FA_PART_C256_INSTS,
+    LFM3_BLOCK_TOKENS, LFM3_CONV_TAP, LFM3_DEC_ACT_BYTES, LFM3_DEC_SLOT_FIN_NORM,
+    LFM3_DEC_SLOT_NORM_0, LFM3_DEC_SLOT_NORM_1, LFM3_DEC_YN_BYTES, LFM3_FFN_PAD, LFM3_FFN_SRC,
+    LFM3_H, LFM3_HEAD_DIM, LFM3_KV_BYTES, LFM3_KV_CHUNK_T, LFM3_KV_DIM, LFM3_KVO_BYTES,
+    LFM3_MAX_KV_CHUNKS, LFM3_MAX_TOKENS, LFM3_N_HEADS, LFM3_N_KV_HEADS, LFM3_PREFILL_ACT_BYTES,
+    LFM3_PREFILL_B, LFM3_PREFILL_SLOT_ATTN_GATE, LFM3_PREFILL_SLOT_NORM_0,
+    LFM3_PREFILL_SLOT_NORM_1, LFM3_PREFILL_SLOT_NORM_2, LFM3_PREFILL_SLOT_NORM_3,
+    LFM3_PREFILL_SLOT_Q_BF16, LFM3_PREFILL_SLOT_ROPE_PKT_0A, LFM3_PREFILL_SLOT_ROPE_PKT_0B,
+    LFM3_PREFILL_SLOT_ROPE_PKT_1A, LFM3_PREFILL_SLOT_ROPE_PKT_1B, LFM3_PREFILL_YN_BYTES,
+    LFM3_Q_DIM, LFM3_W_BYTES, Q4LAYER_LFM3_CONV_INSTS, Q4LAYER_LFM3_FA_FIN_BUCKETS,
+    Q4LAYER_LFM3_FA_PART_C256_INSTS, Q4LAYER_LFM3_KV_BUCKETS, Q4LAYER_LFM3_PHASE_A_INSTS,
+    Q4LAYER_LFM3_XCLBIN, Q4LAYER_TILE_F32, Q4PREFILL_LFM3_ATTN_BUCKETS,
+    Q4PREFILL_LFM3_BIDIR_A_INSTS, Q4PREFILL_LFM3_BIDIR_B_BUCKETS, Q4PREFILL_LFM3_CONV_INSTS,
+    Q4PREFILL_LFM3_FA_FIN_BUCKETS, Q4PREFILL_LFM3_FA_PART_C256_INSTS,
     Q4PREFILL_LFM3_FA_PART0_C256_INSTS, Q4PREFILL_LFM3_XCLBIN, init_lfm3_bo_y_norms,
     init_lfm3_prefill_bo_y_norms, inst_words, read_le_f32_slice, try_select_lfm3_kv_bucket,
     write_le_f32_slice, write_lfm3_ext_params, write_lfm3_params_at, write_lfm3_prefill_ext_params,
     write_lfm3_prefill_step_params, write_lfm3_step_params,
 };
 use crate::backend::xdna::repack::{
-    f32_to_bf16, pack_f32_stage_k1024, pack_q4_0_stage_k1024, pack_q4_0_stage_padded_k1024,
+    f32_to_bf16, pack_f32_mse_stage_k1024, pack_q4_0_stage_k1024, pack_q4_0_stage_padded_k1024,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
@@ -62,7 +63,7 @@ const ATTN_DEC_KVO_BYTES: usize = LFM3_N_KV_HEADS * 512 * 4;
 const ATTN_KV_CHUNK_V_OFFSET: usize = 2304 * 4;
 const PHASE_A_Q_BYTES: usize = 73_728 * 4;
 const PHASE_A_GATE_BYTES: usize = 2_304 * 4;
-const MAX_DEC_KV_CHUNKS: usize = 255;
+const MAX_DEC_KV_CHUNKS: usize = 511;
 const PREFILL_STEP_PARAMS_BYTE_OFF: usize = (LFM3_PREFILL_SLOT_NORM_0 + 2048) * 4;
 const PREFILL_NORM1_PARAMS_BYTE_OFF: usize = (LFM3_PREFILL_SLOT_NORM_1 + 2048) * 4;
 const PREFILL_NORM2_PARAMS_BYTE_OFF: usize = (LFM3_PREFILL_SLOT_NORM_2 + 2048) * 4;
@@ -107,14 +108,16 @@ fn lfm3_swa_limit_chunks(swa_window: usize) -> usize {
     (lfm3_swa_keep_chunks(swa_window) + 8).min(LFM3_MAX_KV_CHUNKS)
 }
 
-#[inline]
-fn bf16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
-    f32::from_bits((u16::from_le_bytes(bytes) as u32) << 16)
-}
-
-#[inline]
-fn bf16_bytes_to_f16(bytes: [u8; 2]) -> u16 {
-    crate::quant::f32_to_f16(bf16_bytes_to_f32(bytes))
+#[derive(Clone, Copy)]
+struct PrefillAttnMirrorEntry {
+    layer: usize,
+    pos0: usize,
+    blk0: usize,
+    loc0: usize,
+    n0: usize,
+    blk1: usize,
+    loc1: usize,
+    n1: usize,
 }
 
 /// Pack `compute_lfm3_rope_cs(pos)` as `[cos[0..64], sin[0..64]]` matching
@@ -220,7 +223,8 @@ fn pack_weight_stage(
         .map_err(|e| anyhow::anyhow!(e))?;
     } else {
         let f32_buf = dequant_matrix_padded(cpu, wref, 0, rows, src_cols, padded_cols);
-        pack_f32_stage_k1024(dst, &f32_buf, rows, padded_cols).map_err(|e| anyhow::anyhow!(e))?;
+        pack_f32_mse_stage_k1024(dst, &f32_buf, rows, padded_cols)
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(())
 }
@@ -253,7 +257,7 @@ fn pack_conv_in_proj(cpu: &LfmModel, dst_bo: &mut [u8], wref: &WeightRef) -> Res
     } else {
         for (i, &tile_off) in TILE_OFFS.iter().enumerate() {
             let f32_buf = dequant_matrix_padded(cpu, wref, i * LFM3_H, LFM3_H, LFM3_H, LFM3_H);
-            pack_f32_stage_k1024(
+            pack_f32_mse_stage_k1024(
                 &mut dst_bo[tile_off * TILE_BYTES..],
                 &f32_buf,
                 LFM3_H,
@@ -977,21 +981,31 @@ impl XdnaLfm3Model {
                 .map_err(|e| anyhow::anyhow!("layer {l} bo_w sync failed: {e}"))?;
             layer_bo_w.push(bo_w);
 
-            let mut bo_kv = kernels
-                .prefill_conv
-                .alloc_bo(LFM3_KV_BYTES, 6)
-                .map_err(|e| anyhow::anyhow!("layer {l} bo_kv alloc failed: {e}"))?;
-            bo_kv.as_mut_slice().fill(0);
-            bo_kv
-                .sync_to_device()
-                .map_err(|e| anyhow::anyhow!("layer {l} bo_kv sync failed: {e}"))?;
-            layer_kv_blocks.push(vec![bo_kv]);
+            let swa_window = cpu.xdna_lfm3_attn_window(l).unwrap_or(0);
+            let prealloc_blocks = if is_conv || swa_window > 0 {
+                1
+            } else {
+                cfg.max_seq_len.div_ceil(LFM3_BLOCK_TOKENS).clamp(1, 2)
+            };
+            let mut blocks = Vec::with_capacity(prealloc_blocks);
+            for _ in 0..prealloc_blocks {
+                let mut bo_kv = kernels
+                    .prefill_conv
+                    .alloc_bo(LFM3_KV_BYTES, 6)
+                    .map_err(|e| anyhow::anyhow!("layer {l} bo_kv alloc failed: {e}"))?;
+                bo_kv.as_mut_slice().fill(0);
+                bo_kv
+                    .sync_to_device()
+                    .map_err(|e| anyhow::anyhow!("layer {l} bo_kv sync failed: {e}"))?;
+                blocks.push(bo_kv);
+            }
+            layer_kv_blocks.push(blocks);
 
             let (rope_theta, rope_freq_factors) = cpu.xdna_lfm3_rope_params(l);
             layers.push(Lfm3LayerStatic {
                 is_conv,
                 is_non_causal: cpu.layer_is_non_causal(l),
-                swa_window: cpu.xdna_lfm3_attn_window(l).unwrap_or(0),
+                swa_window,
                 rope_theta,
                 rope_freq_factors: rope_freq_factors.map(|f| f.to_vec()),
                 attn_norm: cpu.attn_norm_weight(l).to_vec(),
@@ -1129,7 +1143,7 @@ impl XdnaLfm3Model {
             layer_bo_kvo,
             bo_yn,
             bucket_plans: Lfm3ParityPlanCache::new(16),
-            ext_plans: Lfm3ParityPlanCache::new(2),
+            ext_plans: Lfm3ParityPlanCache::new(8),
             conv_kv_in_kvo: false,
         })
     }
@@ -1248,7 +1262,7 @@ impl XdnaLfm3Model {
                     n_past,
                     is_causal,
                     0,
-                    4,
+                    if use_part0 { 6 } else { 4 },
                     eps,
                     blk * LFM3_MAX_KV_CHUNKS,
                     has_fa_state,
@@ -2004,19 +2018,17 @@ impl XdnaLfm3Model {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn save_attn_prefill_sub_kvo_to_kv_and_state(
+    fn save_attn_prefill_sub_kvo_to_bo_kv(
         kvo_bytes: &[u8],
         kvo_head_off: usize,
         blocks: &mut Vec<XdnaBo>,
         allocator: &XdnaKernel,
         swa_base: &mut usize,
         swa_window: usize,
-        layer_state: Option<&mut LayerState>,
         pos0: usize,
-        n_valid: usize,
-        use_f16: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(usize, usize, usize), String> {
         let global_chunk = pos0 / LFM3_KV_CHUNK_T;
+        let swa_before = *swa_base;
         let (blk, loc_chunk) = if swa_window > 0 {
             Self::ensure_swa_capacity_for_chunk(
                 &mut blocks[0],
@@ -2036,63 +2048,200 @@ impl XdnaLfm3Model {
             Self::ensure_paged_block(blocks, allocator, blk)?;
             (blk, global_chunk % LFM3_MAX_KV_CHUNKS)
         };
+        let shift = swa_base.saturating_sub(swa_before);
         let bo_kv = &mut blocks[blk];
+        let kb = bo_kv.as_mut_slice();
         for kvh in 0..LFM3_N_KV_HEADS {
             let kvo_off = (kvo_head_off + kvh) * TILE_BYTES;
             let src = &kvo_bytes[kvo_off..kvo_off + TILE_BYTES];
             let dst_off = (kvh * LFM3_MAX_KV_CHUNKS + loc_chunk) * TILE_BYTES;
-            bo_kv.as_mut_slice()[dst_off..dst_off + TILE_BYTES].copy_from_slice(src);
+            kb[dst_off..dst_off + TILE_BYTES].copy_from_slice(src);
+        }
+        Ok((blk, loc_chunk, shift))
+    }
+
+    fn sync_bo_kv_sub_chunk(
+        bo_kv: &XdnaBo,
+        loc_chunk: usize,
+        n_chunks: usize,
+        global_chunk: usize,
+    ) -> Result<(), String> {
+        let sync_bytes = n_chunks * TILE_BYTES;
+        for kvh in 0..LFM3_N_KV_HEADS {
+            let dst_off = (kvh * LFM3_MAX_KV_CHUNKS + loc_chunk) * TILE_BYTES;
             bo_kv
-                .sync_range_to_device(TILE_BYTES, dst_off)
+                .sync_range_to_device(sync_bytes, dst_off)
                 .map_err(|e| {
                     format!("attn chunk {global_chunk} kvh {kvh} bo_kv sync failed: {e}")
                 })?;
         }
-        if let Some(LayerState::Attention {
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_attn_prefill_kvo_to_bo_kv(
+        kvo: &XdnaBo,
+        blocks: &mut Vec<XdnaBo>,
+        allocator: &XdnaKernel,
+        swa_base: &mut usize,
+        swa_window: usize,
+        layer: usize,
+        pos0: usize,
+        n_valid: usize,
+    ) -> Result<PrefillAttnMirrorEntry, String> {
+        let kvo_bytes = kvo.as_slice();
+        let n0 = n_valid.min(LFM3_KV_CHUNK_T);
+        let (blk0, mut loc0, _) = Self::save_attn_prefill_sub_kvo_to_bo_kv(
+            kvo_bytes, 0, blocks, allocator, swa_base, swa_window, pos0,
+        )?;
+        let (blk1, loc1, n1) = if n_valid > LFM3_KV_CHUNK_T {
+            let n1 = n_valid - LFM3_KV_CHUNK_T;
+            let (b1, l1, shift1) = Self::save_attn_prefill_sub_kvo_to_bo_kv(
+                kvo_bytes,
+                LFM3_N_KV_HEADS,
+                blocks,
+                allocator,
+                swa_base,
+                swa_window,
+                pos0 + LFM3_KV_CHUNK_T,
+            )?;
+            loc0 = loc0.saturating_sub(shift1);
+            (b1, l1, n1)
+        } else {
+            (blk0, loc0, 0)
+        };
+        let gc0 = pos0 / LFM3_KV_CHUNK_T;
+        if n1 > 0 && blk0 == blk1 && loc1 == loc0 + 1 {
+            Self::sync_bo_kv_sub_chunk(&blocks[blk0], loc0, 2, gc0)?;
+        } else {
+            Self::sync_bo_kv_sub_chunk(&blocks[blk0], loc0, 1, gc0)?;
+            if n1 > 0 {
+                Self::sync_bo_kv_sub_chunk(&blocks[blk1], loc1, 1, gc0 + 1)?;
+            }
+        }
+        Ok(PrefillAttnMirrorEntry {
+            layer,
+            pos0,
+            blk0,
+            loc0,
+            n0,
+            blk1,
+            loc1,
+            n1,
+        })
+    }
+
+    fn mirror_prefill_sub_bo_kv_to_state(
+        bo_bytes: &[u8],
+        loc_chunk: usize,
+        layer_state: &mut LayerState,
+        pos0: usize,
+        n_valid: usize,
+        use_f16: bool,
+    ) {
+        let LayerState::Attention {
             key_cache,
             value_cache,
             key_cache_f16,
             value_cache_f16,
             ..
-        }) = layer_state
-        {
-            let needed = (pos0 + n_valid) * LFM3_KV_DIM;
-            if use_f16 {
-                if key_cache_f16.len() < needed {
-                    key_cache_f16.resize(needed, 0);
-                }
-                if value_cache_f16.len() < needed {
-                    value_cache_f16.resize(needed, 0);
-                }
-            } else {
-                if key_cache.len() < needed {
-                    key_cache.resize(needed, 0.0);
-                }
-                if value_cache.len() < needed {
-                    value_cache.resize(needed, 0.0);
-                }
+        } = layer_state
+        else {
+            return;
+        };
+        let needed = (pos0 + n_valid) * LFM3_KV_DIM;
+        let head_bytes = LFM3_HEAD_DIM * 2;
+        if use_f16 {
+            if key_cache_f16.len() < needed {
+                key_cache_f16.resize(needed, 0);
+            }
+            if value_cache_f16.len() < needed {
+                value_cache_f16.resize(needed, 0);
             }
             for t in 0..n_valid {
                 let dst_row = (pos0 + t) * LFM3_KV_DIM;
                 for kvh in 0..LFM3_N_KV_HEADS {
-                    let k_src = (kvo_head_off + kvh) * TILE_BYTES + t * LFM3_HEAD_DIM * 2;
+                    let k_src =
+                        (kvh * LFM3_MAX_KV_CHUNKS + loc_chunk) * TILE_BYTES + t * head_bytes;
                     let v_src = k_src + ATTN_KV_CHUNK_V_OFFSET;
                     let dst = dst_row + kvh * LFM3_HEAD_DIM;
-                    for d in 0..LFM3_HEAD_DIM {
-                        let kb = [kvo_bytes[k_src + d * 2], kvo_bytes[k_src + d * 2 + 1]];
-                        let vb = [kvo_bytes[v_src + d * 2], kvo_bytes[v_src + d * 2 + 1]];
-                        if use_f16 {
-                            key_cache_f16[dst + d] = bf16_bytes_to_f16(kb);
-                            value_cache_f16[dst + d] = bf16_bytes_to_f16(vb);
-                        } else {
-                            key_cache[dst + d] = bf16_bytes_to_f32(kb);
-                            value_cache[dst + d] = bf16_bytes_to_f32(vb);
-                        }
-                    }
+                    crate::backend::cpu::bf16_le_bytes_to_f16_into(
+                        &bo_bytes[k_src..k_src + head_bytes],
+                        &mut key_cache_f16[dst..dst + LFM3_HEAD_DIM],
+                    );
+                    crate::backend::cpu::bf16_le_bytes_to_f16_into(
+                        &bo_bytes[v_src..v_src + head_bytes],
+                        &mut value_cache_f16[dst..dst + LFM3_HEAD_DIM],
+                    );
+                }
+            }
+        } else {
+            if key_cache.len() < needed {
+                key_cache.resize(needed, 0.0);
+            }
+            if value_cache.len() < needed {
+                value_cache.resize(needed, 0.0);
+            }
+            for t in 0..n_valid {
+                let dst_row = (pos0 + t) * LFM3_KV_DIM;
+                for kvh in 0..LFM3_N_KV_HEADS {
+                    let k_src =
+                        (kvh * LFM3_MAX_KV_CHUNKS + loc_chunk) * TILE_BYTES + t * head_bytes;
+                    let v_src = k_src + ATTN_KV_CHUNK_V_OFFSET;
+                    let dst = dst_row + kvh * LFM3_HEAD_DIM;
+                    crate::backend::cpu::bf16_le_bytes_to_f32_into(
+                        &bo_bytes[k_src..k_src + head_bytes],
+                        &mut key_cache[dst..dst + LFM3_HEAD_DIM],
+                    );
+                    crate::backend::cpu::bf16_le_bytes_to_f32_into(
+                        &bo_bytes[v_src..v_src + head_bytes],
+                        &mut value_cache[dst..dst + LFM3_HEAD_DIM],
+                    );
                 }
             }
         }
-        Ok(())
+    }
+
+    fn mirror_attn_prefill_bo_kv_to_state(
+        blocks: &[XdnaBo],
+        layer_state: &mut LayerState,
+        entry: &PrefillAttnMirrorEntry,
+        use_f16: bool,
+    ) {
+        Self::mirror_prefill_sub_bo_kv_to_state(
+            blocks[entry.blk0].as_slice(),
+            entry.loc0,
+            layer_state,
+            entry.pos0,
+            entry.n0,
+            use_f16,
+        );
+        if entry.n1 > 0 {
+            Self::mirror_prefill_sub_bo_kv_to_state(
+                blocks[entry.blk1].as_slice(),
+                entry.loc1,
+                layer_state,
+                entry.pos0 + LFM3_KV_CHUNK_T,
+                entry.n1,
+                use_f16,
+            );
+        }
+    }
+
+    fn flush_pending_attn_mirrors(
+        pending: &mut Vec<PrefillAttnMirrorEntry>,
+        layer_kv_blocks: &[Vec<XdnaBo>],
+        layers_state: &mut [LayerState],
+        use_f16: bool,
+    ) {
+        for entry in pending.drain(..) {
+            Self::mirror_attn_prefill_bo_kv_to_state(
+                &layer_kv_blocks[entry.layer],
+                &mut layers_state[entry.layer],
+                &entry,
+                use_f16,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2102,38 +2251,16 @@ impl XdnaLfm3Model {
         allocator: &XdnaKernel,
         swa_base: &mut usize,
         swa_window: usize,
-        mut layer_state: Option<&mut LayerState>,
+        layer_state: Option<&mut LayerState>,
         pos0: usize,
         n_valid: usize,
         use_f16: bool,
     ) -> Result<(), String> {
-        let kvo_bytes = kvo.as_slice();
-        let n0 = n_valid.min(LFM3_KV_CHUNK_T);
-        Self::save_attn_prefill_sub_kvo_to_kv_and_state(
-            kvo_bytes,
-            0,
-            blocks,
-            allocator,
-            swa_base,
-            swa_window,
-            layer_state.as_deref_mut(),
-            pos0,
-            n0,
-            use_f16,
+        let entry = Self::save_attn_prefill_kvo_to_bo_kv(
+            kvo, blocks, allocator, swa_base, swa_window, 0, pos0, n_valid,
         )?;
-        if n_valid > LFM3_KV_CHUNK_T {
-            Self::save_attn_prefill_sub_kvo_to_kv_and_state(
-                kvo_bytes,
-                LFM3_N_KV_HEADS,
-                blocks,
-                allocator,
-                swa_base,
-                swa_window,
-                layer_state,
-                pos0 + LFM3_KV_CHUNK_T,
-                n_valid - LFM3_KV_CHUNK_T,
-                use_f16,
-            )?;
+        if let Some(ls) = layer_state {
+            Self::mirror_attn_prefill_bo_kv_to_state(blocks, ls, &entry, use_f16);
         }
         Ok(())
     }
@@ -2274,6 +2401,7 @@ impl XdnaLfm3Model {
                     y_next,
                     kv_in,
                     kv_out,
+                    &layer_kv_blocks[l][0],
                 ])
             } else {
                 let bidx = if layer.swa_window > 0 {
@@ -2281,12 +2409,14 @@ impl XdnaLfm3Model {
                 } else {
                     attn_bidx
                 };
+                let kv_hi = layer_kv_blocks[l].get(1).unwrap_or(&layer_kv_blocks[l][0]);
                 kernels.dec_attn(bidx)?.create_run(&[
                     &layer_bo_w[l],
                     &dec_bo_y[l],
                     y_next,
                     &layer_kv_blocks[l][0],
                     &dec_bo_kvo[l],
+                    kv_hi,
                 ])
             }
             .map_err(|e| format!("layer {l} dec create_run: {e}"))?;
@@ -2343,7 +2473,14 @@ impl XdnaLfm3Model {
                 };
                 runs.push(
                     k_conv
-                        .create_run(&[&layer_bo_w[l], &dec_bo_y[l], y_next, kv_in, kv_out])
+                        .create_run(&[
+                            &layer_bo_w[l],
+                            &dec_bo_y[l],
+                            y_next,
+                            kv_in,
+                            kv_out,
+                            &layer_kv_blocks[l][0],
+                        ])
                         .map_err(|e| format!("layer {l} dec ext conv create_run: {e}"))?,
                 );
             } else if layer.swa_window > 0 {
@@ -2355,6 +2492,7 @@ impl XdnaLfm3Model {
                             y_next,
                             &layer_kv_blocks[l][0],
                             &dec_bo_kvo[l],
+                            &layer_kv_blocks[l][0],
                         ])
                         .map_err(|e| format!("layer {l} dec ext swa create_run: {e}"))?,
                 );
@@ -2366,6 +2504,7 @@ impl XdnaLfm3Model {
                         y_next,
                         &layer_kv_blocks[l][0],
                         &dec_bo_kvo[l],
+                        &layer_kv_blocks[l][0],
                     ])
                     .map_err(|e| format!("layer {l} dec ext phase_a create_run: {e}"))?,
                 );
@@ -2388,6 +2527,7 @@ impl XdnaLfm3Model {
                             y_next,
                             &layer_kv_blocks[l][fin_blk],
                             &dec_bo_kvo[l],
+                            &layer_kv_blocks[l][0],
                         ])
                         .map_err(|e| format!("layer {l} dec ext fa_fin create_run: {e}"))?,
                 );
@@ -2739,7 +2879,11 @@ impl XdnaLfm3Model {
             total_past_chunks % LFM3_MAX_KV_CHUNKS,
         );
         let (fin_bidx, fin_cap) = if !use_fast_plan {
-            try_select_lfm3_kv_bucket(&attn_bucket_caps, rem)?
+            let fin_bucket_caps: Vec<usize> = Q4LAYER_LFM3_FA_FIN_BUCKETS
+                .iter()
+                .map(|&(c, _)| c)
+                .collect();
+            try_select_lfm3_kv_bucket(&fin_bucket_caps, rem)?
         } else {
             (0, 0)
         };
@@ -3099,6 +3243,29 @@ impl XdnaLfm3Model {
         Ok(())
     }
 
+    /// Embed token IDs on CPU and execute one NPU prefill pass, computing final
+    /// logits only when `need_logits` is true.
+    fn run_npu_prefill_tokens(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+        need_logits: bool,
+    ) -> Vec<f32> {
+        let vocab_size = self.cpu.config().vocab_size;
+        let out_len = if need_logits { vocab_size } else { 0 };
+        if tokens.is_empty() {
+            return self.reject_input("forward_prefill requires non-empty tokens".into(), out_len);
+        }
+        let Some(embs) = self.cpu.embed_token_rows(tokens) else {
+            return self.reject_input(
+                format!("token id out of range for vocab {vocab_size}"),
+                out_len,
+            );
+        };
+        self.run_npu_prefill_embeddings(&embs, tokens.len(), start_pos, state, need_logits)
+    }
+
     fn run_npu_prefill_embeddings(
         &self,
         embeddings: &[f32],
@@ -3275,6 +3442,8 @@ impl XdnaLfm3Model {
             let mut t_attn_npu_us = 0.0f64;
             let mut t_conv_kv_us = 0.0f64;
             let mut t_attn_kv_us = 0.0f64;
+            let mut pending_attn_mirrors: Vec<PrefillAttnMirrorEntry> =
+                Vec::with_capacity(self.layers.len());
 
             for c in 0..n_chunks {
                 let tc0 = prof.then(crate::time::Instant::now);
@@ -3345,19 +3514,38 @@ impl XdnaLfm3Model {
                 for (l, layer) in self.layers.iter().enumerate() {
                     let mut sync_part0 = false;
                     let mut sync_fin = false;
-                    if !layer.is_conv
-                        && layer.swa_window > 0
-                        && let Err(e) = Self::ensure_swa_capacity_for_chunk(
+                    if !layer.is_conv && layer.swa_window > 0 {
+                        let global_chunk = pos0 / LFM3_KV_CHUNK_T;
+                        if global_chunk.saturating_sub(swa_base_chunk[l])
+                            >= lfm3_swa_limit_chunks(layer.swa_window)
+                            && let Some(pos) =
+                                pending_attn_mirrors.iter().position(|e| e.layer == l)
+                        {
+                            let entry = pending_attn_mirrors.swap_remove(pos);
+                            Self::mirror_attn_prefill_bo_kv_to_state(
+                                &layer_kv_blocks[l],
+                                &mut state.layers[l],
+                                &entry,
+                                use_f16,
+                            );
+                        }
+                        if let Err(e) = Self::ensure_swa_capacity_for_chunk(
                             &mut layer_kv_blocks[l][0],
                             &mut swa_base_chunk[l],
                             layer.swa_window,
-                            pos0 / LFM3_KV_CHUNK_T,
-                        )
-                    {
-                        return self.record_device_fault(
-                            format!("prefill c={c} layer {l} swa compact: {e}"),
-                            out_len,
-                        );
+                            global_chunk,
+                        ) {
+                            Self::flush_pending_attn_mirrors(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                            );
+                            return self.record_device_fault(
+                                format!("prefill c={c} layer {l} swa compact: {e}"),
+                                out_len,
+                            );
+                        }
                     }
                     {
                         let yb = pre_bo_y_layers[l].as_mut_slice();
@@ -3421,7 +3609,7 @@ impl XdnaLfm3Model {
                                         pos0,
                                         true,
                                         0,
-                                        4,
+                                        6,
                                         eps,
                                         0,
                                         false,
@@ -3512,7 +3700,15 @@ impl XdnaLfm3Model {
                             )
                         }) {
                             Ok(p) => p,
-                            Err(e) => return self.record_device_fault(e, out_len),
+                            Err(e) => {
+                                Self::flush_pending_attn_mirrors(
+                                    &mut pending_attn_mirrors,
+                                    layer_kv_blocks,
+                                    &mut state.layers,
+                                    use_f16,
+                                );
+                                return self.record_device_fault(e, out_len);
+                            }
                         };
                         (p, InFlightLfm3Run::PreFast { parity, key })
                     } else {
@@ -3534,7 +3730,15 @@ impl XdnaLfm3Model {
                             )
                         }) {
                             Ok(p) => p,
-                            Err(e) => return self.record_device_fault(e, out_len),
+                            Err(e) => {
+                                Self::flush_pending_attn_mirrors(
+                                    &mut pending_attn_mirrors,
+                                    layer_kv_blocks,
+                                    &mut state.layers,
+                                    use_f16,
+                                );
+                                return self.record_device_fault(e, out_len);
+                            }
                         };
                         (p, InFlightLfm3Run::PreExt { parity, key })
                     };
@@ -3542,6 +3746,12 @@ impl XdnaLfm3Model {
                     *in_flight = Some(active_run);
                     match plan.runlist.execute() {
                         Ok(()) => {
+                            Self::flush_pending_attn_mirrors(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                            );
                             let w = plan.runlist.wait(QUIESCE_TIMEOUT_MS);
                             if w.is_ok() {
                                 *in_flight = None;
@@ -3554,6 +3764,12 @@ impl XdnaLfm3Model {
                         }
                     }
                 } else {
+                    Self::flush_pending_attn_mirrors(
+                        &mut pending_attn_mirrors,
+                        layer_kv_blocks,
+                        &mut state.layers,
+                        use_f16,
+                    );
                     Self::run_prefill_ext_multi_block_step(
                         &self.layers,
                         kernels,
@@ -3577,6 +3793,12 @@ impl XdnaLfm3Model {
                     t_attn_npu_us += t.elapsed().as_secs_f64() * 1e6;
                 }
                 if let Err(e) = res {
+                    Self::flush_pending_attn_mirrors(
+                        &mut pending_attn_mirrors,
+                        layer_kv_blocks,
+                        &mut state.layers,
+                        use_f16,
+                    );
                     return self.record_device_fault(
                         format!("prefill c={c} runlist execute/wait: {e}"),
                         out_len,
@@ -3629,26 +3851,51 @@ impl XdnaLfm3Model {
                         if let Err(e) =
                             pre_bo_kvo_layers[l].sync_range_from_device(attn_kvo_bytes, 0)
                         {
+                            Self::flush_pending_attn_mirrors(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                            );
                             return self.record_device_fault(
                                 format!("prefill c={c} layer {l} attn kvo sync: {e}"),
                                 out_len,
                             );
                         }
-                        if let Err(e) = Self::save_attn_prefill_kvo_to_kv_and_state(
+                        match Self::save_attn_prefill_kvo_to_bo_kv(
                             &pre_bo_kvo_layers[l],
                             &mut layer_kv_blocks[l],
                             &kernels.prefill_conv,
                             &mut swa_base_chunk[l],
                             layer.swa_window,
-                            Some(&mut state.layers[l]),
+                            l,
                             pos0,
                             n_valid,
-                            use_f16,
                         ) {
-                            return self.record_device_fault(
-                                format!("prefill c={c} layer {l} attn kvo save: {e}"),
-                                out_len,
-                            );
+                            Ok(entry) => {
+                                if is_last_chunk {
+                                    Self::mirror_attn_prefill_bo_kv_to_state(
+                                        &layer_kv_blocks[l],
+                                        &mut state.layers[l],
+                                        &entry,
+                                        use_f16,
+                                    );
+                                } else {
+                                    pending_attn_mirrors.push(entry);
+                                }
+                            }
+                            Err(e) => {
+                                Self::flush_pending_attn_mirrors(
+                                    &mut pending_attn_mirrors,
+                                    layer_kv_blocks,
+                                    &mut state.layers,
+                                    use_f16,
+                                );
+                                return self.record_device_fault(
+                                    format!("prefill c={c} layer {l} attn kvo save: {e}"),
+                                    out_len,
+                                );
+                            }
                         }
                         if let Some(t) = tak0 {
                             t_attn_kv_us += t.elapsed().as_secs_f64() * 1e6;
@@ -4599,20 +4846,7 @@ impl Model for XdnaLfm3Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let vocab_size = self.cpu.config().vocab_size;
-        if tokens.is_empty() {
-            return self.reject_input(
-                "forward_prefill requires non-empty tokens".into(),
-                vocab_size,
-            );
-        }
-        let Some(embs) = self.cpu.embed_token_rows(tokens) else {
-            return self.reject_input(
-                format!("token id out of range for vocab {vocab_size}"),
-                vocab_size,
-            );
-        };
-        self.run_npu_prefill_embeddings(&embs, tokens.len(), start_pos, state, true)
+        self.run_npu_prefill_tokens(tokens, start_pos, state, true)
     }
 
     fn forward_prefill_chunked(
@@ -4630,16 +4864,17 @@ impl Model for XdnaLfm3Model {
             ubatch
         };
         crate::model::run_chunked_prefill(tokens, start_pos, eff_ubatch, cancel, |chunk, pos| {
-            let logits = self.forward_prefill(chunk, pos, state);
+            let need_logits = pos + chunk.len() == start_pos + tokens.len();
+            let logits = self.run_npu_prefill_tokens(chunk, pos, state, need_logits);
             if self
                 .decode_error
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_some()
             {
-                (0, Some(logits))
+                (0, need_logits.then_some(logits))
             } else {
-                (chunk.len(), Some(logits))
+                (chunk.len(), need_logits.then_some(logits))
             }
         })
     }
@@ -5543,7 +5778,7 @@ mod tests {
                 st.seq_len = pos;
             };
 
-            // Extended decode with `num_full=1, has_rem=false` (`pos=8192`) and `has_rem=true` (`pos=8224`) via real sync.
+            // Fast-bucket decode past 8K (`pos=8192`, `pos=8224` use `Q4LAYER_LFM3_KV_BUCKETS` up to `c511`).
             let emb = model.embed_token_rows(&[1]).unwrap();
             seed_state_to_pos(&mut state, 8192);
             let dec_1a = model.forward_from_embedding(&emb, 8192, &mut state);
@@ -5645,8 +5880,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            dec_norm1_syncs, 4,
-            "expected exact 4 DEC_NORM1 step_params syncs (1 for 8192 + 1 for 8224 + 2 for 16417)"
+            dec_norm1_syncs, 2,
+            "expected exact 2 DEC_NORM1 step_params syncs (0 for fast 8192/8224 + 2 for 16417)"
         );
         assert!(events.iter().any(|e| matches!(
             e,

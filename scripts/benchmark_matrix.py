@@ -12,6 +12,8 @@ DEFAULT_FLAGSHIPS = [
     "LFM2.5-VL-1.6B-Q8_0.gguf",
     "LFM2.5-2.6B-Q5_K_M.gguf",
     "LFM2.5-8B-A1B-Q4_0.gguf",
+    "LFM2.5-24B-A2B-QAD-Q4_0.gguf",
+    "LFM2.5-24B-A2B-Q4_0.gguf",
 ]
 
 def find_models(models_dir, target_names=None):

@@ -95,6 +95,23 @@ pub trait AudioAccelerator: Send + Sync {
     /// Whether [`Self::sample_audio_frame`] is actually implemented here.
     fn supports_depthformer(&self) -> bool;
 
+    /// Whether [`Self::sample_audio_frame_lfm3a`] accelerates the 12-codebook MaskGIT
+    /// depthformer (`lfm3a_gen`).
+    fn supports_lfm3a_gen_depthformer(&self) -> bool {
+        false
+    }
+
+    /// Sample one variable-length frame of audio codes for `lfm3a_gen` models using the
+    /// accelerated MaskGIT depthformer, returning `None` when not supported.
+    fn sample_audio_frame_lfm3a(
+        &self,
+        _embedding: &[f32],
+        _temperature: f32,
+        _top_k: usize,
+    ) -> Option<Vec<i32>> {
+        None
+    }
+
     /// Whether [`Self::detokenize_to_spectrum`] supports `lfm3a_gen` 12-codebook FSQ detokenizers.
     fn supports_lfm3a_gen_detokenizer(&self) -> bool {
         false
@@ -202,21 +219,34 @@ pub fn build_audio_accelerator(
     use crate::engine::BackendPreference as BP;
     if is_lfm3a_gen_gguf(gguf) {
         return match backend {
-            BP::Hexagon | BP::Npu | BP::Auto => try_hexagon_audio_decoder(gguf),
+            BP::Hexagon => try_hexagon_audio_decoder(gguf),
+            BP::Npu | BP::Auto => {
+                try_xdna_audio_decoder(gguf).or_else(|| try_hexagon_audio_decoder(gguf))
+            }
             _ => None,
         };
     }
     match backend {
         BP::Cpu => None,
-        // Hexagon is the only NPU with an audio accelerator today; `Npu` takes
-        // the same path and gains other vendors here as they grow one.
-        BP::Hexagon | BP::Npu => try_hexagon_audio_decoder(gguf),
+        BP::Hexagon => try_hexagon_audio_decoder(gguf),
+        BP::Npu => try_xdna_audio_decoder(gguf).or_else(|| try_hexagon_audio_decoder(gguf)),
         BP::Metal => try_metal_audio_decoder(gguf),
         BP::Gpu => try_wgpu_audio_decoder(gguf),
         BP::Auto => try_metal_audio_decoder(gguf)
+            .or_else(|| try_xdna_audio_decoder(gguf))
             .or_else(|| try_hexagon_audio_decoder(gguf))
             .or_else(|| try_wgpu_audio_decoder(gguf)),
     }
+}
+
+#[cfg(feature = "xdna")]
+fn try_xdna_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
+    crate::model::audio_decoder_xdna::try_xdna_audio_decoder(gguf)
+}
+
+#[cfg(not(feature = "xdna"))]
+fn try_xdna_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
+    None
 }
 
 #[cfg(feature = "hexagon")]
@@ -1296,6 +1326,7 @@ pub(crate) fn next_xorshift64_f32_01(rng_state: &mut u64) -> f32 {
     test,
     feature = "gpu",
     feature = "hexagon",
+    feature = "xdna",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 #[inline]
@@ -1387,7 +1418,7 @@ impl DepthformerState {
 
 /// Apply RoPE (interleaved / LLAMA_ROPE_TYPE_NORM) to a single head.
 /// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
-fn apply_rope_interleaved(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+pub(crate) fn apply_rope_interleaved(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let mut theta = pos as f32;
     for i in 0..head_dim / 2 {
@@ -1402,7 +1433,7 @@ fn apply_rope_interleaved(x: &mut [f32], pos: usize, head_dim: usize, freq_base:
 
 /// Apply RoPE (NeoX style / LLAMA_ROPE_TYPE_NEOX) to a single head.
 /// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
-fn apply_rope_neox(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+pub(crate) fn apply_rope_neox(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let mut theta = pos as f32;
     for i in 0..head_dim / 2 {

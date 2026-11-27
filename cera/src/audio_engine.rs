@@ -500,14 +500,18 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_accelerated_df: !weights.is_lfm3a_gen()
-                && active_accelerator.is_some_and(|a| {
-                    crate::model::audio_decoder::accelerated_depthformer_enabled(
-                        a.supports_depthformer(),
-                        a.depthformer_default_on(),
-                        gpu_depthformer,
-                    )
-                }),
+            use_accelerated_df: active_accelerator.is_some_and(|a| {
+                let df_ok = if weights.is_lfm3a_gen() {
+                    a.supports_lfm3a_gen_depthformer()
+                } else {
+                    a.supports_depthformer()
+                };
+                crate::model::audio_decoder::accelerated_depthformer_enabled(
+                    df_ok,
+                    a.depthformer_default_on(),
+                    gpu_depthformer,
+                )
+            }),
             detok_fallback_cpu: false,
             streaming: true,
             all_codes: Vec::new(),
@@ -536,13 +540,36 @@ impl<'a> AudioOutputDecoder<'a> {
     pub fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
         if self.weights.is_lfm3a_gen() {
             let t0 = Instant::now();
-            let codes_vec = sample_frame(
-                self.weights,
-                &mut self.df_state,
-                embed,
-                self.audio_temperature,
-                self.audio_top_k,
-            );
+            let codes_vec = match (self.use_accelerated_df, self.accelerator) {
+                (true, Some(a)) => {
+                    let _ = a.take_audio_error();
+                    let sampled =
+                        a.sample_audio_frame_lfm3a(embed, self.audio_temperature, self.audio_top_k);
+                    if let Some(e) = a.take_audio_error() {
+                        let detail = match e {
+                            crate::CeraError::Backend(detail) => detail,
+                            other => other.to_string(),
+                        };
+                        return FrameOutcome::Fault(detail);
+                    }
+                    sampled.unwrap_or_else(|| {
+                        sample_frame(
+                            self.weights,
+                            &mut self.df_state,
+                            embed,
+                            self.audio_temperature,
+                            self.audio_top_k,
+                        )
+                    })
+                }
+                _ => sample_frame(
+                    self.weights,
+                    &mut self.df_state,
+                    embed,
+                    self.audio_temperature,
+                    self.audio_top_k,
+                ),
+            };
             self.time_depthformer += t0.elapsed();
 
             if codes_vec
@@ -2362,5 +2389,89 @@ pub(crate) mod tests {
         assert!(dec2.all_spectrum.is_empty());
         assert!(dec2.all_codes.is_empty());
         assert_eq!(dec2.finish(|_, _| {}), 0);
+    }
+
+    #[test]
+    fn lfm3a_gen_accelerated_depthformer_and_fault_handling() {
+        struct MockLfm3aAccel {
+            fail: bool,
+            calls: std::sync::atomic::AtomicUsize,
+            err: std::sync::Mutex<Option<crate::CeraError>>,
+        }
+        impl crate::model::audio_decoder::AudioAccelerator for MockLfm3aAccel {
+            fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+                unreachable!("lfm3a_gen path must call sample_audio_frame_lfm3a");
+            }
+            fn supports_lfm3a_gen_depthformer(&self) -> bool {
+                true
+            }
+            fn sample_audio_frame_lfm3a(&self, _: &[f32], _: f32, _: usize) -> Option<Vec<i32>> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.fail {
+                    *self.err.lock().unwrap() =
+                        Some(crate::CeraError::Backend("lfm3a df fault".into()));
+                    None
+                } else {
+                    Some(vec![12; 12])
+                }
+            }
+            fn detokenize_to_spectrum(
+                &self,
+                _: &crate::model::audio_decoder::DetokenizerWeights,
+                _: &[i32],
+            ) -> Vec<f32> {
+                vec![0.0; 10]
+            }
+            fn reset_depthformer(&self) {}
+            fn reset_detokenizer(&self) {}
+            fn supports_depthformer(&self) -> bool {
+                true
+            }
+            fn supports_lfm3a_gen_detokenizer(&self) -> bool {
+                true
+            }
+            fn depthformer_default_on(&self) -> bool {
+                true
+            }
+            fn take_audio_error(&self) -> Option<crate::CeraError> {
+                self.err.lock().unwrap().take()
+            }
+        }
+
+        let (mut dec, mut detok) = empty_vocoder_weights();
+        dec.lfm3a_gen = true;
+        dec.decoder_config.n_codebook = 12;
+        dec.decoder_config.n_vocab = 257;
+        dec.audio_embedding.embedding =
+            crate::model::weights::MmapWeight::from_owned_f32(vec![0.1; 12 * 257 * 4], 12 * 257, 4);
+        detok.config.n_codes = 12;
+        detok.emb_weight =
+            crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 12 * 257 * 4], 12 * 257, 4);
+
+        let ok_acc = MockLfm3aAccel {
+            fail: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            err: std::sync::Mutex::new(None),
+        };
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&ok_acc), 0.0, 1, false)
+            .with_streaming(false);
+        assert!(decoder.supports_accelerated_depthformer());
+        assert!(matches!(
+            decoder.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        assert_eq!(ok_acc.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let err_acc = MockLfm3aAccel {
+            fail: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            err: std::sync::Mutex::new(None),
+        };
+        let mut fault_dec = AudioOutputDecoder::new(&dec, &detok, Some(&err_acc), 0.0, 1, false);
+        assert_eq!(
+            fault_dec.decode_frame(&[0.0; 4]),
+            FrameOutcome::Fault("lfm3a df fault".into())
+        );
     }
 }

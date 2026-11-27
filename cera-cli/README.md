@@ -88,6 +88,7 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `list-hf` | Discover and list GGUF model files in a Hugging Face repository. |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
+| `download-hf` | Download a Hugging Face GGUF repository into local cache without loading it. |
 | `vad` | Run Voice Activity Detection (VAD) on audio files using pure-Rust Silero VAD v5 with timestamp segmentation and `--json` export. |
 | `diarize` | Run speaker diarization on audio files using Streaming Sortformer or Nemotron-3-Diarization (plus `--compare`). |
 | `transcribe` | Transcribe speech audio to text using OpenAI Whisper or LFM2-Audio ASR with multi-language and timestamp support. |

@@ -231,13 +231,21 @@ CERA_XDNA_API int cera_xdna_kernel_load(cera_xdna_device* d, const void* xclbin,
         // lighter QoS hint or default shared context if resource limits reject it.
         xrt::hw_context ctx;
         bool created = false;
-        for (uint32_t gops : {40000u, 8000u, 1000u}) {
+        static constexpr uint32_t kQosProfiles[][4] = {
+            // {gops, dma_bandwidth (GB/s), fps, latency}
+            {50000u, 256u, 1000u, 1u},
+            {50000u, 128u, 1000u, 1u},
+            {40000u, 55u, 100u, 10u},
+            {8000u, 55u, 100u, 10u},
+            {1000u, 55u, 100u, 10u},
+        };
+        for (const auto& p : kQosProfiles) {
           try {
             xrt::hw_context::cfg_param_type qos{
-                {"gops", gops},
-                {"fps", 100},
-                {"dma_bandwidth", 55},
-                {"latency", 10},
+                {"gops", p[0]},
+                {"dma_bandwidth", p[1]},
+                {"fps", p[2]},
+                {"latency", p[3]},
             };
             ctx = xrt::hw_context(k->dev, x_uuid, qos);
             created = true;

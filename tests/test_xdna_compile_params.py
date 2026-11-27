@@ -249,39 +249,61 @@ class TestXdnaCompileParams(unittest.TestCase):
                 validate_compile_params(1, bad_chunks, valid_modes=valid_modes, nonzero_kv_modes=(3,))  # type: ignore[arg-type]
 
     def test_prefill_scripts_valid_and_invalid_compile_params(self) -> None:
-        valid_lfm2 = (0, 1, 2, 4, 5)
+        valid_lfm2 = (0, 1, 2, 4, 5, 6)
         for mode in valid_lfm2:
-            for chunks in (1, 256):
-                validate_compile_params(mode, chunks, valid_modes=valid_lfm2, nonzero_kv_modes=(4,))
+            for chunks in (1, 1024):
+                validate_compile_params(mode, chunks, valid_modes=valid_lfm2, nonzero_kv_modes=(4,), max_kv_chunks=1024)
             if mode != 4:
-                validate_compile_params(mode, 0, valid_modes=valid_lfm2, nonzero_kv_modes=(4,))
+                validate_compile_params(mode, 0, valid_modes=valid_lfm2, nonzero_kv_modes=(4,), max_kv_chunks=1024)
 
         with self.assertRaisesRegex(ValueError, "unsupported layer_mode"):
-            validate_compile_params(3, 1, valid_modes=valid_lfm2, nonzero_kv_modes=(4,))
+            validate_compile_params(3, 1, valid_modes=valid_lfm2, nonzero_kv_modes=(4,), max_kv_chunks=1024)
         with self.assertRaisesRegex(ValueError, "layer_mode=4 requires kv_chunks >= 1"):
-            validate_compile_params(4, 0, valid_modes=valid_lfm2, nonzero_kv_modes=(4,))
+            validate_compile_params(4, 0, valid_modes=valid_lfm2, nonzero_kv_modes=(4,), max_kv_chunks=1024)
         with self.assertRaisesRegex(ValueError, "kv_chunks"):
-            validate_compile_params(5, 257, valid_modes=valid_lfm2, nonzero_kv_modes=(4,))
+            validate_compile_params(5, 1025, valid_modes=valid_lfm2, nonzero_kv_modes=(4,), max_kv_chunks=1024)
 
-        valid_lfm3 = (0, 1, 2, 3, 4, 5)
+        valid_lfm2_ext = (0, 1, 2, 3, 4, 5, 6, 7)
+        for slot in (0, 1, 2, 3):
+            validate_compile_params(
+                3,
+                1,
+                valid_modes=valid_lfm2_ext,
+                nonzero_kv_modes=(3, 4),
+                max_kv_chunks=1024,
+                param_slot=slot,
+                valid_param_slots=(0, 1, 2, 3),
+            )
+        with self.assertRaisesRegex(ValueError, "kv_chunks"):
+            validate_compile_params(
+                5,
+                1025,
+                valid_modes=valid_lfm2_ext,
+                nonzero_kv_modes=(3, 4),
+                max_kv_chunks=1024,
+                param_slot=0,
+                valid_param_slots=(0, 1, 2, 3),
+            )
+
+        valid_lfm3 = (0, 1, 2, 3, 4, 5, 6)
         with self.assertRaisesRegex(ValueError, "valid_param_slots is required"):
             validate_compile_params(1, 0, valid_modes=valid_lfm3, param_slot=0)
 
         for slot in (0, 1, 2, 3):
             validate_compile_params(
-                3,
+                6,
                 1,
                 valid_modes=valid_lfm3,
-                nonzero_kv_modes=(3, 4),
+                nonzero_kv_modes=(3, 4, 6),
                 param_slot=slot,
                 valid_param_slots=(0, 1, 2, 3),
             )
-        with self.assertRaisesRegex(ValueError, "layer_mode=3 requires kv_chunks >= 1"):
+        with self.assertRaisesRegex(ValueError, "layer_mode=6 requires kv_chunks >= 1"):
             validate_compile_params(
-                3,
+                6,
                 0,
                 valid_modes=valid_lfm3,
-                nonzero_kv_modes=(3, 4),
+                nonzero_kv_modes=(3, 4, 6),
                 param_slot=0,
                 valid_param_slots=(0, 1, 2, 3),
             )
@@ -291,7 +313,7 @@ class TestXdnaCompileParams(unittest.TestCase):
                     1,
                     1,
                     valid_modes=valid_lfm3,
-                    nonzero_kv_modes=(3, 4),
+                    nonzero_kv_modes=(3, 4, 6),
                     param_slot=bad_slot,  # type: ignore[arg-type]
                     valid_param_slots=(0, 1, 2, 3),
                 )
@@ -302,12 +324,14 @@ class TestXdnaCompileParams(unittest.TestCase):
         lfm2_dec = os.path.join(IRON_ROOT, "q4layer_lfm2", "q4layer_lfm2.py")
         lfm3_dec = os.path.join(IRON_ROOT, "q4layer_lfm3", "q4layer_lfm3.py")
         lfm2_pre = os.path.join(IRON_ROOT, "q4prefill_lfm2", "q4prefill_lfm2.py")
+        lfm2_pre_ext = os.path.join(IRON_ROOT, "q4prefill_lfm2_ext", "q4prefill_lfm2_ext.py")
         lfm3_pre = os.path.join(IRON_ROOT, "q4prefill_lfm3", "q4prefill_lfm3.py")
 
-        self.assertEqual(_inspect_generator_wiring(lfm2_dec, "q4layer_lfm2", (0, 1, 2, 3, 4), (3,)), (True, True, True))
+        self.assertEqual(_inspect_generator_wiring(lfm2_dec, "q4layer_lfm2", (0, 1, 2, 3, 4, 5, 6, 7), (3,)), (True, True, True))
         self.assertEqual(_inspect_generator_wiring(lfm3_dec, "q4layer_lfm3", (0, 1, 2, 3, 4), (3,)), (True, True, True))
-        self.assertEqual(_inspect_generator_wiring(lfm2_pre, "q4prefill_lfm2", (0, 1, 2, 4, 5), (4,)), (True, True, True))
-        self.assertEqual(_inspect_generator_wiring(lfm3_pre, "q4prefill_lfm3", (0, 1, 2, 3, 4, 5), (3, 4), (0, 1, 2, 3)), (True, True, True))
+        self.assertEqual(_inspect_generator_wiring(lfm2_pre, "q4prefill_lfm2", (0, 1, 2, 4, 5, 6), (4,)), (True, True, True))
+        self.assertEqual(_inspect_generator_wiring(lfm2_pre_ext, "q4prefill_lfm2", (0, 1, 2, 3, 4, 5, 6, 7), (3, 4), (0, 1, 2, 3)), (True, True, True))
+        self.assertEqual(_inspect_generator_wiring(lfm3_pre, "q4prefill_lfm3", (0, 1, 2, 3, 4, 5, 6), (3, 4, 6), (0, 1, 2, 3)), (True, True, True))
 
         c_lfm2_dec = _eval_top_level_ints(lfm2_dec)
         self.assertEqual(c_lfm2_dec["SLOT_NORM_0"], rs["LFM2_DEC_SLOT_NORM_0"])
@@ -344,6 +368,20 @@ class TestXdnaCompileParams(unittest.TestCase):
         self.assertEqual(c_lfm2_pre["KV_TOTAL"] * 4, rs["LFM2_KV_BYTES"])
         self.assertLessEqual(c_lfm2_pre["SLOT_FA_STATE"] + 147456, c_lfm2_pre["SLOT_XQ"])
 
+        c_lfm2_ext = _eval_top_level_ints(lfm2_pre_ext)
+        self.assertEqual(c_lfm2_ext["SLOT_EXT_PARAMS_0"], rs["LFM2_PREFILL_SLOT_EXT_PARAMS_0"])
+        self.assertEqual(c_lfm2_ext["SLOT_EXT_PARAMS_1"], rs["LFM2_PREFILL_SLOT_EXT_PARAMS_1"])
+        self.assertEqual(c_lfm2_ext["SLOT_EXT_PARAMS_2"], rs["LFM2_PREFILL_SLOT_EXT_PARAMS_2"])
+        self.assertEqual(c_lfm2_ext["SLOT_NORM_0"], rs["LFM2_PREFILL_SLOT_NORM_0"])
+        self.assertEqual(c_lfm2_ext["SLOT_NORM_1"], rs["LFM2_PREFILL_SLOT_NORM_1"])
+        self.assertEqual(c_lfm2_ext["SLOT_ROPE_PKT_0"], rs["LFM2_PREFILL_SLOT_ROPE_PKT_0"])
+        self.assertEqual(c_lfm2_ext["SLOT_ROPE_PKT_1"], rs["LFM2_PREFILL_SLOT_ROPE_PKT_1"])
+        self.assertEqual(c_lfm2_ext["MAX_KV_CHUNKS"], rs["LFM2_MAX_KV_CHUNKS"])
+        self.assertEqual(c_lfm2_ext["W_TOTAL"] * 4, rs["LFM2_W_BYTES"])
+        self.assertEqual(c_lfm2_ext["ACT_TOTAL"] * 4, rs["LFM2_PREFILL_ACT_BYTES"])
+        self.assertEqual(c_lfm2_ext["YN_TOTAL"] * 4, rs["LFM2_PREFILL_YN_BYTES"])
+        self.assertEqual(c_lfm2_ext["KV_TOTAL"] * 4, rs["LFM2_KV_BYTES"])
+
         c_lfm3_pre = _eval_top_level_ints(lfm3_pre)
         self.assertEqual(c_lfm3_pre["SLOT_FA_Q"], rs["LFM3_PREFILL_SLOT_Q_BF16"])
         self.assertEqual(c_lfm3_pre["SLOT_ATTN_GATE"], rs["LFM3_PREFILL_SLOT_ATTN_GATE"])
@@ -367,6 +405,7 @@ class TestXdnaCompileParams(unittest.TestCase):
             ("q4layer_lfm2", "q4layer_lfm2", "3", "4"),
             ("q4layer_lfm3", "q4layer_lfm3", "3", "4"),
             ("q4prefill_lfm2", "q4prefill_lfm2", "4", "5"),
+            ("q4prefill_lfm2_ext", "q4prefill_lfm2", "3", "5"),
             ("q4prefill_lfm3", "q4prefill_lfm3", "4", "5"),
         ]
         mods, dispatched = _make_mock_modules()
@@ -379,23 +418,25 @@ class TestXdnaCompileParams(unittest.TestCase):
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
 
-                extra_args = ["--param-slot", "2"] if subdir == "q4prefill_lfm3" else []
+                has_param_slot = subdir in {"q4prefill_lfm2_ext", "q4prefill_lfm3"}
+                extra_args = ["--param-slot", "2"] if has_param_slot else []
                 with mock.patch.object(sys, "argv", [path, "--layer-mode", ok_mode, "--kv-chunks", "0", *extra_args]):
                     mod.main()
                 self.assertEqual(dispatched[-1]["fn"], fn_name)
                 expected_kw = {"layer_mode": int(ok_mode), "kv_chunks": 0}
-                if subdir == "q4prefill_lfm3":
+                if has_param_slot:
                     expected_kw["param_slot"] = 2
                 self.assertEqual(dispatched[-1]["kwargs"], expected_kw)
 
                 # Inner `@iron.jit` guard also fires when the lowered function is called directly.
+                n_pos = 6 if subdir == "q4layer_lfm3" else 5
                 with self.assertRaises(ValueError):
-                    getattr(mod, fn_name)(None, None, None, None, None, layer_mode=int(nz_mode), kv_chunks=0)
-                if subdir == "q4prefill_lfm3":
+                    getattr(mod, fn_name)(*([None] * n_pos), layer_mode=int(nz_mode), kv_chunks=0)
+                if has_param_slot:
                     with self.assertRaises(ValueError):
-                        getattr(mod, fn_name)(None, None, None, None, None, layer_mode=int(ok_mode), kv_chunks=0, param_slot=4)
+                        getattr(mod, fn_name)(*([None] * n_pos), layer_mode=int(ok_mode), kv_chunks=0, param_slot=4)
 
-                for bad_chunks in ("-1", "257"):
+                for bad_chunks in ("-1", str(mod.MAX_KV_CHUNKS + 1)):
                     with self.assertRaises(ValueError):
                         with mock.patch.object(sys, "argv", [path, "--layer-mode", ok_mode, "--kv-chunks", bad_chunks]):
                             mod.main()
@@ -404,7 +445,7 @@ class TestXdnaCompileParams(unittest.TestCase):
                     with mock.patch.object(sys, "argv", [path, "--layer-mode", nz_mode, "--kv-chunks", "0"]):
                         mod.main()
 
-                if subdir == "q4prefill_lfm3":
+                if has_param_slot:
                     with self.assertRaises(ValueError):
                         with mock.patch.object(sys, "argv", [path, "--layer-mode", "3", "--kv-chunks", "0"]):
                             mod.main()

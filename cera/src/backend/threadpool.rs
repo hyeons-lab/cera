@@ -122,11 +122,12 @@ const SPIN_BEFORE_PARK: u32 = 100_000;
 /// prefill workers warm at the same bounded spin as decode.
 #[cfg(all(not(miri), target_os = "windows"))]
 const PREFILL_SPIN_BEFORE_PARK: u32 = 100_000;
-/// Extended prefill-pool spin budget while a Windows hybrid XDNA decode model is alive.
-/// Keeps Q6_K LM-head workers warm across ~13–25 ms NPU token latencies without
-/// multi-millisecond OS park/wake stalls, while still parking after ~36 ms of idleness.
+/// Short prefill-pool spin budget while a Windows hybrid XDNA decode model is alive.
+/// Parks LM-head workers within ~30 us after each dispatch so CPU threads stay idle at 0 W
+/// during 13–25 ms NPU token compute, giving the NPU full socket PPT headroom while avoiding
+/// multi-thread busy-spin contention.
 #[cfg(all(any(feature = "xdna", test), not(miri), target_os = "windows"))]
-const XDNA_PREFILL_SPIN_BEFORE_PARK: u32 = 24_000_000;
+const XDNA_PREFILL_SPIN_BEFORE_PARK: u32 = 20_000;
 /// Shorter spin limit for prefill pools on non-Windows targets so workers park quickly
 /// when a chunk finishes or decode begins instead of contending for core clocks/TDP.
 #[cfg(all(not(miri), not(target_os = "windows")))]
@@ -1695,7 +1696,7 @@ const fn xdna_warm_spin_target() -> u32 {
 
 #[cfg(any(feature = "xdna", test))]
 const fn resolved_prefill_spin(default_spin: u32, leases: usize, warm_target: u32) -> u32 {
-    if leases > 0 && warm_target > default_spin {
+    if leases > 0 {
         warm_target
     } else {
         default_spin
@@ -4018,21 +4019,18 @@ mod tests {
 
     #[test]
     fn xdna_prefill_warm_spin_updates_and_respects_env_override() {
-        assert_eq!(resolved_prefill_spin(100_000, 0, 24_000_000), 100_000);
-        assert_eq!(resolved_prefill_spin(100_000, 1, 24_000_000), 24_000_000);
-        assert_eq!(resolved_prefill_spin(30_000_000, 1, 24_000_000), 30_000_000);
+        assert_eq!(resolved_prefill_spin(100_000, 0, 20_000), 100_000);
+        assert_eq!(resolved_prefill_spin(100_000, 1, 20_000), 20_000);
+        assert_eq!(resolved_prefill_spin(30_000_000, 1, 20_000), 20_000);
 
         // Pin `build_with_spin` across baseline, prefill-warm, decode-pool, and CERA_SPIN-locked paths.
         let cold_pool = RowPool::build_with_spin(1, &[], &[], &[], true, None, 0);
         let baseline = cold_pool.shared.spin_limit.load(Ordering::Acquire);
         assert!(!cold_pool.shared.spin_locked_by_env);
         assert_eq!(baseline, PREFILL_SPIN_BEFORE_PARK);
-        apply_prefill_spin_target(&cold_pool, 1, 24_000_000);
-        assert_eq!(
-            cold_pool.shared.spin_limit.load(Ordering::Acquire),
-            24_000_000
-        );
-        apply_prefill_spin_target(&cold_pool, 0, 24_000_000);
+        apply_prefill_spin_target(&cold_pool, 1, 20_000);
+        assert_eq!(cold_pool.shared.spin_limit.load(Ordering::Acquire), 20_000);
+        apply_prefill_spin_target(&cold_pool, 0, 20_000);
         assert_eq!(
             cold_pool.shared.spin_limit.load(Ordering::Acquire),
             baseline

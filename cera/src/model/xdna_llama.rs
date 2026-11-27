@@ -2426,7 +2426,7 @@ pub fn load_model_xdna(
             context_size,
             model_id,
         )?),
-        "lfm2" => Box::new(super::xdna_lfm2::XdnaLfm2Model::from_gguf_with_id(
+        "lfm2" | "lfm2moe" => Box::new(super::xdna_lfm2::XdnaLfm2Model::from_gguf_with_id(
             gguf,
             context_size,
             model_id,
@@ -2438,7 +2438,7 @@ pub fn load_model_xdna(
         )?),
         _ => bail!(
             "unsupported architecture for AMD XDNA NPU: {arch} \
-             (XDNA backend supports Llama-3.2-1B, LFM2/LFM2.5-1.2B, and LFM3)"
+             (XDNA backend supports Llama-3.2-1B, LFM2/LFM2.5/LFM2-MoE, and LFM3)"
         ),
     };
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]

@@ -1229,6 +1229,26 @@ enum Command {
         cache_dir: Option<String>,
     },
 
+    /// Download a Hugging Face GGUF model repository into the local cache
+    /// without loading model weights.
+    DownloadHf {
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-24B-A2B-GGUF`).
+        hf: String,
+
+        /// Quantization label (e.g. `QAD-Q4_0`, `Q4_0`, `Q4_K_M`, `Q8_0`).
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`)
+        /// when converting a SafeTensors-only repository.
+        #[arg(long)]
+        quant_strategy: Option<String>,
+
+        /// Cache root for downloads. Default: `$HOME/.cache/cera`.
+        #[arg(long)]
+        cache_dir: Option<String>,
+    },
+
     /// Run Voice Activity Detection (VAD) using Silero VAD.
     Vad {
         /// Path to the Silero VAD `.gguf` model file.
@@ -1586,30 +1606,45 @@ fn resolve_manifest_file_for_download(
     }
 }
 
+/// Download every file declared in `manifest` to `repo` and print its cached path.
+fn download_manifest_files(
+    repo: &cera::bundle::BundleRepo,
+    progress: &CliDownloadProgress,
+    manifest: &cera::manifest::Manifest,
+    manifest_dir: Option<&Path>,
+    label: &str,
+) -> Result<()> {
+    for (role, value) in manifest.files_in_order() {
+        let path = resolve_manifest_file_for_download(repo, progress, value, manifest_dir)
+            .with_context(|| format!("resolving `{role}` file for `{label}`"))?;
+        eprintln!("  {role}: {}", path.display());
+    }
+    progress.finish_line();
+    Ok(())
+}
+
 fn download_bundle_pair(
     repo: &cera::bundle::BundleRepo,
     pair: &BundleQuantPair,
     progress: &CliDownloadProgress,
 ) -> Result<()> {
     let normalized = normalize_bundle_id(&pair.bundle_id);
-    let manifest_url = cera::bundle::leap_bundles_manifest_url(&normalized, &pair.quant)?;
+    let label = format!("{normalized}:{}", pair.quant);
     eprintln!("Resolving bundle `{normalized}` (quant `{}`)", pair.quant);
-    let manifest_result = repo.resolve_url(&manifest_url, None);
-    progress.finish_line();
-    let manifest_path =
-        manifest_result.with_context(|| format!("downloading manifest `{manifest_url}`"))?;
-    let manifest = cera::manifest::Manifest::from_file(&manifest_path)?;
-    let manifest_dir = manifest_path.parent();
-    eprintln!("  manifest: {}", manifest_path.display());
-    for (role, value) in manifest.files_in_order() {
-        let path = resolve_manifest_file_for_download(repo, progress, value, manifest_dir)
-            .with_context(|| {
-                format!("resolving `{role}` file for `{normalized}:{}`", pair.quant)
-            })?;
-        eprintln!("  {role}: {}", path.display());
-    }
-    progress.finish_line();
-    Ok(())
+    let (manifest, manifest_dir) =
+        if let Some(known) = cera::bundle::known_bundle_manifest(&normalized, &pair.quant) {
+            (known, None)
+        } else {
+            let manifest_url = cera::bundle::leap_bundles_manifest_url(&normalized, &pair.quant)?;
+            let manifest_result = repo.resolve_url(&manifest_url, None);
+            progress.finish_line();
+            let manifest_path = manifest_result
+                .with_context(|| format!("downloading manifest `{manifest_url}`"))?;
+            eprintln!("  manifest: {}", manifest_path.display());
+            let manifest = cera::manifest::Manifest::from_file(&manifest_path)?;
+            (manifest, manifest_path.parent().map(Path::to_path_buf))
+        };
+    download_manifest_files(repo, progress, &manifest, manifest_dir.as_deref(), &label)
 }
 
 /// Write the chat history to `path` as a plain-text transcript:
@@ -4905,6 +4940,30 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::DownloadHf {
+            hf,
+            quant,
+            quant_strategy,
+            cache_dir,
+        } => {
+            let cache = cache_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(default_cache_dir);
+            eprintln!("Cache: {}", cache.display());
+            let progress = Arc::new(CliDownloadProgress::default());
+            let progress_dyn = progress.clone() as Arc<dyn cera::bundle::DownloadProgress>;
+            let repo = cera::bundle::BundleRepo::with_progress(cache, progress_dyn.clone());
+            eprintln!("Resolving Hugging Face model `{hf}`");
+            let manifest = cera::bundle::hf::inspect_and_resolve_manifest(
+                &hf,
+                quant.as_deref(),
+                quant_strategy.as_deref(),
+                Some(repo.store_dir()),
+                Some(progress_dyn),
+            )?;
+            progress.finish_line();
+            download_manifest_files(&repo, &progress, &manifest, None, &hf)?;
+        }
         Command::ListHf { hf, json } => {
             let spec = cera::bundle::HfSpec::parse(&hf)?;
             let info = cera::bundle::fetch_model_info(&spec)?;
@@ -7613,6 +7672,35 @@ mod tests {
                 r.is_err(),
                 "expected malformed download pair `{arg}` to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn download_hf_parses_repo_and_flags() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "download-hf",
+            "LiquidAI/LFM2.5-24B-A2B-GGUF",
+            "--quant",
+            "QAD-Q4_0",
+            "--cache-dir",
+            "/tmp/cera-cache",
+        ])
+        .expect("download-hf should parse repo, quant, and cache-dir");
+
+        match cli.command {
+            Command::DownloadHf {
+                hf,
+                quant,
+                quant_strategy,
+                cache_dir,
+            } => {
+                assert_eq!(hf, "LiquidAI/LFM2.5-24B-A2B-GGUF");
+                assert_eq!(quant.as_deref(), Some("QAD-Q4_0"));
+                assert!(quant_strategy.is_none());
+                assert_eq!(cache_dir.as_deref(), Some("/tmp/cera-cache"));
+            }
+            _ => panic!("expected DownloadHf command"),
         }
     }
 

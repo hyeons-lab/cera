@@ -22,8 +22,9 @@ use anyhow::Result;
 use crate::backend::wgpu::DevicePollExt;
 
 use super::vision_encoder::{
+    LFM3_MM_INPUT_NORM_EPS, Lfm3BlockOp, Lfm3NormWeights, MmNormStage, PatchEmbedWeights,
     VisionEncoderConfig, VisionEncoderWeights, extract_patch, interpolate_pos_embed_2d,
-    pixel_shuffle,
+    mm_norm_stage, pixel_shuffle,
 };
 use crate::model::weights::MmapWeight;
 
@@ -193,6 +194,235 @@ pub trait VitGpuOps {
     /// the per-kernel GPU timestamps (`CERA_GPU_PROFILE=1`); default no-ops.
     fn begin_encode(&self) {}
     fn end_encode(&self) {}
+
+    /// Whether this backend implements the LFM3 hybrid vision primitives (`rmsnorm`, `silu_mul`,
+    /// `lfm3_conv_spatial`, `lfm3_gqa_mrope_attention`).
+    fn supports_lfm3(&self) -> bool {
+        false
+    }
+
+    /// Out-of-place RMSNorm over the last dim: `src * inv_rms * weight` per row.
+    fn rmsnorm(
+        &self,
+        _src: &Self::Buf,
+        _weight: &Self::Buf,
+        _eps: f32,
+        _rows: usize,
+        _dim: usize,
+    ) -> Self::Buf {
+        unimplemented!("rmsnorm not supported by this vision backend")
+    }
+
+    /// In-place SwiGLU elementwise gate: `gate[i] = silu(gate[i]) * up[i]`.
+    fn silu_mul(&self, _gate: &Self::Buf, _up: &Self::Buf, _len: usize) {
+        unimplemented!("silu_mul not supported by this vision backend")
+    }
+
+    /// LFM3 gated 2D depthwise spatial convolution over `[grid_h, grid_w, d]` tokens given the
+    /// `[grid_h * grid_w, proj_rows]` output of `conv2d_in_proj` (`proj_rows == 3 * d` or `2 * d`).
+    #[allow(clippy::too_many_arguments)]
+    fn lfm3_conv_spatial(
+        &self,
+        _proj: &Self::Buf,
+        _proj_rows: usize,
+        _depthwise_w: &[f32],
+        _depthwise_b: Option<&[f32]>,
+        _grid_w: usize,
+        _grid_h: usize,
+        _d: usize,
+        _kernel_size: usize,
+    ) -> Self::Buf {
+        unimplemented!("lfm3_conv_spatial not supported by this vision backend")
+    }
+
+    /// 2D M-RoPE + bidirectional grouped-query attention over `[grid_h * grid_w]` tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn lfm3_gqa_mrope_attention(
+        &self,
+        _q: &Self::Buf,
+        _k: &Self::Buf,
+        _v: &Self::Buf,
+        _grid_w: usize,
+        _grid_h: usize,
+        _n_head: usize,
+        _n_head_kv: usize,
+        _head_dim: usize,
+        _rope_theta: f32,
+    ) -> Self::Buf {
+        unimplemented!("lfm3_gqa_mrope_attention not supported by this vision backend")
+    }
+}
+
+fn opt_buf<O: VitGpuOps>(ops: &O, data: &[f32]) -> Option<O::Buf> {
+    (!data.is_empty()).then(|| ops.upload(data))
+}
+
+fn combine_patch_embed(
+    w0: &PatchEmbedWeights,
+    w1: Option<&PatchEmbedWeights>,
+    in_dim: usize,
+    out_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut convt = vec![0f32; in_dim * out_dim];
+    for i in 0..in_dim {
+        for o in 0..out_dim {
+            convt[o * in_dim + i] = w0.conv_w[i * out_dim + o];
+        }
+    }
+    let mut conv_b = w0.conv_b.clone();
+    if let Some(pe1) = w1 {
+        for i in 0..in_dim {
+            for o in 0..out_dim {
+                convt[o * in_dim + i] += pe1.conv_w[i * out_dim + o];
+            }
+        }
+        if !pe1.conv_b.is_empty() {
+            if conv_b.is_empty() {
+                conv_b = pe1.conv_b.clone();
+            } else {
+                for (d, &s) in conv_b.iter_mut().zip(pe1.conv_b.iter()) {
+                    *d += s;
+                }
+            }
+        }
+    }
+    (convt, conv_b)
+}
+
+struct GpuLfm3Norm<O: VitGpuOps> {
+    len: usize,
+    weight: O::Buf,
+    bias: Option<O::Buf>,
+}
+
+fn upload_lfm3_norm<O: VitGpuOps>(ops: &O, norm: &Lfm3NormWeights) -> Option<GpuLfm3Norm<O>> {
+    if norm.weight.is_empty() {
+        return None;
+    }
+    Some(GpuLfm3Norm {
+        len: norm.weight.len(),
+        weight: ops.upload(&norm.weight),
+        bias: norm.bias.as_deref().and_then(|b| opt_buf(ops, b)),
+    })
+}
+
+#[allow(clippy::large_enum_variant)]
+enum GpuLfm3BlockOp<O: VitGpuOps> {
+    Conv {
+        in_proj_w: O::Weight,
+        in_proj_b: Option<O::Buf>,
+        in_proj_rows: usize,
+        depthwise_w: Vec<f32>,
+        depthwise_b: Option<Vec<f32>>,
+        kernel_size: usize,
+        out_proj_w: O::Weight,
+        out_proj_b: Option<O::Buf>,
+    },
+    Attn {
+        q_w: O::Weight,
+        q_b: Option<O::Buf>,
+        k_w: O::Weight,
+        k_b: Option<O::Buf>,
+        v_w: O::Weight,
+        v_b: Option<O::Buf>,
+        q_norm: Option<GpuLfm3Norm<O>>,
+        k_norm: Option<GpuLfm3Norm<O>>,
+        o_w: O::Weight,
+        o_b: Option<O::Buf>,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+    },
+}
+
+struct GpuLfm3Block<O: VitGpuOps> {
+    ln1: Option<GpuLfm3Norm<O>>,
+    op: GpuLfm3BlockOp<O>,
+    ln2: Option<GpuLfm3Norm<O>>,
+    gate_w: Option<O::Weight>,
+    gate_b: Option<O::Buf>,
+    up_w: O::Weight,
+    up_b: Option<O::Buf>,
+    down_w: O::Weight,
+    down_b: Option<O::Buf>,
+}
+
+struct GpuLfm3Weights<O: VitGpuOps> {
+    embedding_norm: Option<GpuLfm3Norm<O>>,
+    blocks: Vec<GpuLfm3Block<O>>,
+    post_ln: Option<GpuLfm3Norm<O>>,
+    mm_input_norm: Option<(GpuLfm3Norm<O>, MmNormStage)>,
+}
+
+impl<O: VitGpuOps> GpuLfm3Weights<O> {
+    fn build(ops: &O, w: &VisionEncoderWeights) -> Self {
+        let cfg = &w.config;
+        let blocks = w
+            .lfm3_blocks
+            .iter()
+            .map(|b| {
+                let op = match &b.op {
+                    Lfm3BlockOp::Conv(c) => GpuLfm3BlockOp::Conv {
+                        in_proj_w: ops.upload_weight(&c.in_proj_w),
+                        in_proj_b: c.in_proj_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                        in_proj_rows: c.in_proj_w.rows,
+                        depthwise_w: c.depthwise_w.clone(),
+                        depthwise_b: c.depthwise_b.clone(),
+                        kernel_size: c.kernel_size,
+                        out_proj_w: ops.upload_weight(&c.out_proj_w),
+                        out_proj_b: c.out_proj_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                    },
+                    Lfm3BlockOp::Attn(a) => GpuLfm3BlockOp::Attn {
+                        q_w: ops.upload_weight(&a.q_w),
+                        q_b: a.q_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                        k_w: ops.upload_weight(&a.k_w),
+                        k_b: a.k_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                        v_w: ops.upload_weight(&a.v_w),
+                        v_b: a.v_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                        q_norm: upload_lfm3_norm(ops, &a.q_norm),
+                        k_norm: upload_lfm3_norm(ops, &a.k_norm),
+                        o_w: ops.upload_weight(&a.o_w),
+                        o_b: a.o_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                        n_head: a.n_head,
+                        n_head_kv: a.n_head_kv,
+                        head_dim: a.head_dim,
+                    },
+                };
+                GpuLfm3Block {
+                    ln1: upload_lfm3_norm(ops, &b.ln1),
+                    op,
+                    ln2: upload_lfm3_norm(ops, &b.ln2),
+                    gate_w: b.ffn.gate_w.as_ref().map(|gw| ops.upload_weight(gw)),
+                    gate_b: b.ffn.gate_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                    up_w: ops.upload_weight(&b.ffn.up_w),
+                    up_b: b.ffn.up_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                    down_w: ops.upload_weight(&b.ffn.down_w),
+                    down_b: b.ffn.down_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                }
+            })
+            .collect();
+
+        let post_ln = (!w.post_ln_w.is_empty()).then(|| GpuLfm3Norm {
+            len: w.post_ln_w.len(),
+            weight: ops.upload(&w.post_ln_w),
+            bias: opt_buf(ops, &w.post_ln_b),
+        });
+        let merged_dim = cfg.n_embd * cfg.scale_factor * cfg.scale_factor;
+        let mm_input_norm = w.mm_input_norm.as_ref().and_then(|norm| {
+            let stage = mm_norm_stage(norm.weight.len(), cfg.n_embd, merged_dim)?;
+            upload_lfm3_norm(ops, norm).map(|gpu_norm| (gpu_norm, stage))
+        });
+
+        Self {
+            embedding_norm: w
+                .embedding_norm
+                .as_ref()
+                .and_then(|n| upload_lfm3_norm(ops, n)),
+            blocks,
+            post_ln,
+            mm_input_norm,
+        }
+    }
 }
 
 /// One ViT block's weights, uploaded to GPU buffers. Linear weights are
@@ -229,20 +459,22 @@ pub struct GpuVitWeights<O: VitGpuOps> {
     position_embed: Vec<f32>,
     /// Patch-embed kernel transposed to `[n_embd, in_dim]` (the `linear`
     /// layout); the CPU encoder stores it as `[in_dim, n_embd]` for its
-    /// `C = A·B` matmul, but `linear` computes `A·Bᵀ`.
+    /// `C = A·B` matmul, but `linear` computes `A·Bᵀ`. When `patch_embed_1`
+    /// is present for `encode_image`, its transposed weights are pre-summed.
     patch_conv_wt: O::Weight,
-    patch_conv_b: O::Buf,
+    patch_conv_b: Option<O::Buf>,
     blocks: Vec<GpuVitBlock<O>>,
-    post_ln_w: O::Buf,
-    post_ln_b: O::Buf,
+    post_ln_w: Option<O::Buf>,
+    post_ln_b: Option<O::Buf>,
     mm1_w: O::Weight,
-    mm1_b: O::Buf,
+    mm1_b: Option<O::Buf>,
     mm2_w: O::Weight,
-    mm2_b: O::Buf,
+    mm2_b: Option<O::Buf>,
     /// Projector intermediate width (`mm.1` rows). Derived from the tensor
     /// shape, not the LFM2 `projection_dim·2` convention, to stay robust to
     /// variants — matching `vision_encoder`'s loader.
     proj_intermediate: usize,
+    lfm3: Option<GpuLfm3Weights<O>>,
 }
 
 impl<O: VitGpuOps> GpuVitWeights<O> {
@@ -253,14 +485,8 @@ impl<O: VitGpuOps> GpuVitWeights<O> {
         let in_dim = 3 * p * p;
         let out_dim = cfg.n_embd;
 
-        // Transpose conv_w [in_dim, out_dim] → [out_dim, in_dim].
-        let src = &w.patch_embed.conv_w;
-        let mut convt = vec![0f32; in_dim * out_dim];
-        for i in 0..in_dim {
-            for o in 0..out_dim {
-                convt[o * in_dim + i] = src[i * out_dim + o];
-            }
-        }
+        let (convt, conv_b) =
+            combine_patch_embed(&w.patch_embed, w.patch_embed_1.as_ref(), in_dim, out_dim);
 
         let blocks = w
             .blocks
@@ -285,19 +511,22 @@ impl<O: VitGpuOps> GpuVitWeights<O> {
             })
             .collect();
 
+        let lfm3 = (w.is_lfm3() && ops.supports_lfm3()).then(|| GpuLfm3Weights::build(ops, w));
+
         GpuVitWeights {
             position_embed: w.position_embed.clone(),
             patch_conv_wt: ops.upload_weight_f32(&convt, out_dim, in_dim),
-            patch_conv_b: ops.upload(&w.patch_embed.conv_b),
+            patch_conv_b: opt_buf(ops, &conv_b),
             blocks,
-            post_ln_w: ops.upload(&w.post_ln_w),
-            post_ln_b: ops.upload(&w.post_ln_b),
+            post_ln_w: (!w.is_lfm3()).then(|| opt_buf(ops, &w.post_ln_w)).flatten(),
+            post_ln_b: (!w.is_lfm3()).then(|| opt_buf(ops, &w.post_ln_b)).flatten(),
             mm1_w: ops.upload_weight(&w.projector.mm1_w),
-            mm1_b: ops.upload(&w.projector.mm1_b),
+            mm1_b: opt_buf(ops, &w.projector.mm1_b),
             mm2_w: ops.upload_weight(&w.projector.mm2_w),
-            mm2_b: ops.upload(&w.projector.mm2_b),
+            mm2_b: opt_buf(ops, &w.projector.mm2_b),
             proj_intermediate: w.projector.mm1_w.rows,
             cfg,
+            lfm3,
         }
     }
 }
@@ -447,11 +676,19 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         "encode_image_gpu: pixels.len() {} != 3·target_w·target_h",
         pixels.len()
     );
+    let max_tokens = if cfg.is_lfm3() || ops.supports_lfm3() {
+        ops.attention_token_limit(head_dim)
+    } else {
+        MAX_VIT_TOKENS
+    };
     anyhow::ensure!(
-        n_patches <= MAX_VIT_TOKENS,
-        "encode_image_gpu: {n_patches} patches exceeds GPU MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); \
+        n_patches <= max_tokens,
+        "encode_image_gpu: {n_patches} patches exceeds backend token limit ({max_tokens}); \
          caller should fall back to CPU",
     );
+    if cfg.is_lfm3() {
+        return encode_lfm3_gpu(ops, gpu_w, pixels, grid_w, grid_h);
+    }
     // Only now touch the GPU context (flush the pending encoder, reset the profiler): a rejected
     // input must leave it as it was.
     ops.begin_encode();
@@ -502,10 +739,11 @@ pub fn encode_image_gpu<O: VitGpuOps>(
             in_dim
         )
     );
-    timed!(
-        "bias_add",
-        ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd)
-    );
+    timed!("bias_add", {
+        if let Some(b) = &gpu_w.patch_conv_b {
+            ops.bias_add(&tokens, b, n_patches, n_embd);
+        }
+    });
 
     // 2. Add (interpolated) position embeddings. The trained grid is square;
     // guard that in release too (the CPU encoder only `debug_assert`s it), since
@@ -595,16 +833,17 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     }
 
     // 4. Post-LN.
+    let post_ln_w = gpu_w
+        .post_ln_w
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("encode_image_gpu: missing post_ln_w"))?;
+    let post_ln_b = gpu_w
+        .post_ln_b
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("encode_image_gpu: missing post_ln_b"))?;
     let tokens = timed!(
         "layernorm",
-        ops.layernorm(
-            &tokens,
-            &gpu_w.post_ln_w,
-            &gpu_w.post_ln_b,
-            eps,
-            n_patches,
-            n_embd
-        )
+        ops.layernorm(&tokens, post_ln_w, post_ln_b, eps, n_patches, n_embd)
     );
 
     // 5. Pixel-shuffle on CPU (pure rearrangement).
@@ -624,22 +863,279 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         "linear",
         ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim)
     );
-    timed!("bias_add", ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim));
+    timed!("bias_add", {
+        if let Some(b) = &gpu_w.mm1_b {
+            ops.bias_add(&mid, b, n_out, mid_dim);
+        }
+    });
     timed!("gelu", ops.gelu(&mid, n_out * mid_dim));
     let out = timed!(
         "linear",
         ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim)
     );
-    timed!(
-        "bias_add",
-        ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim)
-    );
+    timed!("bias_add", {
+        if let Some(b) = &gpu_w.mm2_b {
+            ops.bias_add(&out, b, n_out, proj_dim);
+        }
+    });
 
     let result = timed!("download", ops.download(&out, n_out * proj_dim));
     ops.end_encode();
     if let Some(p) = &prof {
         p.report(n_patches, gpu_w.blocks.len());
     }
+    Ok(result)
+}
+
+fn opt_bias_add<O: VitGpuOps>(ops: &O, x: &O::Buf, b: Option<&O::Buf>, rows: usize, dim: usize) {
+    if let Some(b) = b {
+        ops.bias_add(x, b, rows, dim);
+    }
+}
+
+fn apply_lfm3_norm<O: VitGpuOps>(
+    ops: &O,
+    src: &O::Buf,
+    norm: Option<&GpuLfm3Norm<O>>,
+    eps: f32,
+    total_elems: usize,
+) -> Option<O::Buf> {
+    let norm = norm?;
+    if norm.len == 0 || !total_elems.is_multiple_of(norm.len) {
+        return None;
+    }
+    let rows = total_elems / norm.len;
+    Some(if let Some(bias) = &norm.bias {
+        ops.layernorm(src, &norm.weight, bias, eps, rows, norm.len)
+    } else {
+        ops.rmsnorm(src, &norm.weight, eps, rows, norm.len)
+    })
+}
+
+fn encode_lfm3_gpu<O: VitGpuOps>(
+    ops: &O,
+    gpu_w: &GpuVitWeights<O>,
+    pixels: &[f32],
+    grid_w: usize,
+    grid_h: usize,
+) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        ops.supports_lfm3(),
+        "vision backend does not support LFM3 hybrid blocks"
+    );
+    let lfm3 = gpu_w
+        .lfm3
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("GpuVitWeights built without LFM3 block weights"))?;
+
+    let cfg = &gpu_w.cfg;
+    let p = cfg.patch_size;
+    let in_dim = 3 * p * p;
+    let n_embd = cfg.n_embd;
+    let n_ff = cfg.n_ff;
+    let n_patches = grid_w * grid_h;
+    let eps = cfg.eps;
+
+    ops.begin_encode();
+
+    // 1. Patch embed (`patch_embed` + optional `patch_embed_1` summed in `patch_conv_wt`).
+    let patches = im2col_patches(pixels, cfg, grid_w, grid_h);
+    let patches_buf = ops.upload(&patches);
+    let mut tokens = ops.linear(
+        &patches_buf,
+        &gpu_w.patch_conv_wt,
+        n_patches,
+        n_embd,
+        in_dim,
+    );
+    opt_bias_add(ops, &tokens, gpu_w.patch_conv_b.as_ref(), n_patches, n_embd);
+
+    // 2. Post-patch embedding norm and optional interpolated position embeddings.
+    if let Some(normed) = apply_lfm3_norm(
+        ops,
+        &tokens,
+        lfm3.embedding_norm.as_ref(),
+        eps,
+        n_patches * n_embd,
+    ) {
+        tokens = normed;
+    }
+    if !gpu_w.position_embed.is_empty() {
+        anyhow::ensure!(
+            cfg.n_trained_patches > 0,
+            "n_trained_patches must be greater than 0"
+        );
+        let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
+        anyhow::ensure!(
+            trained_side * trained_side == cfg.n_trained_patches,
+            "non-square trained pos-embed grid ({} patches) is not supported",
+            cfg.n_trained_patches,
+        );
+        let pos: std::borrow::Cow<[f32]> = if grid_w == trained_side && grid_h == trained_side {
+            std::borrow::Cow::Borrowed(&gpu_w.position_embed)
+        } else {
+            std::borrow::Cow::Owned(interpolate_pos_embed_2d(
+                &gpu_w.position_embed,
+                trained_side,
+                trained_side,
+                grid_h,
+                grid_w,
+                n_embd,
+            ))
+        };
+        anyhow::ensure!(
+            !pos.is_empty(),
+            "failed to interpolate 2D position embeddings (dimension mismatch)"
+        );
+        let pos_buf = ops.upload(&pos);
+        ops.add(&tokens, &pos_buf, n_patches * n_embd);
+    }
+
+    // 3. Hybrid Conv2d / 2D M-RoPE GQA Attention blocks.
+    for blk in &lfm3.blocks {
+        let pre1_opt = apply_lfm3_norm(ops, &tokens, blk.ln1.as_ref(), eps, n_patches * n_embd);
+        let pre1 = pre1_opt.as_ref().unwrap_or(&tokens);
+        match &blk.op {
+            GpuLfm3BlockOp::Conv {
+                in_proj_w,
+                in_proj_b,
+                in_proj_rows,
+                depthwise_w,
+                depthwise_b,
+                kernel_size,
+                out_proj_w,
+                out_proj_b,
+            } => {
+                let proj = ops.linear(pre1, in_proj_w, n_patches, *in_proj_rows, n_embd);
+                opt_bias_add(ops, &proj, in_proj_b.as_ref(), n_patches, *in_proj_rows);
+                let conv_out = ops.lfm3_conv_spatial(
+                    &proj,
+                    *in_proj_rows,
+                    depthwise_w,
+                    depthwise_b.as_deref(),
+                    grid_w,
+                    grid_h,
+                    n_embd,
+                    *kernel_size,
+                );
+                let out = ops.linear(&conv_out, out_proj_w, n_patches, n_embd, n_embd);
+                opt_bias_add(ops, &out, out_proj_b.as_ref(), n_patches, n_embd);
+                ops.add(&tokens, &out, n_patches * n_embd);
+            }
+            GpuLfm3BlockOp::Attn {
+                q_w,
+                q_b,
+                k_w,
+                k_b,
+                v_w,
+                v_b,
+                q_norm,
+                k_norm,
+                o_w,
+                o_b,
+                n_head,
+                n_head_kv,
+                head_dim,
+            } => {
+                let q_dim = n_head * head_dim;
+                let kv_dim = n_head_kv * head_dim;
+                let mut q = ops.linear(pre1, q_w, n_patches, q_dim, n_embd);
+                opt_bias_add(ops, &q, q_b.as_ref(), n_patches, q_dim);
+                let mut k = ops.linear(pre1, k_w, n_patches, kv_dim, n_embd);
+                opt_bias_add(ops, &k, k_b.as_ref(), n_patches, kv_dim);
+                let v = ops.linear(pre1, v_w, n_patches, kv_dim, n_embd);
+                opt_bias_add(ops, &v, v_b.as_ref(), n_patches, kv_dim);
+
+                if let Some(qn) = apply_lfm3_norm(ops, &q, q_norm.as_ref(), eps, n_patches * q_dim)
+                {
+                    q = qn;
+                }
+                if let Some(kn) = apply_lfm3_norm(ops, &k, k_norm.as_ref(), eps, n_patches * kv_dim)
+                {
+                    k = kn;
+                }
+                let attn_out = ops.lfm3_gqa_mrope_attention(
+                    &q,
+                    &k,
+                    &v,
+                    grid_w,
+                    grid_h,
+                    *n_head,
+                    *n_head_kv,
+                    *head_dim,
+                    cfg.rope_theta,
+                );
+                let out = ops.linear(&attn_out, o_w, n_patches, n_embd, q_dim);
+                opt_bias_add(ops, &out, o_b.as_ref(), n_patches, n_embd);
+                ops.add(&tokens, &out, n_patches * n_embd);
+            }
+        }
+
+        let pre2_opt = apply_lfm3_norm(ops, &tokens, blk.ln2.as_ref(), eps, n_patches * n_embd);
+        let pre2 = pre2_opt.as_ref().unwrap_or(&tokens);
+        let mid = ops.linear(pre2, &blk.up_w, n_patches, n_ff, n_embd);
+        opt_bias_add(ops, &mid, blk.up_b.as_ref(), n_patches, n_ff);
+        let ffn_act = if let Some(gate_w) = &blk.gate_w {
+            let gate = ops.linear(pre2, gate_w, n_patches, n_ff, n_embd);
+            opt_bias_add(ops, &gate, blk.gate_b.as_ref(), n_patches, n_ff);
+            ops.silu_mul(&gate, &mid, n_patches * n_ff);
+            gate
+        } else {
+            ops.gelu(&mid, n_patches * n_ff);
+            mid
+        };
+        let down = ops.linear(&ffn_act, &blk.down_w, n_patches, n_embd, n_ff);
+        opt_bias_add(ops, &down, blk.down_b.as_ref(), n_patches, n_embd);
+        ops.add(&tokens, &down, n_patches * n_embd);
+    }
+
+    // 4. Optional post_ln and PreMerge mm.input_norm.
+    if let Some(normed) =
+        apply_lfm3_norm(ops, &tokens, lfm3.post_ln.as_ref(), eps, n_patches * n_embd)
+    {
+        tokens = normed;
+    }
+    if let Some((mm_norm, MmNormStage::PreMerge)) = &lfm3.mm_input_norm
+        && let Some(normed) = apply_lfm3_norm(
+            ops,
+            &tokens,
+            Some(mm_norm),
+            LFM3_MM_INPUT_NORM_EPS,
+            n_patches * n_embd,
+        )
+    {
+        tokens = normed;
+    }
+
+    // 5. Spatial merge (`pixel_shuffle`) + optional PostMerge mm.input_norm.
+    let tok_cpu = ops.download(&tokens, n_patches * n_embd);
+    let pooled = pixel_shuffle(&tok_cpu, cfg, grid_w, grid_h);
+    let pooled_in_dim = n_embd * cfg.scale_factor * cfg.scale_factor;
+    let n_out = pooled.len() / pooled_in_dim;
+    let mut pooled_buf = ops.upload(&pooled);
+    if let Some((mm_norm, MmNormStage::PostMerge)) = &lfm3.mm_input_norm
+        && let Some(normed) = apply_lfm3_norm(
+            ops,
+            &pooled_buf,
+            Some(mm_norm),
+            LFM3_MM_INPUT_NORM_EPS,
+            n_out * pooled_in_dim,
+        )
+    {
+        pooled_buf = normed;
+    }
+
+    // 6. 2-layer GELU MLP projector (`mm.0`/`mm.1` + GELU + `mm.2`).
+    let mid_dim = gpu_w.proj_intermediate;
+    let proj_dim = cfg.projection_dim;
+    let mid = ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim);
+    opt_bias_add(ops, &mid, gpu_w.mm1_b.as_ref(), n_out, mid_dim);
+    ops.gelu(&mid, n_out * mid_dim);
+    let out = ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim);
+    opt_bias_add(ops, &out, gpu_w.mm2_b.as_ref(), n_out, proj_dim);
+
+    let result = ops.download(&out, n_out * proj_dim);
+    ops.end_encode();
     Ok(result)
 }
 
@@ -700,7 +1196,9 @@ pub async fn encode_image_gpu_wgpu_async(
         n_embd,
         in_dim,
     );
-    ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd);
+    if let Some(b) = &gpu_w.patch_conv_b {
+        ops.bias_add(&tokens, b, n_patches, n_embd);
+    }
 
     // 2. Add (interpolated) position embeddings.
     anyhow::ensure!(
@@ -758,14 +1256,15 @@ pub async fn encode_image_gpu_wgpu_async(
     }
 
     // 4. Post-LN.
-    let tokens = ops.layernorm(
-        &tokens,
-        &gpu_w.post_ln_w,
-        &gpu_w.post_ln_b,
-        eps,
-        n_patches,
-        n_embd,
-    );
+    let post_ln_w = gpu_w
+        .post_ln_w
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("encode_image_gpu_wgpu_async: missing post_ln_w"))?;
+    let post_ln_b = gpu_w
+        .post_ln_b
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("encode_image_gpu_wgpu_async: missing post_ln_b"))?;
+    let tokens = ops.layernorm(&tokens, post_ln_w, post_ln_b, eps, n_patches, n_embd);
 
     // 5. Pixel-shuffle on CPU (async readback).
     ops.flush();
@@ -782,10 +1281,14 @@ pub async fn encode_image_gpu_wgpu_async(
     let pooled_buf = ops.upload(&pooled);
     let proj_dim = cfg.projection_dim;
     let mid = ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim);
-    ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim);
+    if let Some(b) = &gpu_w.mm1_b {
+        ops.bias_add(&mid, b, n_out, mid_dim);
+    }
     ops.gelu(&mid, n_out * mid_dim);
     let out = ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim);
-    ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim);
+    if let Some(b) = &gpu_w.mm2_b {
+        ops.bias_add(&out, b, n_out, proj_dim);
+    }
 
     ops.flush();
     let result = ops.ctx.download_f32_async(&out, n_out * proj_dim).await?;
@@ -2404,9 +2907,14 @@ impl VitGpuOps for MetalVitOps {
 /// Wraps a backend's ops + uploaded weights so the whole ViT runs on the GPU.
 /// Implementors are `Send + Sync` so the engine can share them across sessions.
 pub trait VisionGpuEncode: Send + Sync {
-    /// The backend this encoder runs on: `metal`, `wgpu` or `hexagon`.
+    /// The backend this encoder runs on: `metal`, `wgpu`, `hexagon` or `xdna`.
     fn backend_label(&self) -> &'static str {
         "gpu"
+    }
+
+    /// Maximum patch token count supported by this encoder before falling back to CPU.
+    fn max_tokens(&self) -> usize {
+        MAX_VIT_TOKENS
     }
 
     /// Encode preprocessed pixels (`[3·H·W]` NCHW, normalized) at the given
@@ -2888,13 +3396,13 @@ pub fn build_vit_stack(
             .or_else(|| try_hexagon_stack(spec, MAX_VIT_TOKENS))
             .or_else(|| {
                 xdna_vit_worthwhile_for_auto(spec.blocks.len(), spec.width)
-                    .then(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
+                    .then(|| try_xdna_stack(spec, usize::MAX))
                     .flatten()
             })
             .or_else(|| try_wgpu_stack(spec, false)),
         BP::Hexagon => try_hexagon_stack(spec, MAX_VIT_TOKENS),
         BP::Npu => {
-            try_hexagon_stack(spec, MAX_VIT_TOKENS).or_else(|| try_xdna_stack(spec, MAX_VIT_TOKENS))
+            try_hexagon_stack(spec, MAX_VIT_TOKENS).or_else(|| try_xdna_stack(spec, usize::MAX))
         }
         BP::Cpu => None,
     }
@@ -3093,10 +3601,9 @@ enum VisionEncoderAccel {
     Metal,
 }
 
-/// The accelerators to try for a vision encoder, in order. The LFM3 ViT (conv-gated blocks,
-/// temporal patch embedding, `lfm3_blocks`) has no accelerated implementation: the Hexagon
-/// and XDNA encoders iterate `weights.blocks`, which is empty for it, so they would run zero
-/// blocks and return wrong embeddings with no error. It stays on the CPU.
+/// The accelerators to try for a vision encoder, in order. LFM3 hybrid vision encoders
+/// (`lfm3vl`, `lfm3o`) run on XDNA (`Npu` / `Auto`) and stay on CPU for backends that only
+/// implement standard ViT blocks (`Wgpu`, `Hexagon`, `Metal`).
 fn vision_encoder_candidates(
     is_lfm3: bool,
     backend: crate::engine::BackendPreference,
@@ -3104,7 +3611,10 @@ fn vision_encoder_candidates(
     use crate::engine::BackendPreference as BP;
     use VisionEncoderAccel::{Hexagon, Metal, Wgpu, Xdna};
     if is_lfm3 {
-        return &[];
+        return match backend {
+            BP::Npu | BP::Auto => &[Xdna],
+            _ => &[],
+        };
     }
     match backend {
         BP::Cpu => &[],
@@ -3155,20 +3665,21 @@ pub fn build_gpu_vision_encoder(
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     let is_lfm3 = weights.config.projector_type.is_lfm3();
-    if is_lfm3 && !matches!(backend, crate::engine::BackendPreference::Cpu) {
-        tracing::debug!("vision encoder: lfm3 has no accelerated encoder; using the CPU encoder");
+    let candidates = vision_encoder_candidates(is_lfm3, backend);
+    if candidates.is_empty() && !matches!(backend, crate::engine::BackendPreference::Cpu) {
+        tracing::debug!(
+            "vision encoder: no accelerated encoder for {backend:?}; using the CPU encoder"
+        );
     }
     let allow_auto_xdna = backend != crate::engine::BackendPreference::Auto
         || xdna_vit_worthwhile_for_auto(weights.blocks.len(), weights.config.n_embd);
-    vision_encoder_candidates(is_lfm3, backend)
-        .iter()
-        .find_map(|accel| match accel {
-            VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
-            VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
-            VisionEncoderAccel::Xdna if allow_auto_xdna => try_xdna_vision_encoder_for(weights),
-            VisionEncoderAccel::Xdna => None,
-            VisionEncoderAccel::Metal => try_metal_vision_encoder(weights),
-        })
+    candidates.iter().find_map(|accel| match accel {
+        VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
+        VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
+        VisionEncoderAccel::Xdna if allow_auto_xdna => try_xdna_vision_encoder_for(weights),
+        VisionEncoderAccel::Xdna => None,
+        VisionEncoderAccel::Metal => try_metal_vision_encoder(weights),
+    })
 }
 
 #[cfg(feature = "gpu")]
@@ -3340,14 +3851,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_lfm3_vision_encoder_is_never_routed_to_an_accelerator() {
+    fn the_lfm3_vision_encoder_only_routes_to_xdna_on_npu_and_auto() {
         use crate::engine::BackendPreference as BP;
-        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Npu, BP::Metal, BP::Auto] {
+        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Metal] {
             assert!(
                 vision_encoder_candidates(true, backend).is_empty(),
                 "lfm3 was routed under {backend:?}"
             );
         }
+        assert_eq!(
+            vision_encoder_candidates(true, BP::Npu),
+            &[VisionEncoderAccel::Xdna]
+        );
+        assert_eq!(
+            vision_encoder_candidates(true, BP::Auto),
+            &[VisionEncoderAccel::Xdna]
+        );
         assert_eq!(
             vision_encoder_candidates(false, BP::Auto),
             &[

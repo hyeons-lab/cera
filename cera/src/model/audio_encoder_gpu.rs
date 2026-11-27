@@ -43,8 +43,8 @@
 use anyhow::Result;
 
 use super::audio_encoder::{
-    AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, ConvStemWeights, POS_EMB_DIM,
-    relative_pos_emb,
+    AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, ConvLayerWeights,
+    ConvStemWeights, POS_EMB_DIM, lfm3a_stem_geometry, relative_pos_emb,
 };
 #[cfg(feature = "gpu")]
 use super::vision_encoder_gpu::{VitBuf, VitGpuOps, WgpuVitOps, WgpuVitWeight};
@@ -428,6 +428,80 @@ pub trait AudioEncoderGpuOps {
         n_frames: usize,
         effective_n_len: usize,
     ) -> Self::Buf;
+
+    /// Whether this backend implements the LFM3A hybrid audio encoder primitives.
+    fn supports_lfm3a(&self) -> bool {
+        false
+    }
+
+    /// Maximum post-stem frame count supported by this audio backend (`MAX_AUDIO_TOKENS` for wgpu).
+    fn max_audio_tokens(&self) -> usize {
+        MAX_AUDIO_TOKENS
+    }
+
+    /// Out-of-place RMSNorm over the last dim (`rows` rows of width `dim`).
+    fn rmsnorm(
+        &self,
+        _src: &Self::Buf,
+        _weight: &Self::Buf,
+        _eps: f32,
+        _rows: usize,
+        _dim: usize,
+    ) -> Self::Buf {
+        unimplemented!("rmsnorm not supported by this audio backend")
+    }
+
+    /// In-place SwiGLU elementwise gate: `gate[i] = silu(gate[i]) * up[i]`.
+    fn silu_mul(&self, _gate: &Self::Buf, _up: &Self::Buf, _len: usize) {
+        unimplemented!("silu_mul not supported by this audio backend")
+    }
+
+    /// Run the 3- or 5-layer LFM3A SiLU conv stem on `[n_frames, n_mel]` and return the
+    /// flattened `[t_out, plane]` feature buffer paired with `t_out`.
+    fn lfm3a_conv_stem(
+        &self,
+        _mel: &Self::Buf,
+        _n_frames: usize,
+        _n_mel: usize,
+        _layers: &[ConvLayerWeights],
+    ) -> (Self::Buf, usize) {
+        unimplemented!("lfm3a_conv_stem not supported by this audio backend")
+    }
+
+    /// LFM3A causal depthwise ShortConv over `[t, 3 * n_embd]` (`[B, C, X]`).
+    fn lfm3a_shortconv_dw(
+        &self,
+        _bcx: &Self::Buf,
+        _conv_dw_w: &[f32],
+        _conv_dw_b: &[f32],
+        _kernel_size: usize,
+        _t: usize,
+        _n_embd: usize,
+    ) -> Self::Buf {
+        unimplemented!("lfm3a_shortconv_dw not supported by this audio backend")
+    }
+
+    /// LFM3A Q/K per-head RMSNorm + NeoX RoPE + causal sliding-window GQA + optional sigmoid gate.
+    #[allow(clippy::too_many_arguments)]
+    fn lfm3a_swa_attention(
+        &self,
+        _q: &Self::Buf,
+        _k: &Self::Buf,
+        _v: &Self::Buf,
+        _gate: Option<&Self::Buf>,
+        _gate_rows: usize,
+        _q_norm_w: &[f32],
+        _k_norm_w: &[f32],
+        _t: usize,
+        _n_head: usize,
+        _n_head_kv: usize,
+        _d_head: usize,
+        _eps: f32,
+        _rope_theta: f32,
+        _sliding_window: usize,
+    ) -> Self::Buf {
+        unimplemented!("lfm3a_swa_attention not supported by this audio backend")
+    }
 }
 
 /// The constant inputs of the log-mel front-end, uploaded once per model.
@@ -714,19 +788,71 @@ fn validate_block(il: usize, b: &ConformerLayerWeights, cfg: &AudioEncoderConfig
 /// Built once via [`GpuAudioWeights::build`] and reused across chunks: the
 /// upload (the mmproj dequantized where the backend has no packed GEMM) is the
 /// expensive part and must not happen per utterance.
+fn opt_audio_buf<O: AudioEncoderGpuOps>(ops: &O, data: &[f32]) -> Option<O::Buf> {
+    (!data.is_empty()).then(|| ops.upload(data))
+}
+
+#[allow(clippy::large_enum_variant)]
+enum GpuLfm3aBlockOp<O: AudioEncoderGpuOps> {
+    ShortConv {
+        conv_pw1_w: O::Weight,
+        conv_pw1_b: Option<O::Buf>,
+        conv_dw_w: Vec<f32>,
+        conv_dw_b: Vec<f32>,
+        kernel_size: usize,
+        conv_pw2_w: O::Weight,
+        conv_pw2_b: Option<O::Buf>,
+        attn_post_norm_w: Option<O::Buf>,
+    },
+    Attn {
+        attn_q_w: O::Weight,
+        attn_q_b: Option<O::Buf>,
+        attn_k_w: O::Weight,
+        attn_k_b: Option<O::Buf>,
+        attn_v_w: O::Weight,
+        attn_v_b: Option<O::Buf>,
+        attn_gate_w: Option<O::Weight>,
+        attn_gate_rows: usize,
+        q_norm_w: Vec<f32>,
+        k_norm_w: Vec<f32>,
+        attn_o_w: O::Weight,
+        attn_o_b: Option<O::Buf>,
+        attn_post_norm_w: Option<O::Buf>,
+    },
+}
+
+struct GpuLfm3aBlock<O: AudioEncoderGpuOps> {
+    ln1_w: O::Buf,
+    op: GpuLfm3aBlockOp<O>,
+    ln2_w: O::Buf,
+    ffn_gate_w: O::Weight,
+    ffn_up_w: O::Weight,
+    ffn_down_w: O::Weight,
+    ffn_post_norm_w: Option<O::Buf>,
+}
+
+struct GpuLfm3aWeights<O: AudioEncoderGpuOps> {
+    stem_layers: Vec<ConvLayerWeights>,
+    blocks: Vec<GpuLfm3aBlock<O>>,
+    post_ln_w: Option<O::Buf>,
+    rope_theta: f32,
+    n_head_kv: usize,
+    sliding_window: usize,
+}
+
 pub struct GpuAudioWeights<O: AudioEncoderGpuOps> {
     cfg: AudioEncoderConfig,
-    /// Window, twiddles and mel filterbank for the GPU log-mel front-end. Not a
-    /// weight (nothing here comes out of the GGUF), but it has the same lifetime
-    /// and the same reason to exist: uploaded once, reused per utterance.
-    mel_frontend: GpuMelFrontend<O>,
+    /// Window, twiddles and mel filterbank for the GPU log-mel front-end (`None` for LFM3A,
+    /// which uses `log_mel_spectrogram_lfm3a`).
+    mel_frontend: Option<GpuMelFrontend<O>>,
     stem: Vec<GpuStemLayer<O>>,
     pre_encode_out_w: O::Weight,
-    pre_encode_out_b: O::Buf,
+    pre_encode_out_b: Option<O::Buf>,
     /// Column count of `pre_encode_out` (`channels · freq` after the stem),
     /// carried from the loaded weight so the flatten can be checked against it.
     pre_encode_in_dim: usize,
     blocks: Vec<GpuConformerBlock<O>>,
+    lfm3a: Option<GpuLfm3aWeights<O>>,
     adapter_norm_w: O::Buf,
     adapter_norm_b: O::Buf,
     adapter_up_w: O::Weight,
@@ -738,7 +864,248 @@ pub struct GpuAudioWeights<O: AudioEncoderGpuOps> {
     adapter_intermediate: usize,
 }
 
+fn validate_adapter_weights(w: &AudioEncoderWeights, cfg: &AudioEncoderConfig) -> Result<usize> {
+    let adapter_intermediate = w.mlp_adapter.up_w.rows;
+    anyhow::ensure!(
+        w.mlp_adapter.norm_w.len() == cfg.n_embd
+            && w.mlp_adapter.norm_b.len() == cfg.n_embd
+            && w.mlp_adapter.up_b.len() == adapter_intermediate
+            && w.mlp_adapter.down_b.len() == cfg.llm_hidden_size,
+        "audio encoder MLP adapter vectors disagree with the config \
+         (norm {}/{}, up_b {}, down_b {}; n_embd {}, intermediate {}, llm_hidden {})",
+        w.mlp_adapter.norm_w.len(),
+        w.mlp_adapter.norm_b.len(),
+        w.mlp_adapter.up_b.len(),
+        w.mlp_adapter.down_b.len(),
+        cfg.n_embd,
+        adapter_intermediate,
+        cfg.llm_hidden_size,
+    );
+    anyhow::ensure!(
+        w.mlp_adapter.up_w.cols == cfg.n_embd
+            && w.mlp_adapter.down_w.cols == adapter_intermediate
+            && w.mlp_adapter.down_w.rows == cfg.llm_hidden_size,
+        "audio encoder MLP adapter shapes disagree with the config \
+         (up [{}, {}], down [{}, {}], n_embd {}, llm_hidden_size {})",
+        w.mlp_adapter.up_w.rows,
+        w.mlp_adapter.up_w.cols,
+        w.mlp_adapter.down_w.rows,
+        w.mlp_adapter.down_w.cols,
+        cfg.n_embd,
+        cfg.llm_hidden_size,
+    );
+    Ok(adapter_intermediate)
+}
+
 impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
+    /// True when loaded from an LFM3A (`lfm3a`) hybrid audio encoder.
+    pub fn is_lfm3a(&self) -> bool {
+        self.lfm3a.is_some()
+    }
+
+    fn build_lfm3a(ops: &O, w: &AudioEncoderWeights) -> Result<Self> {
+        anyhow::ensure!(
+            ops.supports_lfm3a(),
+            "audio encoder backend does not support LFM3A hybrid blocks"
+        );
+        let cfg = w.config.clone();
+        let n_embd = cfg.n_embd;
+        let n_ff = cfg.n_ff;
+        let n_head = cfg.n_head;
+        anyhow::ensure!(n_head > 0, "audio encoder config has n_head = 0");
+        anyhow::ensure!(
+            n_embd.is_multiple_of(n_head),
+            "audio encoder n_embd ({n_embd}) is not divisible by n_head ({n_head})",
+        );
+        let d_head = n_embd / n_head;
+        anyhow::ensure!(
+            w.layers.len() == cfg.n_layer && !w.layers.is_empty(),
+            "audio encoder config.n_layer ({}) != loaded blocks ({})",
+            cfg.n_layer,
+            w.layers.len(),
+        );
+        let n_stem = w.conv_stem.layers.len();
+        anyhow::ensure!(
+            n_stem == 3 || n_stem == 5,
+            "lfm3a conv stem has {n_stem} layers, expected 3 or 5"
+        );
+        let stem_shapes: Vec<&[usize]> = w
+            .conv_stem
+            .layers
+            .iter()
+            .map(|l| l.shape.as_slice())
+            .collect();
+        let (stem_ch, stem_f) = lfm3a_stem_geometry(&stem_shapes, cfg.n_mel_bins)?;
+        anyhow::ensure!(
+            w.conv_stem.pre_encode_out_w.rows == n_embd
+                && w.conv_stem.pre_encode_out_w.cols == stem_ch * stem_f
+                && (w.conv_stem.pre_encode_out_b.is_empty()
+                    || w.conv_stem.pre_encode_out_b.len() == n_embd),
+            "lfm3a pre_encode_out shape [{}, {}] / bias ({}) mismatch stem {}x{} and n_embd={n_embd}",
+            w.conv_stem.pre_encode_out_w.rows,
+            w.conv_stem.pre_encode_out_w.cols,
+            w.conv_stem.pre_encode_out_b.len(),
+            stem_ch,
+            stem_f,
+        );
+        let adapter_intermediate = validate_adapter_weights(w, &cfg)?;
+
+        let first_extras = w.layers[0]
+            .lfm3a
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("lfm3a block 0 missing Lfm3aLayerExtras"))?;
+        let rope_theta = first_extras.rope_theta;
+        let n_head_kv = first_extras.n_head_kv.max(1);
+        anyhow::ensure!(
+            n_head.is_multiple_of(n_head_kv),
+            "lfm3a n_head ({n_head}) not divisible by n_head_kv ({n_head_kv})"
+        );
+        let n_embd_kv = n_head_kv * d_head;
+        let sliding_window = first_extras.sliding_window;
+        let post_ln_w = opt_audio_buf(ops, &first_extras.post_ln_w);
+
+        let mut blocks = Vec::with_capacity(w.layers.len());
+        for (il, b) in w.layers.iter().enumerate() {
+            let extras = b
+                .lfm3a
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lfm3a block {il} missing Lfm3aLayerExtras"))?;
+            anyhow::ensure!(
+                b.ln1_w.len() == n_embd && b.ln2_w.len() == n_embd,
+                "lfm3a block {il} ln1/ln2 lens ({}, {}) != n_embd ({n_embd})",
+                b.ln1_w.len(),
+                b.ln2_w.len()
+            );
+            anyhow::ensure!(
+                b.ffn_up_1_w.rows == n_ff
+                    && b.ffn_up_1_w.cols == n_embd
+                    && b.ffn_up_w.rows == n_ff
+                    && b.ffn_up_w.cols == n_embd
+                    && b.ffn_down_w.rows == n_embd
+                    && b.ffn_down_w.cols == n_ff,
+                "lfm3a block {il} SwiGLU FFN shapes invalid for n_embd={n_embd}, n_ff={n_ff}"
+            );
+            anyhow::ensure!(
+                extras.attn_post_norm_w.is_empty() || extras.attn_post_norm_w.len() == n_embd,
+                "lfm3a block {il} attn_post_norm len ({}) != n_embd ({n_embd})",
+                extras.attn_post_norm_w.len()
+            );
+            anyhow::ensure!(
+                extras.ffn_post_norm_w.is_empty() || extras.ffn_post_norm_w.len() == n_embd,
+                "lfm3a block {il} ffn_post_norm len ({}) != n_embd ({n_embd})",
+                extras.ffn_post_norm_w.len()
+            );
+
+            let attn_post_norm_w = opt_audio_buf(ops, &extras.attn_post_norm_w);
+            let op = if !b.conv_dw_w.is_empty() {
+                anyhow::ensure!(
+                    (b.conv_dw_shape.len() == 2 || b.conv_dw_shape.len() == 3)
+                        && b.conv_dw_shape[0] > 0
+                        && b.conv_dw_shape[0] * n_embd == b.conv_dw_w.len(),
+                    "lfm3a block {il} ShortConv conv_dw shape {:?} / len {} invalid",
+                    b.conv_dw_shape,
+                    b.conv_dw_w.len()
+                );
+                anyhow::ensure!(
+                    b.conv_pw1_w.rows == 3 * n_embd
+                        && b.conv_pw1_w.cols == n_embd
+                        && b.conv_pw2_w.rows == n_embd
+                        && b.conv_pw2_w.cols == n_embd,
+                    "lfm3a block {il} ShortConv pw1/pw2 shapes invalid for n_embd={n_embd}"
+                );
+                GpuLfm3aBlockOp::ShortConv {
+                    conv_pw1_w: ops.upload_weight(&b.conv_pw1_w),
+                    conv_pw1_b: opt_audio_buf(ops, &b.conv_pw1_b),
+                    conv_dw_w: b.conv_dw_w.clone(),
+                    conv_dw_b: b.conv_dw_b.clone(),
+                    kernel_size: b.conv_dw_shape[0],
+                    conv_pw2_w: ops.upload_weight(&b.conv_pw2_w),
+                    conv_pw2_b: opt_audio_buf(ops, &b.conv_pw2_b),
+                    attn_post_norm_w,
+                }
+            } else {
+                anyhow::ensure!(
+                    b.attn_q_w.rows == n_embd
+                        && b.attn_q_w.cols == n_embd
+                        && b.attn_k_w.rows == n_embd_kv
+                        && b.attn_k_w.cols == n_embd
+                        && b.attn_v_w.rows == n_embd_kv
+                        && b.attn_v_w.cols == n_embd
+                        && b.attn_o_w.rows == n_embd
+                        && b.attn_o_w.cols == n_embd,
+                    "lfm3a block {il} attention projection shapes invalid for n_embd={n_embd}, kv={n_embd_kv}"
+                );
+                anyhow::ensure!(
+                    extras.q_norm_w.len() == d_head && extras.k_norm_w.len() == d_head,
+                    "lfm3a block {il} q/k norm lens ({}, {}) != d_head ({d_head})",
+                    extras.q_norm_w.len(),
+                    extras.k_norm_w.len()
+                );
+                let (attn_gate_w, attn_gate_rows) = if let Some(gw) = &extras.attn_gate_w {
+                    anyhow::ensure!(
+                        gw.cols == n_embd && (gw.rows == n_head || gw.rows == n_head * d_head),
+                        "lfm3a block {il} attn_gate shape ({}, {}) invalid",
+                        gw.rows,
+                        gw.cols
+                    );
+                    (Some(ops.upload_weight(gw)), gw.rows)
+                } else {
+                    (None, 0)
+                };
+                GpuLfm3aBlockOp::Attn {
+                    attn_q_w: ops.upload_weight(&b.attn_q_w),
+                    attn_q_b: opt_audio_buf(ops, &b.attn_q_b),
+                    attn_k_w: ops.upload_weight(&b.attn_k_w),
+                    attn_k_b: opt_audio_buf(ops, &b.attn_k_b),
+                    attn_v_w: ops.upload_weight(&b.attn_v_w),
+                    attn_v_b: opt_audio_buf(ops, &b.attn_v_b),
+                    attn_gate_w,
+                    attn_gate_rows,
+                    q_norm_w: extras.q_norm_w.clone(),
+                    k_norm_w: extras.k_norm_w.clone(),
+                    attn_o_w: ops.upload_weight(&b.attn_o_w),
+                    attn_o_b: opt_audio_buf(ops, &b.attn_o_b),
+                    attn_post_norm_w,
+                }
+            };
+
+            blocks.push(GpuLfm3aBlock {
+                ln1_w: ops.upload(&b.ln1_w),
+                op,
+                ln2_w: ops.upload(&b.ln2_w),
+                ffn_gate_w: ops.upload_weight(&b.ffn_up_1_w),
+                ffn_up_w: ops.upload_weight(&b.ffn_up_w),
+                ffn_down_w: ops.upload_weight(&b.ffn_down_w),
+                ffn_post_norm_w: opt_audio_buf(ops, &extras.ffn_post_norm_w),
+            });
+        }
+
+        Ok(Self {
+            mel_frontend: None,
+            cfg,
+            stem: Vec::new(),
+            pre_encode_out_w: ops.upload_weight(&w.conv_stem.pre_encode_out_w),
+            pre_encode_out_b: opt_audio_buf(ops, &w.conv_stem.pre_encode_out_b),
+            pre_encode_in_dim: w.conv_stem.pre_encode_out_w.cols,
+            blocks: Vec::new(),
+            lfm3a: Some(GpuLfm3aWeights {
+                stem_layers: w.conv_stem.layers.clone(),
+                blocks,
+                post_ln_w,
+                rope_theta,
+                n_head_kv,
+                sliding_window,
+            }),
+            adapter_norm_w: ops.upload(&w.mlp_adapter.norm_w),
+            adapter_norm_b: ops.upload(&w.mlp_adapter.norm_b),
+            adapter_up_w: ops.upload_weight(&w.mlp_adapter.up_w),
+            adapter_up_b: ops.upload(&w.mlp_adapter.up_b),
+            adapter_down_w: ops.upload_weight(&w.mlp_adapter.down_w),
+            adapter_down_b: ops.upload(&w.mlp_adapter.down_b),
+            adapter_intermediate,
+        })
+    }
+
     /// Upload every encoder weight via `ops`. Run once per loaded model.
     ///
     /// Fails rather than uploading a model this path cannot run correctly: the
@@ -746,6 +1113,9 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
     /// all checked here, where the error can name the tensor, instead of
     /// surfacing as a wrong-shaped dispatch later.
     pub fn build(ops: &O, w: &AudioEncoderWeights) -> Result<Self> {
+        if w.is_lfm3a() {
+            return Self::build_lfm3a(ops, w);
+        }
         let cfg = w.config.clone();
         anyhow::ensure!(cfg.n_head > 0, "audio encoder config has n_head = 0");
         anyhow::ensure!(
@@ -800,35 +1170,7 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
             cfg.n_embd,
         );
 
-        let adapter_intermediate = w.mlp_adapter.up_w.rows;
-        anyhow::ensure!(
-            w.mlp_adapter.norm_w.len() == cfg.n_embd
-                && w.mlp_adapter.norm_b.len() == cfg.n_embd
-                && w.mlp_adapter.up_b.len() == adapter_intermediate
-                && w.mlp_adapter.down_b.len() == cfg.llm_hidden_size,
-            "audio encoder MLP adapter vectors disagree with the config \
-             (norm {}/{}, up_b {}, down_b {}; n_embd {}, intermediate {}, llm_hidden {})",
-            w.mlp_adapter.norm_w.len(),
-            w.mlp_adapter.norm_b.len(),
-            w.mlp_adapter.up_b.len(),
-            w.mlp_adapter.down_b.len(),
-            cfg.n_embd,
-            adapter_intermediate,
-            cfg.llm_hidden_size,
-        );
-        anyhow::ensure!(
-            w.mlp_adapter.up_w.cols == cfg.n_embd
-                && w.mlp_adapter.down_w.cols == adapter_intermediate
-                && w.mlp_adapter.down_w.rows == cfg.llm_hidden_size,
-            "audio encoder MLP adapter shapes disagree with the config \
-             (up [{}, {}], down [{}, {}], n_embd {}, llm_hidden_size {})",
-            w.mlp_adapter.up_w.rows,
-            w.mlp_adapter.up_w.cols,
-            w.mlp_adapter.down_w.rows,
-            w.mlp_adapter.down_w.cols,
-            cfg.n_embd,
-            cfg.llm_hidden_size,
-        );
+        let adapter_intermediate = validate_adapter_weights(w, &cfg)?;
 
         let blocks = w
             .layers
@@ -880,13 +1222,14 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            mel_frontend: GpuMelFrontend::build(ops, cfg.n_mel_bins)?,
+            mel_frontend: Some(GpuMelFrontend::build(ops, cfg.n_mel_bins)?),
             cfg,
             stem,
             pre_encode_out_w: ops.upload_weight(&w.conv_stem.pre_encode_out_w),
-            pre_encode_out_b: ops.upload(&w.conv_stem.pre_encode_out_b),
+            pre_encode_out_b: opt_audio_buf(ops, &w.conv_stem.pre_encode_out_b),
             pre_encode_in_dim: w.conv_stem.pre_encode_out_w.cols,
             blocks,
+            lfm3a: None,
             adapter_norm_w: ops.upload(&w.mlp_adapter.norm_w),
             adapter_norm_b: ops.upload(&w.mlp_adapter.norm_b),
             adapter_up_w: ops.upload_weight(&w.mlp_adapter.up_w),
@@ -1041,7 +1384,8 @@ fn conv_stem_gpu<O: AudioEncoderGpuOps>(
     let no_layers = || anyhow::anyhow!("conv_stem_gpu: conv stem has no layers");
     let last = specs.last().ok_or_else(no_layers)?;
     let (t, f_out) = (last.h_out, last.w_out);
-    anyhow::ensure!(t > 0 && t <= MAX_AUDIO_TOKENS, "{}", over_capacity_msg(t));
+    let cap = ops.max_audio_tokens();
+    anyhow::ensure!(t > 0 && t <= cap, "{}", over_capacity_msg(t));
     // A backend with a dispatch limit refuses an unsplittable shape here, where the
     // refusal is still a `Result`: `conv2d` itself returns a buffer and can only abort.
     for spec in &specs {
@@ -1085,7 +1429,9 @@ fn conv_stem_gpu<O: AudioEncoderGpuOps>(
     // Permute (channel, time, freq) → (time, channel·freq), then project.
     let flat = ops.transpose_blocked(&cur, cur_ch, t, f_out);
     let x = ops.linear(&flat, &gpu_w.pre_encode_out_w, t, cfg.n_embd, plane);
-    ops.bias_add(&x, &gpu_w.pre_encode_out_b, t, cfg.n_embd);
+    if let Some(b) = &gpu_w.pre_encode_out_b {
+        ops.bias_add(&x, b, t, cfg.n_embd);
+    }
     Ok((x, t))
 }
 
@@ -1099,17 +1445,15 @@ fn conv_stem_gpu<O: AudioEncoderGpuOps>(
 /// one. `conv_stem_gpu` re-checks with the specs it actually dispatches, so the
 /// guard still holds for a caller that skips this.
 fn ensure_capacity<O: AudioEncoderGpuOps>(
+    ops: &O,
     gpu_w: &GpuAudioWeights<O>,
     n_frames: usize,
 ) -> Result<()> {
     let t_out = gpu_w
         .predict_t_out(n_frames)
         .ok_or_else(|| anyhow::anyhow!("{}", unrunnable_stem_msg(n_frames)))?;
-    anyhow::ensure!(
-        t_out > 0 && t_out <= MAX_AUDIO_TOKENS,
-        "{}",
-        over_capacity_msg(t_out)
-    );
+    let cap = ops.max_audio_tokens();
+    anyhow::ensure!(t_out > 0 && t_out <= cap, "{}", over_capacity_msg(t_out));
     Ok(())
 }
 
@@ -1140,7 +1484,7 @@ fn upload_mel<O: AudioEncoderGpuOps>(
     if n_frames == 0 {
         return Ok(None);
     }
-    ensure_capacity(gpu_w, n_frames)?;
+    ensure_capacity(ops, gpu_w, n_frames)?;
     Ok(Some(ops.upload(mel)))
 }
 
@@ -1183,6 +1527,19 @@ pub fn encode_audio_mel_gpu<O: AudioEncoderGpuOps>(
     mel: &[f32],
     n_frames: usize,
 ) -> Result<(Vec<f32>, usize)> {
+    if gpu_w.is_lfm3a() {
+        anyhow::ensure!(
+            mel.len() == n_frames * gpu_w.cfg.n_mel_bins,
+            "audio encoder: mel.len() {} != n_frames * n_mel_bins ({n_frames} * {})",
+            mel.len(),
+            gpu_w.cfg.n_mel_bins,
+        );
+        if n_frames == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let mel_buf = ops.upload(mel);
+        return encode_audio_lfm3a_gpu(ops, gpu_w, &mel_buf, n_frames);
+    }
     let Some(mel_buf) = upload_mel(ops, gpu_w, mel, n_frames)? else {
         return Ok((Vec::new(), 0));
     };
@@ -1204,21 +1561,200 @@ pub fn encode_audio_pcm_gpu<O: AudioEncoderGpuOps>(
     gpu_w: &GpuAudioWeights<O>,
     pcm: &[f32],
 ) -> Result<(Vec<f32>, usize)> {
+    if gpu_w.is_lfm3a() {
+        let (mel, n_frames) =
+            crate::model::audio_preprocessor::log_mel_spectrogram_lfm3a(pcm, gpu_w.cfg.n_mel_bins);
+        if n_frames == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let mel_buf = ops.upload(&mel);
+        return encode_audio_lfm3a_gpu(ops, gpu_w, &mel_buf, n_frames);
+    }
     let n_frames = crate::model::audio_preprocessor::n_frames_for(pcm.len());
     if n_frames == 0 {
         return Ok((Vec::new(), 0));
     }
-    ensure_capacity(gpu_w, n_frames)?;
+    ensure_capacity(ops, gpu_w, n_frames)?;
+
+    let mel_frontend = gpu_w
+        .mel_frontend
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("audio encoder missing mel_frontend"))?;
 
     // The front-end decides emptiness from the same `n_frames_for` the early
     // return above used, so this arm cannot be reached; it is here because the
     // return type is an `Option`, not as a second guard on the same condition.
     // (Its other failure mode, a chunk too large for the kernels' `u32` sizes,
     // is an `Err` and propagates rather than arriving here as an empty result.)
-    let Some((mel, n_frames)) = log_mel_spectrogram_gpu(ops, &gpu_w.mel_frontend, pcm)? else {
+    let Some((mel, n_frames)) = log_mel_spectrogram_gpu(ops, mel_frontend, pcm)? else {
         return Ok((Vec::new(), 0));
     };
     encode_audio_gpu(ops, gpu_w, &mel, n_frames)
+}
+
+fn adapter_forward_gpu<O: AudioEncoderGpuOps>(
+    ops: &O,
+    gpu_w: &GpuAudioWeights<O>,
+    x: &O::Buf,
+    t: usize,
+    norm_eps: f32,
+) -> (Vec<f32>, usize) {
+    let cfg = &gpu_w.cfg;
+    let n_ff_adapter = gpu_w.adapter_intermediate;
+    let llm_hidden = cfg.llm_hidden_size;
+    let normed = ops.layernorm(
+        x,
+        &gpu_w.adapter_norm_w,
+        &gpu_w.adapter_norm_b,
+        norm_eps,
+        t,
+        cfg.n_embd,
+    );
+    let mid = ops.linear(&normed, &gpu_w.adapter_up_w, t, n_ff_adapter, cfg.n_embd);
+    ops.bias_add(&mid, &gpu_w.adapter_up_b, t, n_ff_adapter);
+    ops.gelu_erf(&mid, t * n_ff_adapter);
+    let out = ops.linear(&mid, &gpu_w.adapter_down_w, t, llm_hidden, n_ff_adapter);
+    ops.bias_add(&out, &gpu_w.adapter_down_b, t, llm_hidden);
+    (ops.download(&out, t * llm_hidden), t)
+}
+
+fn encode_audio_lfm3a_gpu<O: AudioEncoderGpuOps>(
+    ops: &O,
+    gpu_w: &GpuAudioWeights<O>,
+    mel: &O::Buf,
+    n_frames: usize,
+) -> Result<(Vec<f32>, usize)> {
+    anyhow::ensure!(
+        ops.supports_lfm3a(),
+        "audio encoder backend does not support LFM3A hybrid blocks"
+    );
+    let lfm3a = gpu_w
+        .lfm3a
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("GpuAudioWeights built without LFM3A block weights"))?;
+    let cfg = &gpu_w.cfg;
+    let (n_embd, n_ff, n_head, eps) = (cfg.n_embd, cfg.n_ff, cfg.n_head, cfg.eps);
+    let n_head_kv = lfm3a.n_head_kv;
+    let d_head = n_embd / n_head;
+    let n_embd_kv = n_head_kv * d_head;
+
+    let (flat_seq, t) = ops.lfm3a_conv_stem(mel, n_frames, cfg.n_mel_bins, &lfm3a.stem_layers);
+    if t == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let mut x = ops.linear(
+        &flat_seq,
+        &gpu_w.pre_encode_out_w,
+        t,
+        n_embd,
+        gpu_w.pre_encode_in_dim,
+    );
+    if let Some(b) = &gpu_w.pre_encode_out_b {
+        ops.bias_add(&x, b, t, n_embd);
+    }
+    let x_len = t * n_embd;
+
+    for blk in &lfm3a.blocks {
+        let normed = ops.rmsnorm(&x, &blk.ln1_w, eps, t, n_embd);
+        match &blk.op {
+            GpuLfm3aBlockOp::ShortConv {
+                conv_pw1_w,
+                conv_pw1_b,
+                conv_dw_w,
+                conv_dw_b,
+                kernel_size,
+                conv_pw2_w,
+                conv_pw2_b,
+                attn_post_norm_w,
+            } => {
+                let bcx = ops.linear(&normed, conv_pw1_w, t, 3 * n_embd, n_embd);
+                if let Some(b) = conv_pw1_b {
+                    ops.bias_add(&bcx, b, t, 3 * n_embd);
+                }
+                let conv_y =
+                    ops.lfm3a_shortconv_dw(&bcx, conv_dw_w, conv_dw_b, *kernel_size, t, n_embd);
+                let mut y_out = ops.linear(&conv_y, conv_pw2_w, t, n_embd, n_embd);
+                if let Some(b) = conv_pw2_b {
+                    ops.bias_add(&y_out, b, t, n_embd);
+                }
+                if let Some(pw) = attn_post_norm_w {
+                    y_out = ops.rmsnorm(&y_out, pw, eps, t, n_embd);
+                }
+                ops.add(&x, &y_out, x_len);
+            }
+            GpuLfm3aBlockOp::Attn {
+                attn_q_w,
+                attn_q_b,
+                attn_k_w,
+                attn_k_b,
+                attn_v_w,
+                attn_v_b,
+                attn_gate_w,
+                attn_gate_rows,
+                q_norm_w,
+                k_norm_w,
+                attn_o_w,
+                attn_o_b,
+                attn_post_norm_w,
+            } => {
+                let q = ops.linear(&normed, attn_q_w, t, n_embd, n_embd);
+                if let Some(b) = attn_q_b {
+                    ops.bias_add(&q, b, t, n_embd);
+                }
+                let k = ops.linear(&normed, attn_k_w, t, n_embd_kv, n_embd);
+                if let Some(b) = attn_k_b {
+                    ops.bias_add(&k, b, t, n_embd_kv);
+                }
+                let v = ops.linear(&normed, attn_v_w, t, n_embd_kv, n_embd);
+                if let Some(b) = attn_v_b {
+                    ops.bias_add(&v, b, t, n_embd_kv);
+                }
+                let gate = attn_gate_w
+                    .as_ref()
+                    .map(|gw| ops.linear(&normed, gw, t, *attn_gate_rows, n_embd));
+                let attn_v = ops.lfm3a_swa_attention(
+                    &q,
+                    &k,
+                    &v,
+                    gate.as_ref(),
+                    *attn_gate_rows,
+                    q_norm_w,
+                    k_norm_w,
+                    t,
+                    n_head,
+                    n_head_kv,
+                    d_head,
+                    eps,
+                    lfm3a.rope_theta,
+                    lfm3a.sliding_window,
+                );
+                let mut o_out = ops.linear(&attn_v, attn_o_w, t, n_embd, n_embd);
+                if let Some(b) = attn_o_b {
+                    ops.bias_add(&o_out, b, t, n_embd);
+                }
+                if let Some(pw) = attn_post_norm_w {
+                    o_out = ops.rmsnorm(&o_out, pw, eps, t, n_embd);
+                }
+                ops.add(&x, &o_out, x_len);
+            }
+        }
+
+        let normed2 = ops.rmsnorm(&x, &blk.ln2_w, eps, t, n_embd);
+        let gate = ops.linear(&normed2, &blk.ffn_gate_w, t, n_ff, n_embd);
+        let up = ops.linear(&normed2, &blk.ffn_up_w, t, n_ff, n_embd);
+        ops.silu_mul(&gate, &up, t * n_ff);
+        let mut down = ops.linear(&gate, &blk.ffn_down_w, t, n_embd, n_ff);
+        if let Some(pw) = &blk.ffn_post_norm_w {
+            down = ops.rmsnorm(&down, pw, eps, t, n_embd);
+        }
+        ops.add(&x, &down, x_len);
+    }
+
+    if let Some(post_ln_w) = &lfm3a.post_ln_w {
+        x = ops.rmsnorm(&x, post_ln_w, eps, t, n_embd);
+    }
+
+    Ok(adapter_forward_gpu(ops, gpu_w, &x, t, 1e-5))
 }
 
 /// The encoder proper, from an already-resident `[n_frames, n_mel_bins]`
@@ -1336,23 +1872,7 @@ fn encode_audio_gpu<O: AudioEncoderGpuOps>(
     }
 
     // ── Stage 4: MLP adapter → LLM hidden size ──
-    let n_ff_adapter = gpu_w.adapter_intermediate;
-    let llm_hidden = cfg.llm_hidden_size;
-    let normed = ops.layernorm(
-        &x,
-        &gpu_w.adapter_norm_w,
-        &gpu_w.adapter_norm_b,
-        eps,
-        t,
-        n_embd,
-    );
-    let mid = ops.linear(&normed, &gpu_w.adapter_up_w, t, n_ff_adapter, n_embd);
-    ops.bias_add(&mid, &gpu_w.adapter_up_b, t, n_ff_adapter);
-    ops.gelu_erf(&mid, t * n_ff_adapter);
-    let out = ops.linear(&mid, &gpu_w.adapter_down_w, t, llm_hidden, n_ff_adapter);
-    ops.bias_add(&out, &gpu_w.adapter_down_b, t, llm_hidden);
-
-    Ok((ops.download(&out, t * llm_hidden), t))
+    Ok(adapter_forward_gpu(ops, gpu_w, &x, t, eps))
 }
 
 /// One Conformer macaron feed-forward sub-block, accumulated into `x` at half
@@ -2486,10 +3006,8 @@ enum AudioEncoderAccel {
     Metal,
 }
 
-/// The accelerators to try for an audio encoder, in order. The LFM3A encoder (hybrid short
-/// conv and attention, RMS norms) has no accelerated implementation: the Hexagon, XDNA, Metal and
-/// wgpu encoders all stage the LFM2A Conformer layout, so sending it to one would bring a
-/// device up and then reject the weights (or run the wrong graph). It stays on the CPU.
+/// The accelerators to try for an audio encoder, in order. LFM3A hybrid encoders route to
+/// AMD XDNA (`Npu` / `Auto`) and stay on CPU for backends that only host LFM2A Conformers.
 fn audio_encoder_candidates(
     is_lfm3a: bool,
     backend: crate::engine::BackendPreference,
@@ -2497,7 +3015,10 @@ fn audio_encoder_candidates(
     use crate::engine::BackendPreference as BP;
     use AudioEncoderAccel::{Hexagon, Metal, Wgpu, Xdna};
     if is_lfm3a {
-        return &[];
+        return match backend {
+            BP::Npu | BP::Auto => &[Xdna],
+            _ => &[],
+        };
     }
     match backend {
         BP::Cpu => &[],
@@ -2523,7 +3044,7 @@ fn xdna_worthwhile_for_auto(n_layers: usize, n_embd: usize) -> bool {
 
 /// Build a cached GPU audio encoder for `weights`, honoring `backend`.
 ///
-/// Returns `None` for `Cpu`, for the LFM3A encoder (CPU only, see
+/// Returns `None` for `Cpu`, for unsupported backends on LFM3A (CPU fallback, see
 /// `audio_encoder_candidates`), when the chosen backend's feature isn't compiled,
 /// or when the device/context can't be created. The caller then uses the CPU
 /// encoder. `Auto` prefers Metal, then Hexagon, then XDNA (when stack size
@@ -2533,8 +3054,10 @@ pub fn build_gpu_audio_encoder(
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
     let candidates = audio_encoder_candidates(weights.is_lfm3a(), backend);
-    if weights.is_lfm3a() && !matches!(backend, crate::engine::BackendPreference::Cpu) {
-        tracing::debug!("audio encoder: lfm3a has no accelerated encoder; using the CPU encoder");
+    if candidates.is_empty() && !matches!(backend, crate::engine::BackendPreference::Cpu) {
+        tracing::debug!(
+            "audio encoder: no accelerated encoder for {backend:?}; using the CPU encoder"
+        );
     }
     let allow_auto_xdna = backend != crate::engine::BackendPreference::Auto
         || xdna_worthwhile_for_auto(weights.layers.len(), weights.config.n_embd);
@@ -2625,14 +3148,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_lfm3a_encoder_is_never_routed_to_an_accelerator() {
+    fn the_lfm3a_encoder_only_routes_to_xdna_on_npu_and_auto() {
         use crate::engine::BackendPreference as BP;
-        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Npu, BP::Metal, BP::Auto] {
+        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Metal] {
             assert!(
                 audio_encoder_candidates(true, backend).is_empty(),
                 "lfm3a was routed under {backend:?}"
             );
         }
+        assert_eq!(
+            audio_encoder_candidates(true, BP::Npu),
+            &[AudioEncoderAccel::Xdna]
+        );
+        assert_eq!(
+            audio_encoder_candidates(true, BP::Auto),
+            &[AudioEncoderAccel::Xdna]
+        );
         // the LFM2A routes include both NPU backends
         assert_eq!(
             audio_encoder_candidates(false, BP::Auto),

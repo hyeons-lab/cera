@@ -60,6 +60,23 @@ extern const int32_t dec_lane_idx[16];
 aie::vector<float, 16> dec_fmul_16(aie::vector<float, 16> a, aie::vector<float, 16> b);
 aie::vector<float, 16> dec_inv_16(aie::vector<float, 16> v);
 aie::vector<float, 16> dec_exp2f_16(aie::vector<float, 16> x);
+void dec_scale_o(float alpha);
+void dec_reset_fa_state();
+
+static inline __attribute__((always_inline)) aie::vector<float, 16> fast_fmul2_16(
+    aie::vector<float, 16> a,
+    aie::vector<float, 16> b) {
+  aie::vector<bfloat16, 16> ah = aie::accum<accfloat, 16>(a).template to_vector<bfloat16>();
+  aie::vector<bfloat16, 16> bh = aie::accum<accfloat, 16>(b).template to_vector<bfloat16>();
+  aie::vector<bfloat16, 16> al = aie::accum<accfloat, 16>(
+      aie::sub(a, aie::accum<accfloat, 16>(ah).template to_vector<float>())).template to_vector<bfloat16>();
+  aie::vector<bfloat16, 16> bl = aie::accum<accfloat, 16>(
+      aie::sub(b, aie::accum<accfloat, 16>(bh).template to_vector<float>())).template to_vector<bfloat16>();
+  aie::accum<accfloat, 16> acc = aie::mul<accfloat>(ah, bh);
+  acc = aie::mac(acc, ah, bl);
+  acc = aie::mac(acc, al, bh);
+  return acc.template to_vector<float>();
+}
 
 static inline aie::vector<bfloat16, 16> dec_f32_to_bf16_16(aie::vector<float, 16> v) {
   aie::accum<accfloat, 16> a;
