@@ -859,9 +859,9 @@ impl CeraEngine {
         // device is available. Uploading the mmproj to the GPU here (once)
         // keeps it off the per-image hot path. Falls back to `None` (CPU
         // encode) for `Cpu`, disabled features, or device-init failure.
-        // Under `Auto` the vision encoder goes where the trunk went, so a model on the NPU does
-        // not end up with its tower on another accelerator when the NPU has no room for it.
-        let vision_backend = match (cfg.backend, model.backend_label()) {
+        // Under `Auto` auxiliary towers go where the trunk went, so a model on the NPU does
+        // not end up with a tower on another accelerator when the NPU has no room for it.
+        let aux_backend = match (cfg.backend, model.backend_label()) {
             (BackendPreference::Auto, "metal") => BackendPreference::Metal,
             (BackendPreference::Auto, "hexagon") => BackendPreference::Hexagon,
             (BackendPreference::Auto, "xdna") => BackendPreference::Npu,
@@ -871,7 +871,7 @@ impl CeraEngine {
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
             crate::model::vision_encoder_gpu::build_gpu_vision_encoder(
                 w,
-                encoder_backend("CERA_VISION_BACKEND", vision_backend),
+                encoder_backend("CERA_VISION_BACKEND", aux_backend),
             )
         });
         if gpu_vision_encoder.is_none()
@@ -882,12 +882,12 @@ impl CeraEngine {
         let gpu_audio_encoder = audio_encoder.as_ref().and_then(|w| {
             crate::model::audio_encoder_gpu::build_gpu_audio_encoder(
                 w,
-                encoder_backend("CERA_AUDIO_ENCODER_BACKEND", vision_backend),
+                encoder_backend("CERA_AUDIO_ENCODER_BACKEND", aux_backend),
             )
         });
         let (eager_audio_decoder, eager_detok_weights, eager_audio_accelerator) =
             if path.is_some() && aux.audio_decoder.is_none() {
-                try_load_audio_decoder_and_detok(&manifest, vision_backend)
+                try_load_audio_decoder_and_detok(&manifest, aux_backend)
             } else {
                 (aux.audio_decoder, aux.detok_weights, aux.audio_accelerator)
             };
