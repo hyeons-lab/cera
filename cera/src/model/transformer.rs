@@ -2536,6 +2536,14 @@ impl DecodeAttnDims {
     fn kv_dim(&self) -> usize {
         self.n_kv_heads * self.head_dim
     }
+
+    /// First cached position the query attends: keys before a sliding window get no weight.
+    #[inline]
+    fn window_start(&self) -> usize {
+        self.sliding_window
+            .filter(|&w| w > 0)
+            .map_or(0, |w| self.seq_len.saturating_sub(w))
+    }
 }
 
 /// Score-MACs (`n_heads * seq_len * head_dim`) below which the head loop runs on
@@ -2610,10 +2618,6 @@ fn decode_attn_head(
     if let Some(cap) = d.attn_logit_softcapping {
         cpu::softcap_inplace(scores, cap);
     }
-    if let Some(w) = d.sliding_window.filter(|&w| w > 0) {
-        let cutoff = d.seq_len.saturating_sub(w);
-        scores[..cutoff].fill(f32::NEG_INFINITY);
-    }
     cpu::softmax_inplace(scores);
 
     match kv {
@@ -2642,7 +2646,8 @@ fn decode_attn_head(
     }
 }
 
-/// Decode-time grouped-query attention over the whole KV cache, writing
+/// Decode-time grouped-query attention over the KV cache (on a sliding-window
+/// layer, only its last `sliding_window` positions), writing
 /// `attn_out[q_dim]`. Shared by the dense transformers and LFM2's non-TurboQuant
 /// path — the two head loops were identical.
 ///
@@ -2680,6 +2685,24 @@ pub(crate) fn decode_attention(
         d.n_heads,
         d.n_kv_heads
     );
+    // Rows before the window are skipped, not masked: masking gave them a weight of exactly 0.
+    let start = d.window_start();
+    let skip = start * d.kv_dim();
+    let kv = &match *kv {
+        KvView::F32 { k, v } => KvView::F32 {
+            k: &k[skip..],
+            v: &v[skip..],
+        },
+        KvView::F16 { k, v } => KvView::F16 {
+            k: &k[skip..],
+            v: &v[skip..],
+        },
+    };
+    let d = &DecodeAttnDims {
+        seq_len: d.seq_len - start,
+        sliding_window: None,
+        ..*d
+    };
     let work = d
         .n_heads
         .saturating_mul(d.seq_len)
@@ -3712,16 +3735,41 @@ mod tests {
 mod decode_attn_tests {
     use super::*;
 
-    /// Reference: the serial head loop `decode_attention` replaced, driven
-    /// through the same per-head primitive so the only thing under test is the
-    /// fan-out plumbing — head→row mapping, the fused `scores | out` arena, and
-    /// the gather back into `attn_out`.
-    fn serial_reference(q: &[f32], kv: &KvView<'_>, d: &DecodeAttnDims) -> Vec<f32> {
-        let mut out = vec![0.0f32; d.n_heads * d.head_dim];
-        let mut scores = vec![0.0f32; d.seq_len];
-        for h in 0..d.n_heads {
-            let head_out = &mut out[h * d.head_dim..(h + 1) * d.head_dim];
-            decode_attn_head(q, kv, d, h, &mut scores, head_out);
+    /// Reference: the serial head loop over the whole cache, masking the keys
+    /// before a sliding window to -inf ahead of the softmax, as `decode_attention`
+    /// did before it skipped them. Same kernels in the same order, so comparing
+    /// bit for bit checks the fan-out plumbing (head to row mapping, the fused
+    /// `scores | out` arena, the gather into `attn_out`) and the window skip.
+    fn masked_reference(q: &[f32], kv: &KvView<'_>, d: &DecodeAttnDims) -> Vec<f32> {
+        let (hd, kv_dim, n) = (d.head_dim, d.kv_dim(), d.seq_len);
+        let cutoff = d
+            .sliding_window
+            .filter(|&w| w > 0)
+            .map_or(0, |w| n.saturating_sub(w));
+        let mut out = vec![0.0f32; d.n_heads * hd];
+        let mut scores = vec![0.0f32; n];
+        for (h, head_out) in out.chunks_exact_mut(hd).enumerate() {
+            let q_head = &q[h * hd..(h + 1) * hd];
+            let off = (h / d.group_size()) * hd;
+            match kv {
+                KvView::F32 { k, .. } => {
+                    cpu::attn_scores(q_head, k, &mut scores, kv_dim, off, hd, d.scale, n)
+                }
+                KvView::F16 { k, .. } => {
+                    cpu::attn_scores_f16(q_head, k, &mut scores, kv_dim, off, hd, d.scale, n)
+                }
+            }
+            if let Some(cap) = d.attn_logit_softcapping {
+                cpu::softcap_inplace(&mut scores, cap);
+            }
+            scores[..cutoff].fill(f32::NEG_INFINITY);
+            cpu::softmax_inplace(&mut scores);
+            match kv {
+                KvView::F32 { v, .. } => cpu::attn_values(&scores, v, head_out, kv_dim, off, hd, n),
+                KvView::F16 { v, .. } => {
+                    cpu::attn_values_f16(&scores, v, head_out, kv_dim, off, hd, n)
+                }
+            }
         }
         out
     }
@@ -3733,7 +3781,7 @@ mod decode_attn_tests {
         // computes the work term differently is not a mirror.
         let work = d
             .n_heads
-            .saturating_mul(d.seq_len)
+            .saturating_mul(d.seq_len - d.window_start())
             .saturating_mul(d.head_dim);
         d.n_heads > 1 && work >= decode_attn_par_min_work() && cpu::decode_par_threads() > 1
     }
@@ -3750,6 +3798,7 @@ mod decode_attn_tests {
         n_kv_heads: usize,
         head_dim: usize,
         seq_len: usize,
+        sliding_window: Option<usize>,
         expect_fan_out: bool,
     ) {
         let kv_dim = n_kv_heads * head_dim;
@@ -3763,23 +3812,42 @@ mod decode_attn_tests {
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg()).collect();
         let k: Vec<f32> = (0..seq_len * kv_dim).map(|_| lcg()).collect();
         let v: Vec<f32> = (0..seq_len * kv_dim).map(|_| lcg()).collect();
-        let k_f16: Vec<u16> = k
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
-        let v_f16: Vec<u16> = v
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
+        // `decode_attention` gets NaN in the value rows before the window: reading them, as the
+        // masked path did, gives 0 * NaN = NaN.
+        let start = sliding_window
+            .filter(|&w| w > 0)
+            .map_or(0, |w| seq_len.saturating_sub(w));
+        let mut v_nan = v.clone();
+        v_nan[..start * kv_dim].fill(f32::NAN);
+        let to_f16 = |x: &[f32]| -> Vec<u16> {
+            x.iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect()
+        };
+        let (k_f16, v_f16, v_nan_f16) = (to_f16(&k), to_f16(&v), to_f16(&v_nan));
 
-        for use_f16 in [false, true] {
-            let kv = if use_f16 {
-                KvView::F16 {
-                    k: &k_f16,
-                    v: &v_f16,
-                }
+        for (use_f16, attn_logit_softcapping) in [
+            (false, None),
+            (true, None),
+            (false, Some(0.5)),
+            (true, Some(0.5)),
+        ] {
+            let (kv, kv_nan) = if use_f16 {
+                (
+                    KvView::F16 {
+                        k: &k_f16,
+                        v: &v_f16,
+                    },
+                    KvView::F16 {
+                        k: &k_f16,
+                        v: &v_nan_f16,
+                    },
+                )
             } else {
-                KvView::F32 { k: &k, v: &v }
+                (
+                    KvView::F32 { k: &k, v: &v },
+                    KvView::F32 { k: &k, v: &v_nan },
+                )
             };
             let d = DecodeAttnDims {
                 n_heads,
@@ -3787,8 +3855,8 @@ mod decode_attn_tests {
                 head_dim,
                 scale: 1.0 / (head_dim as f32).sqrt(),
                 seq_len,
-                attn_logit_softcapping: None,
-                sliding_window: None,
+                attn_logit_softcapping,
+                sliding_window,
             };
             // Skipped when the gate is overridden, since the override moves the
             // very threshold this is asserting against — otherwise anyone who
@@ -3803,15 +3871,17 @@ mod decode_attn_tests {
                      branch — this test would not be checking what it claims"
                 );
             }
-            let want = serial_reference(&q, &kv, &d);
+            let want = masked_reference(&q, &kv, &d);
             let mut got = vec![0.0f32; n_heads * head_dim];
             // Deliberately undersized: `decode_attention` must grow and re-lay-out
             // whatever it is handed, exactly as it does when depth advances.
             let mut scratch = vec![0.0f32; 1];
-            decode_attention(&q, &kv, &d, &mut got, &mut scratch);
+            decode_attention(&q, &kv_nan, &d, &mut got, &mut scratch);
             assert_eq!(
                 got, want,
-                "decode_attention differs (n_heads={n_heads}, seq_len={seq_len}, use_f16={use_f16})"
+                "decode_attention differs (n_heads={n_heads}, n_kv_heads={n_kv_heads}, \
+                 seq_len={seq_len}, window={sliding_window:?}, use_f16={use_f16}, \
+                 softcap={attn_logit_softcapping:?})"
             );
         }
     }
@@ -3822,9 +3892,31 @@ mod decode_attn_tests {
     #[test]
     fn decode_attention_parallel_matches_serial() {
         // 8 * 256 * 64 = 131072 MACs ≥ DECODE_ATTN_PAR_MIN_WORK_DEFAULT.
-        run_case(8, 2, 64, 256, true);
+        run_case(8, 2, 64, 256, None, true);
         // GQA with group_size 1 (MHA) and an odd head count, still above the gate.
-        run_case(7, 7, 64, 512, true);
+        run_case(7, 7, 64, 512, None, true);
+    }
+
+    /// A sliding-window layer reads only its last `window` rows. Below, at, one
+    /// past and far past the window, for GQA ratios 1, 4 and 8, the result must
+    /// equal the masked full-cache reference bit for bit: a skipped row had a
+    /// softmax weight of exactly 0, so no sum changes. The NaN rows in `run_case`
+    /// fail any path that still reads them.
+    #[test]
+    fn decode_attention_sliding_window_matches_masked_reference() {
+        for (n_heads, n_kv_heads) in [(4, 4), (16, 4), (16, 2)] {
+            for seq_len in [6, 7, 8, 1500] {
+                // At most 16 * 7 * 64 = 7168 MACs: under the gate.
+                run_case(n_heads, n_kv_heads, 64, seq_len, Some(7), false);
+            }
+            for seq_len in [255, 256, 257, 1500] {
+                // At least 4 * 255 * 64 = 65280 MACs: on the pool.
+                run_case(n_heads, n_kv_heads, 64, seq_len, Some(256), true);
+            }
+        }
+        // The small window on the pool (16 * 7 * 128 = 14336 MACs), the large one serial.
+        run_case(16, 4, 128, 1500, Some(7), true);
+        run_case(1, 1, 64, 1500, Some(256), false);
     }
 
     /// Below the gate the same call must take the serial branch and agree too —
@@ -3839,9 +3931,9 @@ mod decode_attn_tests {
     #[test]
     fn decode_attention_serial_branch_matches_reference() {
         // 8 * 8 * 64 = 4096 MACs, under DECODE_ATTN_PAR_MIN_WORK_DEFAULT.
-        run_case(8, 2, 64, 8, false);
+        run_case(8, 2, 64, 8, None, false);
         // n_heads == 1: over the work gate, but nothing to spread.
-        run_case(1, 1, 64, 4096, false);
+        run_case(1, 1, 64, 4096, None, false);
     }
 
     /// Depth grows by one position per token, so the fused arena is re-laid-out
@@ -3851,7 +3943,8 @@ mod decode_attn_tests {
     ///
     /// Run for both cache representations: f16 reads the same arena through a
     /// different kernel pair, so a stride bug could show up in one and not the
-    /// other. One `scratch` spans the whole walk, as in a real session.
+    /// other. One `scratch` spans the whole walk, as in a real session. The
+    /// windowed walks cross their window, where the read start begins to move.
     #[test]
     fn decode_attention_across_growing_depth() {
         let n_heads = 8;
@@ -3878,7 +3971,11 @@ mod decode_attn_tests {
             .map(|&x| half::f16::from_f32(x).to_bits())
             .collect();
 
-        for use_f16 in [false, true] {
+        // Window 7 stays under the work gate; window 100 crosses it at depth 16.
+        for (use_f16, sliding_window) in [None, Some(7), Some(100)]
+            .into_iter()
+            .flat_map(|w| [(false, w), (true, w)])
+        {
             let mut scratch = Vec::new();
             for seq_len in 1..=max_len {
                 let n = seq_len * kv_dim;
@@ -3900,14 +3997,15 @@ mod decode_attn_tests {
                     scale: 1.0 / (head_dim as f32).sqrt(),
                     seq_len,
                     attn_logit_softcapping: None,
-                    sliding_window: None,
+                    sliding_window,
                 };
-                let want = serial_reference(&q, &kv, &d);
+                let want = masked_reference(&q, &kv, &d);
                 let mut got = vec![0.0f32; n_heads * head_dim];
                 decode_attention(&q, &kv, &d, &mut got, &mut scratch);
                 assert_eq!(
                     got, want,
-                    "decode_attention differs at seq_len={seq_len} (use_f16={use_f16})"
+                    "decode_attention differs at seq_len={seq_len} \
+                     (use_f16={use_f16}, window={sliding_window:?})"
                 );
             }
         }
@@ -3951,7 +4049,7 @@ mod decode_attn_tests {
         let mut scratch = Vec::new();
         decode_attention(&q, &kv, &dims, &mut out, &mut scratch);
 
-        // Tokens 0..6 are masked to -inf by sliding_window = 4, so their attention weight is 0.
+        // Tokens 0..6 fall outside sliding_window = 4 and are skipped.
         // The output must strictly be 1.0 from tokens 6..10.
         for &val in &out {
             assert!(
@@ -3980,7 +4078,7 @@ mod decode_attn_tests {
             scale: 1.0,
             seq_len,
             attn_logit_softcapping: None,
-            sliding_window: Some(0), // Window of 0 must not mask all tokens to -inf
+            sliding_window: Some(0), // Window of 0 must not skip every token
         };
 
         let mut out = vec![0.0f32; head_dim];
@@ -4013,7 +4111,7 @@ mod decode_attn_tests {
             scale: 1.0,
             seq_len,
             attn_logit_softcapping: None,
-            sliding_window: Some(seq_len + 10), // Window > seq_len: no tokens masked
+            sliding_window: Some(seq_len + 10), // Window > seq_len: no tokens skipped
         };
 
         let mut out = vec![0.0f32; head_dim];
@@ -4060,8 +4158,8 @@ mod decode_attn_tests {
         let mut scratch = Vec::new();
         decode_attention(&q, &kv, &d, &mut out, &mut scratch);
 
-        // Tokens 0 and 1 must be strictly -inf even after softcapping,
-        // so they do not leak into softmax. Tokens 2 and 3 equal 0.5 each -> 3.0.
+        // Tokens 0 and 1 are skipped under softcapping too, so they do not leak into
+        // softmax. Tokens 2 and 3 equal 0.5 each -> 3.0.
         for &val in &out[..head_dim] {
             assert!(
                 (val - 3.0).abs() < 1e-5,
@@ -4113,7 +4211,7 @@ mod decode_attn_tests {
         let mut scratch = Vec::new();
         decode_attention(&q, &kv, &d, &mut out, &mut scratch);
 
-        // Masked tokens 0 and 1 must evaluate to -inf, yielding ~3.0 from tokens 2 and 3.
+        // Skipped tokens 0 and 1 must not contribute, yielding ~3.0 from tokens 2 and 3.
         for &val in &out[..head_dim] {
             assert!(
                 (val - 3.0).abs() < 1e-3,
