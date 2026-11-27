@@ -1,5 +1,6 @@
-//! Teacher-forced parity oracle for `XdnaLlamaModel` vs CPU `LlamaModel`
-//! on `Llama-3.2-1B-Instruct-Q4_0.gguf` (Section 4 of `docs/XDNA_PHASE0_RESULTS.md`).
+//! Teacher-forced parity oracle for an XDNA NPU model vs the CPU model on the same GGUF:
+//! `Llama-3.2-1B-Instruct-Q4_0.gguf` (Section 4 of `docs/XDNA_PHASE0_RESULTS.md`), or an
+//! LFM2 / LFM2.5 / LFM3 Q4_0 GGUF.
 //!
 //! Usage:
 //!   `cargo run --release -p cera --features xdna --example xdna_parity_oracle -- <model.gguf> [n_positions]`
@@ -8,19 +9,21 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cera::backend::xdna::kernels::{
-    MAX_KV_CACHE_TOKENS, check_parity_thresholds, logit_cosine_similarity, top_k_logits,
+    MAX_KV_CACHE_TOKENS, ParityTally, check_parity_thresholds, logit_cosine_similarity,
+    top_k_logits,
 };
 use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
-use cera::model::Model;
-use cera::model::llama::LlamaModel;
-use cera::model::xdna_llama::XdnaLlamaModel;
+use cera::tokenizer::BpeTokenizer;
 
 const PROMPT_LEN: usize = 16;
+/// LFM chat-format counterpart of the 16-token Llama-3 system-turn prompt.
+const LFM_PROMPT: &str =
+    "<|startoftext|><|im_start|>system\nCutting Knowledge Date: December 2023\n<|im_end|>\n";
 
 fn print_usage() {
     println!(
-        "Usage: xdna_parity_oracle <model.gguf> [n_positions] [prompt_len]\n  <model.gguf>   Path to Llama-3.2-1B Q4_0 GGUF\n  [n_positions]  Teacher-forced decode steps (default: 512)\n  [prompt_len]   Prompt length in 16..={} (default: 16)",
+        "Usage: xdna_parity_oracle <model.gguf> [n_positions] [prompt_len]\n  <model.gguf>   Path to a Llama-3.2-1B, LFM2/LFM2.5 or LFM3 Q4_0 GGUF\n  [n_positions]  Teacher-forced decode steps (default: 512)\n  [prompt_len]   Prompt length in 16..={} (default: 16)",
         MAX_KV_CACHE_TOKENS - 1
     );
 }
@@ -101,16 +104,15 @@ fn main() -> ExitCode {
     };
 
     let ctx_len = (prompt_len + n_forced + 64).max(1024);
-    let cpu_model =
-        match LlamaModel::from_gguf_with_id(gguf.clone(), ctx_len, "cpu-oracle".to_string()) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to load CPU model: {e:#}");
-                return ExitCode::FAILURE;
-            }
-        };
-    let npu_model = match XdnaLlamaModel::from_gguf_with_id(gguf, ctx_len, "npu-oracle".to_string())
-    {
+    let is_llama = gguf.get_str("general.architecture") == Some("llama");
+    let cpu_model = match cera::model::load_model(gguf.clone(), None, ctx_len) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to load CPU model: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let npu_model = match cera::model::load_model_xdna(gguf.clone(), None, ctx_len) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to load XDNA NPU model: {e:#}");
@@ -118,9 +120,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // Repeat 16-token Llama-3 instruct prompt prefix up to `prompt_len` so
+    // Repeat 16-token Llama-3 instruct prompt prefix (or `LFM_PROMPT`) up to `prompt_len` so
     // NPU prefill and decode can both be tested at arbitrary prompt lengths.
-    let base_prompt: [u32; PROMPT_LEN] = [
+    let llama_prompt: [u32; PROMPT_LEN] = [
         128000, // <|begin_of_text|>
         128006, // <|start_header_id|>
         9125,   // system
@@ -138,6 +140,17 @@ fn main() -> ExitCode {
         198,    // \n
         128009, // <|eot_id|>
     ];
+    let base_prompt = if is_llama {
+        llama_prompt.to_vec()
+    } else {
+        match BpeTokenizer::from_gguf(&gguf) {
+            Ok(tok) => tok.encode(LFM_PROMPT),
+            Err(e) => {
+                eprintln!("Failed to load tokenizer: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let prompt_tokens: Vec<u32> = (0..prompt_len)
         .map(|i| {
             if i == 0 {
@@ -231,6 +244,7 @@ fn main() -> ExitCode {
     let mut top1_disagreements: Vec<(usize, u32, u32, f32, f32)> = Vec::new();
     let mut top10_overlaps: Vec<usize> = Vec::with_capacity(n_forced);
     let mut cosines: Vec<f64> = Vec::with_capacity(n_forced);
+    let mut tally = ParityTally::default();
 
     let mut cpu_dec_secs = 0.0f64;
     let mut npu_dec_secs = 0.0f64;
@@ -289,6 +303,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         };
         cosines.push(cos);
+        tally.record(pos, &cpu_logits, &npu_logits);
 
         // Teacher forcing: advance both with CPU's greedy token.
         next_tok = cpu_top1;
@@ -327,6 +342,7 @@ fn main() -> ExitCode {
         n_forced as f64 / npu_dec_secs,
         npu_dec_secs * 1e3,
     );
+    println!("  {tally}");
     if !top1_disagreements.is_empty() {
         println!(
             "  top-1 disagreements ({}): max CPU top-2 margin = {:.4}",

@@ -95,6 +95,7 @@ jobs:
         run: |
           python3 tests/test_format_review_comment.py
           python3 -m unittest tests/test_xdna_compile_params.py
+          python3 -m unittest tests/test_gsm8k_eval.py
           python3 tests/api_contracts/check.py
           python3 -m unittest discover -s tests/api_contracts
       - name: Shell and IRON generator syntax check

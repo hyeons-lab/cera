@@ -1722,6 +1722,8 @@ pub const PARITY_MIN_MEAN_COS: f64 = 0.99;
 pub const PARITY_MIN_STEP_COS: f64 = 0.97;
 /// Certified maximum CPU top-2 logit margin on any top-1 disagreement (`<= 2.0`).
 pub const PARITY_MAX_CPU_MARGIN: f32 = 2.0;
+/// CPU top-1 lead over its top-2 logit from which the NPU top-1 must agree (a sure step).
+pub const PARITY_SURE_STEP_MARGIN: f32 = 1.0;
 
 /// Select `(bucket_idx, skip_kv)` for `pos` prior cached tokens across
 /// strictly ascending `bucket_chunks` capacities in `1..=Q4LAYER_ATTN_CHUNKS`.
@@ -1969,6 +1971,94 @@ pub fn logit_cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
     cos.is_finite().then(|| cos.clamp(-1.0, 1.0))
 }
 
+/// `KL(P || Q)` in nats between `softmax(p_logits)` and `softmax(q_logits)`, in `f64`;
+/// `None` on a length mismatch, empty slices, or a non-finite logit.
+pub fn logit_kl_divergence(p_logits: &[f32], q_logits: &[f32]) -> Option<f64> {
+    if p_logits.len() != q_logits.len()
+        || p_logits.is_empty()
+        || p_logits.iter().chain(q_logits).any(|x| !x.is_finite())
+    {
+        return None;
+    }
+    let log_sum_exp = |v: &[f32]| {
+        let max = v
+            .iter()
+            .fold(f64::NEG_INFINITY, |m, &x| m.max(f64::from(x)));
+        max + v
+            .iter()
+            .map(|&x| (f64::from(x) - max).exp())
+            .sum::<f64>()
+            .ln()
+    };
+    let (lse_p, lse_q) = (log_sum_exp(p_logits), log_sum_exp(q_logits));
+    Some(
+        p_logits
+            .iter()
+            .zip(q_logits)
+            .map(|(&p, &q)| {
+                let log_p = f64::from(p) - lse_p;
+                log_p.exp() * (log_p - (f64::from(q) - lse_q))
+            })
+            .sum(),
+    )
+}
+
+/// Sure-step top-1 agreement and `KL(CPU || NPU)` over the positions a parity check compares.
+#[derive(Debug, Default)]
+pub struct ParityTally {
+    /// Positions recorded.
+    pub positions: usize,
+    /// Positions whose CPU top-1 leads its top-2 by at least [`PARITY_SURE_STEP_MARGIN`].
+    pub sure_steps: usize,
+    /// `(position, CPU top-2 margin)` of each sure step whose NPU top-1 differs from the CPU's.
+    pub sure_mismatches: Vec<(usize, f32)>,
+    /// Sum of per-position `KL(CPU || NPU)` (infinite for a non-finite logit vector).
+    pub kl_sum: f64,
+    /// Largest per-position `KL(CPU || NPU)`.
+    pub kl_max: f64,
+}
+
+impl ParityTally {
+    /// Record the logits compared at `pos`.
+    pub fn record(&mut self, pos: usize, cpu_logits: &[f32], npu_logits: &[f32]) {
+        let kl = logit_kl_divergence(cpu_logits, npu_logits).unwrap_or(f64::INFINITY);
+        self.positions += 1;
+        self.kl_sum += kl;
+        self.kl_max = self.kl_max.max(kl);
+        let cpu_top = top_k_logits(cpu_logits, 2);
+        let margin = match cpu_top.as_slice() {
+            [(_, first), (_, second)] => first - second,
+            _ => return,
+        };
+        if margin < PARITY_SURE_STEP_MARGIN {
+            return;
+        }
+        self.sure_steps += 1;
+        if top_k_logits(npu_logits, 1).first().map(|&(idx, _)| idx) != Some(cpu_top[0].0) {
+            self.sure_mismatches.push((pos, margin));
+        }
+    }
+
+    /// Mean per-position `KL(CPU || NPU)` (`0.0` before the first record).
+    pub fn kl_mean(&self) -> f64 {
+        self.kl_sum / self.positions.max(1) as f64
+    }
+}
+
+impl std::fmt::Display for ParityTally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sure-step top1 {}/{} (cpu margin >= {PARITY_SURE_STEP_MARGIN}) over {} positions, KL(cpu||npu) mean={:.6} max={:.6}",
+            self.sure_steps - self.sure_mismatches.len(),
+            self.sure_steps,
+            self.positions,
+            self.kl_mean(),
+            self.kl_max
+        )
+    }
+}
+
 /// Verify teacher-forced parity summary metrics against Section 4 of
 /// `docs/XDNA_PHASE0_RESULTS.md`.
 pub fn check_parity_thresholds(
@@ -2199,6 +2289,34 @@ mod tests {
             Q4PREFILL_LAYER_KV_BUCKETS.last().unwrap().0 * Q4LAYER_ATTN_CHUNK_T,
             Q4PREFILL_MAX_POS0
         );
+    }
+
+    #[test]
+    fn parity_tally_checks_only_sure_steps_and_kl_sees_a_logit_scale() {
+        assert_eq!(logit_kl_divergence(&[1.0, 2.0], &[1.0]), None);
+        assert_eq!(logit_kl_divergence(&[], &[]), None);
+        assert_eq!(logit_kl_divergence(&[f32::NAN, 0.0], &[0.0, 0.0]), None);
+        let shifted = logit_kl_divergence(&[3.0, 1.0, -2.0], &[13.0, 11.0, 8.0]).expect("finite");
+        assert!(shifted.abs() < 1e-12);
+        let kl = logit_kl_divergence(&[0.0, 0.0], &[9.0f32.ln(), 0.0]).expect("finite");
+        assert!((kl - (0.5 * (0.5f64 / 0.9).ln() + 0.5 * (0.5f64 / 0.1).ln())).abs() < 1e-6);
+        let cpu = [4.0f32, 1.0, -3.0];
+        let doubled = cpu.map(|x| 2.0 * x);
+        let cos = logit_cosine_similarity(&cpu, &doubled).expect("unit cos");
+        assert!((cos - 1.0).abs() < 1e-12);
+        assert!(logit_kl_divergence(&cpu, &doubled).expect("finite") > 0.01);
+
+        let mut tally = ParityTally::default();
+        tally.record(40, &[0.0, 2.5, 1.0], &[0.0, 2.0, 1.5]);
+        tally.record(41, &[0.0, 1.5, 1.0], &[0.0, 1.0, 1.5]);
+        tally.record(42, &[0.0, 2.0, 1.0], &[0.0, 1.0, 2.0]);
+        assert_eq!((tally.positions, tally.sure_steps), (3, 2));
+        assert_eq!(tally.sure_mismatches, [(42, 1.0)]);
+        assert!(tally.kl_max > 0.0 && tally.kl_mean() <= tally.kl_max);
+        tally.record(43, &[0.0, 0.5], &[f32::NAN, 0.0]);
+        assert_eq!(tally.sure_steps, 2);
+        assert!(tally.kl_max.is_infinite());
+        assert!(tally.to_string().starts_with("sure-step top1 1/2 "));
     }
 
     #[test]
