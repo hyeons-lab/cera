@@ -1062,7 +1062,11 @@ mod tests {
         let read_q = |row: usize, col: usize| -> i8 {
             let e = col * 16 + row;
             let byte = packed[e / 2];
-            let nib = if e % 2 == 0 { byte & 0xF } else { byte >> 4 };
+            let nib = if e.is_multiple_of(2) {
+                byte & 0xF
+            } else {
+                byte >> 4
+            };
             if nib >= 8 { nib as i8 - 16 } else { nib as i8 }
         };
 

@@ -6439,7 +6439,7 @@ mod tests {
         let blocks_per_row = cols / 32;
         let mut out = vec![0u8; rows * blocks_per_row * 18];
         let scale = crate::quant::f32_to_f16(0.0625).to_le_bytes();
-        for (bi, blk) in out.chunks_exact_mut(18).enumerate() {
+        for (bi, blk) in out.as_chunks_mut::<18>().0.iter_mut().enumerate() {
             blk[0..2].copy_from_slice(&scale);
             for (k, byte) in blk[2..18].iter_mut().enumerate() {
                 let lo = ((bi * 7 + k * 3 + usize::from(seed)) % 13) + 1;
@@ -6529,68 +6529,68 @@ mod tests {
             );
         for l in 1..=2 {
             b = b
-                .tensor_f32(&format!("blk.{l}.attn_norm.weight"), &[LFM3_H], &ones_h)
+                .tensor_f32(format!("blk.{l}.attn_norm.weight"), &[LFM3_H], &ones_h)
                 .tensor_f32(
-                    &format!("blk.{l}.post_attention_norm.weight"),
+                    format!("blk.{l}.post_attention_norm.weight"),
                     &[LFM3_H],
                     &ones_h,
                 )
-                .tensor_f32(&format!("blk.{l}.ffn_norm.weight"), &[LFM3_H], &ones_h)
-                .tensor_f32(&format!("blk.{l}.post_ffw_norm.weight"), &[LFM3_H], &ones_h)
+                .tensor_f32(format!("blk.{l}.ffn_norm.weight"), &[LFM3_H], &ones_h)
+                .tensor_f32(format!("blk.{l}.post_ffw_norm.weight"), &[LFM3_H], &ones_h)
                 .tensor(
-                    &format!("blk.{l}.attn_q.weight"),
+                    format!("blk.{l}.attn_q.weight"),
                     &[LFM3_H, LFM3_Q_DIM],
                     2,
                     make_q4_0_bytes(LFM3_Q_DIM, LFM3_H),
                 )
                 .tensor(
-                    &format!("blk.{l}.attn_k.weight"),
+                    format!("blk.{l}.attn_k.weight"),
                     &[LFM3_H, LFM3_KV_DIM],
                     2,
                     make_q4_0_bytes(LFM3_KV_DIM, LFM3_H),
                 )
                 .tensor(
-                    &format!("blk.{l}.attn_v.weight"),
+                    format!("blk.{l}.attn_v.weight"),
                     &[LFM3_H, LFM3_KV_DIM],
                     2,
                     make_q4_0_bytes(LFM3_KV_DIM, LFM3_H),
                 )
                 .tensor(
-                    &format!("blk.{l}.attn_gate.weight"),
+                    format!("blk.{l}.attn_gate.weight"),
                     &[LFM3_H, LFM3_N_HEADS],
                     2,
                     make_q4_0_bytes(LFM3_N_HEADS, LFM3_H),
                 )
                 .tensor(
-                    &format!("blk.{l}.attn_output.weight"),
+                    format!("blk.{l}.attn_output.weight"),
                     &[LFM3_Q_DIM, LFM3_H],
                     2,
                     make_q4_0_bytes(LFM3_H, LFM3_Q_DIM),
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.attn_q_norm.weight"),
+                    format!("blk.{l}.attn_q_norm.weight"),
                     &[LFM3_HEAD_DIM],
                     &ones_hd,
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.attn_k_norm.weight"),
+                    format!("blk.{l}.attn_k_norm.weight"),
                     &[LFM3_HEAD_DIM],
                     &ones_hd,
                 )
                 .tensor(
-                    &format!("blk.{l}.ffn_gate.weight"),
+                    format!("blk.{l}.ffn_gate.weight"),
                     &[LFM3_H, LFM3_FFN_SRC],
                     2,
                     make_q4_0_bytes(LFM3_FFN_SRC, LFM3_H),
                 )
                 .tensor(
-                    &format!("blk.{l}.ffn_up.weight"),
+                    format!("blk.{l}.ffn_up.weight"),
                     &[LFM3_H, LFM3_FFN_SRC],
                     2,
                     make_q4_0_bytes(LFM3_FFN_SRC, LFM3_H),
                 )
                 .tensor(
-                    &format!("blk.{l}.ffn_down.weight"),
+                    format!("blk.{l}.ffn_down.weight"),
                     &[LFM3_FFN_SRC, LFM3_H],
                     2,
                     make_q4_0_bytes(LFM3_H, LFM3_FFN_SRC),
@@ -7242,7 +7242,7 @@ mod tests {
             // Starting at `pos0 = 288` (`chunk=9`) with `n_valid = 48` crosses `limit=10` between
             // subchunk 0 (`chunk 9`) and subchunk 1 (`chunk 10`), shifting `loc0` by `shift1 = 8`.
             seed_lfm3_attention_and_conv(&mut state, 288, 2.0, -2.0);
-            let out = model.forward_prefill(&vec![1; 48], 288, &mut state);
+            let out = model.forward_prefill(&[1; 48], 288, &mut state);
             assert_eq!(out.len(), model.config().vocab_size);
             assert_eq!(state.seq_len, 336);
             assert!(model.take_decode_error().is_none());

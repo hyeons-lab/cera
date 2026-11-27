@@ -3461,40 +3461,40 @@ mod tests {
             .tensor_f32("output_norm.weight", &[hs], &vec![1.0; hs]);
         for l in 0..N_LAYERS {
             b = b
-                .tensor_f32(&format!("blk.{l}.attn_norm.weight"), &[hs], &vec![1.0; hs])
-                .tensor_f32(&format!("blk.{l}.ffn_norm.weight"), &[hs], &vec![1.0; hs])
+                .tensor_f32(format!("blk.{l}.attn_norm.weight"), &[hs], &vec![1.0; hs])
+                .tensor_f32(format!("blk.{l}.ffn_norm.weight"), &[hs], &vec![1.0; hs])
                 .tensor_f32(
-                    &format!("blk.{l}.attn_q.weight"),
+                    format!("blk.{l}.attn_q.weight"),
                     &[hs, nh * hd],
                     &vec![0.0; hs * nh * hd],
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.attn_k.weight"),
+                    format!("blk.{l}.attn_k.weight"),
                     &[hs, nkv * hd],
                     &vec![0.0; hs * nkv * hd],
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.attn_v.weight"),
+                    format!("blk.{l}.attn_v.weight"),
                     &[hs, nkv * hd],
                     &vec![0.0; hs * nkv * hd],
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.attn_output.weight"),
+                    format!("blk.{l}.attn_output.weight"),
                     &[nh * hd, hs],
                     &vec![0.0; nh * hd * hs],
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.ffn_gate.weight"),
+                    format!("blk.{l}.ffn_gate.weight"),
                     &[hs, inter],
                     &vec![0.0; hs * inter],
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.ffn_up.weight"),
+                    format!("blk.{l}.ffn_up.weight"),
                     &[hs, inter],
                     &vec![0.0; hs * inter],
                 )
                 .tensor_f32(
-                    &format!("blk.{l}.ffn_down.weight"),
+                    format!("blk.{l}.ffn_down.weight"),
                     &[inter, hs],
                     &vec![0.0; inter * hs],
                 );
@@ -3704,7 +3704,7 @@ mod tests {
                 let mut state = seed_llama_f16_state(&cfg, 1);
                 model.lock_npu().synced_kv_len = 1;
 
-                let out = model.forward_prefill(&vec![1; 16], 1, &mut state);
+                let out = model.forward_prefill(&[1; 16], 1, &mut state);
                 assert!(out.iter().all(|&v| v == 0.0));
                 assert!(model.state_torn.load(Ordering::SeqCst));
                 assert!(model.take_decode_error().is_some());
@@ -3740,7 +3740,7 @@ mod tests {
                 let mut state = seed_llama_f16_state(&cfg, 1);
                 model.lock_npu().synced_kv_len = 1;
 
-                let out = model.forward_prefill(&vec![1; 16], 1, &mut state);
+                let out = model.forward_prefill(&[1; 16], 1, &mut state);
                 assert!(out.iter().all(|&v| v == 0.0));
                 assert!(model.state_torn.load(Ordering::SeqCst));
                 assert!(model.take_decode_error().is_some());
@@ -3826,7 +3826,7 @@ mod tests {
             );
 
             // Same short-layer input error in `forward_prefill` keeps `state_torn` false.
-            let pre_err_out = model.forward_prefill(&vec![1; 16], 2, &mut short_state);
+            let pre_err_out = model.forward_prefill(&[1; 16], 2, &mut short_state);
             assert!(pre_err_out.iter().all(|&v| v == 0.0));
             assert!(
                 !model.state_torn.load(Ordering::SeqCst),

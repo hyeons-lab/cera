@@ -625,7 +625,7 @@ impl<O: VitGpuOps> GpuLfm3Weights<O> {
         let mm_input_norm = if let Some(norm) = &w.mm_input_norm {
             validate_lfm3_norm("mm.input_norm", norm, &[d, merged_dim])?;
             let stage = mm_norm_stage(norm.weight.len(), d, merged_dim);
-            upload_lfm3_norm(ops, norm).and_then(|gpu_norm| stage.map(|s| (gpu_norm, s)))
+            upload_lfm3_norm(ops, norm).zip(stage)
         } else {
             None
         };

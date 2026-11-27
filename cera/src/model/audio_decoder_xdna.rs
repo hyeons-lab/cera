@@ -2356,17 +2356,17 @@ mod tests {
         for j in 0..8 {
             b = b
                 .tensor_f32(
-                    &format!("depth_embeddings.{j}.embedding.weight"),
+                    format!("depth_embeddings.{j}.embedding.weight"),
                     &[df_embd, 1],
                     &vec![0.01; df_embd],
                 )
                 .tensor_f32(
-                    &format!("depth_embeddings.{j}.embedding_norm.weight"),
+                    format!("depth_embeddings.{j}.embedding_norm.weight"),
                     &[df_embd],
                     &vec![1.0; df_embd],
                 )
                 .tensor_f32(
-                    &format!("depth_embeddings.{j}.to_logits.weight"),
+                    format!("depth_embeddings.{j}.to_logits.weight"),
                     &[df_embd, 1],
                     &vec![0.01; df_embd],
                 );
@@ -2407,58 +2407,58 @@ mod tests {
             let p = format!("lfm.layers.{i}");
             b = b
                 .tensor_f32(
-                    &format!("{p}.operator_norm.weight"),
+                    format!("{p}.operator_norm.weight"),
                     &[detok_embd],
                     &vec![1.0; detok_embd],
                 )
                 .tensor_f32(
-                    &format!("{p}.ffn_norm.weight"),
+                    format!("{p}.ffn_norm.weight"),
                     &[detok_embd],
                     &vec![1.0; detok_embd],
                 )
                 .tensor_f32(
-                    &format!("{p}.feed_forward.w1.weight"),
+                    format!("{p}.feed_forward.w1.weight"),
                     &[detok_embd, detok_embd],
                     &vec![0.01; detok_embd * detok_embd],
                 )
                 .tensor_f32(
-                    &format!("{p}.feed_forward.w2.weight"),
+                    format!("{p}.feed_forward.w2.weight"),
                     &[detok_embd, detok_embd],
                     &vec![0.01; detok_embd * detok_embd],
                 )
                 .tensor_f32(
-                    &format!("{p}.feed_forward.w3.weight"),
+                    format!("{p}.feed_forward.w3.weight"),
                     &[detok_embd, detok_embd],
                     &vec![0.01; detok_embd * detok_embd],
                 );
             if [0, 1, 3, 5, 7].contains(&i) {
                 b = b
                     .tensor_f32(
-                        &format!("{p}.conv.in_proj.weight"),
+                        format!("{p}.conv.in_proj.weight"),
                         &[detok_embd, 3 * detok_embd],
                         &vec![0.01; 3 * detok_embd * detok_embd],
                     )
                     .tensor_f32(
-                        &format!("{p}.conv.out_proj.weight"),
+                        format!("{p}.conv.out_proj.weight"),
                         &[detok_embd, detok_embd],
                         &vec![0.01; detok_embd * detok_embd],
                     )
                     .tensor_f32(
-                        &format!("{p}.conv.conv.weight"),
+                        format!("{p}.conv.conv.weight"),
                         &[3, detok_embd],
                         &vec![0.05; 3 * detok_embd],
                     );
             } else {
                 for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
                     b = b.tensor_f32(
-                        &format!("{p}.self_attn.{proj}.weight"),
+                        format!("{p}.self_attn.{proj}.weight"),
                         &[detok_embd, detok_embd],
                         &vec![0.01; detok_embd * detok_embd],
                     );
                 }
                 for norm in ["q_layernorm", "k_layernorm"] {
                     b = b.tensor_f32(
-                        &format!("{p}.self_attn.{norm}.weight"),
+                        format!("{p}.self_attn.{norm}.weight"),
                         &[detok_embd],
                         &vec![1.0; detok_embd],
                     );
@@ -2785,7 +2785,7 @@ mod tests {
             assert!(acc3.supports_lfm3a_gen_depthformer());
             assert!(acc3.supports_lfm3a_gen_detokenizer());
             let codes = acc3
-                .sample_audio_frame_lfm3a(&vec![0.25; 12], 0.0, 1)
+                .sample_audio_frame_lfm3a(&[0.25; 12], 0.0, 1)
                 .expect("lfm3a sample");
             assert_eq!(codes.len(), 12);
             assert!(acc3.take_audio_error().is_none());

@@ -19440,7 +19440,9 @@ mod gemv_active_tests {
         let row_bytes = (k / 256) * size_of::<BlockQ6K>();
         let mut q6_bytes = vec![0x11u8; m * row_bytes + 64];
         for (bi, chunk) in q6_bytes[..m * row_bytes]
-            .chunks_exact_mut(size_of::<BlockQ6K>())
+            .as_chunks_mut::<{ size_of::<BlockQ6K>() }>()
+            .0
+            .iter_mut()
             .enumerate()
         {
             let d = half::f16::from_f32(0.01 + 0.002 * (bi % 5) as f32);

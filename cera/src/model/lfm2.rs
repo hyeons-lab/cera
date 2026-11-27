@@ -9797,8 +9797,8 @@ pub(crate) mod bidirectional_float_tests {
                             &[MOE_HS, MOE_HS],
                             &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
                         )
-                        .tensor_f32("blk.1.attn_q_norm.weight", &[32], &vec![1.0f32; 32])
-                        .tensor_f32("blk.1.attn_k_norm.weight", &[32], &vec![1.0f32; 32])
+                        .tensor_f32("blk.1.attn_q_norm.weight", &[32], &[1.0f32; 32])
+                        .tensor_f32("blk.1.attn_k_norm.weight", &[32], &[1.0f32; 32])
                         .tensor_f32("blk.1.ffn_gate_inp.weight", &[MOE_HS, N_EXPERT], router)
                         .tensor_f32("blk.1.exp_probs_b.bias", &[N_EXPERT], &[0.0; N_EXPERT]);
                     if use_q4_experts {
