@@ -4211,21 +4211,50 @@ mod tests {
         );
     }
 
+    /// Probe the current thread's affinity mask using a valid bit from `GetProcessAffinityMask`
+    /// and return `(initial_mask, c0, c1, multi_mask)` when at least two logical CPUs are allowed.
+    #[cfg(all(target_os = "windows", not(miri)))]
+    fn windows_probe_two_core_affinity() -> Option<(usize, usize, usize, usize)> {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessAffinityMask(
+                process: isize,
+                process_affinity_mask: *mut usize,
+                system_affinity_mask: *mut usize,
+            ) -> i32;
+        }
+        let mut process_mask = 0usize;
+        let mut system_mask = 0usize;
+        // SAFETY: `GetCurrentProcess()` returns a valid pseudo-handle and both out pointers target
+        // initialized `usize` locals (`DWORD_PTR`).
+        let ok = unsafe {
+            GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask)
+        };
+        assert_ne!(ok, 0, "GetProcessAffinityMask must succeed");
+        if process_mask == 0 {
+            return None;
+        }
+        let probe_bit = 1usize << process_mask.trailing_zeros();
+        let initial_mask = set_windows_thread_affinity_mask(probe_bit)
+            .expect("SetThreadAffinityMask with valid process-mask bit must return prior mask");
+        set_windows_thread_affinity_mask(initial_mask)
+            .expect("restoring initial thread affinity mask");
+        if initial_mask.count_ones() < 2 {
+            return None;
+        }
+        let c0 = initial_mask.trailing_zeros() as usize;
+        let rem = initial_mask & !(1usize << c0);
+        let c1 = rem.trailing_zeros() as usize;
+        let multi_mask = (1usize << c0) | (1usize << c1);
+        Some((initial_mask, c0, c1, multi_mask))
+    }
+
     #[cfg(all(target_os = "windows", not(miri)))]
     #[test]
     fn windows_claim_guard_restores_affinity_mask_on_drop() {
         let result = thread::spawn(|| {
-            let initial_mask = set_windows_thread_affinity_mask(1)
-                .expect("SetThreadAffinityMask(1) must return prior mask");
-            set_windows_thread_affinity_mask(initial_mask)
-                .expect("restoring initial thread affinity mask");
-            if initial_mask.count_ones() < 2 {
-                return None;
-            }
-            let c0 = initial_mask.trailing_zeros() as usize;
-            let rem = initial_mask & !(1usize << c0);
-            let c1 = rem.trailing_zeros() as usize;
-            let multi_mask = (1usize << c0) | (1usize << c1);
+            let (initial_mask, c0, _c1, multi_mask) = windows_probe_two_core_affinity()?;
 
             set_windows_thread_affinity_mask(multi_mask)
                 .expect("setting two-core mask before ClaimGuard test");
@@ -4261,17 +4290,9 @@ mod tests {
     #[test]
     fn windows_real_dispatch_pins_and_release_caller_pin_restores_mask() {
         thread::spawn(|| {
-            let initial_mask = set_windows_thread_affinity_mask(1)
-                .expect("SetThreadAffinityMask(1) must return prior mask");
-            set_windows_thread_affinity_mask(initial_mask)
-                .expect("restoring initial thread affinity mask");
-            if initial_mask.count_ones() < 2 {
+            let Some((initial_mask, c0, c1, multi_mask)) = windows_probe_two_core_affinity() else {
                 return;
-            }
-            let c0 = initial_mask.trailing_zeros() as usize;
-            let rem = initial_mask & !(1usize << c0);
-            let c1 = rem.trailing_zeros() as usize;
-            let multi_mask = (1usize << c0) | (1usize << c1);
+            };
             set_windows_thread_affinity_mask(multi_mask).expect("setting multi-core baseline");
 
             let pool = RowPool::build_with_spin(2, &[c0, c1], &[], &[], true, None, 0);

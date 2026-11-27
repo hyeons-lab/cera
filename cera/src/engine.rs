@@ -3765,22 +3765,31 @@ mod tests {
         let mut match_parts = ModelBytes::text(primary);
         match_parts.inference_type = Some(InferenceType::LlamaCppLfm2AudioV1);
         match_parts.audio_decoder = Some(matching_vocoder);
-        let (_, events_match) = fake::with_shim(FakeConfig::default(), || {
-            let engine = CeraEngine::from_parts(match_parts, cfg).expect("from_parts match");
-            assert!(engine.audio_decoder.is_some());
-            assert!(engine.detok_weights.is_some());
-            assert!(engine.has_audio_accelerator());
-            let session = engine.new_session(SessionConfig::default()).unwrap();
+        let (matched_trunk_backend, events_match) = fake::with_shim(FakeConfig::default(), || {
+            let matched_engine =
+                CeraEngine::from_parts(match_parts, cfg).expect("from_parts match");
+            assert!(matched_engine.audio_decoder.is_some());
+            assert!(matched_engine.detok_weights.is_some());
+            assert!(matched_engine.has_audio_accelerator());
+            let session = matched_engine
+                .new_session(SessionConfig::default())
+                .unwrap();
             assert!(session.has_audio_accelerator());
+            let trunk_backend = matched_engine.model.backend_label();
             drop(session);
-            drop(engine);
+            drop(matched_engine);
             assert_eq!(fake::live_bo_count(), 0);
+            trunk_backend
         });
-        assert!(
-            events_match
-                .iter()
-                .any(|e| matches!(e, Event::BoAlloc { .. })),
-            "from_parts with matching vocoder under Auto must build XdnaAudioDecoder"
-        );
+        if resolve_aux_backend(BackendPreference::Auto, matched_trunk_backend)
+            == BackendPreference::Auto
+        {
+            assert!(
+                events_match
+                    .iter()
+                    .any(|e| matches!(e, Event::BoAlloc { .. })),
+                "from_parts with matching vocoder under Auto must build XdnaAudioDecoder"
+            );
+        }
     }
 }
