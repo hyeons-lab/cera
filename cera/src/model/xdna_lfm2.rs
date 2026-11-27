@@ -40,7 +40,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
 use crate::model::lfm2::{LfmModel, XdnaMoePrefillScratch};
 use crate::model::xdna_llama::{
-    HybridPendingSlot, QUIESCE_TIMEOUT_MS, check_hybrid_kv_rewind_state,
+    HybridPendingSlot, QUIESCE_TIMEOUT_MS, check_hybrid_kv_rewind_state, npu_decode_on_cpu,
     validate_xdna_kv_compression,
 };
 use crate::model::{BlockType, Model, ModelConfig, ModelSessionGate, ModelSessionLease, WeightRef};
@@ -923,7 +923,8 @@ pub struct XdnaLfm2Model {
     state_torn: AtomicBool,
     session_gate: ModelSessionGate,
     profile_decode: bool,
-    _prefill_warm_guard: crate::backend::PrefillWarmGuard,
+    cpu_decode: bool,
+    _prefill_warm_guard: Option<crate::backend::PrefillWarmGuard>,
 }
 
 impl Drop for XdnaLfm2Model {
@@ -1050,7 +1051,8 @@ impl XdnaLfm2Model {
             moe_prefill_scratch: XdnaMoePrefillScratch::default(),
         };
 
-        let warm_guard = crate::backend::acquire_prefill_warm_spin();
+        let cpu_decode = npu_decode_on_cpu();
+        let warm_guard = (!cpu_decode).then(crate::backend::acquire_prefill_warm_spin);
         crate::backend::warm_prefill_pool(LfmModel::xdna_head_threads());
 
         Ok(Self {
@@ -1062,6 +1064,7 @@ impl XdnaLfm2Model {
             state_torn: AtomicBool::new(false),
             session_gate: ModelSessionGate::default(),
             profile_decode: crate::backend::cpu_features::profile_decode_enabled(),
+            cpu_decode,
             _prefill_warm_guard: warm_guard,
         })
     }
@@ -4800,6 +4803,41 @@ impl XdnaLfm2Model {
         )
     }
 
+    /// NPU keeps `synced_len`, so its next prefill copies in the rows the CPU decode writes.
+    // LFM2 resync rewrites every KV row, so the first append after CPU decode costs O(context).
+    fn prepare_cpu_decode(&self, state: &mut InferenceState, pos: usize) -> bool {
+        let use_f16 = state.kv_f16;
+        let mut npu = self.lock_npu();
+        let res = (|| -> Result<(), SyncErr> {
+            if self.state_torn.load(Ordering::SeqCst) {
+                return Err(SyncErr::Input(
+                    "XDNA NPU state torn after a fault; call try_reset_kv".to_string(),
+                ));
+            }
+            self.validate_cpu_state_for_sync(state, npu.pending_kv.as_ref(), pos, use_f16)
+                .map_err(SyncErr::Input)?;
+            npu.quiesce_in_flight().map_err(SyncErr::Device)?;
+            if !npu.pending_kv.flush_into(state) {
+                npu.synced_len = 0;
+                npu.force_conv_sync = true;
+                self.validate_cpu_state_for_sync(state, None, pos, use_f16)
+                    .map_err(SyncErr::Input)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => true,
+            Err(SyncErr::Input(e)) => {
+                let _ = self.reject_input(e, 0);
+                false
+            }
+            Err(SyncErr::Device(e)) => {
+                let _ = self.record_device_fault(e, 0);
+                false
+            }
+        }
+    }
+
     fn run_single_embedding_forward(
         &self,
         embedding: &[f32],
@@ -4833,6 +4871,13 @@ impl XdnaLfm2Model {
         }
         if let Err(e) = self.validate_state(state) {
             return self.reject_input(e, vocab_size);
+        }
+        if self.cpu_decode {
+            return if self.prepare_cpu_decode(state, pos) {
+                self.cpu.forward_from_embedding(embedding, pos, state)
+            } else {
+                vec![0.0f32; vocab_size]
+            };
         }
         let use_f16 = state.kv_f16;
         let mut npu = self.lock_npu();
@@ -5027,6 +5072,13 @@ impl Model for XdnaLfm2Model {
             );
             return 0;
         };
+        if self.cpu_decode {
+            return if self.prepare_cpu_decode(state, pos) {
+                self.cpu.forward_greedy(tokens, pos, state)
+            } else {
+                0
+            };
+        }
         let use_f16 = state.kv_f16;
         if state.scratch.logits.len() < vocab_size {
             state.scratch.logits.resize(vocab_size, 0.0);
@@ -5417,8 +5469,67 @@ mod tests {
     }
 
     #[test]
+    fn causal_lfm2_cpu_decode_flushes_pending_and_npu_prefill_resyncs_on_fake_shim() {
+        with_shim(FakeConfig::default(), || {
+            let mut npu_model =
+                XdnaLfm2Model::from_gguf_with_id(tiny_lfm2_gguf(), 128, "test".into())
+                    .expect("load LFM2 on fake shim");
+            npu_model.cpu_decode = true;
+            let model: &dyn Model = &npu_model;
+            let mut state =
+                InferenceState::from_config_capped(model.config(), &KvCompression::F16, 128)
+                    .unwrap();
+            let kv_rows = |state: &InferenceState| match &state.layers[1] {
+                LayerState::Attention { key_cache_f16, .. } => key_cache_f16.len() / LFM2_KV_DIM,
+                _ => panic!("layer 1 must be attention"),
+            };
+
+            // A 3-token prefill runs as NPU decode steps and defers the last row.
+            let _ = model.forward_prefill(&[1, 2, 3], 0, &mut state);
+            assert_eq!(state.seq_len, 3);
+            assert_eq!(kv_rows(&state), 2);
+            assert!(npu_model.lock_npu().pending_kv.as_ref().is_some());
+
+            let logits = model.forward(&[4], 3, &mut state);
+            assert_eq!(logits.len(), model.config().vocab_size);
+            assert!(npu_model.lock_npu().pending_kv.as_ref().is_none());
+            let tok = model.forward_greedy(&[5], 4, &mut state);
+            assert!((tok as usize) < model.config().vocab_size);
+            let emb = model.embed_token_rows(&[6]).unwrap();
+            let _ = model.forward_from_embedding(&emb, 5, &mut state);
+            assert!(model.take_decode_error().is_none());
+            assert_eq!(state.seq_len, 6);
+            assert_eq!(kv_rows(&state), 6);
+            assert_eq!(npu_model.lock_npu().synced_len, 3);
+
+            // Tag a CPU-written K row; the next NPU prefill must copy it in before running.
+            if let LayerState::Attention { key_cache_f16, .. } = &mut state.layers[1] {
+                key_cache_f16[4 * LFM2_KV_DIM] = crate::quant::f32_to_f16(1.5);
+            }
+            let _ = model.forward_prefill(&[9, 10], 6, &mut state);
+            assert!(model.take_decode_error().is_none());
+            assert_eq!(state.seq_len, 8);
+            let npu = npu_model.lock_npu();
+            assert_eq!(npu.synced_len, 8);
+            let k_off = 4 * LFM2_HEAD_DIM * 2;
+            let k = &npu.layer_kv_blocks[1][0].as_slice()[k_off..k_off + 2];
+            assert_eq!(u16::from_le_bytes([k[0], k[1]]), f32_to_bf16(1.5));
+        });
+    }
+
+    #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
     fn hw_gate_lfm2_causal_parity_and_throughput() {
+        run_hw_gate_lfm2_causal(false);
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
+    fn hw_gate_lfm2_cpu_decode_parity() {
+        run_hw_gate_lfm2_causal(true);
+    }
+
+    fn run_hw_gate_lfm2_causal(cpu_decode: bool) {
         let path = std::path::PathBuf::from(
             r"C:\Users\iamst\.cache\triage\models\huggingface.co\LiquidAI\LFM2.5-1.2B-Instruct-GGUF\resolve\main\LFM2.5-1.2B-Instruct-Q4_0.gguf",
         );
@@ -5426,8 +5537,14 @@ mod tests {
 
         let gguf = GgufFile::open(&path).expect("open LFM2.5-1.2B-Instruct-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
-        let npu =
-            crate::model::load_model_xdna(gguf, Some(&path), 2048).expect("load LFM2.5 on XDNA");
+        let npu: Box<dyn Model> = if cpu_decode {
+            let mut m = XdnaLfm2Model::from_gguf_with_id(gguf, 2048, path.display().to_string())
+                .expect("load LFM2.5 on XDNA");
+            m.cpu_decode = true;
+            Box::new(m)
+        } else {
+            crate::model::load_model_xdna(gguf, Some(&path), 2048).expect("load LFM2.5 on XDNA")
+        };
         let cpu = LfmModel::from_gguf(GgufFile::open(&path).expect("open CPU gguf"), 2048)
             .expect("load LFM2.5 on CPU");
         assert_eq!(npu.backend_label(), "xdna");
@@ -5496,7 +5613,7 @@ mod tests {
         let mean_cos = decode_coss.iter().sum::<f32>() / decode_coss.len() as f32;
         let min_cos = decode_coss.iter().copied().fold(f32::INFINITY, f32::min);
         eprintln!(
-            "LFM2.5 NPU decode (16 steps): mean_cos={mean_cos:.6} min_cos={min_cos:.6} top1={top1_matches}/16 ms/tok={:.2} ({:.1} tok/s)",
+            "LFM2.5 decode (16 steps): mean_cos={mean_cos:.6} min_cos={min_cos:.6} top1={top1_matches}/16 ms/tok={:.2} ({:.1} tok/s)",
             (decode_secs * 1e3) / 16.0,
             16.0 / decode_secs
         );
