@@ -455,7 +455,9 @@ pub struct ScratchBuffers {
     /// Scratch for attention scores (grows with seq_len). Reused across heads
     /// when the decode head loop runs serially; when it runs on the pool,
     /// `transformer::decode_attention` re-lays it out as one
-    /// `seq_len + head_dim` row per head so the heads don't share a buffer.
+    /// `seq_len + head_dim` row per head, or on its split-key path one
+    /// `group * (DECODE_ATTN_KEY_BLOCK + 2 + head_dim)` row per KV head and key
+    /// block, so no two workers share a buffer.
     pub scores: Vec<f32>,
     /// Q8_0 quantization scratch: scales for the input vector (max_k / 32 entries).
     pub q8_scales: Vec<f32>,
