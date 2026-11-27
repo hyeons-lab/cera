@@ -1602,7 +1602,18 @@ fn resolve_manifest_file_for_download(
     } else if let Some(dir) = manifest_dir {
         Ok(dir.join(path))
     } else {
-        Ok(path.to_path_buf())
+        let in_store = repo.store_dir().join(path);
+        if in_store.exists() {
+            Ok(in_store)
+        } else if path.exists() {
+            Ok(path.to_path_buf())
+        } else {
+            anyhow::bail!(
+                "relative manifest file `{value}` could not be resolved without a manifest directory (checked `{}` and `{}`)",
+                in_store.display(),
+                path.display()
+            )
+        }
     }
 }
 
@@ -9482,5 +9493,71 @@ mod tests {
         assert_eq!(p90, 50.0);
         assert_eq!(mean, 30.0);
         assert!((stddev - 14.1421356).abs() < 1e-4);
+    }
+
+    #[test]
+    fn resolve_manifest_file_for_download_resolves_store_dir_manifest_dir_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let stored_file = store_dir.join("cached.gguf");
+        std::fs::write(&stored_file, b"gguf").unwrap();
+
+        let repo = cera::bundle::BundleRepo::new(&store_dir);
+        let progress = super::CliDownloadProgress::default();
+
+        let abs = dir.path().join("direct.gguf");
+        assert_eq!(
+            super::resolve_manifest_file_for_download(
+                &repo,
+                &progress,
+                abs.to_str().unwrap(),
+                None,
+            )
+            .unwrap(),
+            abs
+        );
+
+        let manifest_dir = dir.path().join("bundle");
+        assert_eq!(
+            super::resolve_manifest_file_for_download(
+                &repo,
+                &progress,
+                "weights/model.gguf",
+                Some(&manifest_dir),
+            )
+            .unwrap(),
+            manifest_dir.join("weights/model.gguf")
+        );
+
+        assert_eq!(
+            super::resolve_manifest_file_for_download(&repo, &progress, "cached.gguf", None)
+                .unwrap(),
+            stored_file
+        );
+
+        assert!(std::path::Path::new("Cargo.toml").exists());
+        assert_eq!(
+            super::resolve_manifest_file_for_download(&repo, &progress, "Cargo.toml", None)
+                .unwrap(),
+            std::path::PathBuf::from("Cargo.toml")
+        );
+
+        let err = super::resolve_manifest_file_for_download(
+            &repo,
+            &progress,
+            "missing-relative-file.gguf",
+            None,
+        )
+        .expect_err("missing relative manifest file without manifest_dir must error");
+        assert!(
+            err.to_string().contains("without a manifest directory"),
+            "unexpected error: {err}"
+        );
+
+        let uri_err =
+            super::resolve_manifest_file_for_download(&repo, &progress, "file://model.gguf", None)
+                .expect_err("file:// scheme must be rejected");
+        assert!(uri_err.to_string().contains("file://"));
     }
 }

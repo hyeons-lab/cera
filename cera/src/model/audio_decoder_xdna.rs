@@ -67,7 +67,8 @@ struct XdnaDfState {
 
 impl XdnaDfState {
     fn new(cfg: &DepthformerConfig) -> Self {
-        let kv_len = cfg.max_seq_len * cfg.n_head_kv * cfg.n_embd_head;
+        let max_positions = cfg.max_seq_len.max(8);
+        let kv_len = max_positions * cfg.n_head_kv * cfg.n_embd_head;
         let kv = (0..cfg.n_layer)
             .map(|_| (vec![0.0f32; kv_len], vec![0.0f32; kv_len]))
             .collect();
@@ -172,6 +173,45 @@ impl XdnaDepthformer {
         next_atomic_xorshift64_f32_01(&self.rng_state)
     }
 
+    /// Project LLM hidden state into either a shared `[n_embd]` vector or per-codebook `[n_cb, n_embd]` matrix.
+    fn project_llm_input(
+        &self,
+        runner: &XdnaGemmRunner,
+        embedding: &[f32],
+        n_cb: usize,
+    ) -> Result<(Vec<f32>, bool)> {
+        let n_embd = self.depthformer_config.n_embd;
+        let llm_dim = self.depth_linear_cols;
+        let dl_rows = self.depth_linear_rows;
+        anyhow::ensure!(n_embd > 0, "XDNA depthformer requires n_embd > 0");
+        let shared_llm_proj = dl_rows == n_embd;
+        let required_rows = if shared_llm_proj {
+            n_embd
+        } else {
+            n_cb.saturating_mul(n_embd)
+        };
+        anyhow::ensure!(
+            dl_rows >= required_rows,
+            "XDNA depthformer depth_linear rows ({dl_rows}) < required ({required_rows}) for {n_cb} codebooks"
+        );
+
+        let mut llm_in = vec![0.0f32; llm_dim];
+        let copy_len = embedding.len().min(llm_dim);
+        llm_in[..copy_len].copy_from_slice(&embedding[..copy_len]);
+
+        let mut llm_proj_buf =
+            runner.matmul_f32(&llm_in, &self.w_depth_linear, 1, dl_rows, llm_dim)?;
+        anyhow::ensure!(
+            llm_proj_buf.len() >= required_rows,
+            "XDNA depthformer projection output len ({}) < required ({required_rows})",
+            llm_proj_buf.len()
+        );
+        for (dst, &b) in llm_proj_buf.iter_mut().zip(self.depth_linear_b.iter()) {
+            *dst += b;
+        }
+        Ok((llm_proj_buf, shared_llm_proj))
+    }
+
     /// Run one autoregressive LFM2A frame (`8` codebooks).
     fn sample_frame_lfm2a(
         &self,
@@ -182,27 +222,27 @@ impl XdnaDepthformer {
     ) -> Result<[i32; 8]> {
         let dec = &self.decoder_config;
         let cfg = &self.depthformer_config;
+        let n_cb = dec.n_codebook.min(8);
         let n_embd = cfg.n_embd;
         let n_head = cfg.n_head;
         let n_kv = cfg.n_head_kv;
         let hd = cfg.n_embd_head;
+        anyhow::ensure!(
+            n_embd > 0 && n_head > 0 && n_kv > 0 && hd > 0,
+            "XDNA depthformer requires positive attention and embedding dimensions"
+        );
+        anyhow::ensure!(
+            self.codebooks.len() >= n_cb,
+            "XDNA depthformer codebooks ({}) < {n_cb}",
+            self.codebooks.len()
+        );
         let q_dim = n_head * hd;
         let kv_dim = n_kv * hd;
-        let group_size = (n_head / n_kv.max(1)).max(1);
+        let group_size = (n_head / n_kv).max(1);
         let scale = 1.0f32 / (hd as f32).sqrt();
-        let llm_dim = self.depth_linear_cols;
-        let dl_rows = self.depth_linear_rows;
 
-        let mut llm_in = vec![0.0f32; llm_dim];
-        let copy_len = embedding.len().min(llm_dim);
-        llm_in[..copy_len].copy_from_slice(&embedding[..copy_len]);
-
-        // Project LLM hidden -> all codebook inputs in a single XDNA GEMM call.
-        let mut all_llm_proj =
-            runner.matmul_f32(&llm_in, &self.w_depth_linear, 1, dl_rows, llm_dim)?;
-        for (dst, &b) in all_llm_proj.iter_mut().zip(self.depth_linear_b.iter()) {
-            *dst += b;
-        }
+        // Project LLM hidden -> codebook inputs in a single XDNA GEMM call.
+        let (all_llm_proj, shared_llm_proj) = self.project_llm_input(runner, embedding, n_cb)?;
 
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.reset_kv();
@@ -215,10 +255,14 @@ impl XdnaDepthformer {
         let mut scores = vec![0.0f32; cfg.max_seq_len.max(8)];
         let mut attn_out = vec![0.0f32; q_dim];
 
-        for (j, code_slot) in codes.iter_mut().enumerate().take(dec.n_codebook.min(8)) {
+        for (j, code_slot) in codes.iter_mut().enumerate().take(n_cb) {
             let pos = st.n_past;
-            let row_start = j * n_embd;
-            cur.copy_from_slice(&all_llm_proj[row_start..row_start + n_embd]);
+            let proj_src = if shared_llm_proj {
+                &all_llm_proj[..n_embd]
+            } else {
+                &all_llm_proj[j * n_embd..(j + 1) * n_embd]
+            };
+            cur.copy_from_slice(proj_src);
 
             if j > 0 && prev_token >= 0 {
                 let prev_cb = &self.codebooks[j - 1];
@@ -362,26 +406,26 @@ impl XdnaDepthformer {
         let cfg = &self.decoder_config;
         let df_cfg = &self.depthformer_config;
         let n_cb = cfg.n_codebook;
+        if n_cb == 0 {
+            return Ok(Vec::new());
+        }
         let n_vocab = cfg.n_vocab;
         let mask_id = n_vocab.saturating_sub(1) as i32;
         let n_embd = df_cfg.n_embd;
         let n_head = df_cfg.n_head;
         let n_kv = df_cfg.n_head_kv;
         let hd = df_cfg.n_embd_head;
+        anyhow::ensure!(
+            n_embd > 0 && n_head > 0 && n_kv > 0 && hd > 0,
+            "XDNA lfm3a depthformer requires positive attention and embedding dimensions"
+        );
+        anyhow::ensure!(
+            self.codebooks.len() >= n_cb,
+            "XDNA lfm3a depthformer codebooks ({}) < {n_cb}",
+            self.codebooks.len()
+        );
         let eps = df_cfg.rms_norm_eps;
-        let llm_dim = self.depth_linear_cols;
-        let dl_rows = self.depth_linear_rows;
-        let shared_llm_proj = dl_rows == n_embd;
-
-        let mut llm_in = vec![0.0f32; llm_dim];
-        let copy_len = embedding.len().min(llm_dim);
-        llm_in[..copy_len].copy_from_slice(&embedding[..copy_len]);
-
-        let mut llm_proj_buf =
-            runner.matmul_f32(&llm_in, &self.w_depth_linear, 1, dl_rows, llm_dim)?;
-        for (dst, &b) in llm_proj_buf.iter_mut().zip(self.depth_linear_b.iter()) {
-            *dst += b;
-        }
+        let (llm_proj_buf, shared_llm_proj) = self.project_llm_input(runner, embedding, n_cb)?;
 
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut codes = vec![mask_id; n_cb];
@@ -588,14 +632,15 @@ impl XdnaDepthformer {
                 let mut logits =
                     runner.matmul_f32(&normed_row, &cb.w_to_logits, 1, cb.n_vocab, cb.n_embd)?;
 
-                if !st.code_history.is_empty() {
-                    let mut seen = vec![false; n_vocab];
+                if !st.code_history.is_empty() && !logits.is_empty() {
+                    let vocab_cap = logits.len().min(n_vocab);
+                    let mut seen = vec![false; vocab_cap];
                     for past_frame in &st.code_history {
                         if let Some(&past_code) = past_frame.get(j)
                             && past_code >= 0
                         {
                             let idx = past_code as usize;
-                            if idx < n_vocab && !seen[idx] {
+                            if idx < vocab_cap && !seen[idx] {
                                 seen[idx] = true;
                                 if logits[idx] > 0.0 {
                                     logits[idx] /= LFM3A_REP_PENALTY;
@@ -628,7 +673,10 @@ impl XdnaDepthformer {
                     0.0
                 };
 
-                if !t_step.is_finite() || t_step <= 0.0 || top_k == 1 {
+                if logits.is_empty() {
+                    cand_tokens[j] = 0;
+                    confidences[j] = f32::NEG_INFINITY;
+                } else if !t_step.is_finite() || t_step <= 0.0 || top_k == 1 {
                     let best = argmax(&logits);
                     cand_tokens[j] = best as i32;
                     confidences[j] = logits[best as usize] - log_z;
@@ -767,6 +815,28 @@ struct XdnaDetokenizer {
 impl XdnaDetokenizer {
     fn new(runner: &XdnaGemmRunner, weights: &DetokenizerWeights) -> Result<Self> {
         let lfm3_gen = weights.is_lfm3a_gen();
+        anyhow::ensure!(
+            weights.config.n_embd > 0,
+            "XDNA detokenizer config requires n_embd > 0"
+        );
+        anyhow::ensure!(
+            weights.config.layer_is_conv.len() == weights.layers.len(),
+            "XDNA detokenizer layer_is_conv len ({}) != layers len ({})",
+            weights.config.layer_is_conv.len(),
+            weights.layers.len()
+        );
+        if weights.config.layer_is_conv.iter().any(|&c| !c) {
+            anyhow::ensure!(
+                weights.config.swa_window_size > 0,
+                "XDNA detokenizer with attention layers requires swa_window_size > 0"
+            );
+            anyhow::ensure!(
+                weights.config.n_head > 0
+                    && weights.config.n_head_kv > 0
+                    && weights.config.n_embd_head > 0,
+                "XDNA detokenizer with attention layers requires positive head dimensions"
+            );
+        }
         let mut layers = Vec::with_capacity(weights.layers.len());
         for (il, lw) in weights.layers.iter().enumerate() {
             let is_conv = weights.config.layer_is_conv[il];
@@ -860,6 +930,7 @@ impl XdnaDetokenizer {
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let n_embd = cfg.n_embd;
+        anyhow::ensure!(n_embd > 0, "XDNA detokenizer requires n_embd > 0");
 
         let embedding = detok_embed_codes(cpu_weights, codes);
         let single_frame_bins = (cfg.n_fft / 2 + 1) * 2;
@@ -868,6 +939,11 @@ impl XdnaDetokenizer {
         } else {
             upsample(&embedding, n_embd, 6)
         };
+        anyhow::ensure!(
+            !tokens.is_empty() && tokens.len().is_multiple_of(n_embd),
+            "XDNA detokenizer embedded token buffer len ({}) is invalid for n_embd={n_embd}",
+            tokens.len()
+        );
         let n_tokens = tokens.len() / n_embd;
         let mut hidden = tokens;
         let mut norm_mat = vec![0.0f32; n_tokens * n_embd];
@@ -950,6 +1026,10 @@ impl XdnaDetokenizer {
                 let n_head = cfg.n_head;
                 let n_kv = cfg.n_head_kv;
                 let hd = cfg.n_embd_head;
+                anyhow::ensure!(
+                    cfg.swa_window_size > 0 && n_head > 0 && n_kv > 0 && hd > 0,
+                    "XDNA detokenizer attention layer requires positive swa_window_size and head dimensions"
+                );
                 let q_dim = n_head * hd;
                 let kv_stride = n_kv * hd;
                 let group_size = (n_head / n_kv.max(1)).max(1);
@@ -1261,8 +1341,12 @@ impl AudioAccelerator for XdnaAudioDecoder {
     }
 
     fn take_audio_error(&self) -> Option<CeraError> {
-        let _ = self.runner.take_err();
-        take_fault(&self.last_error)
+        let own_err = take_fault(&self.last_error);
+        let runner_err = self
+            .runner
+            .take_err()
+            .map(|e| CeraError::Backend(format!("XDNA runner: {e:#}")));
+        own_err.or(runner_err)
     }
 
     fn try_acquire_session(&self) -> bool {
@@ -1715,6 +1799,154 @@ mod tests {
                 assert_eq!(npu_spec.len(), cpu_spec.len());
                 assert!(npu_spec.iter().all(|v| v.is_finite()));
             }
+
+            drop(xdna);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_detokenizer_rejects_invalid_config_and_zero_swa_attn() {
+        fake::with_shim(FakeConfig::default(), || {
+            let (dec_w, mut detok_w) = synth_lfm2a_weights();
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+
+            detok_w.config.layer_is_conv.pop();
+            let err = match XdnaAudioDecoder::from_parts(runner.clone(), None, Some(&detok_w)) {
+                Ok(_) => panic!("expected layer_is_conv mismatch error"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("layer_is_conv"));
+
+            let (_, mut bad_swa_detok) = synth_lfm2a_weights();
+            bad_swa_detok.config.swa_window_size = 0;
+            let err = match XdnaAudioDecoder::from_parts(runner.clone(), None, Some(&bad_swa_detok))
+            {
+                Ok(_) => panic!("expected swa_window_size=0 attention error"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("swa_window_size"));
+
+            let (_, mut bad_embd_detok) = synth_lfm2a_weights();
+            bad_embd_detok.config.n_embd = 0;
+            let err =
+                match XdnaAudioDecoder::from_parts(runner.clone(), None, Some(&bad_embd_detok)) {
+                    Ok(_) => panic!("expected n_embd=0 error"),
+                    Err(e) => e,
+                };
+            assert!(err.to_string().contains("n_embd"));
+
+            // Conv-only detokenizers do not touch attention KV and may set swa_window_size = 0.
+            let (_, mut conv_only_detok) = synth_lfm2a_weights();
+            conv_only_detok.config.swa_window_size = 0;
+            conv_only_detok.config.layer_is_conv = vec![true];
+            conv_only_detok.layers.truncate(1);
+            let xdna = XdnaAudioDecoder::from_parts(runner, Some(&dec_w), Some(&conv_only_detok))
+                .expect("conv-only detokenizer with swa_window_size=0 should construct");
+            let spec = xdna.detokenize_to_spectrum(&conv_only_detok, &[1; 8]);
+            assert!(xdna.take_audio_error().is_none());
+            assert!(!spec.is_empty());
+
+            drop(xdna);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_lfm2a_shared_projection_and_small_max_seq_len() {
+        fake::with_shim(FakeConfig::default(), || {
+            let (mut dec_w, _) = synth_lfm2a_weights();
+            let n_embd = dec_w.depthformer_config.n_embd;
+            let llm_dim = dec_w.decoder_config.n_embd;
+            let n_vocab = dec_w.decoder_config.n_vocab as i32;
+            dec_w.depthformer_config.max_seq_len = 2;
+            dec_w.depth_linear_w = f32_w(n_embd, llm_dim, 80, 0.2);
+            dec_w.depth_linear_b = det_vec(n_embd, 81, 0.02);
+
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let xdna = XdnaAudioDecoder::from_parts(runner.clone(), Some(&dec_w), None)
+                .expect("shared projection lfm2a");
+            let embed = det_vec(llm_dim, 7, 0.5);
+            let codes = xdna.sample_audio_frame(&embed, 0.0, 1);
+            assert!(xdna.take_audio_error().is_none());
+            assert!(codes.iter().all(|&c| (0..n_vocab).contains(&c)));
+
+            dec_w.depth_linear_w = f32_w(2 * n_embd, llm_dim, 80, 0.2);
+            dec_w.depth_linear_b = det_vec(2 * n_embd, 81, 0.02);
+            let bad_xdna = XdnaAudioDecoder::from_parts(runner, Some(&dec_w), None)
+                .expect("construct with undersized depth_linear");
+            let fallback = bad_xdna.sample_audio_frame(&embed, 0.0, 1);
+            assert_eq!(fallback, [0; 8]);
+            let err = bad_xdna
+                .take_audio_error()
+                .expect("undersized depth_linear must surface error");
+            assert!(err.to_string().contains("depth_linear"));
+
+            drop(xdna);
+            drop(bad_xdna);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_lfm3a_repetition_penalty_oob_history_and_empty_logits() {
+        fake::with_shim(FakeConfig::default(), || {
+            let (mut dec_w, _) = synth_lfm3a_weights();
+            let n_embd = dec_w.depthformer_config.n_embd;
+            dec_w.depth_embeddings[0].to_logits = f32_w(4, n_embd, 70, 0.25);
+            dec_w.depth_embeddings[1].to_logits = MmapWeight::from_owned_f32(Vec::new(), 0, n_embd);
+
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let xdna = XdnaAudioDecoder::from_parts(runner, Some(&dec_w), None)
+                .expect("XdnaAudioDecoder lfm3a");
+            let df = xdna.depthformer.as_ref().expect("depthformer");
+            {
+                let mut st = df.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.push_code_history(vec![200, 15, i32::MAX, -3]);
+            }
+
+            let embed = det_vec(dec_w.decoder_config.n_embd, 19, 0.4);
+            let greedy = xdna
+                .sample_audio_frame_lfm3a(&embed, 0.0, 1)
+                .expect("greedy lfm3a with empty and smaller codebook logits");
+            assert!(xdna.take_audio_error().is_none());
+            assert_eq!(greedy.len(), 12);
+            assert!((0..4).contains(&greedy[0]));
+
+            let sampled = xdna
+                .sample_audio_frame_lfm3a(&embed, 0.8, 4)
+                .expect("stochastic lfm3a with empty and smaller codebook logits");
+            assert!(xdna.take_audio_error().is_none());
+            assert_eq!(sampled.len(), 12);
+            assert!((0..4).contains(&sampled[0]));
+
+            drop(xdna);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_take_audio_error_drains_runner_fault() {
+        use crate::model::vision_encoder_gpu::VitGpuOps;
+        use crate::model::xdna_towers::XdnaVitOps;
+
+        fake::with_shim(FakeConfig::default(), || {
+            let (dec_w, _) = synth_lfm2a_weights();
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let xdna = XdnaAudioDecoder::from_parts(runner.clone(), Some(&dec_w), None)
+                .expect("XdnaAudioDecoder");
+            assert!(xdna.take_audio_error().is_none());
+
+            let _ = XdnaVitOps::new(runner).upload_weight_f32(&[], 1, 1);
+            let err = xdna
+                .take_audio_error()
+                .expect("runner fault should surface through take_audio_error");
+            assert!(
+                err.to_string()
+                    .contains("gemm_bf16 weight length 0 != 1 * 1"),
+                "unexpected runner error: {err}"
+            );
+            assert!(xdna.take_audio_error().is_none());
 
             drop(xdna);
             assert_eq!(fake::live_bo_count(), 0);

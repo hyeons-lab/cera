@@ -1735,8 +1735,9 @@ fn release_warm_spin_lease(slot: &Mutex<Option<PoolSlot>>, leases: &AtomicUsize,
     sync_slot_spin_limit_in(slot, leases, warm_target);
 }
 
-/// RAII lease keeping [`RowPool::prefill`] workers spinning across hybrid NPU
-/// token gaps on Windows until dropped (or bypassed by an explicit `CERA_SPIN`).
+/// RAII lease tightening [`RowPool::prefill`] workers' spin budget to
+/// [`XDNA_PREFILL_SPIN_BEFORE_PARK`] (`20_000`, ~30 us) on Windows while a hybrid
+/// NPU decode model is live until dropped (or bypassed by an explicit `CERA_SPIN`).
 #[cfg(any(feature = "xdna", test))]
 #[derive(Debug)]
 pub(crate) struct PrefillWarmGuard {
@@ -1751,7 +1752,8 @@ impl Drop for PrefillWarmGuard {
 }
 
 impl RowPool {
-    /// Acquire a refcounted lease that extends [`RowPool::prefill`]'s spin budget
+    /// Acquire a refcounted lease that sets [`RowPool::prefill`]'s spin budget to
+    /// [`xdna_warm_spin_target()`] (`20_000` on Windows to eliminate NPU PPT contention)
     /// while a hybrid XDNA decode model is live, restoring the baseline budget on drop.
     #[cfg(any(feature = "xdna", test))]
     pub(crate) fn acquire_prefill_warm_spin() -> PrefillWarmGuard {
