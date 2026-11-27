@@ -230,6 +230,39 @@ pub(crate) fn validate_xdna_kv_compression(
     Ok(())
 }
 
+/// Whether `CERA_NPU_DECODE=cpu` moves the single-token decode steps of the hybrid XDNA LFM2/LFM3
+/// models to their CPU model, keeping prefill on the NPU.
+///
+/// Always `false` under `cfg(test)` so an ambient shell variable never reroutes tests; unit tests
+/// exercise [`npu_decode_on_cpu_from_lookup`] directly.
+pub(crate) fn npu_decode_on_cpu() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        npu_decode_on_cpu_from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
+/// `cpu` (trimmed, any case) selects CPU decode. Unset, empty and `npu` keep NPU decode, and any
+/// other value logs a warning and keeps NPU decode.
+fn npu_decode_on_cpu_from_lookup(lookup: impl FnOnce(&str) -> Option<String>) -> bool {
+    let Some(raw) = lookup("CERA_NPU_DECODE") else {
+        return false;
+    };
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("cpu") {
+        return true;
+    }
+    if !v.is_empty() && !v.eq_ignore_ascii_case("npu") {
+        tracing::warn!("cera: ignoring unrecognized CERA_NPU_DECODE={v:?}; expected cpu or npu");
+        eprintln!("cera: ignoring unrecognized CERA_NPU_DECODE={v:?}; expected cpu or npu");
+    }
+    false
+}
+
 /// Deferred host-side CPU `InferenceState` mirror work for hybrid XDNA
 /// decode models (`XdnaLfm2Model`, `XdnaLfm3Model`).
 ///
@@ -2500,6 +2533,27 @@ mod tests {
         let err = validate_xdna_kv_compression(&cfg, &KvCompression::turboquant(42))
             .expect_err("TurboQuant must be rejected on XDNA");
         assert!(err.to_string().contains("TurboQuant"));
+    }
+
+    #[test]
+    fn npu_decode_on_cpu_from_lookup_selects_cpu_only_for_cpu() {
+        assert!(!npu_decode_on_cpu_from_lookup(|_| None));
+        for v in ["cpu", " CPU ", "Cpu"] {
+            assert!(
+                npu_decode_on_cpu_from_lookup(|k| {
+                    assert_eq!(k, "CERA_NPU_DECODE");
+                    Some(v.to_string())
+                }),
+                "{v:?} must select CPU decode"
+            );
+        }
+        for v in ["", "  ", "npu", "NPU", "gpu", "1", "cpu0"] {
+            assert!(
+                !npu_decode_on_cpu_from_lookup(|_| Some(v.to_string())),
+                "{v:?} must keep NPU decode"
+            );
+        }
+        assert!(!npu_decode_on_cpu());
     }
 
     #[test]

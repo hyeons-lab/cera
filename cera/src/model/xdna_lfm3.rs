@@ -43,7 +43,7 @@ use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
 use crate::model::lfm2::LfmModel;
 use crate::model::transformer::{self, WeightRef};
 use crate::model::xdna_llama::{
-    HybridPendingSlot, PendingHybridCpuKv, check_hybrid_kv_rewind_state,
+    HybridPendingSlot, PendingHybridCpuKv, check_hybrid_kv_rewind_state, npu_decode_on_cpu,
     validate_xdna_kv_compression,
 };
 use crate::model::{
@@ -896,6 +896,7 @@ pub struct XdnaLfm3Model {
     decode_error: Mutex<Option<CeraError>>,
     session_gate: ModelSessionGate,
     profile_decode: bool,
+    cpu_decode: bool,
     _prefill_warm_guard: Option<crate::backend::PrefillWarmGuard>,
 }
 
@@ -1053,6 +1054,7 @@ impl XdnaLfm3Model {
         } else {
             None
         };
+        let cpu_decode = is_causal && npu_decode_on_cpu();
 
         Ok(Self {
             cpu,
@@ -1078,8 +1080,9 @@ impl XdnaLfm3Model {
             decode_error: Mutex::new(None),
             session_gate: ModelSessionGate::default(),
             profile_decode: crate::backend::cpu_features::profile_decode_enabled(),
+            cpu_decode,
             _prefill_warm_guard: {
-                let g = is_causal.then(crate::backend::acquire_prefill_warm_spin);
+                let g = (is_causal && !cpu_decode).then(crate::backend::acquire_prefill_warm_spin);
                 if is_causal {
                     crate::backend::warm_prefill_pool(LfmModel::xdna_head_threads());
                 }
@@ -4579,6 +4582,40 @@ impl XdnaLfm3Model {
         )
     }
 
+    /// NPU keeps `synced_len`, so its next prefill copies in the rows the CPU decode writes.
+    fn prepare_cpu_decode(&self, state: &mut InferenceState, pos: usize) -> bool {
+        let mut npu = self.lock_npu();
+        let res = (|| -> Result<(), SyncErr> {
+            if self.state_torn.load(Ordering::SeqCst) {
+                return Err(SyncErr::Input(
+                    "XDNA NPU state torn after a fault; call try_reset_kv".to_string(),
+                ));
+            }
+            self.validate_cpu_state_for_sync(state, npu.pending_kv.as_ref(), pos)
+                .map_err(SyncErr::Input)?;
+            npu.quiesce_in_flight().map_err(SyncErr::Device)?;
+            if !npu.pending_kv.flush_into(state) {
+                npu.synced_len = 0;
+                npu.force_conv_sync = true;
+                npu.swa_base_chunk.fill(0);
+                self.validate_cpu_state_for_sync(state, None, pos)
+                    .map_err(SyncErr::Input)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => true,
+            Err(SyncErr::Input(e)) => {
+                let _ = self.reject_input(e, 0);
+                false
+            }
+            Err(SyncErr::Device(e)) => {
+                let _ = self.record_device_fault(e, 0);
+                false
+            }
+        }
+    }
+
     fn run_single_embedding_forward(
         &self,
         embedding: &[f32],
@@ -4612,6 +4649,13 @@ impl XdnaLfm3Model {
         }
         if let Err(e) = self.validate_state(state) {
             return self.reject_input(e, vocab_size);
+        }
+        if self.cpu_decode {
+            return if self.prepare_cpu_decode(state, pos) {
+                self.cpu.forward_from_embedding(embedding, pos, state)
+            } else {
+                vec![0.0f32; vocab_size]
+            };
         }
 
         let mut npu = self.lock_npu();
@@ -4802,6 +4846,13 @@ impl Model for XdnaLfm3Model {
             );
             return 0;
         };
+        if self.cpu_decode {
+            return if self.prepare_cpu_decode(state, pos) {
+                self.cpu.forward_greedy(tokens, pos, state)
+            } else {
+                0
+            };
+        }
         if state.scratch.logits.len() < vocab_size {
             state.scratch.logits.resize(vocab_size, 0.0);
         }
@@ -5240,6 +5291,88 @@ mod tests {
         });
     }
 
+    #[test]
+    fn causal_lfm3_cpu_decode_flushes_pending_and_npu_prefill_resyncs_on_fake_shim() {
+        // Layer 1 as global attention, then as a 64-token sliding window (a 10-chunk NPU ring).
+        for swa_window in [None, Some(64)] {
+            with_shim(FakeConfig::default(), || {
+                let gguf = tiny_lfm3_gguf_with_swa(true, 4096, swa_window);
+                let mut npu_model =
+                    XdnaLfm3Model::from_gguf_with_id(gguf, 4096, "test".to_string())
+                        .expect("load causal LFM3 on fake shim");
+                npu_model.cpu_decode = true;
+                let model: &dyn Model = &npu_model;
+                let mut state =
+                    InferenceState::from_config_capped(model.config(), &KvCompression::F16, 4096)
+                        .unwrap();
+                let kv_rows = |state: &InferenceState| match &state.layers[1] {
+                    LayerState::Attention { key_cache_f16, .. } => {
+                        key_cache_f16.len() / LFM3_KV_DIM
+                    }
+                    _ => panic!("layer 1 must be attention"),
+                };
+
+                // A 3-token prefill runs as NPU decode steps and defers the last row.
+                let _ = model.forward_prefill(&[1, 2, 3], 0, &mut state);
+                assert_eq!(state.seq_len, 3);
+                assert_eq!(kv_rows(&state), 2);
+                assert!(npu_model.lock_npu().pending_kv.as_ref().is_some());
+
+                let logits = model.forward(&[4], 3, &mut state);
+                assert_eq!(logits.len(), model.config().vocab_size);
+                assert!(npu_model.lock_npu().pending_kv.as_ref().is_none());
+                let tok = model.forward_greedy(&[5], 4, &mut state);
+                assert!((tok as usize) < model.config().vocab_size);
+                let emb = model.embed_token_rows(&[6]).unwrap();
+                let _ = model.forward_from_embedding(&emb, 5, &mut state);
+                assert!(model.take_decode_error().is_none());
+                assert_eq!(state.seq_len, 6);
+                assert_eq!(kv_rows(&state), 6);
+                assert_eq!(npu_model.lock_npu().synced_len, 3);
+
+                // Tag a CPU-written K row; the next NPU prefill must copy it in before running.
+                if let LayerState::Attention { key_cache_f16, .. } = &mut state.layers[1] {
+                    key_cache_f16[4 * LFM3_KV_DIM] = crate::quant::f32_to_f16(1.5);
+                }
+                let _ = model.forward_prefill(&[9, 10], 6, &mut state);
+                assert!(model.take_decode_error().is_none());
+                assert_eq!(state.seq_len, 8);
+                {
+                    let npu = npu_model.lock_npu();
+                    assert_eq!(npu.synced_len, 8);
+                    let k_off = 4 * LFM3_HEAD_DIM * 2;
+                    let k = &npu.layer_kv_blocks[1][0].as_slice()[k_off..k_off + 2];
+                    assert_eq!(u16::from_le_bytes([k[0], k[1]]), f32_to_bf16(1.5));
+                }
+
+                // Stand in for a long CPU-decoded reply that runs past the ring.
+                let _ = model.forward(&[11], 8, &mut state);
+                if let LayerState::Attention {
+                    key_cache_f16,
+                    value_cache_f16,
+                    ..
+                } = &mut state.layers[1]
+                {
+                    key_cache_f16.resize(1024 * LFM3_KV_DIM, crate::quant::f32_to_f16(1.0));
+                    value_cache_f16.resize(1024 * LFM3_KV_DIM, crate::quant::f32_to_f16(1.0));
+                    key_cache_f16[1000 * LFM3_KV_DIM] = crate::quant::f32_to_f16(2.5);
+                }
+                state.seq_len = 1024;
+                let _ = model.forward_prefill(&[12, 13], 1024, &mut state);
+                assert!(model.take_decode_error().is_none());
+                let npu = npu_model.lock_npu();
+                assert_eq!(npu.synced_len, 1026);
+                // The ring keeps the 2 window chunks before the last one written (chunk 31).
+                let base = npu.swa_base_chunk[1];
+                assert_eq!(base, if swa_window.is_some() { 29 } else { 0 });
+                let k_off = (1000 / LFM3_KV_CHUNK_T - base) * TILE_BYTES
+                    + (1000 % LFM3_KV_CHUNK_T) * LFM3_HEAD_DIM * 2;
+                let k = &npu.layer_kv_blocks[1][0].as_slice()[k_off..k_off + 2];
+                assert_eq!(u16::from_le_bytes([k[0], k[1]]), f32_to_bf16(2.5));
+            });
+        }
+    }
+
     fn oracle_model_path(file: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -5280,13 +5413,29 @@ mod tests {
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
     fn hw_gate3a_lfm3_causal_parity_and_throughput() {
+        run_hw_gate3a(false);
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
+    fn hw_gate3a_lfm3_cpu_decode_parity() {
+        run_hw_gate3a(true);
+    }
+
+    fn run_hw_gate3a(cpu_decode: bool) {
         let path = oracle_model_path("LFM3-1.7B-QAD-Q4_0.gguf");
         assert!(path.exists(), "missing GGUF at {}", path.display());
 
         let gguf = GgufFile::open(&path).expect("open LFM3-1.7B-QAD-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
-        let npu =
-            crate::model::load_model_xdna(gguf, Some(&path), 2048).expect("load LFM3 on XDNA");
+        let npu: Box<dyn Model> = if cpu_decode {
+            let mut m = XdnaLfm3Model::from_gguf_with_id(gguf, 2048, path.display().to_string())
+                .expect("load LFM3 on XDNA");
+            m.cpu_decode = true;
+            Box::new(m)
+        } else {
+            crate::model::load_model_xdna(gguf, Some(&path), 2048).expect("load LFM3 on XDNA")
+        };
         let cpu = LfmModel::from_gguf(GgufFile::open(&path).expect("open CPU gguf"), 2048)
             .expect("load LFM3 on CPU");
         assert_eq!(npu.backend_label(), "xdna");
