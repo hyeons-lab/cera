@@ -75,6 +75,19 @@ struct XdnaPrefillState {
     _kernels: Vec<XdnaKernel>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightXdnaOp {
+    DecodeBucket(usize),
+    PrefillBucket(usize),
+    PrefillHead,
+}
+
+#[derive(Debug)]
+enum SyncErr {
+    Input(String),
+    Device(String),
+}
+
 struct XdnaDecodeState {
     bucket_chunks: Vec<usize>,
     bucket_runlists: Vec<XdnaRunList>,
@@ -89,7 +102,7 @@ struct XdnaDecodeState {
     _layer_kernels: Vec<XdnaKernel>,
     prefill: Option<Box<XdnaPrefillState>>,
     _device: XdnaDevice,
-    in_flight_bucket: Option<usize>,
+    in_flight: Option<InFlightXdnaOp>,
     synced_kv_len: usize,
     cached_rope: Option<(usize, [f32; 128])>,
     pending_cpu_kv: Option<(usize, LayerKvPair)>,
@@ -204,13 +217,36 @@ fn validate_xdna_llama_cpu(cpu: &LlamaModel) -> Result<()> {
 }
 
 fn quiesce_in_flight(npu: &mut XdnaDecodeState) -> Result<(), String> {
-    if let Some(bucket_idx) = npu.in_flight_bucket {
-        npu.bucket_runlists[bucket_idx]
-            .wait(QUIESCE_TIMEOUT_MS)
-            .map_err(|e| {
-                format!("failed to quiesce in-flight XDNA runlist (bucket {bucket_idx}): {e}")
-            })?;
-        npu.in_flight_bucket = None;
+    if let Some(op) = npu.in_flight {
+        match op {
+            InFlightXdnaOp::DecodeBucket(bucket_idx) => npu.bucket_runlists[bucket_idx]
+                .wait(QUIESCE_TIMEOUT_MS)
+                .map_err(|e| {
+                    format!("failed to quiesce in-flight XDNA runlist (bucket {bucket_idx}): {e}")
+                })?,
+            InFlightXdnaOp::PrefillBucket(pf_bucket_idx) => {
+                if let Some(pf) = npu.prefill.as_ref() {
+                    pf.bucket_runlists[pf_bucket_idx]
+                        .wait(QUIESCE_TIMEOUT_MS)
+                        .map_err(|e| {
+                            format!(
+                                "failed to quiesce in-flight XDNA prefill runlist (bucket {pf_bucket_idx}): {e}"
+                            )
+                        })?;
+                }
+            }
+            InFlightXdnaOp::PrefillHead => {
+                if let Some(pf) = npu.prefill.as_ref() {
+                    pf.head_run
+                        .wait(QUIESCE_TIMEOUT_MS)
+                        .map(|_| ())
+                        .map_err(|e| {
+                            format!("failed to quiesce in-flight XDNA prefill head run: {e}")
+                        })?;
+                }
+            }
+        }
+        npu.in_flight = None;
     }
     Ok(())
 }
@@ -1216,7 +1252,7 @@ impl XdnaLlamaModel {
                 _layer_kernels: layer_kernels,
                 prefill,
                 _device: device,
-                in_flight_bucket: None,
+                in_flight: None,
                 synced_kv_len: 0,
                 cached_rope: None,
                 pending_cpu_kv: None,
@@ -1361,17 +1397,17 @@ impl XdnaLlamaModel {
         npu: &mut XdnaDecodeState,
         state: &mut InferenceState,
         target_pos: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), SyncErr> {
         if state.is_compressed() {
-            return Err(
+            return Err(SyncErr::Input(
                 "TurboQuant KV compression is not supported by the XDNA backend".to_string(),
-            );
+            ));
         }
         if state.layers.len() < N_LAYERS {
-            return Err(format!(
+            return Err(SyncErr::Input(format!(
                 "InferenceState has {} layers, expected at least {N_LAYERS}",
                 state.layers.len()
-            ));
+            )));
         }
         Self::flush_pending_cpu_kv(npu, state);
         if target_pos < npu.synced_kv_len {
@@ -1382,11 +1418,12 @@ impl XdnaLlamaModel {
         }
         let needed = target_pos
             .checked_mul(KV_DIM)
-            .ok_or_else(|| "target_pos overflows KV cache length".to_string())?;
+            .ok_or_else(|| SyncErr::Input("target_pos overflows KV cache length".to_string()))?;
         let start = npu.synced_kv_len;
         let use_f16 = state.kv_f16;
+        // Validate every layer's KV cache shape before writing BOs or syncing so
+        // malformed inputs reject cleanly without tearing NPU state.
         for l in 0..N_LAYERS {
-            let kv_bytes = npu.layer_bo_kv[l].as_mut_slice();
             match &state.layers[l] {
                 LayerState::Attention {
                     key_cache,
@@ -1397,51 +1434,64 @@ impl XdnaLlamaModel {
                 } => {
                     if use_f16 {
                         if key_cache_f16.len() < needed || value_cache_f16.len() < needed {
-                            return Err(format!(
+                            return Err(SyncErr::Input(format!(
                                 "layer {l} f16 KV cache has {}/{} elements, expected at least {needed}",
                                 key_cache_f16.len(),
                                 value_cache_f16.len()
-                            ));
+                            )));
                         }
                     } else if key_cache.len() < needed || value_cache.len() < needed {
-                        return Err(format!(
+                        return Err(SyncErr::Input(format!(
                             "layer {l} f32 KV cache has {}/{} elements, expected at least {needed}",
                             key_cache.len(),
                             value_cache.len()
-                        ));
-                    }
-                    for t in start..target_pos {
-                        for kvh in 0..N_KV_HEADS {
-                            let src_fl = t * KV_DIM + kvh * HEAD_DIM;
-                            if use_f16 {
-                                let mut kh = [0.0f32; HEAD_DIM];
-                                let mut vh = [0.0f32; HEAD_DIM];
-                                for d in 0..HEAD_DIM {
-                                    kh[d] = crate::quant::f16_to_f32(key_cache_f16[src_fl + d]);
-                                    vh[d] = crate::quant::f16_to_f32(value_cache_f16[src_fl + d]);
-                                }
-                                write_q4layer_kv_bf16(kv_bytes, kvh, t, &kh, &vh);
-                            } else {
-                                write_q4layer_kv_bf16(
-                                    kv_bytes,
-                                    kvh,
-                                    t,
-                                    &key_cache[src_fl..src_fl + HEAD_DIM],
-                                    &value_cache[src_fl..src_fl + HEAD_DIM],
-                                );
-                            }
-                        }
+                        )));
                     }
                 }
                 _ => {
-                    return Err(format!(
+                    return Err(SyncErr::Input(format!(
                         "layer {l} does not have an Attention KV state for XDNA"
-                    ));
+                    )));
+                }
+            }
+        }
+        for l in 0..N_LAYERS {
+            let kv_bytes = npu.layer_bo_kv[l].as_mut_slice();
+            let LayerState::Attention {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &state.layers[l]
+            else {
+                unreachable!("validated Attention layers above");
+            };
+            for t in start..target_pos {
+                for kvh in 0..N_KV_HEADS {
+                    let src_fl = t * KV_DIM + kvh * HEAD_DIM;
+                    if use_f16 {
+                        let mut kh = [0.0f32; HEAD_DIM];
+                        let mut vh = [0.0f32; HEAD_DIM];
+                        for d in 0..HEAD_DIM {
+                            kh[d] = crate::quant::f16_to_f32(key_cache_f16[src_fl + d]);
+                            vh[d] = crate::quant::f16_to_f32(value_cache_f16[src_fl + d]);
+                        }
+                        write_q4layer_kv_bf16(kv_bytes, kvh, t, &kh, &vh);
+                    } else {
+                        write_q4layer_kv_bf16(
+                            kv_bytes,
+                            kvh,
+                            t,
+                            &key_cache[src_fl..src_fl + HEAD_DIM],
+                            &value_cache[src_fl..src_fl + HEAD_DIM],
+                        );
+                    }
                 }
             }
             npu.layer_bo_kv[l]
                 .sync_range_to_device(Q4LAYER_KV_BYTES, 0)
-                .map_err(|e| format!("layer {l} KV cache sync to device: {e}"))?;
+                .map_err(|e| SyncErr::Device(format!("layer {l} KV cache sync to device: {e}")))?;
         }
         npu.synced_kv_len = target_pos;
         Ok(())
@@ -1515,7 +1565,10 @@ impl XdnaLlamaModel {
         if npu.synced_kv_len != pos
             && let Err(e) = self.sync_cpu_kv_to_npu(&mut npu, state, pos)
         {
-            return Err(self.record_device_fault(e, vocab_size));
+            return Err(match e {
+                SyncErr::Input(msg) => self.reject_input(msg, vocab_size),
+                SyncErr::Device(msg) => self.record_device_fault(msg, vocab_size),
+            });
         }
 
         let hidden = self.cpu.embed_token(token, "forward");
@@ -1553,9 +1606,9 @@ impl XdnaLlamaModel {
         let t_crit_sync = tc0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
         let t0 = prof.then(crate::time::Instant::now);
-        npu.in_flight_bucket = Some(bucket_idx);
+        npu.in_flight = Some(InFlightXdnaOp::DecodeBucket(bucket_idx));
         if let Err(e) = npu.bucket_runlists[bucket_idx].execute() {
-            npu.in_flight_bucket = None;
+            npu.in_flight = None;
             return Err(self.record_device_fault(format!("token runlist execute: {e}"), vocab_size));
         }
         // Overlap previous token's f16 CPU KV cache extension and next token's
@@ -1572,7 +1625,7 @@ impl XdnaLlamaModel {
             npu.spare_kv = Some((pending_k, pending_v));
             return Err(self.record_device_fault(format!("token runlist wait: {e}"), vocab_size));
         }
-        npu.in_flight_bucket = None;
+        npu.in_flight = None;
         let t_npu_wait = t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
 
         let tkv0 = prof.then(crate::time::Instant::now);
@@ -2011,7 +2064,10 @@ impl Model for XdnaLlamaModel {
             if npu.synced_kv_len != npu_start_pos
                 && let Err(e) = self.sync_cpu_kv_to_npu(&mut npu, state, npu_start_pos)
             {
-                return self.record_device_fault(e, vocab_size);
+                return match e {
+                    SyncErr::Input(msg) => self.reject_input(msg, vocab_size),
+                    SyncErr::Device(msg) => self.record_device_fault(msg, vocab_size),
+                };
             }
 
             let npu_ref = &mut *npu;
@@ -2019,6 +2075,7 @@ impl Model for XdnaLlamaModel {
                 .prefill
                 .as_deref_mut()
                 .expect("checked prefill.is_some()");
+            let in_flight = &mut npu_ref.in_flight;
             let layer_bo_kv = &mut npu_ref.layer_bo_kv;
             let head_bo_y = &mut npu_ref.head_bo_y;
             let synced_kv_len = &mut npu_ref.synced_kv_len;
@@ -2093,13 +2150,17 @@ impl Model for XdnaLlamaModel {
                     }
                 }
 
-                if let Err(e) = pf.bucket_runlists[pf_bucket_idx]
-                    .execute()
-                    .and_then(|()| pf.bucket_runlists[pf_bucket_idx].wait(QUIESCE_TIMEOUT_MS))
-                {
+                *in_flight = Some(InFlightXdnaOp::PrefillBucket(pf_bucket_idx));
+                if let Err(e) = pf.bucket_runlists[pf_bucket_idx].execute() {
+                    *in_flight = None;
                     return self
                         .record_device_fault(format!("prefill runlist failed: {e}"), vocab_size);
                 }
+                if let Err(e) = pf.bucket_runlists[pf_bucket_idx].wait(QUIESCE_TIMEOUT_MS) {
+                    return self
+                        .record_device_fault(format!("prefill runlist failed: {e}"), vocab_size);
+                }
+                *in_flight = None;
 
                 let m_len = n_valid * KV_DIM;
                 for (l, kv_bo) in layer_bo_kv.iter_mut().enumerate().take(N_LAYERS) {
@@ -2211,14 +2272,17 @@ impl Model for XdnaLlamaModel {
                     return self
                         .record_device_fault(format!("prefill head_bo_y sync: {e}"), vocab_size);
                 }
-                if let Err(e) = pf
-                    .head_run
-                    .start()
-                    .and_then(|()| pf.head_run.wait(QUIESCE_TIMEOUT_MS))
-                {
+                *in_flight = Some(InFlightXdnaOp::PrefillHead);
+                if let Err(e) = pf.head_run.start() {
+                    *in_flight = None;
                     return self
                         .record_device_fault(format!("prefill head run failed: {e}"), vocab_size);
                 }
+                if let Err(e) = pf.head_run.wait(QUIESCE_TIMEOUT_MS) {
+                    return self
+                        .record_device_fault(format!("prefill head run failed: {e}"), vocab_size);
+                }
+                *in_flight = None;
                 if let Err(e) =
                     head_bo_y.sync_range_from_device(vocab_size * 4, Q4LAYER_TILE_F32 * 4)
                 {
@@ -2579,7 +2643,7 @@ mod tests {
                 _layer_kernels: Vec::new(),
                 prefill: None,
                 _device: device,
-                in_flight_bucket: None,
+                in_flight: None,
                 synced_kv_len: 16,
                 cached_rope: None,
                 pending_cpu_kv: Some((
@@ -2646,7 +2710,7 @@ mod tests {
                 _layer_kernels: Vec::new(),
                 prefill: None,
                 _device: device,
-                in_flight_bucket: Some(0),
+                in_flight: Some(InFlightXdnaOp::DecodeBucket(0)),
                 synced_kv_len: 0,
                 cached_rope: None,
                 pending_cpu_kv: None,
@@ -2705,7 +2769,7 @@ mod tests {
                 _layer_kernels: Vec::new(),
                 prefill: None,
                 _device: device,
-                in_flight_bucket: Some(0),
+                in_flight: Some(InFlightXdnaOp::DecodeBucket(0)),
                 synced_kv_len: 0,
                 cached_rope: None,
                 pending_cpu_kv: None,
@@ -2714,7 +2778,7 @@ mod tests {
                 q8_quants: Vec::new(),
             };
             assert!(quiesce_in_flight(&mut state).is_err());
-            assert_eq!(state.in_flight_bucket, Some(0));
+            assert_eq!(state.in_flight, Some(InFlightXdnaOp::DecodeBucket(0)));
         });
     }
 
@@ -2784,7 +2848,7 @@ mod tests {
                 _layer_kernels: Vec::new(),
                 prefill: None,
                 _device: device,
-                in_flight_bucket: None,
+                in_flight: None,
                 synced_kv_len: 5,
                 cached_rope: None,
                 pending_cpu_kv: Some((
@@ -2982,7 +3046,7 @@ mod tests {
                 _layer_kernels: Vec::new(),
                 prefill: None,
                 _device: device,
-                in_flight_bucket: None,
+                in_flight: None,
                 synced_kv_len: 1,
                 cached_rope: None,
                 pending_cpu_kv: Some((
@@ -3371,5 +3435,422 @@ mod tests {
                 detail: "deferred NPU KV row references invalid or mismatched layer",
             })
         );
+    }
+
+    fn make_llama_xdna_gguf_for_test() -> GgufFile {
+        use crate::gguf::GgufBuilder;
+        let hs = 32usize;
+        let nh = 8usize;
+        let nkv = N_KV_HEADS;
+        let hd = HEAD_DIM;
+        let inter = 32usize;
+        let vocab = 32usize;
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", "llama")
+            .kv_u32("llama.block_count", N_LAYERS as u32)
+            .kv_u32("llama.embedding_length", hs as u32)
+            .kv_u32("llama.feed_forward_length", inter as u32)
+            .kv_u32("llama.attention.head_count", nh as u32)
+            .kv_u32("llama.attention.head_count_kv", nkv as u32)
+            .kv_u32("llama.attention.key_length", hd as u32)
+            .kv_f32("llama.attention.layer_norm_epsilon", 1e-5)
+            .kv_f32("llama.rope.freq_base", 500_000.0)
+            .kv_u32("llama.context_length", MAX_KV_CACHE_TOKENS as u32)
+            .kv_u32("llama.vocab_size", vocab as u32)
+            .tensor_f32("token_embd.weight", &[hs, vocab], &vec![0.05; hs * vocab])
+            .tensor_f32("output_norm.weight", &[hs], &vec![1.0; hs]);
+        for l in 0..N_LAYERS {
+            b = b
+                .tensor_f32(&format!("blk.{l}.attn_norm.weight"), &[hs], &vec![1.0; hs])
+                .tensor_f32(&format!("blk.{l}.ffn_norm.weight"), &[hs], &vec![1.0; hs])
+                .tensor_f32(
+                    &format!("blk.{l}.attn_q.weight"),
+                    &[hs, nh * hd],
+                    &vec![0.0; hs * nh * hd],
+                )
+                .tensor_f32(
+                    &format!("blk.{l}.attn_k.weight"),
+                    &[hs, nkv * hd],
+                    &vec![0.0; hs * nkv * hd],
+                )
+                .tensor_f32(
+                    &format!("blk.{l}.attn_v.weight"),
+                    &[hs, nkv * hd],
+                    &vec![0.0; hs * nkv * hd],
+                )
+                .tensor_f32(
+                    &format!("blk.{l}.attn_output.weight"),
+                    &[nh * hd, hs],
+                    &vec![0.0; nh * hd * hs],
+                )
+                .tensor_f32(
+                    &format!("blk.{l}.ffn_gate.weight"),
+                    &[hs, inter],
+                    &vec![0.0; hs * inter],
+                )
+                .tensor_f32(
+                    &format!("blk.{l}.ffn_up.weight"),
+                    &[hs, inter],
+                    &vec![0.0; hs * inter],
+                )
+                .tensor_f32(
+                    &format!("blk.{l}.ffn_down.weight"),
+                    &[inter, hs],
+                    &vec![0.0; inter * hs],
+                );
+        }
+        GgufFile::from_bytes(std::sync::Arc::from(b.build_bytes().into_boxed_slice())).unwrap()
+    }
+
+    fn make_llama_xdna_model_for_test(with_prefill: bool) -> (XdnaLlamaModel, ModelConfig) {
+        let cpu = LlamaModel::from_gguf_with_id(
+            make_llama_xdna_gguf_for_test(),
+            MAX_KV_CACHE_TOKENS,
+            "test-xdna-llama".into(),
+        )
+        .expect("load 16-layer cpu llama");
+        let cfg = cpu.config().clone();
+        let device = XdnaDevice::open(0).expect("fake open");
+        let kernel = device
+            .load_kernel(&[1, 2, 3, 4], &[0xAA55_0001])
+            .expect("fake load");
+        let head_bo_w = kernel.alloc_bo(64, 3).expect("head_bo_w");
+        let head_bo_y = kernel.alloc_bo(HEAD_Y_BYTES, 4).expect("head_bo_y");
+        let mut layer_bo_kv = Vec::with_capacity(N_LAYERS);
+        let mut layer_bo_y = Vec::with_capacity(N_LAYERS);
+        for _ in 0..N_LAYERS {
+            layer_bo_kv.push(kernel.alloc_bo(Q4LAYER_KV_BYTES, 6).expect("kv"));
+            layer_bo_y.push(kernel.alloc_bo(Q4LAYER_ACT_BYTES, 4).expect("y"));
+        }
+        let bucket_chunks: Vec<usize> = Q4LAYER_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+        let mut bucket_runlists = Vec::with_capacity(bucket_chunks.len());
+        let mut head_runs = Vec::with_capacity(bucket_chunks.len());
+        let mut layer_runs = Vec::with_capacity(bucket_chunks.len());
+        for _ in &bucket_chunks {
+            let run = kernel
+                .create_run(&[&head_bo_w, &head_bo_y])
+                .expect("dec run");
+            let mut rl = kernel.create_runlist().expect("dec rl");
+            rl.add(&run).expect("add");
+            bucket_runlists.push(rl);
+            head_runs.push(
+                kernel
+                    .create_run(&[&head_bo_w, &head_bo_y])
+                    .expect("head run"),
+            );
+            layer_runs.push(vec![run]);
+        }
+
+        let prefill = if with_prefill {
+            let pf_chunks: Vec<usize> =
+                Q4PREFILL_LAYER_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+            let pf_bo_out = kernel.alloc_bo(Q4PREFILL_ACT_BYTES, 5).expect("pf_bo_out");
+            let mut pf_bo_y = Vec::with_capacity(N_LAYERS);
+            for _ in 0..N_LAYERS {
+                pf_bo_y.push(kernel.alloc_bo(Q4PREFILL_ACT_BYTES, 4).expect("pf_bo_y"));
+            }
+            let pf_head_run = kernel
+                .create_run(&[&head_bo_w, &head_bo_y])
+                .expect("pf head");
+            let mut pf_runlists = Vec::with_capacity(pf_chunks.len());
+            let mut pf_layer_runs = Vec::with_capacity(pf_chunks.len());
+            for _ in &pf_chunks {
+                let run = kernel
+                    .create_run(&[&head_bo_w, &pf_bo_out])
+                    .expect("pf run");
+                let mut rl = kernel.create_runlist().expect("pf rl");
+                rl.add(&run).expect("pf add");
+                pf_runlists.push(rl);
+                pf_layer_runs.push(vec![run]);
+            }
+            Some(Box::new(XdnaPrefillState {
+                bucket_chunks: pf_chunks,
+                bucket_runlists: pf_runlists,
+                head_run: pf_head_run,
+                _layer_runs: pf_layer_runs,
+                bo_out: pf_bo_out,
+                bo_y: pf_bo_y,
+                _bo_w: Vec::new(),
+                _kernels: Vec::new(),
+            }))
+        } else {
+            None
+        };
+
+        let npu = XdnaDecodeState {
+            bucket_chunks,
+            bucket_runlists,
+            _head_runs: head_runs,
+            _layer_runs: layer_runs,
+            head_bo_y,
+            _head_bo_w: head_bo_w,
+            layer_bo_kv,
+            layer_bo_y,
+            _layer_bo_w: Vec::new(),
+            _head_kernel: kernel,
+            _layer_kernels: Vec::new(),
+            prefill,
+            _device: device,
+            in_flight: None,
+            synced_kv_len: 0,
+            cached_rope: None,
+            pending_cpu_kv: None,
+            spare_kv: Some((
+                vec![[0.0f32; KV_DIM]; N_LAYERS],
+                vec![[0.0f32; KV_DIM]; N_LAYERS],
+            )),
+            q8_scales: vec![0.0f32; HIDDEN_SIZE / 32],
+            q8_quants: vec![0i8; HIDDEN_SIZE],
+        };
+        (XdnaLlamaModel::from_parts_for_test(cpu, npu), cfg)
+    }
+
+    fn seed_llama_f16_state(cfg: &ModelConfig, pos: usize) -> InferenceState {
+        let mut st =
+            InferenceState::from_config_capped(cfg, &KvCompression::F16, MAX_KV_CACHE_TOKENS)
+                .expect("state");
+        let kv_row = vec![0.25f32; KV_DIM];
+        for l in 0..N_LAYERS {
+            for _ in 0..pos {
+                st.append_kv_f16(l, &kv_row, &kv_row);
+            }
+        }
+        st.seq_len = pos;
+        st
+    }
+
+    #[test]
+    fn coalesced_decode_layer_bo_kv_sync_range_across_chunk_boundaries() {
+        let expected_size = Q4LAYER_SILU_HALF * 4 + HEAD_DIM * 2;
+        for pos in [1usize, 63, 64, 4095] {
+            let (_, events) = with_shim(FakeConfig::default(), || {
+                let (model, cfg) = make_llama_xdna_model_for_test(false);
+                let mut state = seed_llama_f16_state(&cfg, pos);
+                {
+                    let mut guard = model.lock_npu();
+                    guard.synced_kv_len = pos;
+                    guard.pending_cpu_kv = None;
+                }
+                let out = model.forward(&[1], pos, &mut state);
+                assert_eq!(out.len(), cfg.vocab_size);
+                assert_eq!(state.seq_len, pos + 1);
+                assert!(model.take_decode_error().is_none());
+            });
+
+            let kv_handles: Vec<usize> = events
+                .iter()
+                .filter_map(|e| match e {
+                    FakeEvent::BoAlloc { bytes, handle, .. } if *bytes == Q4LAYER_KV_BYTES => {
+                        Some(*handle)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(kv_handles.len(), N_LAYERS);
+
+            let kv_syncs: Vec<(usize, usize, usize)> = events
+                .iter()
+                .filter_map(|e| match e {
+                    FakeEvent::BoSyncRange {
+                        handle,
+                        to_device: true,
+                        size,
+                        offset,
+                    } if kv_handles.contains(handle) => Some((*handle, *size, *offset)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                kv_syncs.len(),
+                N_LAYERS * N_KV_HEADS,
+                "pos={pos}: expected 1 coalesced KV sync per head per layer"
+            );
+
+            let c = pos / Q4LAYER_ATTN_CHUNK_T;
+            let rem = pos % Q4LAYER_ATTN_CHUNK_T;
+            for (l, &handle) in kv_handles.iter().enumerate() {
+                let mut layer_offs: Vec<(usize, usize)> = kv_syncs
+                    .iter()
+                    .filter(|(h, _, _)| *h == handle)
+                    .map(|&(_, s, o)| (s, o))
+                    .collect();
+                assert_eq!(layer_offs.len(), N_KV_HEADS, "layer {l} pos={pos}");
+                layer_offs.sort_by_key(|&(_, o)| o);
+                for (kvh, (sz, off)) in layer_offs.into_iter().enumerate() {
+                    let tile_start = (kvh * Q4LAYER_ATTN_CHUNKS + c) * Q4LAYER_TILE_F32 * 4;
+                    let expected_off = tile_start + rem * HEAD_DIM * 2;
+                    let tile_end = tile_start + Q4LAYER_TILE_F32 * 4;
+                    assert_eq!(sz, expected_size, "pos={pos} layer={l} kvh={kvh}");
+                    assert_eq!(off, expected_off, "pos={pos} layer={l} kvh={kvh}");
+                    assert!(
+                        off + sz <= tile_end,
+                        "pos={pos} layer={l} kvh={kvh}: coalesced sync overflowed tile"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_prefill_runlist_and_head_run_timeouts_quiesce_in_flight() {
+        // 1. Prefill bucket runlist timeout sets `InFlightXdnaOp::PrefillBucket(0)` and retains it on wait failure.
+        with_shim(
+            FakeConfig {
+                fail_runlist_wait: true,
+                ..FakeConfig::default()
+            },
+            || {
+                let (model, cfg) = make_llama_xdna_model_for_test(true);
+                let mut state = seed_llama_f16_state(&cfg, 1);
+                model.lock_npu().synced_kv_len = 1;
+
+                let out = model.forward_prefill(&vec![1; 16], 1, &mut state);
+                assert!(out.iter().all(|&v| v == 0.0));
+                assert!(model.state_torn.load(Ordering::SeqCst));
+                assert!(model.take_decode_error().is_some());
+                assert_eq!(
+                    model.lock_npu().in_flight,
+                    Some(InFlightXdnaOp::PrefillBucket(0))
+                );
+                assert!(quiesce_in_flight(&mut model.lock_npu()).is_err());
+                assert_eq!(
+                    model.lock_npu().in_flight,
+                    Some(InFlightXdnaOp::PrefillBucket(0))
+                );
+                assert!(
+                    model
+                        .try_reset_kv(&mut state, &KvCompression::F16, 64)
+                        .is_err()
+                );
+                assert!(model.state_torn.load(Ordering::SeqCst));
+                // Clear handle before Drop since fake config rejects waits.
+                model.lock_npu().in_flight = None;
+            },
+        );
+
+        // 2. Prefill `head_run` timeout sets `InFlightXdnaOp::PrefillHead` and retains it on wait failure.
+        with_shim(
+            FakeConfig {
+                fail_runlist_wait: false,
+                run_wait_state: Some(0),
+                ..FakeConfig::default()
+            },
+            || {
+                let (model, cfg) = make_llama_xdna_model_for_test(true);
+                let mut state = seed_llama_f16_state(&cfg, 1);
+                model.lock_npu().synced_kv_len = 1;
+
+                let out = model.forward_prefill(&vec![1; 16], 1, &mut state);
+                assert!(out.iter().all(|&v| v == 0.0));
+                assert!(model.state_torn.load(Ordering::SeqCst));
+                assert!(model.take_decode_error().is_some());
+                assert_eq!(
+                    model.lock_npu().in_flight,
+                    Some(InFlightXdnaOp::PrefillHead)
+                );
+                assert!(quiesce_in_flight(&mut model.lock_npu()).is_err());
+                assert_eq!(
+                    model.lock_npu().in_flight,
+                    Some(InFlightXdnaOp::PrefillHead)
+                );
+                assert!(
+                    model
+                        .try_reset_kv(&mut state, &KvCompression::F16, 64)
+                        .is_err()
+                );
+                assert!(model.state_torn.load(Ordering::SeqCst));
+                model.lock_npu().in_flight = None;
+            },
+        );
+
+        // 3. Healthy quiesce recovery drains pending `PrefillBucket` before `BoFree` on Drop and clears `try_reset_kv`.
+        let (_, events) = with_shim(FakeConfig::default(), || {
+            let (model, cfg) = make_llama_xdna_model_for_test(true);
+            let mut state = seed_llama_f16_state(&cfg, 1);
+            {
+                let mut guard = model.lock_npu();
+                guard.prefill.as_ref().unwrap().bucket_runlists[0]
+                    .execute()
+                    .unwrap();
+                guard.in_flight = Some(InFlightXdnaOp::PrefillBucket(0));
+            }
+            model.state_torn.store(true, Ordering::SeqCst);
+            model
+                .try_reset_kv(&mut state, &KvCompression::F16, 64)
+                .expect("quiesced prefill bucket allows try_reset_kv recovery");
+            assert!(!model.state_torn.load(Ordering::SeqCst));
+            assert_eq!(model.lock_npu().in_flight, None);
+
+            // Leave `PrefillHead` in-flight at Drop and assert Drop quiesces without error.
+            model.lock_npu().in_flight = Some(InFlightXdnaOp::PrefillHead);
+        });
+        assert!(events.iter().any(|e| matches!(
+            e,
+            FakeEvent::RunListWait {
+                timeout_ms: 30_000,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn sync_cpu_kv_to_npu_input_validation_errors_preserve_untorn_state() {
+        with_shim(FakeConfig::default(), || {
+            let (model, cfg) = make_llama_xdna_model_for_test(true);
+
+            // Short final layer (layer 15 has only 1 row instead of 2) fails pre-validation cleanly
+            // without touching `layer_bo_kv[0]` and without tearing `state_torn`.
+            let mut short_state = seed_llama_f16_state(&cfg, 2);
+            if let LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &mut short_state.layers[N_LAYERS - 1]
+            {
+                key_cache_f16.truncate(KV_DIM);
+                value_cache_f16.truncate(KV_DIM);
+            }
+            model.lock_npu().layer_bo_kv[0].as_mut_slice()[0] = 0x5A;
+
+            let dec_err_out = model.forward(&[1], 2, &mut short_state);
+            assert!(dec_err_out.iter().all(|&v| v == 0.0));
+            assert!(
+                !model.state_torn.load(Ordering::SeqCst),
+                "short KV input error in decode must not set state_torn"
+            );
+            assert!(model.take_decode_error().is_some());
+            assert_eq!(
+                model.lock_npu().layer_bo_kv[0].as_slice()[0],
+                0x5A,
+                "pre-validation must reject before mutating earlier layer BOs"
+            );
+
+            // Same short-layer input error in `forward_prefill` keeps `state_torn` false.
+            let pre_err_out = model.forward_prefill(&vec![1; 16], 2, &mut short_state);
+            assert!(pre_err_out.iter().all(|&v| v == 0.0));
+            assert!(
+                !model.state_torn.load(Ordering::SeqCst),
+                "short KV input error in prefill must not set state_torn"
+            );
+            assert!(model.take_decode_error().is_some());
+
+            // Wrong layer kind (`LayerState::Conv` instead of `Attention`) returns `SyncErr::Input`.
+            let mut conv_state = seed_llama_f16_state(&cfg, 2);
+            conv_state.layers[0] = LayerState::Conv {
+                buffer: Vec::new(),
+                history: crate::kv_cache::ConvHistory::new(0),
+            };
+            let wrong_out = model.forward(&[1], 2, &mut conv_state);
+            assert!(wrong_out.iter().all(|&v| v == 0.0));
+            assert!(!model.state_torn.load(Ordering::SeqCst));
+            assert!(model.take_decode_error().is_some());
+
+            // Subsequent healthy `forward` still succeeds because NPU was never torn.
+            let mut good_state = seed_llama_f16_state(&cfg, 2);
+            let ok_out = model.forward(&[1], 2, &mut good_state);
+            assert_eq!(ok_out.len(), cfg.vocab_size);
+            assert!(model.take_decode_error().is_none());
+            assert_eq!(good_state.seq_len, 3);
+        });
     }
 }
