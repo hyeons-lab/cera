@@ -9,7 +9,14 @@
 #   5 = FA Final (Reload SLOT_FA_Q + SLOT_FA_STATE + Gate -> FA + cur_kv -> O -> FFN tail)
 
 import argparse
+import sys
 from pathlib import Path
+
+_IRON_ROOT = str(Path(__file__).resolve().parent.parent)
+if _IRON_ROOT not in sys.path:
+    sys.path.insert(0, _IRON_ROOT)
+
+from compile_params import validate_compile_params
 
 import aie.iron as iron
 import numpy as np
@@ -99,6 +106,21 @@ KV_CHUNK_F32 = 2 * W_ELEMS  # 4608
 KV_TOTAL = MAX_KV_CHUNKS * N_KV_HEADS * KV_CHUNK_F32
 KV_OUT_TOTAL = 2 * N_KV_HEADS * KV_CHUNK_F32  # 8 * 4608
 
+VALID_MODES = (0, 1, 2, 3, 4, 5)
+VALID_PARAM_SLOTS = (0, 1, 2, 3)
+
+
+def _validate_compile_params(layer_mode: int, kv_chunks: int, param_slot: int = 0) -> None:
+    validate_compile_params(
+        layer_mode,
+        kv_chunks,
+        valid_modes=VALID_MODES,
+        nonzero_kv_modes=(3, 4),
+        max_kv_chunks=MAX_KV_CHUNKS,
+        param_slot=param_slot,
+        valid_param_slots=VALID_PARAM_SLOTS,
+    )
+
 
 @iron.jit(use_cache=False)
 def q4prefill_lfm3(
@@ -111,6 +133,7 @@ def q4prefill_lfm3(
     kv_chunks: CompileTime[int] = 0,
     param_slot: CompileTime[int] = 0,
 ):
+    _validate_compile_params(layer_mode, kv_chunks, param_slot)
     here = Path(__file__).resolve().parent
     cxx_inc = cxx_header_path()
 
@@ -1027,10 +1050,11 @@ def q4prefill_lfm3(
 def main():
     parser = argparse.ArgumentParser()
     add_compile_args(parser)
-    parser.add_argument("--layer-mode", type=int, default=1)
+    parser.add_argument("--layer-mode", type=int, default=1, choices=VALID_MODES)
     parser.add_argument("--kv-chunks", type=int, default=0)
-    parser.add_argument("--param-slot", type=int, default=0)
+    parser.add_argument("--param-slot", type=int, default=0, choices=VALID_PARAM_SLOTS)
     opts = parser.parse_args()
+    _validate_compile_params(opts.layer_mode, opts.kv_chunks, opts.param_slot)
     run_design_cli(
         q4prefill_lfm3,
         opts,

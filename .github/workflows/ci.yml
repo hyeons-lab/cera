@@ -94,6 +94,7 @@ jobs:
       - name: Python unit tests
         run: |
           python3 tests/test_format_review_comment.py
+          python3 -m unittest tests/test_xdna_compile_params.py
           python3 tests/api_contracts/check.py
           python3 -m unittest discover -s tests/api_contracts
       - name: Shell and IRON generator syntax check
@@ -102,12 +103,24 @@ jobs:
         run: |
           bash -n scripts/bench_android.sh
           bash -n cera/src/backend/xdna/kernels/build_kernels.sh
+          bash -n cera/src/backend/xdna/kernels/build_lfm2_kernels.sh
           bash -n tools/xdna-spike/fix_and_build.sh
           bash -n tools/xdna-spike/build_spec.sh
           bash -n tools/xdna-spike/iron/build.sh
           python3 -m py_compile \
+            cera/src/backend/xdna/kernels/iron/compile_params.py \
+            cera/src/backend/xdna/kernels/iron/gemm_bf16/gemm_bf16.py \
             cera/src/backend/xdna/kernels/iron/q4gemv/q4gemv.py \
             cera/src/backend/xdna/kernels/iron/q4layer/q4layer.py \
+            cera/src/backend/xdna/kernels/iron/q4layer_lfm2/q4layer_lfm2.py \
+            cera/src/backend/xdna/kernels/iron/q4layer_lfm3/q4layer_lfm3.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_layer/q4prefill_layer.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm2/q4prefill_lfm2.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm2_attn/q4prefill_lfm2_attn.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm2_conv/q4prefill_lfm2_conv.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm3/q4prefill_lfm3.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm3_attn/q4prefill_lfm3_attn.py \
+            cera/src/backend/xdna/kernels/iron/q4prefill_lfm3_conv/q4prefill_lfm3_conv.py \
             tools/xdna-spike/iron/q4gemv/q4gemv.py \
             tools/xdna-spike/iron/q4layer/q4layer.py
       - name: Hexagon skel list pin

@@ -934,31 +934,33 @@ pub const LFM3_DEC_ACT_BYTES: usize = (LFM3_DEC_SLOT_FIN_NORM + 4608) * 4;
 /// Byte length of LFM3 decode `bo_yn` (`2048` floats).
 pub const LFM3_DEC_YN_BYTES: usize = LFM3_H * 4;
 
-/// Choose the smallest `(bucket_idx, chunk_cap)` whose capacity reaches `needed_chunks`.
-pub fn select_lfm3_kv_bucket(bucket_chunks: &[usize], needed_chunks: usize) -> (usize, usize) {
-    assert!(
-        !bucket_chunks.is_empty(),
-        "lfm3 bucket_chunks must be non-empty"
-    );
+/// Choose the smallest `(bucket_idx, chunk_cap)` whose capacity reaches `needed_chunks`, returning an error on empty or oversized inputs.
+pub fn try_select_lfm3_kv_bucket(
+    bucket_chunks: &[usize],
+    needed_chunks: usize,
+) -> Result<(usize, usize), String> {
+    if bucket_chunks.is_empty() {
+        return Err("lfm3 bucket_chunks must be non-empty".to_string());
+    }
     let idx = bucket_chunks
         .iter()
         .position(|&c| c >= needed_chunks)
-        .unwrap_or_else(|| {
-            panic!(
+        .ok_or_else(|| {
+            format!(
                 "lfm3 needed_chunks ({needed_chunks}) exceeds maximum bucket capacity ({})",
                 bucket_chunks.last().copied().unwrap_or(0)
             )
-        });
-    (idx, bucket_chunks[idx])
+        })?;
+    Ok((idx, bucket_chunks[idx]))
 }
 
-/// Write static pre/post RMSNorm weights and optional Q/K norm weights into LFM3 `bo_y`.
+/// Write static pre/post RMSNorm weights and optional Q/K norm weights into LFM3 decode `bo_y`.
 #[allow(clippy::too_many_arguments)]
 pub fn init_lfm3_bo_y_norms(
     buf: &mut [u8],
     slot_norm_0: usize,
     slot_norm_1: usize,
-    slot_rope_pkt: Option<usize>,
+    slot_fin_norm: Option<usize>,
     attn_norm: &[f32],
     post_attn_norm: &[f32],
     ffn_norm: &[f32],
@@ -974,10 +976,10 @@ pub fn init_lfm3_bo_y_norms(
     write_le_f32_slice(buf, slot_norm_0 + LFM3_H, post_attn_norm);
     write_le_f32_slice(buf, slot_norm_1, ffn_norm);
     write_le_f32_slice(buf, slot_norm_1 + LFM3_H, post_ffn_norm);
-    if buf.len() >= LFM3_DEC_ACT_BYTES {
-        write_le_f32_slice(buf, LFM3_DEC_SLOT_FIN_NORM + LFM3_H, post_attn_norm);
+    if let Some(fin_slot) = slot_fin_norm {
+        write_le_f32_slice(buf, fin_slot + LFM3_H, post_attn_norm);
     }
-    if let (Some(_rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
+    if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
         assert_eq!(qn.len(), LFM3_HEAD_DIM);
         assert_eq!(kn.len(), LFM3_HEAD_DIM);
         write_le_f32_slice(buf, slot_norm_0 + 4240, qn);
@@ -1074,13 +1076,11 @@ pub const LFM2_DEC_ACT_BYTES: usize = (LFM2_DEC_SLOT_ROPE_PKT + 4608) * 4;
 /// Byte length of LFM2 decode `bo_yn` (`2048` floats).
 pub const LFM2_DEC_YN_BYTES: usize = LFM2_H * 4;
 
-/// Write static pre-RMSNorm and optional Q/K norm weights into LFM2 prefill or decode `bo_y`.
-#[allow(clippy::too_many_arguments)]
+/// Write static pre-RMSNorm and optional Q/K norm weights into LFM2 decode `bo_y`.
 pub fn init_lfm2_bo_y_norms(
     buf: &mut [u8],
     slot_norm_0: usize,
     slot_norm_1: usize,
-    slot_rope_pkt: Option<usize>,
     attn_norm: &[f32],
     ffn_norm: &[f32],
     q_norm: Option<&[f32]>,
@@ -1090,7 +1090,7 @@ pub fn init_lfm2_bo_y_norms(
     assert_eq!(ffn_norm.len(), LFM2_H);
     write_le_f32_slice(buf, slot_norm_0, attn_norm);
     write_le_f32_slice(buf, slot_norm_1, ffn_norm);
-    if let (Some(_rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
+    if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
         assert_eq!(qn.len(), LFM2_HEAD_DIM);
         assert_eq!(kn.len(), LFM2_HEAD_DIM);
         write_le_f32_slice(buf, slot_norm_0 + 4240, qn);
@@ -1603,6 +1603,10 @@ pub fn check_parity_thresholds(
 mod tests {
     use super::*;
 
+    fn select_lfm3_kv_bucket(bucket_chunks: &[usize], needed_chunks: usize) -> (usize, usize) {
+        try_select_lfm3_kv_bucket(bucket_chunks, needed_chunks).unwrap_or_else(|e| panic!("{e}"))
+    }
+
     #[test]
     fn try_inst_words_rejects_empty_and_unaligned_and_parses_embedded() {
         assert!(try_inst_words(&[]).is_err());
@@ -1859,10 +1863,14 @@ mod tests {
 
     #[test]
     fn lfm3_buckets_and_bo_y_helpers_match_kernel_layout() {
+        assert!(!Q4PREFILL_LFM3_XCLBIN.is_empty());
+        assert!(!Q4LAYER_LFM3_XCLBIN.is_empty());
         for table in [
             &Q4PREFILL_LFM3_ATTN_BUCKETS[..],
             &Q4PREFILL_LFM3_BIDIR_B_BUCKETS[..],
+            &Q4PREFILL_LFM3_FA_FIN_BUCKETS[..],
             &Q4LAYER_LFM3_KV_BUCKETS[..],
+            &Q4LAYER_LFM3_FA_FIN_BUCKETS[..],
         ] {
             for &(_, inst_bytes) in table {
                 assert!(!inst_words(inst_bytes).is_empty());
@@ -1871,9 +1879,31 @@ mod tests {
                 assert!(w[0].0 < w[1].0);
             }
         }
+        assert_eq!(Q4LAYER_LFM3_KV_BUCKETS.first().map(|&(c, _)| c), Some(0));
+        assert_eq!(Q4LAYER_LFM3_KV_BUCKETS.last().map(|&(c, _)| c), Some(255));
+        assert_eq!(
+            Q4PREFILL_LFM3_FA_FIN_BUCKETS.first().map(|&(c, _)| c),
+            Some(0)
+        );
+        assert_eq!(
+            Q4PREFILL_LFM3_FA_FIN_BUCKETS.last().map(|&(c, _)| c),
+            Some(255)
+        );
+        assert_eq!(
+            Q4LAYER_LFM3_FA_FIN_BUCKETS.first().map(|&(c, _)| c),
+            Some(0)
+        );
+        assert_eq!(
+            Q4LAYER_LFM3_FA_FIN_BUCKETS.last().map(|&(c, _)| c),
+            Some(255)
+        );
         assert!(!inst_words(Q4PREFILL_LFM3_CONV_INSTS).is_empty());
         assert!(!inst_words(Q4PREFILL_LFM3_BIDIR_A_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM3_FA_PART0_C256_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM3_FA_PART_C256_INSTS).is_empty());
         assert!(!inst_words(Q4LAYER_LFM3_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM3_PHASE_A_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM3_FA_PART_C256_INSTS).is_empty());
 
         let attn_buckets: Vec<usize> = Q4PREFILL_LFM3_ATTN_BUCKETS
             .iter()
@@ -1881,6 +1911,8 @@ mod tests {
             .collect();
         assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 0), (0, 0));
         assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 3), (3, 4));
+        assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 192), (13, 192));
+        assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 193), (14, 255));
         assert_eq!(
             select_lfm3_kv_bucket(&attn_buckets, 255),
             (attn_buckets.len() - 1, 255)
@@ -1895,6 +1927,14 @@ mod tests {
             select_lfm3_kv_bucket(&bidir_buckets, 256),
             (bidir_buckets.len() - 1, 256)
         );
+        let empty_err = try_select_lfm3_kv_bucket(&[], 0).unwrap_err();
+        assert!(empty_err.contains("non-empty"), "{empty_err}");
+        let oob_err = try_select_lfm3_kv_bucket(&attn_buckets, 256).unwrap_err();
+        assert!(
+            oob_err.contains("exceeds maximum bucket capacity"),
+            "{oob_err}"
+        );
+        assert_eq!(try_select_lfm3_kv_bucket(&attn_buckets, 255), Ok((14, 255)));
 
         let mut bo_y = vec![0u8; LFM3_PREFILL_ACT_BYTES];
         let attn_norm = vec![1.25f32; LFM3_H];
@@ -1944,19 +1984,23 @@ mod tests {
             1e-5,
             Some(&rope_cs),
         );
+        write_lfm3_prefill_ext_params(&mut bo_y, 256, true, true);
         let p_off = (LFM3_PREFILL_SLOT_NORM_0 + 2048) * 4;
-        let read_i32 = |idx: usize| {
+        let read_pre_i32 = |idx: usize| {
             let off = p_off + idx * 4;
             i32::from_le_bytes(bo_y[off..off + 4].try_into().unwrap())
         };
-        assert_eq!(read_i32(0), 64);
-        assert_eq!(read_i32(1), 45);
-        assert_eq!(read_i32(2), 4);
-        assert_eq!(read_i32(3), 96);
-        assert_eq!(read_i32(4), 0);
-        assert_eq!(read_i32(5), 512);
-        assert_eq!(read_i32(6), 3);
-        assert_eq!(read_i32(7) as u32, 1e-5f32.to_bits());
+        assert_eq!(read_pre_i32(0), 64);
+        assert_eq!(read_pre_i32(1), 45);
+        assert_eq!(read_pre_i32(2), 4);
+        assert_eq!(read_pre_i32(3), 96);
+        assert_eq!(read_pre_i32(4), 0);
+        assert_eq!(read_pre_i32(5), 512);
+        assert_eq!(read_pre_i32(6), 3);
+        assert_eq!(read_pre_i32(7) as u32, 1e-5f32.to_bits());
+        assert_eq!(read_pre_i32(8), 256);
+        assert_eq!(read_pre_i32(9), 1);
+        assert_eq!(read_pre_i32(10), 1);
         let mut got_rope = Vec::with_capacity(rope_cs.len());
         for slot in [
             LFM3_PREFILL_SLOT_ROPE_PKT_0A,
@@ -1969,6 +2013,265 @@ mod tests {
             got_rope.extend_from_slice(&pkt);
         }
         assert_eq!(got_rope, rope_cs);
+
+        // Verify decode BO layout (`init_lfm3_bo_y_norms`, `write_lfm3_step_params`, `write_lfm3_ext_params`).
+        let mut dec_bo_y = vec![0u8; LFM3_DEC_ACT_BYTES];
+        init_lfm3_bo_y_norms(
+            &mut dec_bo_y,
+            LFM3_DEC_SLOT_NORM_0,
+            LFM3_DEC_SLOT_NORM_1,
+            Some(LFM3_DEC_SLOT_FIN_NORM),
+            &attn_norm,
+            &post_attn_norm,
+            &ffn_norm,
+            &post_ffn_norm,
+            Some(&q_norm),
+            Some(&k_norm),
+        );
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0, &mut got);
+        assert_eq!(got, attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + LFM3_H, &mut got);
+        assert_eq!(got, post_attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_1, &mut got);
+        assert_eq!(got, ffn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_1 + LFM3_H, &mut got);
+        assert_eq!(got, post_ffn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_FIN_NORM + LFM3_H, &mut got);
+        assert_eq!(got, post_attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + 4240, &mut got_qk);
+        assert_eq!(got_qk, q_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + 4368, &mut got_qk);
+        assert_eq!(got_qk, k_norm);
+        let dec_p_off = (LFM3_DEC_SLOT_NORM_0 + 4096) * 4;
+        dec_bo_y[dec_p_off..dec_p_off + 11 * 4].fill(0xAA);
+        let dec_rope: Vec<f32> = (0..LFM3_HEAD_DIM).map(|i| (i as f32) * 0.5).collect();
+        write_lfm3_step_params(
+            &mut dec_bo_y,
+            LFM3_DEC_SLOT_NORM_0,
+            Some(LFM3_DEC_SLOT_NORM_0 + 4112),
+            16385,
+            1,
+            16,
+            16385,
+            true,
+            0,
+            2,
+            1e-6,
+            Some(&dec_rope),
+        );
+        write_lfm3_ext_params(&mut dec_bo_y, LFM3_DEC_SLOT_NORM_0, 512, true, false);
+        let read_dec_i32 = |idx: usize| {
+            let off = dec_p_off + idx * 4;
+            i32::from_le_bytes(dec_bo_y[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_dec_i32(0), 16385);
+        assert_eq!(read_dec_i32(1), 1);
+        assert_eq!(read_dec_i32(2), 16);
+        assert_eq!(read_dec_i32(3), 16385);
+        assert_eq!(read_dec_i32(4), 1);
+        assert_eq!(read_dec_i32(5), 0);
+        assert_eq!(read_dec_i32(6), 2);
+        assert_eq!(read_dec_i32(7) as u32, 1e-6f32.to_bits());
+        assert_eq!(read_dec_i32(8), 512);
+        assert_eq!(read_dec_i32(9), 1);
+        assert_eq!(read_dec_i32(10), 0);
+        let mut got_dec_rope = vec![0.0f32; LFM3_HEAD_DIM];
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + 4112, &mut got_dec_rope);
+        assert_eq!(got_dec_rope, dec_rope);
+    }
+
+    #[test]
+    fn lfm2_buckets_and_bo_y_helpers_match_kernel_layout() {
+        for table in [
+            &Q4LAYER_LFM2_KV_BUCKETS[..],
+            &Q4LAYER_LFM2_FA_FIN_BUCKETS[..],
+            &Q4PREFILL_LFM2_ATTN_BUCKETS[..],
+            &Q4PREFILL_LFM2_FA_FIN_BUCKETS[..],
+        ] {
+            for &(_, inst_bytes) in table {
+                assert!(!inst_words(inst_bytes).is_empty());
+            }
+            for w in table.windows(2) {
+                assert!(w[0].0 < w[1].0);
+            }
+            assert_eq!(table.first().map(|&(c, _)| c), Some(0));
+            assert_eq!(table.last().map(|&(c, _)| c), Some(255));
+        }
+        assert!(!inst_words(Q4LAYER_LFM2_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM2_PHASE_A_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM2_FA_PART_C256_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_PHASE_A_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_FA_PART_C256_INSTS).is_empty());
+
+        let caps: Vec<usize> = Q4LAYER_LFM2_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+        assert_eq!(try_select_lfm3_kv_bucket(&caps, 0), Ok((0, 0)));
+        assert_eq!(try_select_lfm3_kv_bucket(&caps, 255), Ok((14, 255)));
+        assert!(try_select_lfm3_kv_bucket(&caps, 256).is_err());
+
+        let mut dec_bo_y = vec![0u8; LFM2_DEC_ACT_BYTES];
+        let attn_norm = vec![0.5f32; LFM2_H];
+        let ffn_norm = vec![-0.25f32; LFM2_H];
+        let q_norm = vec![1.5f32; LFM2_HEAD_DIM];
+        let k_norm = vec![-1.5f32; LFM2_HEAD_DIM];
+        init_lfm2_bo_y_norms(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_NORM_0,
+            LFM2_DEC_SLOT_NORM_1,
+            &attn_norm,
+            &ffn_norm,
+            Some(&q_norm),
+            Some(&k_norm),
+        );
+        let mut got = vec![0.0f32; LFM2_H];
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0, &mut got);
+        assert_eq!(got, attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_1, &mut got);
+        assert_eq!(got, ffn_norm);
+        let mut got_qk = vec![0.0f32; LFM2_HEAD_DIM];
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0 + 4240, &mut got_qk);
+        assert_eq!(got_qk, q_norm);
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0 + 4368, &mut got_qk);
+        assert_eq!(got_qk, k_norm);
+        let dec_rope: Vec<f32> = (0..LFM2_HEAD_DIM).map(|i| (i as f32) * 0.25).collect();
+        // Poison param slots before writing to ensure 0-reset fields overwrite prior garbage.
+        for slot in [
+            LFM2_DEC_SLOT_NORM_0 + 4096,
+            LFM2_DEC_SLOT_NORM_1 + 4096,
+            LFM2_DEC_SLOT_ROPE_PKT + 4096,
+        ] {
+            let off = slot * 4;
+            dec_bo_y[off..off + 11 * 4].fill(0xAA);
+        }
+        write_lfm3_step_params(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_NORM_0,
+            Some(LFM2_DEC_SLOT_NORM_0 + 4112),
+            8193,
+            1,
+            0,
+            8191,
+            true,
+            0,
+            2,
+            1e-5,
+            Some(&dec_rope),
+        );
+        write_lfm3_params_at(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_NORM_1 + 4096,
+            8193,
+            1,
+            LFM2_MAX_KV_CHUNKS,
+            8191,
+            true,
+            0,
+            3,
+            1e-5,
+            256,
+            true,
+            true,
+        );
+        write_lfm3_params_at(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_ROPE_PKT + 4096,
+            8193,
+            1,
+            1,
+            8191,
+            true,
+            0,
+            4,
+            1e-5,
+            256,
+            true,
+            false,
+        );
+        let read_lfm2_dec_i32 = |slot_params: usize, idx: usize| {
+            let off = (slot_params + idx) * 4;
+            i32::from_le_bytes(dec_bo_y[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 0), 8193);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 3), 8191);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 6), 2);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 10), 0);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_1 + 4096, 8), 256);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_1 + 4096, 9), 1);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_1 + 4096, 10), 1);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_ROPE_PKT + 4096, 6), 4);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_ROPE_PKT + 4096, 9), 1);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_ROPE_PKT + 4096, 10), 0);
+        let mut got_dec_rope = vec![0.0f32; LFM2_HEAD_DIM];
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0 + 4112, &mut got_dec_rope);
+        assert_eq!(got_dec_rope, dec_rope);
+
+        let mut pre_bo_y = vec![0u8; LFM2_PREFILL_ACT_BYTES];
+        init_lfm2_prefill_bo_y_norms(
+            &mut pre_bo_y,
+            &attn_norm,
+            &ffn_norm,
+            Some(&q_norm),
+            Some(&k_norm),
+        );
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_NORM_0, &mut got);
+        assert_eq!(got, attn_norm);
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_NORM_1, &mut got);
+        assert_eq!(got, ffn_norm);
+        for slot in [LFM2_PREFILL_SLOT_ROPE_PKT_0, LFM2_PREFILL_SLOT_ROPE_PKT_1] {
+            read_le_f32_slice(&pre_bo_y, slot + 2048, &mut got_qk);
+            assert_eq!(got_qk, q_norm);
+            read_le_f32_slice(&pre_bo_y, slot + 2112, &mut got_qk);
+            assert_eq!(got_qk, k_norm);
+        }
+        let pre_rope: Vec<f32> = (0..(LFM2_PREFILL_CHUNK_T * LFM2_HEAD_DIM))
+            .map(|i| (i as f32) * 0.0625)
+            .collect();
+        let pre_p_off = (LFM2_PREFILL_SLOT_NORM_0 + 2048) * 4;
+        pre_bo_y[pre_p_off..pre_p_off + 11 * 4].fill(0xAA);
+        write_lfm2_prefill_step_params(
+            &mut pre_bo_y,
+            128,
+            40,
+            8,
+            96,
+            true,
+            0,
+            4,
+            1e-5,
+            Some(&pre_rope),
+        );
+        let read_lfm2_pre_i32 = |buf: &[u8], idx: usize| {
+            let off = pre_p_off + idx * 4;
+            i32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+        };
+        let read_lfm2_pre_f32 = |buf: &[u8], idx: usize| {
+            let off = pre_p_off + idx * 4;
+            f32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 0), 128);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 1), 40);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 2), 8);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 3), 96);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 4), 1);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 5), 0);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 6), 4);
+        assert!((read_lfm2_pre_f32(&pre_bo_y, 7) - 1e-5).abs() < 1e-12);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 8), 0);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 9), 0);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 10), 0);
+        write_lfm2_prefill_ext_params(&mut pre_bo_y, 256, true, true);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 0), 128);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 1), 40);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 6), 4);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 8), 256);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 9), 1);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 10), 1);
+        let half = LFM2_KV_CHUNK_T * LFM2_HEAD_DIM;
+        let mut sub_rope = vec![0.0f32; half];
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_ROPE_PKT_0, &mut sub_rope);
+        assert_eq!(sub_rope, &pre_rope[..half]);
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_ROPE_PKT_1, &mut sub_rope);
+        assert_eq!(sub_rope, &pre_rope[half..]);
     }
 
     #[test]

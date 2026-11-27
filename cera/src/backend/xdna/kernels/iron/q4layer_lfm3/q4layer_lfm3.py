@@ -7,7 +7,14 @@
 #   4 = Attn FA Final (Reload SLOT_HIDDEN_IN + Gate + Q_BF16 + FA_STATE -> FA + cur_kv -> O + FFN)
 
 import argparse
+import sys
 from pathlib import Path
+
+_IRON_ROOT = str(Path(__file__).resolve().parent.parent)
+if _IRON_ROOT not in sys.path:
+    sys.path.insert(0, _IRON_ROOT)
+
+from compile_params import validate_compile_params
 
 import aie.iron as iron
 import numpy as np
@@ -95,6 +102,19 @@ KV_TOTAL = MAX_KV_CHUNKS * N_KV_HEADS * W_ELEMS
 KV_OUT_TOTAL = 8 * W_ELEMS
 
 
+VALID_MODES = (0, 1, 2, 3, 4)
+
+
+def _validate_compile_params(layer_mode: int, kv_chunks: int) -> None:
+    validate_compile_params(
+        layer_mode,
+        kv_chunks,
+        valid_modes=VALID_MODES,
+        nonzero_kv_modes=(3,),
+        max_kv_chunks=MAX_KV_CHUNKS,
+    )
+
+
 @iron.jit(use_cache=False)
 def q4layer_lfm3(
     w: In,
@@ -105,6 +125,7 @@ def q4layer_lfm3(
     layer_mode: CompileTime[int] = 1,
     kv_chunks: CompileTime[int] = 0,
 ):
+    _validate_compile_params(layer_mode, kv_chunks)
     here = Path(__file__).resolve().parent
     cxx_inc = cxx_header_path()
 
@@ -782,9 +803,10 @@ def q4layer_lfm3(
 def main():
     parser = argparse.ArgumentParser()
     add_compile_args(parser)
-    parser.add_argument("--layer-mode", type=int, default=1)
+    parser.add_argument("--layer-mode", type=int, default=1, choices=VALID_MODES)
     parser.add_argument("--kv-chunks", type=int, default=0)
     opts = parser.parse_args()
+    _validate_compile_params(opts.layer_mode, opts.kv_chunks)
     run_design_cli(
         q4layer_lfm3,
         opts,

@@ -48,7 +48,7 @@ const HEAD_DIM: usize = 64;
 const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
 const HEAD_PADDED_VOCAB: usize = 131_072;
 const HEAD_REPACK_CHUNK_ROWS: usize = 256;
-const QUIESCE_TIMEOUT_MS: u32 = 30_000;
+pub(crate) const QUIESCE_TIMEOUT_MS: u32 = 30_000;
 
 const HEAD_Y_BYTES: usize = (Q4LAYER_TILE_F32 + HEAD_PADDED_VOCAB) * 4;
 
@@ -278,6 +278,10 @@ impl PendingHybridCpuKv {
         }
     }
 
+    pub(crate) fn pending_pos(&self) -> usize {
+        self.pending_pos
+    }
+
     pub(crate) fn push_conv_from_kvo(&mut self, layer: usize, kvo_bytes: &[u8]) {
         let idx = self.conv_len;
         let taps = self.conv_taps;
@@ -346,57 +350,108 @@ impl PendingHybridCpuKv {
         self.attn_len = idx + 1;
     }
 
+    pub(crate) fn matches_state(&self, state: &InferenceState) -> bool {
+        if state.is_compressed() {
+            return false;
+        }
+        let Some(exp) = self.pending_pos.checked_mul(self.kv_dim) else {
+            return false;
+        };
+        self.pending_pos.checked_add(1) == Some(state.seq_len)
+            && self.conv[..self.conv_len].iter().all(|(l, _)| {
+                *l < state.layers.len() && matches!(&state.layers[*l], LayerState::Conv { .. })
+            })
+            && self.attn[..self.attn_len].iter().all(|(l, _, _)| {
+                *l < state.layers.len()
+                    && matches!(
+                        &state.layers[*l],
+                        LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                            key_cache_f16,
+                            value_cache_f16,
+                            ..
+                        } if if state.kv_f16 {
+                            key_cache.is_empty()
+                                && value_cache.is_empty()
+                                && key_cache_f16.len() == exp
+                                && value_cache_f16.len() == exp
+                        } else {
+                            key_cache_f16.is_empty()
+                                && value_cache_f16.is_empty()
+                                && key_cache.len() == exp
+                                && value_cache.len() == exp
+                        }
+                    )
+            })
+    }
+
+    fn recycle(mut p: Self, spare: &mut Option<Self>) {
+        p.conv_len = 0;
+        p.attn_len = 0;
+        *spare = Some(p);
+    }
+
     pub(crate) fn discard(pending: &mut Option<Self>, spare: &mut Option<Self>) {
-        if let Some(mut p) = pending.take() {
-            p.conv_len = 0;
-            p.attn_len = 0;
-            *spare = Some(p);
+        if let Some(p) = pending.take() {
+            Self::recycle(p, spare);
         }
     }
 
+    #[must_use]
+    pub(crate) fn discard_for_truncate(
+        pending: &mut Option<Self>,
+        spare: &mut Option<Self>,
+        state: &mut InferenceState,
+        len: usize,
+    ) -> bool {
+        if len >= state.seq_len {
+            return true;
+        }
+        let Some(p) = pending.take() else {
+            return true;
+        };
+        let matched = p.matches_state(state);
+        let pending_pos = p.pending_pos;
+        Self::recycle(p, spare);
+        if !matched {
+            return false;
+        }
+        // The deferred row sits at `pending_pos == state.seq_len - 1 >= len`, so dropping it
+        // rather than flushing it lands directly at the materialized `pending_pos` prefix.
+        state.seq_len = pending_pos;
+        if state.seq_len == 0 {
+            for layer in &mut state.layers {
+                if let LayerState::Conv { buffer, history } = layer {
+                    buffer.fill(0.0);
+                    history.clear();
+                }
+            }
+        } else if state.seq_len == len
+            && state.layers.iter().any(
+                |layer| matches!(layer, LayerState::Conv { history, .. } if !history.has_pos(len)),
+            )
+        {
+            // Match `InferenceState::truncate_to`'s missing-checkpoint fallback: clear both
+            // `Conv` and `Attention` down to 0 so `Attention` KV is never left with zeroed `Conv`.
+            state.truncate_to(0);
+            return false;
+        }
+        true
+    }
+
+    #[must_use]
     pub(crate) fn flush_into(
         pending: &mut Option<Self>,
         spare: &mut Option<Self>,
         state: &mut InferenceState,
-    ) {
-        let Some(mut p) = pending.take() else {
-            return;
+    ) -> bool {
+        let Some(p) = pending.take() else {
+            return true;
         };
-        let expected_kv = p.pending_pos.checked_mul(p.kv_dim);
-        let state_matches = expected_kv.is_some_and(|exp| {
-            p.pending_pos.checked_add(1) == Some(state.seq_len)
-                && p.conv[..p.conv_len].iter().all(|(l, _)| {
-                    *l < state.layers.len() && matches!(&state.layers[*l], LayerState::Conv { .. })
-                })
-                && p.attn[..p.attn_len].iter().all(|(l, _, _)| {
-                    *l < state.layers.len()
-                        && matches!(
-                            &state.layers[*l],
-                            LayerState::Attention {
-                                key_cache,
-                                value_cache,
-                                key_cache_f16,
-                                value_cache_f16,
-                                ..
-                            } if if state.kv_f16 {
-                                key_cache.is_empty()
-                                    && value_cache.is_empty()
-                                    && key_cache_f16.len() == exp
-                                    && value_cache_f16.len() == exp
-                            } else {
-                                key_cache_f16.is_empty()
-                                    && value_cache_f16.is_empty()
-                                    && key_cache.len() == exp
-                                    && value_cache.len() == exp
-                            }
-                        )
-                })
-        });
-        if !state_matches {
-            p.conv_len = 0;
-            p.attn_len = 0;
-            *spare = Some(p);
-            return;
+        if !p.matches_state(state) {
+            Self::recycle(p, spare);
+            return false;
         }
         let next_pos = p.pending_pos + 1;
         for (l, src_buf) in &p.conv[..p.conv_len] {
@@ -447,9 +502,8 @@ impl PendingHybridCpuKv {
                 }
             }
         }
-        p.conv_len = 0;
-        p.attn_len = 0;
-        *spare = Some(p);
+        Self::recycle(p, spare);
+        true
     }
 }
 
@@ -478,8 +532,14 @@ impl HybridPendingSlot {
         PendingHybridCpuKv::discard(&mut self.pending, &mut self.spare);
     }
 
-    pub(crate) fn flush_into(&mut self, state: &mut InferenceState) {
-        PendingHybridCpuKv::flush_into(&mut self.pending, &mut self.spare, state);
+    #[must_use]
+    pub(crate) fn discard_for_truncate(&mut self, state: &mut InferenceState, len: usize) -> bool {
+        PendingHybridCpuKv::discard_for_truncate(&mut self.pending, &mut self.spare, state, len)
+    }
+
+    #[must_use]
+    pub(crate) fn flush_into(&mut self, state: &mut InferenceState) -> bool {
+        PendingHybridCpuKv::flush_into(&mut self.pending, &mut self.spare, state)
     }
 
     pub(crate) fn as_ref(&self) -> Option<&PendingHybridCpuKv> {
@@ -503,6 +563,18 @@ pub(crate) fn check_hybrid_kv_rewind_state(
             return Err(KvRewindError::InvalidCacheLayout {
                 layer: 0,
                 detail: "deferred NPU KV row does not match the current position",
+            });
+        }
+        if !p.conv[..p.conv_len]
+            .iter()
+            .all(|&(l, _)| matches!(state.layers.get(l), Some(LayerState::Conv { .. })))
+            || !p.attn[..p.attn_len]
+                .iter()
+                .all(|&(l, _, _)| matches!(state.layers.get(l), Some(LayerState::Attention { .. })))
+        {
+            return Err(KvRewindError::InvalidCacheLayout {
+                layer: 0,
+                detail: "deferred NPU KV row references invalid or mismatched layer",
             });
         }
         let expected =
@@ -2979,11 +3051,39 @@ mod tests {
                 .check_kv_rewind(&state, 0)
                 .expect("reset state is healthy");
 
-            // `forward_greedy` reports input/torn faults without panicking and clears via reset.
+            // `forward_greedy` preserves scratch and updates `seq_len` at `pos=0`,
+            // `try_truncate_kv(&mut state, 0)` rewinds cleanly, error paths do not tear state,
+            // and torn faults hold until reset.
+            state.scratch.logits.reserve(cfg.vocab_size);
+            let scratch_ptr = state.scratch.logits.as_ptr();
+            let greedy_p0 = model.forward_greedy(&[0], 0, &mut state);
+            assert!((greedy_p0 as usize) < cfg.vocab_size);
+            assert_eq!(state.seq_len, 1);
+            assert!(model.take_decode_error().is_none());
+            assert!(!model.state_torn.load(Ordering::SeqCst));
+            assert_eq!(state.scratch.logits.as_ptr(), scratch_ptr);
+
+            model.try_truncate_kv(&mut state, 0).unwrap();
+            assert_eq!(state.seq_len, 0);
+
             let tok_oob = model.forward_greedy(&[0], 64, &mut state);
             assert_eq!(tok_oob, 0);
             assert!(model.take_decode_error().is_some());
             assert!(!model.state_torn.load(Ordering::SeqCst));
+
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = model.npu.lock().unwrap();
+                panic!("simulated worker panic before forward_greedy");
+            }));
+            let tok_torn = model.forward_greedy(&[0], state.seq_len, &mut state);
+            assert_eq!(tok_torn, 0);
+            assert!(model.state_torn.load(Ordering::SeqCst));
+            assert!(model.take_decode_error().is_some());
+            model
+                .try_reset_kv(&mut state, &KvCompression::F16, 64)
+                .expect("try_reset_kv clears torn state after forward_greedy");
+            assert!(!model.state_torn.load(Ordering::SeqCst));
+            assert!(model.take_decode_error().is_none());
         });
     }
 
@@ -3022,16 +3122,25 @@ mod tests {
         let conv_taps = 3;
         let mut state = InferenceState::from_config_capped(&cfg, &KvCompression::F16, 64)
             .expect("hybrid state");
-        // Seed pos=0 checkpoint so rewind(0) can validate before pending pos=0 flushes.
+        // Seed pos=0 checkpoint, leave pos=1 uncheckpointed, and stage pending at pos=1.
         if let LayerState::Conv { buffer, history } = &mut state.layers[0] {
             buffer.resize(conv_taps * 2048, 0.0);
             *history = crate::kv_cache::ConvHistory::new(conv_taps * 2048);
             history.push(0, buffer);
         }
-        state.seq_len = 1;
+        if let LayerState::Attention {
+            key_cache_f16,
+            value_cache_f16,
+            ..
+        } = &mut state.layers[1]
+        {
+            key_cache_f16.resize(kv_dim, crate::quant::f32_to_f16(0.5));
+            value_cache_f16.resize(kv_dim, crate::quant::f32_to_f16(-0.5));
+        }
+        state.seq_len = 2;
 
         let mut slot = HybridPendingSlot::default();
-        let mut p = slot.prepare(0, conv_taps, 2048, kv_dim);
+        let mut p = slot.prepare(1, conv_taps, 2048, kv_dim);
         let mut kvo_conv = vec![0u8; 8 * Q4LAYER_TILE_F32 * 4];
         write_le_f32_slice(&mut kvo_conv, 0, &[1.25f32; 256]);
         p.push_conv_from_kvo(0, &kvo_conv);
@@ -3046,34 +3155,69 @@ mod tests {
         p.push_attn_bf16(1, &kvo_attn, 4, 128, 512 * 4);
         slot.commit(p);
 
-        // Before flush, `check_hybrid_kv_rewind_state` accepts `len=0` and rejects missing `len=1`.
+        // Before flush, `check_hybrid_kv_rewind_state` accepts `len=0` and `len=2` (`len == seq_len`),
+        // rejects missing `len=1` with `MissingConvolutionCheckpoint`, and rejects `len=3` (`OutOfBounds`).
         assert_eq!(
             check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 0),
             Ok(())
         );
         assert_eq!(
             check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 2),
-            Err(KvRewindError::OutOfBounds {
-                requested: 2,
-                current: 1,
+            Ok(())
+        );
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 1),
+            Err(KvRewindError::MissingConvolutionCheckpoint {
+                layer: 0,
+                position: 1,
             })
         );
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 3),
+            Err(KvRewindError::OutOfBounds {
+                requested: 3,
+                current: 2,
+            })
+        );
+        assert_eq!(
+            check_hybrid_kv_rewind_state(false, false, slot.as_ref(), &state, 0),
+            Err(KvRewindError::NonCausal)
+        );
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, true, slot.as_ref(), &state, 0),
+            Err(KvRewindError::BackendUnsupported)
+        );
 
-        slot.flush_into(&mut state);
+        assert!(slot.flush_into(&mut state));
         assert!(slot.as_ref().is_none());
-        assert_eq!(state.kv_cache_f16(1).0.len(), kv_dim);
-        assert_eq!(crate::quant::f16_to_f32(state.kv_cache_f16(1).0[0]), 1.0);
-        assert_eq!(crate::quant::f16_to_f32(state.kv_cache_f16(1).1[0]), 2.0);
+        assert_eq!(state.kv_cache_f16(1).0.len(), 2 * kv_dim);
+        assert_eq!(
+            crate::quant::f16_to_f32(state.kv_cache_f16(1).0[kv_dim]),
+            1.0
+        );
+        assert_eq!(
+            crate::quant::f16_to_f32(state.kv_cache_f16(1).1[kv_dim]),
+            2.0
+        );
         if let LayerState::Conv { buffer, history } = &state.layers[0] {
             assert_eq!(buffer[0], 1.25);
-            assert!(history.has_pos(1));
+            assert!(history.has_pos(2));
         } else {
             panic!("expected conv layer state");
         }
-        // After flush, spare buffer is recycled for next token and discard clears pending cleanly.
-        let p2 = slot.prepare(1, conv_taps, 2048, kv_dim);
+        // `discard_for_truncate` drops pending tail without flushing into state.
+        let p2 = slot.prepare(2, conv_taps, 2048, kv_dim);
         slot.commit(p2);
-        slot.discard();
+        state.seq_len = 3;
+        assert!(slot.discard_for_truncate(&mut state, 2));
+        assert!(slot.as_ref().is_none());
+        assert_eq!(state.seq_len, 2);
+        assert_eq!(state.kv_cache_f16(1).0.len(), 2 * kv_dim);
+
+        // State mismatch returns `false` and clears pending without corrupting `state`.
+        let p3 = slot.prepare(99, conv_taps, 2048, kv_dim);
+        slot.commit(p3);
+        assert!(!slot.flush_into(&mut state));
         assert!(slot.as_ref().is_none());
     }
 
@@ -3103,7 +3247,7 @@ mod tests {
         }
         p.push_attn_bf16(1, &kvo_attn, 8, 64, 1024);
         slot.commit(p);
-        slot.flush_into(&mut state);
+        assert!(slot.flush_into(&mut state));
         assert_eq!(state.kv_cache_f16(1).0.len(), kv_dim);
         assert_eq!(
             crate::quant::f16_to_f32(state.kv_cache_f16(1).0[kv_dim - 1]),
@@ -3112,6 +3256,120 @@ mod tests {
         assert_eq!(
             crate::quant::f16_to_f32(state.kv_cache_f16(1).1[kv_dim - 1]),
             2.0
+        );
+    }
+
+    #[test]
+    fn xdna_hybrid_conv_history_ring_boundary_handles_64_positions() {
+        let mut cfg = test_hybrid_config(2);
+        cfg.max_seq_len = 128;
+        let kv_dim = 4 * 128;
+        let conv_taps = 2;
+        let mut state = InferenceState::from_config_capped(&cfg, &KvCompression::F16, 128)
+            .expect("hybrid state");
+        if let LayerState::Conv { buffer, history } = &mut state.layers[0] {
+            buffer.resize(conv_taps * 2048, 0.0);
+            *history = crate::kv_cache::ConvHistory::new(conv_taps * 2048);
+            for pos in 1..=65usize {
+                buffer.fill(pos as f32);
+                history.push(pos, buffer);
+            }
+        }
+        if let LayerState::Attention {
+            key_cache_f16,
+            value_cache_f16,
+            ..
+        } = &mut state.layers[1]
+        {
+            key_cache_f16.resize(65 * kv_dim, 0);
+            value_cache_f16.resize(65 * kv_dim, 0);
+        }
+        state.seq_len = 66;
+
+        let mut slot = HybridPendingSlot::default();
+        let p = slot.prepare(65, conv_taps, 2048, kv_dim);
+        slot.commit(p);
+
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 1),
+            Err(KvRewindError::MissingConvolutionCheckpoint {
+                layer: 0,
+                position: 1,
+            })
+        );
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot.as_ref(), &state, 2),
+            Ok(())
+        );
+        assert!(slot.discard_for_truncate(&mut state, 2));
+        assert_eq!(state.seq_len, 65);
+
+        // Live pending row at `pending_pos == len > 0` without a Conv checkpoint at `len`
+        // must clear both `Attention` and `Conv` down to `seq_len == 0` and return `false`.
+        state.seq_len = 2;
+        if let LayerState::Attention {
+            key_cache_f16,
+            value_cache_f16,
+            ..
+        } = &mut state.layers[1]
+        {
+            key_cache_f16.resize(kv_dim, 1);
+            value_cache_f16.resize(kv_dim, 2);
+        }
+        let p_missing_ckpt = slot.prepare(1, conv_taps, 2048, kv_dim);
+        slot.commit(p_missing_ckpt);
+        assert!(!slot.discard_for_truncate(&mut state, 1));
+        assert_eq!(state.seq_len, 0);
+        if let LayerState::Attention {
+            key_cache_f16,
+            value_cache_f16,
+            ..
+        } = &state.layers[1]
+        {
+            assert!(key_cache_f16.is_empty());
+            assert!(value_cache_f16.is_empty());
+        }
+        if let LayerState::Conv { buffer, .. } = &state.layers[0] {
+            assert!(buffer.iter().all(|&x| x == 0.0));
+        }
+
+        // Live pending row at `pending_pos == 0` zeroes `Conv` buffer and lands at `seq_len == 0`.
+        if let LayerState::Conv { buffer, .. } = &mut state.layers[0] {
+            buffer.fill(5.0);
+        }
+        state.seq_len = 1;
+        let p0 = slot.prepare(0, conv_taps, 2048, kv_dim);
+        slot.commit(p0);
+        assert!(slot.discard_for_truncate(&mut state, 0));
+        assert_eq!(state.seq_len, 0);
+        if let LayerState::Conv { buffer, .. } = &state.layers[0] {
+            assert!(buffer.iter().all(|&x| x == 0.0));
+        }
+
+        // `check_hybrid_kv_rewind_state` validates bounds and layer kind of `p.conv` / `p.attn`.
+        state.seq_len = 66;
+        let kvo_conv = vec![0u8; 8 * Q4LAYER_TILE_F32 * 4];
+        let mut slot2 = HybridPendingSlot::default();
+        let mut bad_conv = slot2.prepare(65, conv_taps, 2048, kv_dim);
+        bad_conv.push_conv_from_kvo(1, &kvo_conv);
+        slot2.commit(bad_conv);
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot2.as_ref(), &state, 2),
+            Err(KvRewindError::InvalidCacheLayout {
+                layer: 0,
+                detail: "deferred NPU KV row references invalid or mismatched layer",
+            })
+        );
+        let kvo_attn = vec![0u8; 4 * 1024];
+        let mut bad_attn = slot2.prepare(65, conv_taps, 2048, kv_dim);
+        bad_attn.push_attn_bf16(0, &kvo_attn, 4, 128, 1024);
+        slot2.commit(bad_attn);
+        assert_eq!(
+            check_hybrid_kv_rewind_state(true, false, slot2.as_ref(), &state, 2),
+            Err(KvRewindError::InvalidCacheLayout {
+                layer: 0,
+                detail: "deferred NPU KV row references invalid or mismatched layer",
+            })
         );
     }
 }

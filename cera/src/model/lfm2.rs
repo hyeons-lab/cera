@@ -2386,27 +2386,77 @@ impl LfmModel {
             })
     }
 
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_embed_logits_refs(&self) -> (&WeightRef, &WeightRef) {
+        (&self.embd_ref, &self.logits_ref)
+    }
+
+    #[cfg(feature = "xdna")]
+    fn default_xdna_head_threads(physical_cores: Option<usize>, available: usize) -> usize {
+        let cores = physical_cores.unwrap_or(available).max(1);
+        if cores > 8 {
+            (cores * 3 / 4).clamp(4, 12)
+        } else {
+            cores
+        }
+    }
+
+    #[cfg(feature = "xdna")]
+    fn xdna_head_threads_from_lookup<F>(
+        lookup: F,
+        physical_cores: Option<usize>,
+        available: usize,
+    ) -> usize
+    where
+        F: FnOnce(&str) -> Option<String>,
+    {
+        if let Some(raw) = lookup("CERA_NPU_HEAD_THREADS") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                match trimmed.parse::<usize>() {
+                    Ok(n) if n >= 1 => return n,
+                    Ok(_) => {
+                        tracing::warn!(
+                            "cera: ignoring CERA_NPU_HEAD_THREADS=0; expected positive integer >= 1"
+                        );
+                        eprintln!(
+                            "cera: ignoring CERA_NPU_HEAD_THREADS=0; expected positive integer >= 1"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "cera: ignoring invalid CERA_NPU_HEAD_THREADS={trimmed:?}; expected integer >= 1"
+                        );
+                        eprintln!(
+                            "cera: ignoring invalid CERA_NPU_HEAD_THREADS={trimmed:?}; expected integer >= 1"
+                        );
+                    }
+                }
+            }
+        }
+        Self::default_xdna_head_threads(physical_cores, available)
+    }
+
     /// Cap the CPU Q6_K LM-head below SMT siblings while leaving physical cores free for the NPU driver.
     #[cfg(feature = "xdna")]
     pub(crate) fn xdna_head_threads() -> usize {
-        fn default_xdna_head_threads() -> usize {
-            let cores = crate::backend::cpu_features::physical_core_count().unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            });
-            if cores > 8 {
-                (cores * 3 / 4).clamp(4, 12)
-            } else {
-                cores.max(1)
-            }
-        }
         static HEAD_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *HEAD_THREADS.get_or_init(|| {
-            std::env::var("CERA_NPU_HEAD_THREADS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or_else(default_xdna_head_threads)
+            let lookup = |_name: &str| -> Option<String> {
+                #[cfg(not(test))]
+                {
+                    std::env::var(_name).ok()
+                }
+                #[cfg(test)]
+                {
+                    None
+                }
+            };
+            let physical = crate::backend::cpu_features::physical_core_count();
+            let available = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            Self::xdna_head_threads_from_lookup(lookup, physical, available)
         })
     }
 
@@ -8721,5 +8771,197 @@ pub(crate) mod bidirectional_float_tests {
             .build();
         let err = LfmModel::parse_config(&all_head, 64).unwrap_err();
         assert!(err.to_string().contains("leaves no trunk"), "{err}");
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_head_threads_from_lookup_parses_bounds_and_ignores_invalid() {
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(20), 40),
+            12
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(16), 32),
+            12
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(12), 24),
+            9
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(9), 18),
+            6
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(8), 16),
+            8
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, None, 16),
+            12
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, None, 6),
+            6
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, None, 0),
+            1
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(0), 0),
+            1
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "1".to_string()),
+                Some(16),
+                32
+            ),
+            1
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| " 6 ".to_string()),
+                Some(16),
+                32
+            ),
+            6
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "OTHER_ENV").then(|| "2".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+        // Zero, empty, and non-numeric overrides fall back cleanly.
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "0".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "  ".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "abc".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_project_logits_scratch_reuse_and_oversize_guard() {
+        // Use Q8_0 `token_embd.weight` so `gemv_active_with_scratch` exercises `q8_scratch`.
+        let embd_f32: Vec<f32> = (0..(VOCAB * HS))
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+            .collect();
+        let mut embd_q8 =
+            vec![
+                0u8;
+                crate::convert::TargetQuant::compute_tensor_bytes(GGML_TYPE_Q8_0, embd_f32.len())
+            ];
+        crate::convert::quantize_tensor_data(&embd_f32, GGML_TYPE_Q8_0, &mut embd_q8).unwrap();
+        let norm_f32 = vec![1.0f32; HS];
+        let b = crate::gguf::GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_u32("lfm2.block_count", 1)
+            .kv_u32("lfm2.embedding_length", HS as u32)
+            .kv_u32("lfm2.feed_forward_length", INTER as u32)
+            .kv_u32("lfm2.attention.head_count", 4)
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0])
+            .kv_u32("lfm2.shortconv.l_cache", 3)
+            .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+            .kv_f32("lfm2.rope.freq_base", 10_000.0)
+            .kv_u32("lfm2.context_length", 64)
+            .kv_u32("lfm2.vocab_size", VOCAB as u32)
+            .tensor("token_embd.weight", &[HS, VOCAB], GGML_TYPE_Q8_0, embd_q8)
+            .tensor_f32("token_embd_norm.weight", &[HS], &norm_f32)
+            .tensor_f32("blk.0.attn_norm.weight", &[HS], &norm_f32)
+            .tensor_f32("blk.0.ffn_norm.weight", &[HS], &norm_f32)
+            .tensor_f32(
+                "blk.0.shortconv.in_proj.weight",
+                &[HS, 3 * HS],
+                &vec![0.01f32; 3 * HS * HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.out_proj.weight",
+                &[HS, HS],
+                &vec![0.01f32; HS * HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.conv.weight",
+                &[3, HS],
+                &vec![0.1f32; 3 * HS],
+            )
+            .tensor_f32(
+                "blk.0.ffn_gate.weight",
+                &[HS, INTER],
+                &vec![0.01f32; HS * INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_up.weight",
+                &[HS, INTER],
+                &vec![0.01f32; HS * INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_down.weight",
+                &[INTER, HS],
+                &vec![0.01f32; INTER * HS],
+            );
+        let model = LfmModel::from_gguf(b.build(), 64).unwrap();
+        let hidden: Vec<f32> = (0..HS).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+        let uncached = model.xdna_project_logits_from_hidden_with_scratch(&hidden, None);
+        let mut scratch = (Vec::new(), Vec::new());
+        let mut pooled = vec![-1.0f32; model.config().vocab_size];
+        model.xdna_project_logits_into_with_scratch(
+            &hidden,
+            &mut pooled,
+            Some((&mut scratch.0, &mut scratch.1)),
+        );
+        assert_eq!(pooled, uncached);
+        let q8_used = crate::backend::cpu::int8_gemm_available();
+        if q8_used {
+            assert_eq!(scratch.0.len(), HS / 32);
+            assert_eq!(scratch.1.len(), HS);
+        }
+        let cap0 = scratch.0.capacity();
+        let cap1 = scratch.1.capacity();
+
+        // Clear lengths while retaining capacity to verify `xdna_project_logits_from_hidden_with_scratch`
+        // actually repopulates and reuses `q8_scratch` without reallocating.
+        scratch.0.clear();
+        scratch.1.clear();
+        let cached = model.xdna_project_logits_from_hidden_with_scratch(
+            &hidden,
+            Some((&mut scratch.0, &mut scratch.1)),
+        );
+        assert_eq!(cached, uncached);
+        if q8_used {
+            assert_eq!(scratch.0.len(), HS / 32);
+            assert_eq!(scratch.1.len(), HS);
+        }
+        assert_eq!(scratch.0.capacity(), cap0);
+        assert_eq!(scratch.1.capacity(), cap1);
+
+        // Oversize hidden slice (>2048) zeroes non-zero caller logits buffer without panicking.
+        let oversize = vec![1.0f32; 2049];
+        pooled.fill(7.5);
+        model.xdna_project_logits_into_with_scratch(&oversize, &mut pooled, None);
+        assert!(pooled.iter().all(|&v| v == 0.0));
     }
 }
