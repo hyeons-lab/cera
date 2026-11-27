@@ -578,12 +578,19 @@ pub(crate) struct XdnaMoePrefillScratch {
     probs: Vec<f32>,
     tok_sel: Vec<(usize, f32)>,
     buckets: Vec<Vec<(usize, f32)>>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     gather_scales: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     gather_quants: Vec<i8>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     exp_gate: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     exp_up: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     exp_down: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     down_scales: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     down_quants: Vec<i8>,
 }
 
@@ -2571,17 +2578,26 @@ impl LfmModel {
         logits: &mut [f32],
         q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
     ) {
-        let max_active = Self::xdna_head_threads();
-        let mut normed = [0.0f32; 2048];
-        let normed_slice = if hidden.len() <= normed.len() {
-            let s = &mut normed[..hidden.len()];
-            s.copy_from_slice(hidden);
-            cpu::rmsnorm(s, &self.output_norm_weight, self.config.rms_norm_eps);
-            &normed[..hidden.len()]
-        } else {
+        if hidden.len() != self.config.hidden_size {
             logits[..self.config.vocab_size].fill(0.0);
             return;
+        }
+        let max_active = Self::xdna_head_threads();
+        let mut stack_normed = [0.0f32; 2048];
+        let mut heap_normed: Vec<f32>;
+        let normed_slice: &mut [f32] = if hidden.len() <= stack_normed.len() {
+            let s = &mut stack_normed[..hidden.len()];
+            s.copy_from_slice(hidden);
+            s
+        } else {
+            heap_normed = hidden.to_vec();
+            &mut heap_normed[..]
         };
+        cpu::rmsnorm(
+            normed_slice,
+            &self.output_norm_weight,
+            self.config.rms_norm_eps,
+        );
         transformer::gemv_active_with_scratch(
             max_active,
             &self.gguf,
@@ -2781,7 +2797,9 @@ impl LfmModel {
         let ne = moe.n_expert;
         let top_k = moe.n_expert_used;
         let ff = moe.expert_ff_len;
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
         let nb_hs = hs / 32;
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
         let nb_ff = ff / 32;
 
         moe_scratch.router_logits.resize(n * ne, 0.0);
@@ -2867,8 +2885,6 @@ impl LfmModel {
                     && transformer::batched_gemm_supports(u.dtype, u.k)
                     && transformer::batched_gemm_supports(d.dtype, d.k)
             });
-        #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas))))]
-        let batched_ok = false;
 
         #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
         if batched_ok {
@@ -2886,9 +2902,9 @@ impl LfmModel {
             if hits.is_empty() {
                 continue;
             }
-            let k_e = hits.len();
             #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
-            if k_e >= 2 && batched_ok {
+            if hits.len() >= 2 && batched_ok {
+                let k_e = hits.len();
                 moe_scratch.gather_scales.resize(k_e * nb_hs, 0.0);
                 moe_scratch.gather_quants.resize(k_e * hs, 0);
                 for (idx, &(tok_j, _)) in hits.iter().enumerate() {
@@ -9553,10 +9569,398 @@ pub(crate) mod bidirectional_float_tests {
         assert_eq!(scratch.0.capacity(), cap0);
         assert_eq!(scratch.1.capacity(), cap1);
 
-        // Oversize hidden slice (>2048) zeroes non-zero caller logits buffer without panicking.
+        // Mismatched hidden slice (len != hidden_size) zeroes non-zero caller logits buffer without panicking.
         let oversize = vec![1.0f32; 2049];
         pooled.fill(7.5);
         model.xdna_project_logits_into_with_scratch(&oversize, &mut pooled, None);
         assert!(pooled.iter().all(|&v| v == 0.0));
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_project_logits_heap_fallback_above_2048() {
+        const BIG_HS: usize = 2560;
+        const BIG_INTER: usize = 256;
+        const BIG_VOCAB: usize = 16;
+        let embd_f32: Vec<f32> = (0..(BIG_VOCAB * BIG_HS))
+            .map(|i| (((i * 17 + 3) % 29) as f32 - 14.0) * 0.04)
+            .collect();
+        let mut embd_q8 =
+            vec![
+                0u8;
+                crate::convert::TargetQuant::compute_tensor_bytes(GGML_TYPE_Q8_0, embd_f32.len(),)
+            ];
+        crate::convert::quantize_tensor_data(&embd_f32, GGML_TYPE_Q8_0, &mut embd_q8).unwrap();
+        let norm_f32: Vec<f32> = (0..BIG_HS)
+            .map(|i| 0.8 + ((i % 11) as f32) * 0.04)
+            .collect();
+        let b = crate::gguf::GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_u32("lfm2.block_count", 1)
+            .kv_u32("lfm2.embedding_length", BIG_HS as u32)
+            .kv_u32("lfm2.feed_forward_length", BIG_INTER as u32)
+            .kv_u32("lfm2.attention.head_count", 40)
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0])
+            .kv_u32("lfm2.shortconv.l_cache", 3)
+            .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+            .kv_f32("lfm2.rope.freq_base", 10_000.0)
+            .kv_u32("lfm2.context_length", 64)
+            .kv_u32("lfm2.vocab_size", BIG_VOCAB as u32)
+            .tensor(
+                "token_embd.weight",
+                &[BIG_HS, BIG_VOCAB],
+                GGML_TYPE_Q8_0,
+                embd_q8,
+            )
+            .tensor_f32("token_embd_norm.weight", &[BIG_HS], &norm_f32)
+            .tensor_f32("blk.0.attn_norm.weight", &[BIG_HS], &norm_f32)
+            .tensor_f32("blk.0.ffn_norm.weight", &[BIG_HS], &norm_f32)
+            .tensor_f32(
+                "blk.0.shortconv.in_proj.weight",
+                &[BIG_HS, 3 * BIG_HS],
+                &vec![0.01f32; 3 * BIG_HS * BIG_HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.out_proj.weight",
+                &[BIG_HS, BIG_HS],
+                &vec![0.01f32; BIG_HS * BIG_HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.conv.weight",
+                &[3, BIG_HS],
+                &vec![0.1f32; 3 * BIG_HS],
+            )
+            .tensor_f32(
+                "blk.0.ffn_gate.weight",
+                &[BIG_HS, BIG_INTER],
+                &vec![0.01f32; BIG_HS * BIG_INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_up.weight",
+                &[BIG_HS, BIG_INTER],
+                &vec![0.01f32; BIG_HS * BIG_INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_down.weight",
+                &[BIG_INTER, BIG_HS],
+                &vec![0.01f32; BIG_INTER * BIG_HS],
+            );
+        let model = LfmModel::from_gguf_no_repack(b.build(), 64).unwrap();
+        let hidden: Vec<f32> = (0..BIG_HS)
+            .map(|i| (((i * 5 + 1) % 19) as f32 - 9.0) * 0.1)
+            .collect();
+        let mut scratch = (Vec::new(), Vec::new());
+        let got = model.xdna_project_logits_from_hidden_with_scratch(
+            &hidden,
+            Some((&mut scratch.0, &mut scratch.1)),
+        );
+        assert_eq!(got.len(), BIG_VOCAB);
+        assert!(got.iter().all(|v| v.is_finite()));
+        assert!(
+            got.iter().any(|&v| v.abs() > 1e-4),
+            "heap fallback for hidden.len() > 2048 produced all-zero logits: {got:?}"
+        );
+
+        let mut expected_normed = hidden.clone();
+        crate::backend::cpu::rmsnorm(&mut expected_normed, &norm_f32, 1e-5);
+        let mut want = vec![0.0f32; BIG_VOCAB];
+        transformer::gemv_active_with_scratch(
+            LfmModel::xdna_head_threads(),
+            &model.gguf,
+            &model.logits_ref,
+            &expected_normed,
+            &mut want,
+            None,
+        );
+        assert_eq!(got, want);
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_prefill_moe_ffn_grouped_matches_forward_moe_ffn() {
+        use crate::convert::writer::GGML_TYPE_Q4_0;
+
+        const MOE_HS: usize = 128;
+        const MOE_INTER: usize = 256;
+        const MOE_EXPERT_FF: usize = 128;
+        const N_EXPERT: usize = 4;
+        const N_EXPERT_USED: usize = 2;
+
+        fn next_vals(seed: &mut u64, count: usize, scale: f32) -> Vec<f32> {
+            (0..count)
+                .map(|_| {
+                    *seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((*seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 2.0 * scale
+                })
+                .collect()
+        }
+
+        let make_q4_0_tensor = |data: &[f32]| -> Vec<u8> {
+            let mut out =
+                vec![
+                    0u8;
+                    crate::convert::TargetQuant::compute_tensor_bytes(GGML_TYPE_Q4_0, data.len(),)
+                ];
+            crate::convert::quantize_tensor_data(data, GGML_TYPE_Q4_0, &mut out).unwrap();
+            out
+        };
+
+        let build_moe_gguf = |use_q4_experts: bool, router: &[f32]| -> GgufFile {
+            let mut seed = 0x517c_c1b7_2722_0a95u64;
+            let mut b = crate::gguf::GgufBuilder::new()
+                .kv_str("general.architecture", "lfm2moe")
+                .kv_u32("lfm2moe.block_count", 2)
+                .kv_u32("lfm2moe.embedding_length", MOE_HS as u32)
+                .kv_u32("lfm2moe.feed_forward_length", MOE_INTER as u32)
+                .kv_u32("lfm2moe.leading_dense_block_count", 1)
+                .kv_u32("lfm2moe.expert_count", N_EXPERT as u32)
+                .kv_u32("lfm2moe.expert_used_count", N_EXPERT_USED as u32)
+                .kv_u32("lfm2moe.expert_feed_forward_length", MOE_EXPERT_FF as u32)
+                .kv_u32("lfm2moe.expert_gating_func", 2)
+                .kv_u32("lfm2moe.attention.head_count", 4)
+                .kv_i32_array("lfm2moe.attention.head_count_kv", vec![0, 1])
+                .kv_u32("lfm2moe.vocab_size", VOCAB as u32)
+                .kv_u32("lfm2moe.context_length", 128)
+                .kv_f32("lfm2moe.rope.freq_base", 10_000.0)
+                .kv_f32("lfm2moe.attention.layer_norm_rms_epsilon", 1e-5)
+                .kv_u32("lfm2moe.shortconv.l_cache", 3);
+
+            let norm_f32 = vec![1.0f32; MOE_HS];
+            b = b
+                .tensor_f32(
+                    "token_embd.weight",
+                    &[MOE_HS, VOCAB],
+                    &next_vals(&mut seed, VOCAB * MOE_HS, 0.3),
+                )
+                .tensor_f32("token_embd_norm.weight", &[MOE_HS], &norm_f32);
+
+            for l in 0..2 {
+                b = b
+                    .tensor_f32(format!("blk.{l}.attn_norm.weight"), &[MOE_HS], &norm_f32)
+                    .tensor_f32(format!("blk.{l}.ffn_norm.weight"), &[MOE_HS], &norm_f32);
+                if l == 0 {
+                    b = b
+                        .tensor_f32(
+                            "blk.0.shortconv.in_proj.weight",
+                            &[MOE_HS, 3 * MOE_HS],
+                            &next_vals(&mut seed, 3 * MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.shortconv.out_proj.weight",
+                            &[MOE_HS, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.shortconv.conv.weight",
+                            &[3, MOE_HS],
+                            &next_vals(&mut seed, 3 * MOE_HS, 0.2),
+                        )
+                        .tensor_f32(
+                            "blk.0.ffn_gate.weight",
+                            &[MOE_HS, MOE_INTER],
+                            &next_vals(&mut seed, MOE_INTER * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.ffn_up.weight",
+                            &[MOE_HS, MOE_INTER],
+                            &next_vals(&mut seed, MOE_INTER * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.ffn_down.weight",
+                            &[MOE_INTER, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_INTER, 0.1),
+                        );
+                } else {
+                    let gate_w = next_vals(&mut seed, N_EXPERT * MOE_EXPERT_FF * MOE_HS, 0.25);
+                    let up_w = next_vals(&mut seed, N_EXPERT * MOE_EXPERT_FF * MOE_HS, 0.25);
+                    let down_w = next_vals(&mut seed, N_EXPERT * MOE_HS * MOE_EXPERT_FF, 0.25);
+                    b = b
+                        .tensor_f32(
+                            "blk.1.attn_q.weight",
+                            &[MOE_HS, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_k.weight",
+                            &[MOE_HS, 32],
+                            &next_vals(&mut seed, 32 * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_v.weight",
+                            &[MOE_HS, 32],
+                            &next_vals(&mut seed, 32 * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_output.weight",
+                            &[MOE_HS, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32("blk.1.attn_q_norm.weight", &[32], &vec![1.0f32; 32])
+                        .tensor_f32("blk.1.attn_k_norm.weight", &[32], &vec![1.0f32; 32])
+                        .tensor_f32("blk.1.ffn_gate_inp.weight", &[MOE_HS, N_EXPERT], router)
+                        .tensor_f32("blk.1.exp_probs_b.bias", &[N_EXPERT], &[0.0; N_EXPERT]);
+                    if use_q4_experts {
+                        b = b
+                            .tensor(
+                                "blk.1.ffn_gate_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                GGML_TYPE_Q4_0,
+                                make_q4_0_tensor(&gate_w),
+                            )
+                            .tensor(
+                                "blk.1.ffn_up_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                GGML_TYPE_Q4_0,
+                                make_q4_0_tensor(&up_w),
+                            )
+                            .tensor(
+                                "blk.1.ffn_down_exps.weight",
+                                &[MOE_EXPERT_FF, MOE_HS, N_EXPERT],
+                                GGML_TYPE_Q4_0,
+                                make_q4_0_tensor(&down_w),
+                            );
+                    } else {
+                        b = b
+                            .tensor_f32(
+                                "blk.1.ffn_gate_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                &gate_w,
+                            )
+                            .tensor_f32(
+                                "blk.1.ffn_up_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                &up_w,
+                            )
+                            .tensor_f32(
+                                "blk.1.ffn_down_exps.weight",
+                                &[MOE_EXPERT_FF, MOE_HS, N_EXPERT],
+                                &down_w,
+                            );
+                    }
+                }
+            }
+            b.build()
+        };
+
+        let mut router = vec![0.0f32; N_EXPERT * MOE_HS];
+        router[0] = 2.0; // expert 0 driven by col 0
+        router[MOE_HS + 1] = 2.0; // expert 1 driven by col 1
+        router[2 * MOE_HS + 2] = 2.0; // expert 2 driven by col 2
+        router[3 * MOE_HS + 3] = -3.0; // expert 3 always cold
+
+        let n = 8usize;
+        let mut inp_seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut ffn_input = next_vals(&mut inp_seed, n * MOE_HS, 0.5);
+        for j in 0..n {
+            let row = &mut ffn_input[j * MOE_HS..(j + 1) * MOE_HS];
+            row[0] = 2.5;
+            if j + 1 < n {
+                row[1] = 2.0;
+                row[2] = -2.5;
+            } else {
+                // Single token routed to expert 2 (`k_e == 1`) alongside expert 0.
+                row[1] = -2.5;
+                row[2] = 2.0;
+            }
+            row[3] = 1.0;
+        }
+
+        let check_parity = |model: LfmModel, label: &str| {
+            let moe = model.xdna_moe_refs(1).expect("layer 1 must be MoE");
+            let mut dec_state = InferenceState::from_config(&model.config).unwrap();
+            dec_state.scratch.q8_scales.resize(MOE_HS / 32, 0.0);
+            dec_state.scratch.q8_quants.resize(MOE_HS, 0);
+            let mut want = vec![0.0f32; n * MOE_HS];
+            for j in 0..n {
+                let x = &ffn_input[j * MOE_HS..(j + 1) * MOE_HS];
+                #[cfg(target_arch = "aarch64")]
+                LfmModel::quantize_to_scratch(x, &mut dec_state);
+                model.forward_moe_ffn(1, moe, MOE_HS, x, &mut dec_state);
+                want[j * MOE_HS..(j + 1) * MOE_HS]
+                    .copy_from_slice(&dec_state.scratch.out[..MOE_HS]);
+            }
+
+            let mut pre_state = InferenceState::for_prefill(&model.config, n).unwrap();
+            let mut scratch = std::mem::take(&mut pre_state.prefill_scratch);
+            scratch.ensure(n, &model.config);
+            scratch.ffn_input[..n * MOE_HS].copy_from_slice(&ffn_input);
+            let mut moe_scratch = XdnaMoePrefillScratch::default();
+            model.xdna_prefill_moe_ffn_grouped(
+                1,
+                moe,
+                MOE_HS,
+                n,
+                None,
+                &mut moe_scratch,
+                &mut scratch,
+                &mut pre_state,
+            );
+            assert_eq!(moe_scratch.buckets[0].len(), n, "{label}: expert 0 bucket");
+            assert_eq!(
+                moe_scratch.buckets[1].len(),
+                n - 1,
+                "{label}: expert 1 bucket (`k_e >= 2`)"
+            );
+            assert_eq!(
+                moe_scratch.buckets[2].len(),
+                1,
+                "{label}: expert 2 bucket (`k_e == 1`)"
+            );
+            assert!(
+                moe_scratch.buckets[3].is_empty(),
+                "{label}: expert 3 bucket empty"
+            );
+
+            let got = &scratch.ffn_out[..n * MOE_HS];
+            for j in 0..n {
+                let g = &got[j * MOE_HS..(j + 1) * MOE_HS];
+                let w = &want[j * MOE_HS..(j + 1) * MOE_HS];
+                let dot: f64 = g.iter().zip(w).map(|(&a, &b)| a as f64 * b as f64).sum();
+                let ng: f64 = g
+                    .iter()
+                    .map(|&a| (a as f64) * (a as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                let nw: f64 = w
+                    .iter()
+                    .map(|&a| (a as f64) * (a as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    ng > 0.0 && nw > 0.0,
+                    "{label} tok {j}: degenerate zero MoE output"
+                );
+                let cos = dot / (ng * nw);
+                let max_abs = g
+                    .iter()
+                    .zip(w)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    cos > 0.999 && max_abs < 0.05,
+                    "{label} tok {j}: cos={cos:.6} max_abs={max_abs:.6}"
+                );
+            }
+        };
+
+        let repacked = LfmModel::from_gguf_with_id_ffn_repack(
+            build_moe_gguf(true, &router),
+            128,
+            String::new(),
+        )
+        .unwrap();
+        check_parity(repacked, "q4_0-ffn-repack");
+
+        let unrepacked = LfmModel::from_gguf_no_repack(build_moe_gguf(true, &router), 128).unwrap();
+        check_parity(unrepacked, "q4_0-no-repack");
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let float_exps =
+                LfmModel::from_gguf_no_repack(build_moe_gguf(false, &router), 128).unwrap();
+            check_parity(float_exps, "f32-non-batched");
+        }
     }
 }

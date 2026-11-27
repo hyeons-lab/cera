@@ -939,16 +939,29 @@ impl Drop for XdnaLfm2Model {
     }
 }
 
+fn host_ffn_hint_from_gguf(gguf: &GgufFile) -> bool {
+    let arch = gguf.get_str("general.architecture");
+    let is_moe_arch = arch.is_some_and(|a| a.eq_ignore_ascii_case("lfm2moe"));
+    let ffn_len = gguf
+        .tensors
+        .get("blk.0.ffn_gate.weight")
+        .and_then(|info| info.shape.get(1).copied())
+        .or_else(|| {
+            arch.and_then(|a| {
+                gguf.get_u32(&format!("{a}.feed_forward_length"))
+                    .map(|n| n as usize)
+            })
+        });
+    is_moe_arch || ffn_len.is_some_and(|n| n != LFM2_FFN)
+}
+
 impl XdnaLfm2Model {
     pub fn from_gguf_with_id(
         gguf: GgufFile,
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        let arch = gguf.get_str("general.architecture");
-        let is_moe_arch = arch.is_some_and(|a| a.eq_ignore_ascii_case("lfm2moe"));
-        let ffn_len = arch.and_then(|a| gguf.get_u32(&format!("{a}.feed_forward_length")));
-        let host_ffn_hint = is_moe_arch || ffn_len.is_some_and(|n| n as usize != LFM2_FFN);
+        let host_ffn_hint = host_ffn_hint_from_gguf(&gguf);
         let cpu = if host_ffn_hint {
             LfmModel::from_gguf_with_id_ffn_repack(gguf, context_size, model_id)?
         } else {
@@ -1132,6 +1145,25 @@ impl XdnaLfm2Model {
             *guard = Some(detail);
         }
         vec![0.0f32; vocab_size]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_prefill_device_fault(
+        &self,
+        pending_attn_mirrors: &mut Vec<Lfm2PrefillAttnMirrorEntry>,
+        layer_kv_blocks: &[Vec<XdnaBo>],
+        layers_state: &mut [LayerState],
+        use_f16: bool,
+        detail: String,
+        out_len: usize,
+    ) -> Vec<f32> {
+        Self::flush_pending_attn_mirrors(
+            pending_attn_mirrors,
+            layer_kv_blocks,
+            layers_state,
+            use_f16,
+        );
+        self.record_device_fault(detail, out_len)
     }
 
     fn reject_input(&self, detail: String, vocab_size: usize) -> Vec<f32> {
@@ -1804,7 +1836,7 @@ impl XdnaLfm2Model {
         use_f16: bool,
         prefetched_rope: &mut Option<(usize, usize, f32, Vec<f32>)>,
         prefill_embs_scratch: &mut (Vec<f32>, Vec<f32>),
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<bool, String> {
         let mut next_tok_ok = true;
         let mut swapped_next_embs = false;
         *in_flight = Some(active_run);
@@ -1850,7 +1882,13 @@ impl XdnaLfm2Model {
             );
             return Err(format!("prefill c={c} runlist exec: {e}"));
         }
-        Ok((next_tok_ok, swapped_next_embs))
+        if !next_tok_ok {
+            return Err(format!(
+                "prefill c={c} lookahead token id out of range for vocab {}",
+                self.cpu.config().vocab_size
+            ));
+        }
+        Ok(swapped_next_embs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3478,10 +3516,12 @@ impl XdnaLfm2Model {
                             .cpu
                             .embed_token_rows_into(&toks[i..i + 1], &mut single_emb)
                         {
-                            return self.reject_input(
-                                format!("token id out of range for vocab {vocab_size}"),
-                                out_len,
-                            );
+                            let detail = format!("token id out of range for vocab {vocab_size}");
+                            return if i == 0 {
+                                self.reject_input(detail, out_len)
+                            } else {
+                                self.record_device_fault(detail, out_len)
+                            };
                         }
                         &single_emb
                     }
@@ -3512,17 +3552,6 @@ impl XdnaLfm2Model {
 
         let pos_aligned = start_pos + cur_start;
         let rem_tokens = n_tokens - cur_start;
-        if npu.prefill.is_none() {
-            npu.prefill = match Self::alloc_prefill_buffers(&mut npu.kernels, &self.layers) {
-                Ok(p) => Some(p),
-                Err(e) => return self.record_device_fault(format!("{e:#}"), out_len),
-            };
-        }
-        if !npu.pending_kv.flush_into(state) {
-            npu.synced_len = 0;
-            npu.force_conv_sync = true;
-        }
-
         let rem_src = match src {
             PrefillSource::Tokens(toks) => PrefillSource::Tokens(&toks[cur_start..]),
             PrefillSource::Embeddings(embeddings, _) => {
@@ -3543,11 +3572,23 @@ impl XdnaLfm2Model {
                 .cpu
                 .embed_token_rows_into(&toks[..n0], &mut npu.prefill_embs_scratch.0[..n0 * LFM2_H])
             {
-                return self.reject_input(
-                    format!("token id out of range for vocab {vocab_size}"),
-                    out_len,
-                );
+                let detail = format!("token id out of range for vocab {vocab_size}");
+                return if cur_start == 0 {
+                    self.reject_input(detail, out_len)
+                } else {
+                    self.record_device_fault(detail, out_len)
+                };
             }
+        }
+        if npu.prefill.is_none() {
+            npu.prefill = match Self::alloc_prefill_buffers(&mut npu.kernels, &self.layers) {
+                Ok(p) => Some(p),
+                Err(e) => return self.record_device_fault(format!("{e:#}"), out_len),
+            };
+        }
+        if !npu.pending_kv.flush_into(state) {
+            npu.synced_len = 0;
+            npu.force_conv_sync = true;
         }
         let attn_caps: Vec<usize> = Q4PREFILL_LFM2_ATTN_BUCKETS
             .iter()
@@ -3853,19 +3894,21 @@ impl XdnaLfm2Model {
                                 Err(e) => Err(e),
                             };
                             if let Err(e) = exec_res {
-                                Self::flush_pending_attn_mirrors(
+                                return self.record_prefill_device_fault(
                                     &mut pending_attn_mirrors,
                                     layer_kv_blocks,
                                     &mut state.layers,
                                     use_f16,
-                                );
-                                return self.record_device_fault(
                                     format!("prefill c={c} layer {l} moe run exec: {e}"),
                                     out_len,
                                 );
                             }
                             if !next_tok_ok {
-                                return self.reject_input(
+                                return self.record_prefill_device_fault(
+                                    &mut pending_attn_mirrors,
+                                    layer_kv_blocks,
+                                    &mut state.layers,
+                                    use_f16,
                                     format!("token id out of range for vocab {vocab_size}"),
                                     out_len,
                                 );
@@ -3998,14 +4041,17 @@ impl XdnaLfm2Model {
                             &mut prefetched_rope,
                             prefill_embs_scratch,
                         ) {
-                            Ok((false, _)) => {
-                                return self.reject_input(
-                                    format!("token id out of range for vocab {vocab_size}"),
+                            Ok(swapped) => swapped_next_embs = swapped,
+                            Err(e) => {
+                                return self.record_prefill_device_fault(
+                                    &mut pending_attn_mirrors,
+                                    layer_kv_blocks,
+                                    &mut state.layers,
+                                    use_f16,
+                                    e,
                                     out_len,
                                 );
                             }
-                            Ok((true, swapped)) => swapped_next_embs = swapped,
-                            Err(e) => return self.record_device_fault(e, out_len),
                         }
                     }
                     if let Some(t) = pre_npu0 {
@@ -4292,7 +4338,14 @@ impl XdnaLfm2Model {
                                     )
                                 };
                                 if let Err(e) = layer_res {
-                                    return self.record_device_fault(e, out_len);
+                                    return self.record_prefill_device_fault(
+                                        &mut pending_attn_mirrors,
+                                        layer_kv_blocks,
+                                        &mut state.layers,
+                                        use_f16,
+                                        e,
+                                        out_len,
+                                    );
                                 }
                             }
                             if let Some((np0, nnv, th)) = next_rope_spec {
@@ -4308,7 +4361,11 @@ impl XdnaLfm2Model {
                                     &toks[next_off..next_off + next_nv],
                                     &mut prefill_embs_scratch.0[..next_nv * LFM2_H],
                                 ) {
-                                    return self.reject_input(
+                                    return self.record_prefill_device_fault(
+                                        &mut pending_attn_mirrors,
+                                        layer_kv_blocks,
+                                        &mut state.layers,
+                                        use_f16,
                                         format!("token id out of range for vocab {vocab_size}"),
                                         out_len,
                                     );
@@ -4341,14 +4398,17 @@ impl XdnaLfm2Model {
                                 &mut prefetched_rope,
                                 prefill_embs_scratch,
                             ) {
-                                Ok((false, _)) => {
-                                    return self.reject_input(
-                                        format!("token id out of range for vocab {vocab_size}"),
+                                Ok(swapped) => swapped_next_embs = swapped,
+                                Err(e) => {
+                                    return self.record_prefill_device_fault(
+                                        &mut pending_attn_mirrors,
+                                        layer_kv_blocks,
+                                        &mut state.layers,
+                                        use_f16,
+                                        e,
                                         out_len,
                                     );
                                 }
-                                Ok((true, swapped)) => swapped_next_embs = swapped,
-                                Err(e) => return self.record_device_fault(e, out_len),
                             }
                         }
                     }
@@ -4426,7 +4486,14 @@ impl XdnaLfm2Model {
                                 l,
                             )
                         {
-                            return self.record_device_fault(e, out_len);
+                            return self.record_prefill_device_fault(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                                e,
+                                out_len,
+                            );
                         }
                     }
                     let conv_kv_in_kvo = pre.conv_kv_in_kvo;
@@ -4437,7 +4504,14 @@ impl XdnaLfm2Model {
                         n_valid,
                         &format!("prefill >32K c={c} layer 0 hidden sync"),
                     ) {
-                        return self.record_device_fault(e, out_len);
+                        return self.record_prefill_device_fault(
+                            &mut pending_attn_mirrors,
+                            layer_kv_blocks,
+                            &mut state.layers,
+                            use_f16,
+                            e,
+                            out_len,
+                        );
                     }
                     if let PrefillSource::Tokens(toks) = rem_src
                         && c + 1 < n_chunks
@@ -4448,7 +4522,11 @@ impl XdnaLfm2Model {
                             &toks[next_off..next_off + next_nv],
                             &mut prefill_embs_scratch.0[..next_nv * LFM2_H],
                         ) {
-                            return self.reject_input(
+                            return self.record_prefill_device_fault(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
                                 format!("token id out of range for vocab {vocab_size}"),
                                 out_len,
                             );
@@ -4704,7 +4782,11 @@ impl XdnaLfm2Model {
                             if let Err(e) =
                                 pre.layer_bo_kvo[l].sync_range_from_device(attn_kvo_sync_bytes, 0)
                             {
-                                return self.record_device_fault(
+                                return self.record_prefill_device_fault(
+                                    &mut pending_attn_mirrors,
+                                    layer_kv_blocks,
+                                    &mut state.layers,
+                                    use_f16,
                                     format!("prefill >32K c={c} layer {l} attn kvo readback: {e}"),
                                     out_len,
                                 );
@@ -4730,7 +4812,11 @@ impl XdnaLfm2Model {
                                     }
                                 }
                                 Err(e) => {
-                                    return self.record_device_fault(
+                                    return self.record_prefill_device_fault(
+                                        &mut pending_attn_mirrors,
+                                        layer_kv_blocks,
+                                        &mut state.layers,
+                                        use_f16,
                                         format!("prefill >32K c={c} layer {l} attn save: {e}"),
                                         out_len,
                                     );
@@ -4747,7 +4833,14 @@ impl XdnaLfm2Model {
                             n_valid,
                             state,
                         ) {
-                            return self.record_device_fault(e, out_len);
+                            return self.record_prefill_device_fault(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                                e,
+                                out_len,
+                            );
                         }
                     }
                     pre.conv_kv_in_kvo = !conv_kv_in_kvo;
@@ -4766,16 +4859,26 @@ impl XdnaLfm2Model {
                 }
             }
 
-            let pre = npu.prefill.as_mut().expect("prefill buffers");
             if !self.host_ffn && is_last_chunk && need_logits {
                 let last_bytes = LFM2_H * 4;
                 let last_off = (n_valid - 1) * last_bytes;
-                if let Err(e) = pre.bo_yn.sync_range_from_device(last_bytes, last_off) {
-                    return self.record_device_fault(
+                let sync_res = npu
+                    .prefill
+                    .as_mut()
+                    .expect("prefill buffers")
+                    .bo_yn
+                    .sync_range_from_device(last_bytes, last_off);
+                if let Err(e) = sync_res {
+                    return self.record_prefill_device_fault(
+                        &mut pending_attn_mirrors,
+                        &npu.layer_kv_blocks,
+                        &mut state.layers,
+                        use_f16,
                         format!("prefill last_hidden sync_from_device: {e}"),
                         out_len,
                     );
                 }
+                let pre = npu.prefill.as_ref().expect("prefill buffers");
                 read_le_f32_slice(
                     pre.bo_yn.as_slice(),
                     (n_valid - 1) * LFM2_H,
@@ -4784,8 +4887,16 @@ impl XdnaLfm2Model {
             }
         }
 
-        if let Err(e) = self.flush_prefill_conv_pingpong(&mut npu) {
-            return self.record_device_fault(e, out_len);
+        let flush_res = self.flush_prefill_conv_pingpong(&mut npu);
+        if let Err(e) = flush_res {
+            return self.record_prefill_device_fault(
+                &mut pending_attn_mirrors,
+                &npu.layer_kv_blocks,
+                &mut state.layers,
+                use_f16,
+                e,
+                out_len,
+            );
         }
 
         state.seq_len = total_tokens;
@@ -5355,6 +5466,7 @@ mod tests {
         GgufFile::from_bytes(std::sync::Arc::from(b.build_bytes().into_boxed_slice())).unwrap()
     }
 
+    #[cfg(feature = "mmap")]
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
         for (&x, &y) in a.iter().zip(b.iter()) {
@@ -5367,6 +5479,7 @@ mod tests {
         if d == 0.0 { 0.0 } else { (dot / d) as f32 }
     }
 
+    #[cfg(feature = "mmap")]
     fn argmax_idx(v: &[f32]) -> usize {
         v.iter()
             .enumerate()
@@ -5416,6 +5529,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
     fn hw_gate_lfm2_causal_parity_and_throughput() {
@@ -5504,6 +5618,7 @@ mod tests {
         assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
     }
 
+    #[cfg(feature = "mmap")]
     fn run_hw_lfm2_long_context_parity(prompt_len: usize, ctx_len: usize, tag: &str) {
         let path = std::path::PathBuf::from(
             r"C:\Users\iamst\.cache\triage\models\huggingface.co\LiquidAI\LFM2.5-1.2B-Instruct-GGUF\resolve\main\LFM2.5-1.2B-Instruct-Q4_0.gguf",
@@ -6109,12 +6224,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
     fn hw_gate_lfm2_long_context_parity() {
         run_hw_lfm2_long_context_parity(8224, 8256, ">8K");
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
     fn hw_gate_lfm2_16k_ext_parity() {
@@ -6122,6 +6239,10 @@ mod tests {
     }
 
     fn tiny_lfm2_moe_gguf() -> GgufFile {
+        tiny_lfm2_moe_gguf_with_ctx(128)
+    }
+
+    fn tiny_lfm2_moe_gguf_with_ctx(ctx_len: u32) -> GgufFile {
         const DENSE_FFN: usize = 128;
         const EXPERT_FFN: usize = 64;
         const N_EXPERT: usize = 4;
@@ -6143,7 +6264,7 @@ mod tests {
                 vec![0, LFM2_N_KV_HEADS as i32, 0],
             )
             .kv_u32("lfm2moe.vocab_size", 64)
-            .kv_u32("lfm2moe.context_length", 128)
+            .kv_u32("lfm2moe.context_length", ctx_len)
             .kv_f32("lfm2moe.rope.freq_base", 10_000_000.0)
             .kv_f32("lfm2moe.attention.layer_norm_rms_epsilon", 1e-5)
             .kv_u32("lfm2moe.shortconv.l_cache", LFM2_CONV_TAPS as u32);
@@ -6460,12 +6581,14 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
     fn hw_gate_lfm2_32k_plus_ext_parity() {
         run_hw_lfm2_long_context_parity(32900, 33024, "32k_plus_ext");
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-24B-A2B-QAD-Q4_0.gguf"]
     fn hw_gate_lfm2moe_causal_parity_and_throughput() {
@@ -6563,6 +6686,7 @@ mod tests {
         assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2-2.6B-Q4_K_M.gguf"]
     fn hw_gate_lfm2_2_6b_q4_k_m_causal_parity_and_throughput() {
@@ -6658,5 +6782,627 @@ mod tests {
         );
         assert!(mean_cos >= 0.985, "mean decode cosine too low: {mean_cos}");
         assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
+    }
+
+    #[test]
+    fn causal_lfm2moe_host_ffn_ext_32k_64k_96k_prefill_decode_greedy_and_b1_on_fake_shim() {
+        let (_, events) = with_shim(FakeConfig::default(), || {
+            let gguf = tiny_lfm2_moe_gguf_with_ctx(131072);
+            let npu_model = XdnaLfm2Model::from_gguf_with_id(gguf, 131072, "test".to_string())
+                .expect("load_model_xdna LFM2-MoE at 128K context");
+            assert!(npu_model.host_ffn);
+            let model: &dyn Model = &npu_model;
+            let mut state = InferenceState::from_config_capped(
+                model.config(),
+                &crate::kv_cache::KvCompression::F16,
+                131072,
+            )
+            .unwrap();
+            let vocab = model.config().vocab_size;
+
+            let seed_state_to_pos = |st: &mut InferenceState, pos: usize| {
+                if let LayerState::Attention {
+                    key_cache_f16,
+                    value_cache_f16,
+                    ..
+                } = &mut st.layers[1]
+                {
+                    key_cache_f16.resize(pos * LFM2_KV_DIM, 0);
+                    value_cache_f16.resize(pos * LFM2_KV_DIM, 0);
+                }
+                for conv_l in [0usize, 2] {
+                    if let LayerState::Conv { buffer, history } = &mut st.layers[conv_l] {
+                        buffer.resize(LFM2_D_CONV * LFM2_H, 0.25);
+                        history.clear();
+                        if pos > 0 {
+                            history.push(pos, buffer);
+                        }
+                    }
+                }
+                st.seq_len = pos;
+                let mut guard = npu_model.lock_npu();
+                guard.pending_kv.discard();
+                guard.synced_len = pos;
+                let max_blk = pos / LFM2_BLOCK_TOKENS;
+                let state_mut = &mut *guard;
+                XdnaLfm2Model::ensure_paged_block(
+                    &state_mut.kernels,
+                    &mut state_mut.layer_kv_blocks[1],
+                    max_blk,
+                    1,
+                )
+                .unwrap();
+            };
+
+            let read_i32 = |slice: &[u8], f32_idx: usize| -> i32 {
+                let off = f32_idx * 4;
+                i32::from_le_bytes(slice[off..off + 4].try_into().unwrap())
+            };
+
+            // 1. Fast path `forward_greedy` and <=32K `host_ffn` prefill (`conv_lmode=5, attn_lmode=6`).
+            let g0 = model.forward_greedy(&[1], 0, &mut state);
+            assert!((g0 as usize) < vocab);
+            assert_eq!(state.seq_len, 1);
+            assert!(model.take_decode_error().is_none());
+
+            seed_state_to_pos(&mut state, 0);
+            let pre_fast = model.forward_prefill(&[1, 2, 3, 4], 0, &mut state);
+            assert_eq!(pre_fast.len(), vocab);
+            assert_eq!(state.seq_len, 4);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let pre = guard.prefill.as_ref().unwrap();
+                assert_eq!(
+                    read_i32(
+                        pre.layer_bo_y[0].as_slice(),
+                        LFM2_PREFILL_SLOT_NORM_0 + 2048 + 6
+                    ),
+                    5
+                );
+                assert_eq!(
+                    read_i32(
+                        pre.layer_bo_y[1].as_slice(),
+                        LFM2_PREFILL_SLOT_NORM_0 + 2048 + 6
+                    ),
+                    6
+                );
+            }
+
+            // 2. >32K (`cur_blk=1`) `host_ffn` prefill (`ext_runs.conv_groups` + `ext_runs.attn_chains`,
+            //    `conv_lmode=7`, `fin_lmode=6`) + decode (`moe_ext_plans`, `ext_fin_lmode=7`) + `forward_greedy`.
+            let embs4 = model.embed_token_rows(&[1, 2, 3, 4]).unwrap();
+            seed_state_to_pos(&mut state, 32768);
+            let pre_32k =
+                model.forward_prefill_from_embeddings_chunk(&embs4, 4, 32768, &mut state, true);
+            assert_eq!(pre_32k.len(), vocab);
+            assert_eq!(state.seq_len, 32772);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let pre = guard.prefill.as_ref().unwrap();
+                let ext = pre.ext_runs.as_ref().expect("host_ffn >32K ext_runs");
+                let used_parity = usize::from(!pre.conv_kv_in_kvo);
+                assert!(ext.conv_groups[used_parity][0].is_some());
+                assert!(ext.conv_groups[used_parity][2].is_some());
+                assert!(ext.attn_chains[1].iter().any(|(blk, _, _)| *blk == 1));
+                assert_eq!(
+                    read_i32(
+                        pre.layer_bo_y[0].as_slice(),
+                        LFM2_PREFILL_SLOT_NORM_0 + 2048 + 6
+                    ),
+                    7
+                );
+                assert_eq!(
+                    read_i32(
+                        pre.layer_bo_y[1].as_slice(),
+                        LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 6
+                    ),
+                    6
+                );
+            }
+
+            let dec_32k = model.forward(&[5], 32772, &mut state);
+            assert_eq!(dec_32k.len(), vocab);
+            assert_eq!(state.seq_len, 32773);
+            assert!(model.take_decode_error().is_none());
+            let g_32k = model.forward_greedy(&[6], 32773, &mut state);
+            assert!((g_32k as usize) < vocab);
+            assert_eq!(state.seq_len, 32774);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let dec = guard.decode.as_ref().unwrap();
+                let has_moe_ext_plan = dec.moe_ext_plans[0][1]
+                    .iter()
+                    .chain(dec.moe_ext_plans[1][1].iter())
+                    .any(|(blk, _, _)| *blk == 1);
+                assert!(
+                    has_moe_ext_plan,
+                    "expected cached blk=1 plan in moe_ext_plans"
+                );
+                assert_eq!(
+                    read_i32(
+                        dec.layer_bo_y[1].as_slice(),
+                        LFM2_DEC_SLOT_ROPE_PKT + 4096 + 6
+                    ),
+                    7
+                );
+            }
+
+            // 3. B=1 continuation across >32K and >64K boundaries (both unaligned prefill and direct decode).
+            seed_state_to_pos(&mut state, 32766);
+            let cont_32k = model.forward_prefill(&[1, 2, 3, 4, 5, 6], 32766, &mut state);
+            assert_eq!(cont_32k.len(), vocab);
+            assert_eq!(state.seq_len, 32772);
+            assert!(model.take_decode_error().is_none());
+
+            seed_state_to_pos(&mut state, 32767);
+            let _ = model.forward(&[1], 32767, &mut state);
+            let g_cross_32k = model.forward_greedy(&[2], 32768, &mut state);
+            assert!((g_cross_32k as usize) < vocab);
+            assert_eq!(state.seq_len, 32769);
+            assert!(model.take_decode_error().is_none());
+
+            seed_state_to_pos(&mut state, 65534);
+            let cont_64k = model.forward_prefill(&[1, 2, 3, 4, 5, 6], 65534, &mut state);
+            assert_eq!(cont_64k.len(), vocab);
+            assert_eq!(state.seq_len, 65540);
+            assert!(model.take_decode_error().is_none());
+
+            seed_state_to_pos(&mut state, 65535);
+            let _ = model.forward(&[1], 65535, &mut state);
+            let g_cross_64k = model.forward_greedy(&[2], 65536, &mut state);
+            assert!((g_cross_64k as usize) < vocab);
+            assert_eq!(state.seq_len, 65537);
+            assert!(model.take_decode_error().is_none());
+
+            // 4. >64K (`cur_blk=2`) `host_ffn` prefill + multi-block decode (`pos=65600`).
+            seed_state_to_pos(&mut state, 65536);
+            let pre_64k =
+                model.forward_prefill_from_embeddings_chunk(&embs4, 4, 65536, &mut state, true);
+            assert_eq!(pre_64k.len(), vocab);
+            assert_eq!(state.seq_len, 65540);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let pre = guard.prefill.as_ref().unwrap();
+                let ext = pre.ext_runs.as_ref().unwrap();
+                assert!(ext.attn_chains[1].iter().any(|(blk, _, _)| *blk == 2));
+                let yb = pre.layer_bo_y[1].as_slice();
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048 + 8),
+                    LFM2_MAX_KV_CHUNKS as i32
+                );
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 8),
+                    (2 * LFM2_MAX_KV_CHUNKS) as i32
+                );
+                assert_eq!(read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 6), 6);
+            }
+
+            seed_state_to_pos(&mut state, 65600);
+            let dec_64k = model.forward(&[7], 65600, &mut state);
+            assert_eq!(dec_64k.len(), vocab);
+            assert_eq!(state.seq_len, 65601);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let yb = guard.decode.as_ref().unwrap().layer_bo_y[1].as_slice();
+                assert_eq!(
+                    read_i32(yb, LFM2_DEC_SLOT_NORM_1 + 4096 + 8),
+                    LFM2_DEC_MAX_KV_PKTS as i32
+                );
+                assert_eq!(read_i32(yb, LFM2_DEC_SLOT_NORM_1 + 4096 + 9), 1);
+                assert_eq!(
+                    read_i32(yb, LFM2_DEC_SLOT_ROPE_PKT + 4096 + 8),
+                    (2 * LFM2_DEC_MAX_KV_PKTS) as i32
+                );
+                assert_eq!(read_i32(yb, LFM2_DEC_SLOT_ROPE_PKT + 4096 + 6), 7);
+            }
+
+            // 5. >96K (`cur_blk=3`) `host_ffn` multi-block prefill + decode.
+            seed_state_to_pos(&mut state, 98304);
+            let pre_96k =
+                model.forward_prefill_from_embeddings_chunk(&embs4, 4, 98304, &mut state, true);
+            assert_eq!(pre_96k.len(), vocab);
+            assert_eq!(state.seq_len, 98308);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let yb = guard.prefill.as_ref().unwrap().layer_bo_y[1].as_slice();
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048 + 8),
+                    (2 * LFM2_MAX_KV_CHUNKS) as i32
+                );
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 8),
+                    (3 * LFM2_MAX_KV_CHUNKS) as i32
+                );
+                assert_eq!(read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 6), 6);
+            }
+            let dec_96k = model.forward_greedy(&[8], 98308, &mut state);
+            assert!((dec_96k as usize) < vocab);
+            assert_eq!(state.seq_len, 98309);
+            assert!(model.take_decode_error().is_none());
+        });
+
+        assert!(
+            events.iter().any(|e| matches!(e, Event::RunListExecute(_))),
+            "expected RunListExecute events for host_ffn >32K/64K/96K"
+        );
+    }
+
+    #[test]
+    fn causal_lfm2_cross_32k_block_prefill_splits_into_blk0_and_blk1_on_fake_shim() {
+        let (_, events) = with_shim(FakeConfig::default(), || {
+            let gguf = tiny_lfm2_gguf_with_ctx(33024);
+            let npu_model = XdnaLfm2Model::from_gguf_with_id(gguf, 33024, "test".to_string())
+                .expect("load_model_xdna LFM2 at 33024 context");
+            let model: &dyn Model = &npu_model;
+            let mut state = InferenceState::from_config_capped(
+                model.config(),
+                &crate::kv_cache::KvCompression::F16,
+                33024,
+            )
+            .unwrap();
+
+            let pos0 = 32736usize; // 1023 * 32; n = 64 crosses 32768 into blk 1!
+            if let LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &mut state.layers[1]
+            {
+                key_cache_f16.resize(pos0 * LFM2_KV_DIM, 0);
+                value_cache_f16.resize(pos0 * LFM2_KV_DIM, 0);
+            }
+            if let LayerState::Conv { buffer, .. } = &mut state.layers[0] {
+                buffer.resize(LFM2_D_CONV * LFM2_H, 0.25);
+            }
+            state.seq_len = pos0;
+            {
+                let mut guard = npu_model.lock_npu();
+                guard.synced_len = pos0;
+            }
+
+            let toks: Vec<u32> = (0..64).map(|i| (i % 16) as u32).collect();
+            let embs64 = model.embed_token_rows(&toks).unwrap();
+            let logits =
+                model.forward_prefill_from_embeddings_chunk(&embs64, 64, pos0, &mut state, true);
+            assert_eq!(logits.len(), model.config().vocab_size);
+            assert_eq!(state.seq_len, pos0 + 64);
+            assert!(model.take_decode_error().is_none());
+
+            // Verify `save_attn_prefill_kvo_to_bo_kv` + `mirror_attn_prefill_bo_kv_to_state`
+            // splits `sub=0` into `blk0[loc0=1023]` and `sub=1` into `blk1[loc1=0]`.
+            {
+                let mut guard = npu_model.lock_npu();
+                let state_mut = &mut *guard;
+                assert_eq!(
+                    state_mut.layer_kv_blocks[1].len(),
+                    2,
+                    "cross-32K prefill must allocate blk 1"
+                );
+                let pre = state_mut.prefill.as_mut().unwrap();
+                {
+                    let kvo_bytes = pre.layer_bo_kvo[1].as_mut_slice();
+                    let row_bytes = LFM2_HEAD_DIM * 2;
+                    for sub in 0..2usize {
+                        for kvh in 0..LFM2_N_KV_HEADS {
+                            let base = (sub * LFM2_N_KV_HEADS + kvh) * (2304 * 4);
+                            for t in 0..LFM2_KV_CHUNK_T {
+                                let k_tag = 1.5 + (sub * 32 + t) as f32 * 0.0625 + kvh as f32;
+                                let v_tag = -2.5 - (sub * 32 + t) as f32 * 0.0625 - kvh as f32;
+                                let kb =
+                                    crate::backend::xdna::repack::f32_to_bf16(k_tag).to_le_bytes();
+                                let vb =
+                                    crate::backend::xdna::repack::f32_to_bf16(v_tag).to_le_bytes();
+                                let k_off = base + t * row_bytes;
+                                let v_off = base + 1024 * 4 + t * row_bytes;
+                                kvo_bytes[k_off..k_off + 2].copy_from_slice(&kb);
+                                kvo_bytes[v_off..v_off + 2].copy_from_slice(&vb);
+                            }
+                        }
+                    }
+                }
+                let entry = XdnaLfm2Model::save_attn_prefill_kvo_to_bo_kv(
+                    &state_mut.kernels,
+                    &pre.layer_bo_kvo[1],
+                    &mut state_mut.layer_kv_blocks[1],
+                    1,
+                    pos0,
+                    64,
+                )
+                .unwrap();
+                assert_eq!((entry.blk0, entry.loc0, entry.n0), (0, 1023, 32));
+                assert_eq!((entry.blk1, entry.loc1, entry.n1), (1, 0, 32));
+                XdnaLfm2Model::mirror_attn_prefill_bo_kv_to_state(
+                    &state_mut.layer_kv_blocks[1],
+                    &mut state.layers[1],
+                    &entry,
+                    true,
+                );
+            }
+
+            if let LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &state.layers[1]
+            {
+                assert_eq!(key_cache_f16.len(), 32800 * LFM2_KV_DIM);
+                for (t_rel, kvh) in [(0usize, 0usize), (31, 5), (32, 3), (63, 7)] {
+                    let pos = pos0 + t_rel;
+                    let idx = pos * LFM2_KV_DIM + kvh * LFM2_HEAD_DIM;
+                    let expected_k = crate::quant::f32_to_f16(f32::from_bits(
+                        u32::from(crate::backend::xdna::repack::f32_to_bf16(
+                            1.5 + t_rel as f32 * 0.0625 + kvh as f32,
+                        )) << 16,
+                    ));
+                    let expected_v = crate::quant::f32_to_f16(f32::from_bits(
+                        u32::from(crate::backend::xdna::repack::f32_to_bf16(
+                            -2.5 - t_rel as f32 * 0.0625 - kvh as f32,
+                        )) << 16,
+                    ));
+                    assert_eq!(key_cache_f16[idx], expected_k, "K mismatch t_rel={t_rel}");
+                    assert_eq!(value_cache_f16[idx], expected_v, "V mismatch t_rel={t_rel}");
+                }
+            } else {
+                panic!("expected Attention state");
+            }
+
+            let dec = model.forward(&[9], 32800, &mut state);
+            assert_eq!(dec.len(), model.config().vocab_size);
+            assert_eq!(state.seq_len, 32801);
+            assert!(model.take_decode_error().is_none());
+        });
+
+        let sub0_off = 1023 * LFM2_KV_CHUNK_BYTES;
+        let sub_sync_size = 1024 * 4 + 32 * LFM2_HEAD_DIM * 2;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::BoSyncRange {
+                    to_device: true,
+                    offset,
+                    size,
+                    ..
+                } if *offset == sub0_off && *size == sub_sync_size
+            )),
+            "expected split sub0 sync at loc=1023 in blk 0"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::BoSyncRange {
+                    to_device: true,
+                    offset: 0,
+                    size,
+                    ..
+                } if *size == sub_sync_size
+            )),
+            "expected split sub1 sync at loc=0 in blk 1"
+        );
+    }
+
+    #[test]
+    fn causal_lfm2_try_truncate_kv_pending_pos0_and_expired_history_on_fake_shim() {
+        with_shim(FakeConfig::default(), || {
+            let gguf = tiny_lfm2_gguf_with_ctx(256);
+            let npu_model = XdnaLfm2Model::from_gguf_with_id(gguf, 256, "test".to_string())
+                .expect("load_model_xdna LFM2 at 256 context");
+            let model: &dyn Model = &npu_model;
+            let mut state = InferenceState::from_config_capped(
+                model.config(),
+                &crate::kv_cache::KvCompression::F16,
+                256,
+            )
+            .unwrap();
+
+            // 1. Decode 1 token at pos=0 -> `pending_kv` holds pending `pos=0`; `try_truncate_kv(..., 0)`
+            //    must discard pending `pos=0`, clear Conv/Attn state, and allow re-decoding at pos=0.
+            let _ = model.forward(&[1], 0, &mut state);
+            assert_eq!(state.seq_len, 1);
+            assert!(
+                npu_model
+                    .lock_npu()
+                    .pending_kv
+                    .as_ref()
+                    .is_some_and(|p| p.pending_pos() == 0)
+            );
+            model.check_kv_rewind(&state, 0).unwrap();
+            model.try_truncate_kv(&mut state, 0).unwrap();
+            assert_eq!(state.seq_len, 0);
+            {
+                let guard = npu_model.lock_npu();
+                assert!(guard.pending_kv.as_ref().is_none());
+                assert_eq!(guard.synced_len, 0);
+                assert!(guard.force_conv_sync);
+            }
+            if let LayerState::Conv { buffer, .. } = &state.layers[0] {
+                assert!(buffer.iter().all(|&x| x == 0.0));
+            }
+            if let LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &state.layers[1]
+            {
+                assert!(key_cache_f16.is_empty());
+                assert!(value_cache_f16.is_empty());
+            }
+
+            // 2. Advance past `CONV_HISTORY_CAPACITY` (64): 4 prefill + 66 decodes => seq_len=70.
+            //    History holds positions 6..=69 (plus pending pos=69); rewinding to 4 must fail
+            //    with `MissingConvolutionCheckpoint` without mutating `state`, while rewinding to 10 succeeds.
+            let _ = model.forward_prefill(&[1, 2, 3, 4], 0, &mut state);
+            for step in 0..66usize {
+                let _ = model.forward(&[((step % 16) + 1) as u32], 4 + step, &mut state);
+            }
+            assert_eq!(state.seq_len, 70);
+            assert_eq!(
+                model.check_kv_rewind(&state, 4),
+                Err(KvRewindError::MissingConvolutionCheckpoint {
+                    layer: 0,
+                    position: 4,
+                })
+            );
+            assert_eq!(
+                model.try_truncate_kv(&mut state, 4),
+                Err(KvRewindError::MissingConvolutionCheckpoint {
+                    layer: 0,
+                    position: 4,
+                })
+            );
+            assert_eq!(state.seq_len, 70);
+            assert!(npu_model.lock_npu().pending_kv.as_ref().is_some());
+
+            model.try_truncate_kv(&mut state, 10).unwrap();
+            assert_eq!(state.seq_len, 10);
+            let cont = model.forward(&[7], 10, &mut state);
+            assert_eq!(cont.len(), model.config().vocab_size);
+            assert_eq!(state.seq_len, 11);
+            assert!(model.take_decode_error().is_none());
+        });
+    }
+
+    #[test]
+    fn host_ffn_hint_falls_back_to_blk0_ffn_gate_shape_when_metadata_omitted() {
+        const CUSTOM_FFN: usize = 10752;
+        with_shim(FakeConfig::default(), || {
+            let mut b = GgufBuilder::new()
+                .kv_str("general.architecture", "lfm2")
+                .kv_u32("lfm2.block_count", 2)
+                .kv_u32("lfm2.embedding_length", LFM2_H as u32)
+                .kv_u32("lfm2.attention.head_count", LFM2_N_HEADS as u32)
+                .kv_i32_array(
+                    "lfm2.attention.head_count_kv",
+                    vec![0, LFM2_N_KV_HEADS as i32],
+                )
+                .kv_u32("lfm2.vocab_size", 64)
+                .kv_u32("lfm2.context_length", 128)
+                .kv_f32("lfm2.rope.freq_base", 1_000_000.0)
+                .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+                .kv_u32("lfm2.shortconv.l_cache", LFM2_CONV_TAPS as u32)
+                .tensor(
+                    "token_embd.weight",
+                    &[LFM2_H, 64],
+                    2,
+                    make_q4_0_bytes(64, LFM2_H),
+                )
+                .tensor_f32("token_embd_norm.weight", &[LFM2_H], &vec![1.0f32; LFM2_H]);
+
+            for l in 0..2usize {
+                b = b
+                    .tensor_f32(
+                        format!("blk.{l}.attn_norm.weight"),
+                        &[LFM2_H],
+                        &vec![1.0; LFM2_H],
+                    )
+                    .tensor_f32(
+                        format!("blk.{l}.ffn_norm.weight"),
+                        &[LFM2_H],
+                        &vec![1.0; LFM2_H],
+                    )
+                    .tensor(
+                        format!("blk.{l}.ffn_gate.weight"),
+                        &[LFM2_H, CUSTOM_FFN],
+                        2,
+                        make_q4_0_bytes(CUSTOM_FFN, LFM2_H),
+                    )
+                    .tensor(
+                        format!("blk.{l}.ffn_up.weight"),
+                        &[LFM2_H, CUSTOM_FFN],
+                        2,
+                        make_q4_0_bytes(CUSTOM_FFN, LFM2_H),
+                    )
+                    .tensor(
+                        format!("blk.{l}.ffn_down.weight"),
+                        &[CUSTOM_FFN, LFM2_H],
+                        2,
+                        make_q4_0_bytes(LFM2_H, CUSTOM_FFN),
+                    );
+                if l == 0 {
+                    b = b
+                        .tensor(
+                            "blk.0.shortconv.in_proj.weight",
+                            &[LFM2_H, 3 * LFM2_H],
+                            2,
+                            make_q4_0_bytes(3 * LFM2_H, LFM2_H),
+                        )
+                        .tensor(
+                            "blk.0.shortconv.out_proj.weight",
+                            &[LFM2_H, LFM2_H],
+                            2,
+                            make_q4_0_bytes(LFM2_H, LFM2_H),
+                        )
+                        .tensor_f32(
+                            "blk.0.shortconv.conv.weight",
+                            &[LFM2_CONV_TAPS, LFM2_H],
+                            &vec![0.1f32; LFM2_CONV_TAPS * LFM2_H],
+                        );
+                } else {
+                    b = b
+                        .tensor(
+                            "blk.1.attn_q.weight",
+                            &[LFM2_H, LFM2_Q_DIM],
+                            2,
+                            make_q4_0_bytes(LFM2_Q_DIM, LFM2_H),
+                        )
+                        .tensor(
+                            "blk.1.attn_k.weight",
+                            &[LFM2_H, LFM2_KV_DIM],
+                            2,
+                            make_q4_0_bytes(LFM2_KV_DIM, LFM2_H),
+                        )
+                        .tensor(
+                            "blk.1.attn_v.weight",
+                            &[LFM2_H, LFM2_KV_DIM],
+                            2,
+                            make_q4_0_bytes(LFM2_KV_DIM, LFM2_H),
+                        )
+                        .tensor(
+                            "blk.1.attn_output.weight",
+                            &[LFM2_Q_DIM, LFM2_H],
+                            2,
+                            make_q4_0_bytes(LFM2_H, LFM2_Q_DIM),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_q_norm.weight",
+                            &[LFM2_HEAD_DIM],
+                            &vec![1.0; LFM2_HEAD_DIM],
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_k_norm.weight",
+                            &[LFM2_HEAD_DIM],
+                            &vec![1.0; LFM2_HEAD_DIM],
+                        );
+                }
+            }
+            let gguf =
+                GgufFile::from_bytes(std::sync::Arc::from(b.build_bytes().into_boxed_slice()))
+                    .unwrap();
+            assert!(host_ffn_hint_from_gguf(&gguf));
+            assert!(!host_ffn_hint_from_gguf(&tiny_lfm2_gguf()));
+
+            let npu_model = XdnaLfm2Model::from_gguf_with_id(gguf, 128, "test".to_string())
+                .expect("load_model_xdna should infer host_ffn from blk.0.ffn_gate.weight");
+            assert!(npu_model.host_ffn);
+            assert_eq!(npu_model.config().intermediate_size, CUSTOM_FFN);
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+            if crate::model::transformer::batched_gemm_supports(DType::Q4_0, LFM2_H) {
+                let (fg, _, _) = npu_model.cpu.xdna_layer_ffn_refs(0).unwrap();
+                assert!(
+                    fg.repacked.is_some(),
+                    "host_ffn_hint must enable RepackScope::FfnOnly for blk.0.ffn_gate.weight"
+                );
+                let (in_proj, _) = npu_model.cpu.xdna_layer_conv_refs(0).unwrap();
+                assert!(
+                    in_proj.repacked.is_none(),
+                    "RepackScope::FfnOnly must skip repacking NPU-resident conv projections"
+                );
+            }
+        });
     }
 }
