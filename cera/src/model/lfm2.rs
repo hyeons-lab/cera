@@ -4767,7 +4767,6 @@ impl LfmModel {
         let bq_scales = &mut bq_scales[..n * hs.div_ceil(32)];
         #[allow(unused_variables)]
         let bq_quants = &mut bq_quants[..n * hs];
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         let is = cfg.intermediate_size;
 
         let profile_prefill = Self::profile_prefill_enabled();
