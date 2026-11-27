@@ -5772,12 +5772,40 @@ pub fn gemv_dispatch_active(
     k: usize,
     q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
 ) {
-    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-    if dtype == DType::Q6K && max_active > 0 && vnni_int8_available() {
-        with_gemv_scratch(q8_scratch, |s, q| unsafe {
-            crate::backend::simd::avx512_vnni::gemv_q6k_f32_active(
-                data, x, y, m, k, s, q, max_active,
-            );
+    if dtype == DType::Q6K {
+        assert_eq!(x.len(), k, "gemv_dispatch_active: x must have k elements");
+        assert!(y.len() >= m, "gemv_dispatch_active: y buffer too small");
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_dispatch_active: k must be divisible by 256 for Q6K"
+        );
+        let row_bytes = (k / 256) * size_of::<BlockQ6K>();
+        let needed_bytes = m
+            .checked_mul(row_bytes)
+            .expect("gemv_dispatch_active: matrix byte size overflow");
+        assert!(
+            data.len() >= needed_bytes,
+            "gemv_dispatch_active: a_quant buffer too small"
+        );
+        let data = &data[..needed_bytes];
+        let y = &mut y[..m];
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if max_active > 0 && vnni_int8_available() {
+            with_gemv_scratch(q8_scratch, |s, q| {
+                // SAFETY: `vnni_int8_available()` confirmed AVX-512 VNNI/VL/AVX2/FMA support,
+                // and the assertions above guarantee `x.len() == k`, `k % 256 == 0`,
+                // `data.len() == m * row_bytes`, and `y.len() == m`.
+                unsafe {
+                    crate::backend::simd::avx512_vnni::gemv_q6k_f32_active(
+                        data, x, y, m, k, s, q, max_active,
+                    );
+                }
+            });
+            return;
+        }
+        with_gemv_max_active(max_active, || {
+            gemv_dispatch(dtype, data, x, y, m, k, q8_scratch)
         });
         return;
     }
@@ -12904,10 +12932,18 @@ pub fn f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
 
 /// Convert `n` little-endian BF16 bit patterns in `src_le` (`2 * n` bytes) to F16 in `dst`
 /// using AVX2 + F16C.
+///
+/// # Safety
+/// - The CPU must support `f16c` and `avx2`.
+/// - `src_le` must be valid for reads of `2 * n` bytes, and `dst` must be valid for
+///   non-overlapping writes of `n` `u16` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "f16c,avx2")]
 unsafe fn bf16_le_bytes_to_f16_f16c(src_le: *const u8, dst: *mut u16, n: usize) {
     use core::arch::x86_64::*;
+    // SAFETY: Caller guarantees `f16c` + `avx2`, `2 * n` readable bytes at `src_le`, and `n`
+    // writable `u16`s at `dst`; the SIMD loop only accesses `i..i + 8` while `i + 8 <= n`, and
+    // the tail loop accesses `i < n`.
     unsafe {
         let mut i = 0usize;
         while i + 8 <= n {
@@ -12928,10 +12964,18 @@ unsafe fn bf16_le_bytes_to_f16_f16c(src_le: *const u8, dst: *mut u16, n: usize) 
 
 /// Convert `n` little-endian BF16 bit patterns in `src_le` (`2 * n` bytes) to f32 in `dst`
 /// using AVX2.
+///
+/// # Safety
+/// - The CPU must support `avx2`.
+/// - `src_le` must be valid for reads of `2 * n` bytes, and `dst` must be valid for
+///   non-overlapping writes of `n` `f32` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn bf16_le_bytes_to_f32_avx2(src_le: *const u8, dst: *mut f32, n: usize) {
     use core::arch::x86_64::*;
+    // SAFETY: Caller guarantees `avx2`, `2 * n` readable bytes at `src_le`, and `n` writable
+    // `f32`s at `dst`; the SIMD loop only accesses `i..i + 8` while `i + 8 <= n`, and the tail
+    // loop accesses `i < n`.
     unsafe {
         let mut i = 0usize;
         while i + 8 <= n {
@@ -18678,25 +18722,89 @@ mod bf16_le_tests {
 
     #[test]
     fn bf16_le_bytes_conversions_match_scalar() {
-        let vals = [
-            0.0f32, -0.0, 1.0, -3.5, 0.000123, 42.25, -1024.5, 1e-4, 6.5, -0.125, 19.75, 0.333,
-        ];
-        let mut src_le = Vec::with_capacity(vals.len() * 2);
-        let mut bf_u16 = Vec::with_capacity(vals.len());
-        for &v in &vals {
-            let bits = half::bf16::from_f32(v).to_bits();
-            bf_u16.push(bits);
+        let mut bf_u16: Vec<u16> = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -3.5,
+            0.000123,
+            42.25,
+            -1024.5,
+            1e-4,
+            6.5,
+            -0.125,
+            19.75,
+            0.333,
+            // F16 subnormal / overflow boundary cases
+            6.097_555e-5,
+            5.960_464_5e-8,
+            -5.960_464_5e-8,
+            65504.0,
+            65520.0,
+            -65520.0,
+        ]
+        .into_iter()
+        .map(|v| half::bf16::from_f32(v).to_bits())
+        .collect();
+        // Raw BF16 subnormals, +/-Inf, qNaN, and sNaN (27 elements: 3x8 SIMD + 3 tail).
+        bf_u16.extend_from_slice(&[
+            0x0001, // smallest positive BF16 subnormal
+            0x007F, // largest positive BF16 subnormal
+            0x8001, // smallest negative BF16 subnormal
+            0x807F, // largest negative BF16 subnormal
+            0x7F80, // +Inf
+            0xFF80, // -Inf
+            0x7FC0, // +qNaN
+            0xFFC0, // -qNaN
+            0x7F81, // +sNaN
+        ]);
+        assert_eq!(bf_u16.len() % 2, 1, "exercise odd element count");
+
+        let mut src_le = Vec::with_capacity(bf_u16.len() * 2 + 1);
+        for &bits in &bf_u16 {
             src_le.extend_from_slice(&bits.to_le_bytes());
         }
-        let mut got_f16 = vec![0u16; vals.len()];
-        let mut got_f32 = vec![0.0f32; vals.len()];
+        // Append an odd trailing byte to verify odd byte-length slicing ignores the trailing byte.
+        src_le.push(0xAB);
+
+        let sentinel_f16 = 0xBEEFu16;
+        let sentinel_f32 = f32::from_bits(0xDEAD_BEEF);
+        let mut got_f16 = vec![sentinel_f16; bf_u16.len() + 3];
+        let mut got_f32 = vec![sentinel_f32; bf_u16.len() + 3];
         bf16_le_bytes_to_f16_into(&src_le, &mut got_f16);
         bf16_le_bytes_to_f32_into(&src_le, &mut got_f32);
         for (i, &b) in bf_u16.iter().enumerate() {
             let want_f32 = f32::from_bits((b as u32) << 16);
             let want_f16 = crate::quant::f32_to_f16(want_f32);
-            assert_eq!(got_f32[i].to_bits(), want_f32.to_bits(), "f32[{i}]");
-            assert_eq!(got_f16[i], want_f16, "f16[{i}]");
+            assert_eq!(
+                got_f32[i].to_bits(),
+                want_f32.to_bits(),
+                "f32[{i}] ({b:#06x})"
+            );
+            assert_eq!(got_f16[i], want_f16, "f16[{i}] ({b:#06x})");
+        }
+        for tail in bf_u16.len()..got_f16.len() {
+            assert_eq!(got_f16[tail], sentinel_f16, "f16 tail[{tail}]");
+            assert_eq!(
+                got_f32[tail].to_bits(),
+                sentinel_f32.to_bits(),
+                "f32 tail[{tail}]"
+            );
+        }
+
+        // Shorter `dst` must limit conversion to `dst.len()`.
+        let short_n = 5;
+        let mut short_f16 = vec![0u16; short_n];
+        let mut short_f32 = vec![0.0f32; short_n];
+        bf16_le_bytes_to_f16_into(&src_le, &mut short_f16);
+        bf16_le_bytes_to_f32_into(&src_le, &mut short_f32);
+        for i in 0..short_n {
+            assert_eq!(short_f16[i], got_f16[i], "short f16[{i}]");
+            assert_eq!(
+                short_f32[i].to_bits(),
+                got_f32[i].to_bits(),
+                "short f32[{i}]"
+            );
         }
     }
 }
@@ -19322,5 +19430,90 @@ mod gemv_active_tests {
             });
             assert_eq!(current_gemv_max_active(), 0);
         }
+    }
+
+    #[test]
+    fn gemv_dispatch_active_q6k_allows_oversized_buffers_zero_rows_and_large_k() {
+        // Exercises oversized `y` / `data`, `m == 0` with non-empty `y`, and `k = 8448 > 8192`
+        // (`heap_buf` path in `gemm_q6_k_n1_drive_512` when AVX-512 VNNI is available).
+        let (m, k) = (5usize, 8448usize);
+        let row_bytes = (k / 256) * size_of::<BlockQ6K>();
+        let mut q6_bytes = vec![0x11u8; m * row_bytes + 64];
+        for (bi, chunk) in q6_bytes[..m * row_bytes]
+            .chunks_exact_mut(size_of::<BlockQ6K>())
+            .enumerate()
+        {
+            let d = half::f16::from_f32(0.01 + 0.002 * (bi % 5) as f32);
+            chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+        }
+        let x: Vec<f32> = (0..k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+
+        let mut expected = vec![0.0f32; m];
+        gemv_dispatch(
+            DType::Q6K,
+            &q6_bytes[..m * row_bytes],
+            &x,
+            &mut expected,
+            m,
+            k,
+            None,
+        );
+
+        let sentinel = -999.25f32;
+        let mut got = vec![sentinel; m + 9];
+        gemv_dispatch_active(2, DType::Q6K, &q6_bytes, &x, &mut got, m, k, None);
+        for i in 0..m {
+            assert!(
+                (got[i] - expected[i]).abs() <= 1e-3 * (1.0 + expected[i].abs()),
+                "row {i}: {} vs {}",
+                got[i],
+                expected[i]
+            );
+        }
+        assert!(got[m..].iter().all(|&v| v == sentinel));
+
+        let mut zero_y = vec![sentinel; 4];
+        gemv_dispatch_active(2, DType::Q6K, &q6_bytes, &x, &mut zero_y, 0, k, None);
+        assert!(zero_y.iter().all(|&v| v == sentinel));
+    }
+
+    #[test]
+    #[should_panic(expected = "x must have k elements")]
+    fn gemv_dispatch_active_q6k_panics_on_x_len_mismatch() {
+        let (m, k) = (2usize, 256usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>()];
+        let x = vec![0.0f32; k - 1];
+        let mut y = vec![0.0f32; m];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "y buffer too small")]
+    fn gemv_dispatch_active_q6k_panics_on_short_y() {
+        let (m, k) = (4usize, 256usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>()];
+        let x = vec![0.0f32; k];
+        let mut y = vec![0.0f32; m - 1];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "k must be divisible by 256")]
+    fn gemv_dispatch_active_q6k_panics_on_unaligned_k() {
+        let (m, k) = (2usize, 128usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>()];
+        let x = vec![0.0f32; k];
+        let mut y = vec![0.0f32; m];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a_quant buffer too small")]
+    fn gemv_dispatch_active_q6k_panics_on_short_a_quant() {
+        let (m, k) = (2usize, 256usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>() - 1];
+        let x = vec![0.0f32; k];
+        let mut y = vec![0.0f32; m];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
     }
 }

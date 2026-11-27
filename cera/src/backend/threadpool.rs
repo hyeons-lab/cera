@@ -1565,10 +1565,10 @@ pub(crate) fn debug_set_caller_pin_for_test(owner: i64, core: usize) -> impl Dro
 }
 
 /// The caller-pin claim one thread holds. Dropping it releases the claim (if the thread still
-/// owns it) and, on Linux and Android, puts back the affinity mask the thread had before it was
-/// pinned, provided the thread's mask is still exactly our pin. That happens when the thread
-/// exits or when [`release_caller_pin`] is called. A thread whose pin another thread took over
-/// was already widened by the taker, and is left alone.
+/// owns it) and, on Linux, Android, and Windows, puts back the affinity mask the thread had before
+/// it was pinned (on Linux/Android, provided the thread's mask is still exactly our pin). That
+/// happens when the thread exits or when [`release_caller_pin`] is called. A thread whose pin
+/// another thread took over was already widened by the taker, and is left alone.
 struct ClaimGuard {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     tid: i64,
@@ -1577,15 +1577,45 @@ struct ClaimGuard {
     /// whatever it runs afterwards, including threads that code spawns, inherits that mask.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     saved: Option<libc::cpu_set_t>,
-    /// Prior Windows thread priority saved when promoting a claimed host caller thread.
+    /// Prior Windows `DWORD_PTR` thread affinity mask returned by `SetThreadAffinityMask` when
+    /// pinning a claimed host caller thread.
     #[cfg(target_os = "windows")]
-    win_prev_priority: Option<i32>,
+    win_prev_affinity: Option<usize>,
+    /// Test-only guard flag so synthetic `ClaimGuard` drop tests do not clear another concurrent
+    /// test's `CALLER_PIN_CLAIMED` state.
+    #[cfg(all(test, target_os = "windows"))]
+    release_claim: bool,
+}
+
+/// RAII guard restoring Windows caller thread EcoQoS/priority elevation independently of core
+/// affinity pinning (`CERA_PIN=0` or contended caller pin).
+#[cfg(target_os = "windows")]
+struct WinQosGuard {
+    prev_priority: Option<i32>,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WinQosGuard {
+    fn drop(&mut self) {
+        restore_windows_thread_interactive(self.prev_priority);
+    }
 }
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
         #[cfg(target_os = "windows")]
-        restore_windows_thread_interactive(self.win_prev_priority);
+        {
+            if let Some(prev_mask) = self.win_prev_affinity
+                && set_windows_thread_affinity_mask(prev_mask).is_none()
+            {
+                let _ = set_current_thread_affinity(pinned_cores());
+            }
+            #[cfg(test)]
+            if !self.release_claim {
+                return;
+            }
+            CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // Put the mask back first, while the claim still describes it: the allowance probe
@@ -1615,7 +1645,7 @@ impl Drop for ClaimGuard {
                 CALLER_PIN_CLAIMED.store(false, Ordering::Release);
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
         {
             CALLER_PIN_CLAIMED.store(false, Ordering::Release);
         }
@@ -1624,6 +1654,8 @@ impl Drop for ClaimGuard {
 
 struct CallerClaim {
     guard: Option<ClaimGuard>,
+    #[cfg(target_os = "windows")]
+    win_qos_guard: Option<WinQosGuard>,
     /// Dispatches to skip before re-attempting a refused pin.
     retry_cooldown: u32,
 }
@@ -1632,6 +1664,8 @@ thread_local! {
     static CLAIM: std::cell::RefCell<CallerClaim> = const {
         std::cell::RefCell::new(CallerClaim {
             guard: None,
+            #[cfg(target_os = "windows")]
+            win_qos_guard: None,
             retry_cooldown: 0,
         })
     };
@@ -1654,6 +1688,10 @@ pub fn release_caller_pin() {
     let _ = CLAIM.try_with(|c| {
         if let Ok(mut claim) = c.try_borrow_mut() {
             claim.guard = None;
+            #[cfg(target_os = "windows")]
+            {
+                claim.win_qos_guard = None;
+            }
             claim.retry_cooldown = 0;
         }
     });
@@ -1814,6 +1852,21 @@ impl RowPool {
                 q.set(true);
             }
         });
+        #[cfg(target_os = "windows")]
+        CLAIM.with(|c| {
+            let mut claim = c.borrow_mut();
+            if claim.win_qos_guard.is_none() {
+                // Opt the process out of EcoQoS/timer throttling in non-test builds even when
+                // `CERA_PIN=0` leaves `caller_pin == None`, and keep caller priority/QoS elevated
+                // until `release_caller_pin()` or thread exit.
+                let prev_priority = if cfg!(not(test)) || self.caller_pin.is_some() {
+                    set_windows_thread_interactive()
+                } else {
+                    elevate_windows_thread()
+                };
+                claim.win_qos_guard = Some(WinQosGuard { prev_priority });
+            }
+        });
         let Some(core) = self.caller_pin else {
             return;
         };
@@ -1858,18 +1911,24 @@ impl RowPool {
             {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let saved = current_thread_affinity();
-                if pin_current_thread_to_core(core) {
+                #[cfg(target_os = "windows")]
+                let win_prev = pin_current_thread_to_core_with_prev(core);
+                #[cfg(target_os = "windows")]
+                let pinned = win_prev.is_some();
+                #[cfg(not(target_os = "windows"))]
+                let pinned = pin_current_thread_to_core(core);
+                if pinned {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let tid = unsafe { libc::gettid() } as i64;
-                    #[cfg(target_os = "windows")]
-                    let win_prev_priority = set_windows_thread_interactive();
                     claim.guard = Some(ClaimGuard {
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         tid,
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         saved,
                         #[cfg(target_os = "windows")]
-                        win_prev_priority,
+                        win_prev_affinity: win_prev,
+                        #[cfg(all(test, target_os = "windows"))]
+                        release_claim: true,
                     });
                     // Record the claim for the allowance probe (see
                     // `thread_self_pinned`): the pinning thread's tid and
@@ -2531,7 +2590,7 @@ fn worker_loop(
         }
         WIN_WORKER_QOS_SET.with(|q| {
             if !q.get() {
-                if pin_core.is_some() || !spread_mask.is_empty() {
+                if cfg!(not(test)) || pin_core.is_some() || !spread_mask.is_empty() {
                     let _ = set_windows_thread_interactive();
                 } else {
                     let _ = elevate_windows_thread();
@@ -2683,7 +2742,12 @@ pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
-    set_current_thread_affinity(&[core])
+    pin_current_thread_to_core_with_prev(core).is_some()
+}
+
+#[cfg(target_os = "windows")]
+fn pin_current_thread_to_core_with_prev(core: usize) -> Option<usize> {
+    set_windows_thread_affinity_mask(build_windows_affinity_mask(&[core]))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
@@ -2810,15 +2874,7 @@ fn set_thread_affinity_for_tid(tid: libc::pid_t, cores: &[usize]) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
-    if cores.is_empty() {
-        return false;
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn SetThreadAffinityMask(thread: isize, thread_affinity_mask: usize) -> usize;
-    }
+fn build_windows_affinity_mask(cores: &[usize]) -> usize {
     let capacity = usize::BITS as usize;
     let mut mask = 0usize;
     for &core in cores {
@@ -2826,12 +2882,31 @@ pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
             mask |= 1usize << core;
         }
     }
+    mask
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_thread_affinity_mask(mask: usize) -> Option<usize> {
     if mask == 0 {
-        return false;
+        return None;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadAffinityMask(thread: isize, thread_affinity_mask: usize) -> usize;
     }
     // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread,
     // and `mask` is non-zero within processor group 0's KAFFINITY bit width.
-    unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) != 0 }
+    let prev = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
+    (prev != 0).then_some(prev)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
+    if cores.is_empty() {
+        return false;
+    }
+    set_windows_thread_affinity_mask(build_windows_affinity_mask(cores)).is_some()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
@@ -4134,5 +4209,140 @@ mod tests {
             ctrl_cooldown, 0,
             "positive-control pin_caller=true dispatch must enter pin_caller_once and decrement retry_cooldown"
         );
+    }
+
+    #[cfg(all(target_os = "windows", not(miri)))]
+    #[test]
+    fn windows_claim_guard_restores_affinity_mask_on_drop() {
+        let result = thread::spawn(|| {
+            let initial_mask = set_windows_thread_affinity_mask(1)
+                .expect("SetThreadAffinityMask(1) must return prior mask");
+            set_windows_thread_affinity_mask(initial_mask)
+                .expect("restoring initial thread affinity mask");
+            if initial_mask.count_ones() < 2 {
+                return None;
+            }
+            let c0 = initial_mask.trailing_zeros() as usize;
+            let rem = initial_mask & !(1usize << c0);
+            let c1 = rem.trailing_zeros() as usize;
+            let multi_mask = (1usize << c0) | (1usize << c1);
+
+            set_windows_thread_affinity_mask(multi_mask)
+                .expect("setting two-core mask before ClaimGuard test");
+            let prev = pin_current_thread_to_core_with_prev(c0)
+                .expect("pinning to c0 should return previous mask");
+            assert_eq!(prev, multi_mask);
+            let pinned_live =
+                set_windows_thread_affinity_mask(1usize << c0).expect("probing pinned mask");
+            assert_eq!(pinned_live, 1usize << c0);
+
+            let guard = ClaimGuard {
+                win_prev_affinity: Some(prev),
+                release_claim: false,
+            };
+            drop(guard);
+
+            let restored_live =
+                set_windows_thread_affinity_mask(initial_mask).expect("probing restored mask");
+            Some((restored_live, multi_mask))
+        })
+        .join()
+        .unwrap();
+
+        if let Some((restored_live, multi_mask)) = result {
+            assert_eq!(
+                restored_live, multi_mask,
+                "ClaimGuard::drop must restore prior Windows DWORD_PTR affinity mask"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "windows", not(miri)))]
+    #[test]
+    fn windows_real_dispatch_pins_and_release_caller_pin_restores_mask() {
+        thread::spawn(|| {
+            let initial_mask = set_windows_thread_affinity_mask(1)
+                .expect("SetThreadAffinityMask(1) must return prior mask");
+            set_windows_thread_affinity_mask(initial_mask)
+                .expect("restoring initial thread affinity mask");
+            if initial_mask.count_ones() < 2 {
+                return;
+            }
+            let c0 = initial_mask.trailing_zeros() as usize;
+            let rem = initial_mask & !(1usize << c0);
+            let c1 = rem.trailing_zeros() as usize;
+            let multi_mask = (1usize << c0) | (1usize << c1);
+            set_windows_thread_affinity_mask(multi_mask).expect("setting multi-core baseline");
+
+            let pool = RowPool::build_with_spin(2, &[c0, c1], &[], &[], true, None, 0);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            let mut claimed = false;
+            while Instant::now() < deadline {
+                CLAIM.with(|c| c.borrow_mut().retry_cooldown = 0);
+                pool.dispatch_range(4, 1, |_, _| {});
+                if CLAIM.with(|c| c.borrow().guard.is_some()) {
+                    claimed = true;
+                    break;
+                }
+                thread::yield_now();
+            }
+            assert!(
+                claimed,
+                "caller should eventually acquire Windows caller pin"
+            );
+
+            let pinned_live =
+                set_windows_thread_affinity_mask(1usize << c0).expect("probing pinned mask");
+            assert_eq!(pinned_live, 1usize << c0);
+
+            release_caller_pin();
+            assert!(CLAIM.with(|c| c.borrow().guard.is_none()));
+            let restored_live = set_windows_thread_affinity_mask(initial_mask)
+                .expect("probing restored mask after release_caller_pin");
+            assert_eq!(
+                restored_live, multi_mask,
+                "release_caller_pin must restore Windows affinity mask from ClaimGuard"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(all(target_os = "windows", not(miri)))]
+    #[test]
+    fn windows_caller_qos_elevates_and_restores_without_caller_pin() {
+        thread::spawn(|| {
+            // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the current thread.
+            let initial_prio = unsafe { win_qos::GetThreadPriority(win_qos::GetCurrentThread()) };
+            assert_ne!(initial_prio, win_qos::THREAD_PRIORITY_ERROR_RETURN);
+
+            // Empty `pin_cores` yields `caller_pin == None` (same as `CERA_PIN=0` or widened prefill).
+            let pool = RowPool::build_with_spin(1, &[], &[], &[], true, None, 0);
+            pool.dispatch_range(4, 1, |_, _| {});
+
+            let (has_guard, has_qos) = CLAIM.with(|c| {
+                (
+                    c.borrow().guard.is_some(),
+                    c.borrow().win_qos_guard.is_some(),
+                )
+            });
+            assert!(!has_guard, "caller_pin == None must not acquire ClaimGuard");
+            assert!(
+                has_qos,
+                "caller QoS guard must be acquired independently of caller_pin"
+            );
+
+            // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the current thread.
+            let elevated_prio = unsafe { win_qos::GetThreadPriority(win_qos::GetCurrentThread()) };
+            assert_eq!(elevated_prio, win_qos::THREAD_PRIORITY_HIGHEST);
+
+            release_caller_pin();
+            assert!(CLAIM.with(|c| c.borrow().win_qos_guard.is_none()));
+            // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the current thread.
+            let restored_prio = unsafe { win_qos::GetThreadPriority(win_qos::GetCurrentThread()) };
+            assert_eq!(restored_prio, initial_prio);
+        })
+        .join()
+        .unwrap();
     }
 }

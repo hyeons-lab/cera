@@ -18385,8 +18385,12 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Horizontal sum of `(facc0 + facc1) - macc` for Q6_K AVX-512 dot accumulators.
+    ///
+    /// # Safety
+    /// Caller must ensure AVX-512F and AVX2 are enabled on the executing CPU.
     #[inline(always)]
     unsafe fn q6k_reduce_512(facc0: __m512, facc1: __m512, macc: __m128) -> f32 {
+        // SAFETY: Caller upholds the AVX-512F/AVX2 target-feature invariant for all intrinsics.
         unsafe {
             let f = _mm512_add_ps(facc0, facc1);
             let lo = _mm512_castps512_ps256(f);
@@ -18401,6 +18405,11 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Accumulate one 128-element half of a `BlockQ6K` into `(facc0, facc1, macc)`.
+    ///
+    /// # Safety
+    /// - Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` are enabled.
+    /// - `nh` must be `0` or `1` so `blk.ql[nh * 64..+64]`, `blk.qh[nh * 32..+32]`, and
+    ///   `blk.scales[nh * 8..+8]` stay within `BlockQ6K`.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn q6k_half_accum_512(
@@ -18421,6 +18430,8 @@ pub(crate) mod avx512_vnni {
         facc1: &mut __m512,
         macc: &mut __m128,
     ) {
+        // SAFETY: `nh < 2` keeps `ql.add(nh * 64)` (64 B), `qh.add(nh * 32)` (32 B), and
+        // `scales.add(nh * 8)` (8 B) strictly inside `blk`; target features are upheld by caller.
         unsafe {
             let ql_vec = _mm512_loadu_si512(blk.ql.as_ptr().add(nh * 64) as *const __m512i);
             let qhb = _mm256_loadu_si256(blk.qh.as_ptr().add(nh * 32) as *const __m256i);
@@ -18469,6 +18480,13 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Compute one Q6_K row dot product using AVX-512 VNNI.
+    ///
+    /// # Safety
+    /// - Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` are enabled (and whatever
+    ///   features `cvt_d` uses).
+    /// - `row_ptr` must be valid for reads of `sb * size_of::<BlockQ6K>()` bytes, `b_quants`
+    ///   must have at least `sb * 256` elements, `b_scales` at least `sb * 8`, and `xs32_sx` at
+    ///   least `sb * 16`.
     #[inline(always)]
     unsafe fn q6k_n1_row_body_512(
         row_ptr: *const u8,
@@ -18478,6 +18496,7 @@ pub(crate) mod avx512_vnni {
         sb: usize,
         cvt_d: impl Fn(u16) -> __m128,
     ) -> f32 {
+        // SAFETY: Caller guarantees target features and slice/pointer lengths for `sb` super-blocks.
         unsafe {
             let mask_0f = _mm512_set1_epi8(0x0F);
             let mask_30 = _mm512_set1_epi8(0x30);
@@ -18516,6 +18535,14 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Compute 4 consecutive Q6_K row dot products sharing activation loads using AVX-512 VNNI.
+    ///
+    /// # Safety
+    /// - Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` are enabled (and whatever
+    ///   features `cvt_d` uses).
+    /// - `row_ptr` must cover 4 consecutive rows of stride `row_bytes`, each containing `sb`
+    ///   `BlockQ6K` blocks (`row_bytes >= sb * size_of::<BlockQ6K>()`).
+    /// - `b_quants`, `b_scales`, and `xs32_sx` must cover `sb * 256`, `sb * 8`, and `sb * 16`
+    ///   elements respectively.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn q6k_n1_4rows_body_512(
@@ -18527,6 +18554,7 @@ pub(crate) mod avx512_vnni {
         sb: usize,
         cvt_d: impl Fn(u16) -> __m128,
     ) -> [f32; 4] {
+        // SAFETY: Caller guarantees target features and valid 4-row matrix/activation extents.
         unsafe {
             let mask_0f = _mm512_set1_epi8(0x0F);
             let mask_30 = _mm512_set1_epi8(0x30);
@@ -18659,6 +18687,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Compute 4 consecutive Q6_K row dot products using AVX-512 VNNI + software `f16_to_f32`.
+    ///
+    /// # Safety
+    /// Same safety invariants as [`q6k_n1_4rows_body_512`].
     #[inline]
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn q6k_n1_4rows_512(
@@ -18669,6 +18700,7 @@ pub(crate) mod avx512_vnni {
         xs32_sx: &[f32],
         sb: usize,
     ) -> [f32; 4] {
+        // SAFETY: Caller guarantees target features and valid 4-row/activation bounds.
         unsafe {
             q6k_n1_4rows_body_512(row_ptr, row_bytes, b_scales, b_quants, xs32_sx, sb, |d| {
                 _mm_set1_ps(crate::quant::f16_to_f32(d))
@@ -18677,6 +18709,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Compute 4 consecutive Q6_K row dot products using AVX-512 VNNI + F16C `_mm_cvtph_ps`.
+    ///
+    /// # Safety
+    /// Caller must ensure `f16c` in addition to the invariants of [`q6k_n1_4rows_body_512`].
     #[inline]
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
     unsafe fn q6k_n1_4rows_512_f16c(
@@ -18687,6 +18722,7 @@ pub(crate) mod avx512_vnni {
         xs32_sx: &[f32],
         sb: usize,
     ) -> [f32; 4] {
+        // SAFETY: Caller guarantees target features (including `f16c`) and valid bounds.
         unsafe {
             q6k_n1_4rows_body_512(row_ptr, row_bytes, b_scales, b_quants, xs32_sx, sb, |d| {
                 _mm_permute_ps::<0x00>(_mm_cvtph_ps(_mm_cvtsi32_si128(d as i32)))
@@ -18695,6 +18731,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Compute one Q6_K row dot product using AVX-512 VNNI + software `f16_to_f32`.
+    ///
+    /// # Safety
+    /// Same safety invariants as [`q6k_n1_row_body_512`].
     #[inline]
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn q6k_n1_row_512(
@@ -18704,6 +18743,7 @@ pub(crate) mod avx512_vnni {
         xs32_sx: &[f32],
         sb: usize,
     ) -> f32 {
+        // SAFETY: Caller guarantees target features and valid row/activation bounds.
         unsafe {
             q6k_n1_row_body_512(row_ptr, b_scales, b_quants, xs32_sx, sb, |d| {
                 _mm_set1_ps(crate::quant::f16_to_f32(d))
@@ -18712,6 +18752,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Compute one Q6_K row dot product using AVX-512 VNNI + F16C `_mm_cvtph_ps`.
+    ///
+    /// # Safety
+    /// Caller must ensure `f16c` in addition to the invariants of [`q6k_n1_row_body_512`].
     #[inline]
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
     unsafe fn q6k_n1_row_512_f16c(
@@ -18721,6 +18764,7 @@ pub(crate) mod avx512_vnni {
         xs32_sx: &[f32],
         sb: usize,
     ) -> f32 {
+        // SAFETY: Caller guarantees target features (including `f16c`) and valid bounds.
         unsafe {
             q6k_n1_row_body_512(row_ptr, b_scales, b_quants, xs32_sx, sb, |d| {
                 _mm_permute_ps::<0x00>(_mm_cvtph_ps(_mm_cvtsi32_si128(d as i32)))
@@ -18729,6 +18773,12 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Precompute per-half-block `(xs * 32) * sum(x_q)` and drive 4-row unrolled Q6_K GEMV.
+    ///
+    /// # Safety
+    /// - Caller must ensure the executing CPU supports the target features required by
+    ///   `rows4_fn`/`row_fn` and AVX-512 VNNI.
+    /// - `k % 256 == 0`, `a_quant.len() >= m * (k / 256) * size_of::<BlockQ6K>()`,
+    ///   `b_scales.len() >= k / 32`, `b_quants.len() >= k`, and `out.len() >= m`.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn gemm_q6_k_n1_drive_512(
@@ -18742,10 +18792,15 @@ pub(crate) mod avx512_vnni {
         rows4_fn: impl Fn(*const u8, usize, &[f32], &[i8], &[f32], usize) -> [f32; 4] + Sync + Send,
         row_fn: impl Fn(*const u8, &[f32], &[i8], &[f32], usize) -> f32 + Sync + Send,
     ) {
+        debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
         let sb = k / 256;
         let nb32 = k / 32;
         let nh16 = k / 16;
         let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+        debug_assert!(a_quant.len() >= m * row_bytes, "Q6_K GEMV: a_quant size");
+        debug_assert!(b_scales.len() >= nb32, "Q6_K GEMV: b_scales size");
+        debug_assert!(b_quants.len() >= k, "Q6_K GEMV: b_quants size");
+        debug_assert!(out.len() >= m, "Q6_K GEMV: out size");
 
         let mut stack_buf = [0.0f32; 512];
         let mut heap_buf;
@@ -18755,6 +18810,8 @@ pub(crate) mod avx512_vnni {
             heap_buf = vec![0.0f32; nh16];
             &mut heap_buf
         };
+        // SAFETY: `b_scales.len() >= nb32`, `b_quants.len() >= k == nb32 * 32`, and
+        // `xs32_sx.len() == nh16 == nb32 * 2`, so every offset in `0..nb32` is in bounds.
         unsafe {
             let ones = _mm_set1_epi8(1);
             let bp = b_quants.as_ptr();
@@ -18771,44 +18828,49 @@ pub(crate) mod avx512_vnni {
 
         let base = a_quant.as_ptr() as usize;
         let xs_ref: &[f32] = xs32_sx;
-        let compute_slice = |(start_row, slice): (usize, &mut [f32])| unsafe {
-            let mut rp = (base as *const u8).add(start_row * row_bytes);
-            let mut idx = 0usize;
-            while idx + 4 <= slice.len() {
-                if start_row + idx + 7 < m {
-                    let pf = rp.add(4 * row_bytes);
-                    _mm_prefetch::<_MM_HINT_T0>(pf as *const i8);
-                    _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes) as *const i8);
-                    _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes) as *const i8);
-                    _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes) as *const i8);
-                    if row_bytes >= 1024 {
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(512) as *const i8);
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes + 512) as *const i8);
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes + 512) as *const i8);
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes + 512) as *const i8);
+        let compute_slice = |(start_row, slice): (usize, &mut [f32])| {
+            // SAFETY: `out` is sliced to `..m` below, so `start_row + slice.len() <= m` and every
+            // row pointer `base + (start_row + idx) * row_bytes` stays within `a_quant`.
+            unsafe {
+                let mut rp = (base as *const u8).add(start_row * row_bytes);
+                let mut idx = 0usize;
+                while idx + 4 <= slice.len() {
+                    if start_row + idx + 7 < m {
+                        let pf = rp.add(4 * row_bytes);
+                        _mm_prefetch::<_MM_HINT_T0>(pf as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes) as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes) as *const i8);
+                        if row_bytes >= 1024 {
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(512) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes + 512) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes + 512) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes + 512) as *const i8);
+                        }
+                        if row_bytes >= 1536 {
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(1024) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes + 1024) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes + 1024) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes + 1024) as *const i8);
+                        }
                     }
-                    if row_bytes >= 1536 {
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(1024) as *const i8);
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(row_bytes + 1024) as *const i8);
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(2 * row_bytes + 1024) as *const i8);
-                        _mm_prefetch::<_MM_HINT_T0>(pf.add(3 * row_bytes + 1024) as *const i8);
+                    let y4 = rows4_fn(rp, row_bytes, b_scales, b_quants, xs_ref, sb);
+                    slice[idx..idx + 4].copy_from_slice(&y4);
+                    rp = rp.add(4 * row_bytes);
+                    idx += 4;
+                }
+                while idx < slice.len() {
+                    if start_row + idx + 1 < m {
+                        _mm_prefetch::<_MM_HINT_T0>(rp.add(row_bytes) as *const i8);
                     }
+                    slice[idx] = row_fn(rp, b_scales, b_quants, xs_ref, sb);
+                    rp = rp.add(row_bytes);
+                    idx += 1;
                 }
-                let y4 = rows4_fn(rp, row_bytes, b_scales, b_quants, xs_ref, sb);
-                slice[idx..idx + 4].copy_from_slice(&y4);
-                rp = rp.add(4 * row_bytes);
-                idx += 4;
-            }
-            while idx < slice.len() {
-                if start_row + idx + 1 < m {
-                    _mm_prefetch::<_MM_HINT_T0>(rp.add(row_bytes) as *const i8);
-                }
-                slice[idx] = row_fn(rp, b_scales, b_quants, xs_ref, sb);
-                rp = rp.add(row_bytes);
-                idx += 1;
             }
         };
 
+        let out = &mut out[..m];
         if m < crate::backend::cpu::gemv_par_threshold() {
             compute_slice((0, out));
         } else if max_active > 0 {
@@ -18828,6 +18890,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// F16C-enabled AVX-512 VNNI entrypoint for Q6_K GEMV (`n = 1`).
+    ///
+    /// # Safety
+    /// Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma,f16c` and valid GEMV dimensions.
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma,f16c")]
     unsafe fn gemm_q6_k_n1_512_f16c(
         a_quant: &[u8],
@@ -18838,6 +18903,7 @@ pub(crate) mod avx512_vnni {
         k: usize,
         max_active: usize,
     ) {
+        // SAFETY: Caller guarantees target features (including `f16c`) and valid GEMV buffers.
         unsafe {
             gemm_q6_k_n1_drive_512(
                 a_quant,
@@ -18854,6 +18920,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Non-F16C AVX-512 VNNI entrypoint for Q6_K GEMV (`n = 1`).
+    ///
+    /// # Safety
+    /// Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` and valid GEMV dimensions.
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn gemm_q6_k_n1_512_base(
         a_quant: &[u8],
@@ -18864,6 +18933,7 @@ pub(crate) mod avx512_vnni {
         k: usize,
         max_active: usize,
     ) {
+        // SAFETY: Caller guarantees target features and valid GEMV buffers.
         unsafe {
             gemm_q6_k_n1_drive_512(
                 a_quant,
@@ -18880,6 +18950,9 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Inner Q6_K GEMV (`n = 1`) AVX-512 VNNI driver with optional active-worker cap.
+    ///
+    /// # Safety
+    /// Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` and valid GEMV dimensions.
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn gemm_q6_k_n1_512_inner(
         a_quant: &[u8],
@@ -18891,13 +18964,18 @@ pub(crate) mod avx512_vnni {
         max_active: usize,
     ) {
         if is_x86_feature_detected!("f16c") {
+            // SAFETY: `f16c` was just verified alongside the caller's AVX-512 VNNI contract.
             unsafe { gemm_q6_k_n1_512_f16c(a_quant, b_scales, b_quants, out, m, k, max_active) };
         } else {
+            // SAFETY: Caller guarantees AVX-512 VNNI/VL/AVX2/FMA and valid GEMV buffers.
             unsafe { gemm_q6_k_n1_512_base(a_quant, b_scales, b_quants, out, m, k, max_active) };
         }
     }
 
     /// Compute Q6_K GEMV (`n = 1`) using AVX-512 VNNI across all pool workers.
+    ///
+    /// # Safety
+    /// Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` and valid GEMV dimensions.
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn gemm_q6_k_n1_512(
         a_quant: &[u8],
@@ -18907,6 +18985,7 @@ pub(crate) mod avx512_vnni {
         m: usize,
         k: usize,
     ) {
+        // SAFETY: Caller guarantees AVX-512 VNNI/VL/AVX2/FMA and valid GEMV buffers.
         unsafe {
             gemm_q6_k_n1_512_inner(a_quant, b_scales, b_quants, out, m, k, 0);
         }
@@ -18924,6 +19003,10 @@ pub(crate) mod avx512_vnni {
     );
 
     /// Q6_K GEMV capped to `max_active` active workers (for XDNA CPU LM head).
+    ///
+    /// # Safety
+    /// - Caller must ensure `avx512f,avx512vl,avx512vnni,avx2,fma` are enabled on this CPU.
+    /// - `k % 256 == 0`, `x.len() == k`, `y.len() == m`, and `a_quant.len() == m * (k / 256) * size_of::<BlockQ6K>()`.
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     pub unsafe fn gemv_q6k_f32_active(
@@ -18936,6 +19019,14 @@ pub(crate) mod avx512_vnni {
         q8_quants: &mut Vec<i8>,
         max_active: usize,
     ) {
+        debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
+        debug_assert_eq!(x.len(), k, "Q6_K GEMV: x size");
+        debug_assert_eq!(y.len(), m, "Q6_K GEMV: y size");
+        let sb = k / 256;
+        let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q6_K GEMV: a_quant size");
+        // SAFETY: Caller guarantees AVX-512 VNNI/VL/AVX2/FMA and validated GEMV buffer sizes;
+        // `q8_scales` and `q8_quants` are resized to `k / 32` and `k` before quantization and GEMV.
         unsafe {
             q8_scales.resize(k / 32, 0.0);
             q8_quants.resize(k, 0);
@@ -21638,6 +21729,74 @@ pub(crate) mod avx512_vnni {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn gemm_q6_k_n1_large_k_heap_buf_and_oversized_out_match_dequant_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            // `k = 8448 > 8192` forces `nh16 = 528 > 512`, exercising the `heap_buf` branch in
+            // `gemm_q6_k_n1_drive_512`; `m = 7` exercises both 4-row unrolled and scalar tail.
+            let (m, k) = (7usize, 8448usize);
+            let sb = k / 256;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            let mut st = 0x51a7_9b23_c0de_1234u64;
+            let mut a = vec![0u8; m * row_bytes];
+            for (bi, chunk) in a
+                .chunks_mut(size_of::<crate::quant::BlockQ6K>())
+                .enumerate()
+            {
+                for b in chunk[..208].iter_mut() {
+                    *b = (lcg01(&mut st) * 255.0) as u8;
+                }
+                let d = half::f16::from_f32(0.004 + 0.002 * (bi % 7) as f32);
+                chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+            }
+
+            let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+            let mut q8_scales = Vec::new();
+            let mut q8_quants = Vec::new();
+            let mut got_active = vec![0.0f32; m];
+            let sentinel = -77.5f32;
+            let mut got_oversized = vec![sentinel; m + 5];
+            let mut got_zero_m = vec![sentinel; 4];
+            // SAFETY: `vnni_kernels_callable()` verified AVX-512 VNNI support and buffer sizes match.
+            unsafe {
+                gemv_q6k_f32_active(
+                    &a,
+                    &x,
+                    &mut got_active,
+                    m,
+                    k,
+                    &mut q8_scales,
+                    &mut q8_quants,
+                    4,
+                );
+                gemm_q6_k_n1_512_inner(&a, &q8_scales, &q8_quants, &mut got_oversized, m, k, 4);
+                gemm_q6_k_n1_512_inner(&a, &q8_scales, &q8_quants, &mut got_zero_m, 0, k, 4);
+            }
+
+            let mut w = vec![0.0f32; k];
+            for i in 0..m {
+                crate::quant::dequantize_q6_k_row(&a[i * row_bytes..(i + 1) * row_bytes], &mut w);
+                let mut want = 0.0f64;
+                for e in 0..k {
+                    let xa = q8_scales[e / 32] * q8_quants[e] as f32;
+                    want += (w[e] * xa) as f64;
+                }
+                for (tag, g) in [
+                    ("active_large_k", got_active[i] as f64),
+                    ("oversized_out", got_oversized[i] as f64),
+                ] {
+                    assert!(
+                        (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                        "{tag} row {i}: got {g} want {want}"
+                    );
+                }
+            }
+            assert!(got_oversized[m..].iter().all(|&v| v == sentinel));
+            assert!(got_zero_m.iter().all(|&v| v == sentinel));
         }
 
         /// The GEMV wrappers against dequantized weights dotted with the
