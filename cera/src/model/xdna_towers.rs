@@ -50,6 +50,7 @@ use crate::model::vision_encoder_gpu::{
     warn_stack_unavailable,
 };
 use crate::model::weights::MmapWeight;
+use crate::tensor::DType;
 
 /// Runlist wait timeout for tower GEMM dispatches (`ms`).
 const GEMM_WAIT_TIMEOUT_MS: u32 = 30_000;
@@ -76,6 +77,46 @@ impl XdnaBuf {
         let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let copy_len = len.min(g.len());
         g[..copy_len].to_vec()
+    }
+
+    fn with_mut_and_ref<R>(
+        dst: &Self,
+        src: &Self,
+        f: impl FnOnce(&mut [f32], Option<&[f32]>) -> R,
+    ) -> R {
+        if Arc::ptr_eq(&dst.0, &src.0) {
+            let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
+            return f(&mut d, None);
+        }
+        let dst_addr = Arc::as_ptr(&dst.0) as usize;
+        let src_addr = Arc::as_ptr(&src.0) as usize;
+        if dst_addr < src_addr {
+            let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
+            let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+            f(&mut d, Some(&s))
+        } else {
+            let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
+            f(&mut d, Some(&s))
+        }
+    }
+
+    fn with_read_bufs<const N: usize, R>(bufs: [&Self; N], f: impl FnOnce([&[f32]; N]) -> R) -> R {
+        let mut order: [(usize, usize); N] =
+            std::array::from_fn(|i| (Arc::as_ptr(&bufs[i].0) as usize, i));
+        order.sort_unstable_by_key(|&(addr, _)| addr);
+        let mut guards = Vec::with_capacity(N);
+        let mut slots = [0usize; N];
+        for (pos, &(addr, orig_idx)) in order.iter().enumerate() {
+            if pos > 0 && addr == order[pos - 1].0 {
+                slots[orig_idx] = guards.len() - 1;
+            } else {
+                guards.push(bufs[orig_idx].0.lock().unwrap_or_else(|e| e.into_inner()));
+                slots[orig_idx] = guards.len() - 1;
+            }
+        }
+        let slices: [&[f32]; N] = std::array::from_fn(|i| guards[slots[i]].as_slice());
+        f(slices)
     }
 }
 
@@ -284,6 +325,41 @@ impl XdnaGemmRunner {
 
     /// Pack and upload an [`MmapWeight`] `[out_dim, in_dim]` into `gemm_bf16` BO tiles.
     pub fn upload_mmap_weight(&self, w: &MmapWeight) -> Result<XdnaGemmWeight> {
+        anyhow::ensure!(
+            matches!(
+                w.dtype,
+                DType::F32
+                    | DType::F16
+                    | DType::BF16
+                    | DType::Q4_0
+                    | DType::Q4_1
+                    | DType::Q8_0
+                    | DType::Q4KM
+                    | DType::Q5KM
+                    | DType::Q6K
+            ),
+            "gemm_bf16 unsupported weight dtype {:?}",
+            w.dtype
+        );
+        let block_size = w.dtype.block_size();
+        anyhow::ensure!(
+            w.cols.is_multiple_of(block_size),
+            "gemm_bf16 weight cols ({}) must be a multiple of {:?} block_size ({block_size})",
+            w.cols,
+            w.dtype
+        );
+        let row_bytes = (w.cols / block_size)
+            .checked_mul(w.dtype.block_bytes())
+            .ok_or_else(|| anyhow::anyhow!("gemm_bf16 row byte size overflow"))?;
+        let expect_bytes = w
+            .rows
+            .checked_mul(row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("gemm_bf16 weight byte size overflow"))?;
+        anyhow::ensure!(
+            w.data().len() >= expect_bytes,
+            "gemm_bf16 weight buffer too small: {} < {expect_bytes}",
+            w.data().len()
+        );
         self.upload_weight_with(
             w.rows,
             w.cols,
@@ -300,8 +376,11 @@ impl XdnaGemmRunner {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<XdnaGemmWeight> {
+        let expected_len = out_dim.checked_mul(in_dim).ok_or_else(|| {
+            anyhow::anyhow!("gemm_bf16 weight size overflow for {out_dim}x{in_dim}")
+        })?;
         anyhow::ensure!(
-            data.len() == out_dim * in_dim,
+            data.len() == expected_len,
             "gemm_bf16 weight length {} != {out_dim} * {in_dim}",
             data.len()
         );
@@ -331,12 +410,18 @@ impl XdnaGemmRunner {
             w.out_dim,
             w.in_dim
         );
+        let min_x = rows
+            .checked_mul(in_dim)
+            .ok_or_else(|| anyhow::anyhow!("gemm_bf16 input size overflow for {rows}x{in_dim}"))?;
+        let out_len = rows.checked_mul(out_dim).ok_or_else(|| {
+            anyhow::anyhow!("gemm_bf16 output size overflow for {rows}x{out_dim}")
+        })?;
         anyhow::ensure!(
-            x.len() >= rows * in_dim,
+            x.len() >= min_x,
             "gemm_bf16 input length {} < {rows} * {in_dim}",
             x.len()
         );
-        let mut out = vec![0.0f32; rows * out_dim];
+        let mut out = vec![0.0f32; out_len];
         if rows == 0 || out_dim == 0 || in_dim == 0 || w.k_slices.is_empty() {
             return Ok(out);
         }
@@ -386,12 +471,13 @@ impl XdnaGemmRunner {
             }
 
             // Submit all (m_tile, n_tile) tiles in one ordered runlist batch.
+            // Declare `runs` before `runlist` so error unwind drops `runlist` before `runs`.
             {
+                let mut runs: Vec<XdnaRun> = Vec::with_capacity(total_tiles);
                 let mut runlist = bucket
                     .kernel
                     .create_runlist()
                     .map_err(|e| anyhow::anyhow!("create gemm_bf16 runlist: {e}"))?;
-                let mut runs: Vec<XdnaRun> = Vec::with_capacity(total_tiles);
                 for mt in 0..m_tiles {
                     for nt in 0..n_tiles {
                         let c_idx = mt * n_tiles + nt;
@@ -663,11 +749,21 @@ impl VitGpuOps for XdnaVitOps {
     }
 
     fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
-        let b = bias.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut d = x.0.lock().unwrap_or_else(|e| e.into_inner());
-        for row in d[..rows * dim].chunks_exact_mut(dim) {
-            add_inplace(row, &b[..dim]);
+        if rows == 0 || dim == 0 {
+            return;
         }
+        XdnaBuf::with_mut_and_ref(x, bias, |d, b_opt| {
+            if let Some(b) = b_opt {
+                for row in d[..rows * dim].chunks_exact_mut(dim) {
+                    add_inplace(row, &b[..dim]);
+                }
+            } else {
+                let b = d[..dim].to_vec();
+                for row in d[..rows * dim].chunks_exact_mut(dim) {
+                    add_inplace(row, &b);
+                }
+            }
+        });
     }
 
     fn layernorm(
@@ -679,24 +775,26 @@ impl VitGpuOps for XdnaVitOps {
         rows: usize,
         dim: usize,
     ) -> Self::Buf {
-        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
-        let w = weight.0.lock().unwrap_or_else(|e| e.into_inner());
-        let b = bias.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = s[..rows * dim].to_vec();
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            out.par_chunks_exact_mut(dim).for_each(|row| {
-                layer_norm_inplace(row, &w[..dim], &b[..dim], eps);
-            });
+        if rows == 0 || dim == 0 {
+            return XdnaBuf::zeroed(0);
         }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for row in out.chunks_exact_mut(dim) {
-                layer_norm_inplace(row, &w[..dim], &b[..dim], eps);
+        XdnaBuf::with_read_bufs([src, weight, bias], |[s, w, b]| {
+            let mut out = s[..rows * dim].to_vec();
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                out.par_chunks_exact_mut(dim).for_each(|row| {
+                    layer_norm_inplace(row, &w[..dim], &b[..dim], eps);
+                });
             }
-        }
-        XdnaBuf::from_vec(out)
+            #[cfg(not(feature = "parallel"))]
+            {
+                for row in out.chunks_exact_mut(dim) {
+                    layer_norm_inplace(row, &w[..dim], &b[..dim], eps);
+                }
+            }
+            XdnaBuf::from_vec(out)
+        })
     }
 
     fn gelu(&self, x: &Self::Buf, len: usize) {
@@ -802,9 +900,18 @@ impl VitGpuOps for XdnaVitOps {
     }
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
-        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
-        add_inplace(&mut d[..len], &s[..len]);
+        if len == 0 {
+            return;
+        }
+        XdnaBuf::with_mut_and_ref(dst, src, |d, s_opt| {
+            if let Some(s) = s_opt {
+                add_inplace(&mut d[..len], &s[..len]);
+            } else {
+                for v in &mut d[..len] {
+                    *v += *v;
+                }
+            }
+        });
     }
 
     fn supports_lfm3(&self) -> bool {
@@ -819,21 +926,32 @@ impl VitGpuOps for XdnaVitOps {
         rows: usize,
         dim: usize,
     ) -> Self::Buf {
-        let x = src.0.lock().unwrap_or_else(|e| e.into_inner());
-        let w = weight.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = vec![0.0f32; rows * dim];
-        let x_rows = &x[..rows * dim];
-        let w_row = &w[..dim];
-        par_rows_n(&mut out, dim, 8, |(r, dst_row)| {
-            rmsnorm_into(&x_rows[r * dim..(r + 1) * dim], dst_row, w_row, eps);
-        });
-        XdnaBuf::from_vec(out)
+        if rows == 0 || dim == 0 {
+            return XdnaBuf::zeroed(0);
+        }
+        XdnaBuf::with_read_bufs([src, weight], |[x, w]| {
+            let mut out = vec![0.0f32; rows * dim];
+            let x_rows = &x[..rows * dim];
+            let w_row = &w[..dim];
+            par_rows_n(&mut out, dim, 8, |(r, dst_row)| {
+                rmsnorm_into(&x_rows[r * dim..(r + 1) * dim], dst_row, w_row, eps);
+            });
+            XdnaBuf::from_vec(out)
+        })
     }
 
     fn silu_mul(&self, gate: &Self::Buf, up: &Self::Buf, len: usize) {
-        let mut g = gate.0.lock().unwrap_or_else(|e| e.into_inner());
-        let u = up.0.lock().unwrap_or_else(|e| e.into_inner());
-        silu_mul_inplace(&mut g[..len], &u[..len]);
+        if len == 0 {
+            return;
+        }
+        XdnaBuf::with_mut_and_ref(gate, up, |g, u_opt| {
+            if let Some(u) = u_opt {
+                silu_mul_inplace(&mut g[..len], &u[..len]);
+            } else {
+                let u = g[..len].to_vec();
+                silu_mul_inplace(&mut g[..len], &u);
+            }
+        });
     }
 
     fn lfm3_conv_spatial(
@@ -848,6 +966,9 @@ impl VitGpuOps for XdnaVitOps {
         kernel_size: usize,
     ) -> Self::Buf {
         let n_tokens = grid_w * grid_h;
+        if n_tokens == 0 || d == 0 {
+            return XdnaBuf::zeroed(0);
+        }
         let proj_guard = proj.0.lock().unwrap_or_else(|e| e.into_inner());
         let proj_slice = &proj_guard[..n_tokens * proj_rows];
 
@@ -1131,7 +1252,14 @@ pub(crate) fn try_xdna_vision_encoder(
     };
     let ops = XdnaVitOps::new(runner);
     let _ = ops.take_err();
-    let gpu_w = GpuVitWeights::build(&ops, weights);
+    let gpu_w = match GpuVitWeights::try_build(&ops, weights) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("vision encoder: XDNA backend unavailable for this model: {e:#}");
+            eprintln!("vision encoder: XDNA backend unavailable for this model: {e:#}");
+            return None;
+        }
+    };
     if let Some(e) = ops.take_err() {
         tracing::warn!("vision encoder: XDNA weight upload failed, falling back: {e:#}");
         eprintln!("vision encoder: XDNA weight upload failed, falling back: {e:#}");
@@ -1229,9 +1357,17 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
     }
 
     fn scaled_add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize, scale: f32) {
-        let s = src.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut d = dst.0.lock().unwrap_or_else(|e| e.into_inner());
-        axpy_inplace(&mut d[..len], &s[..len], scale);
+        if len == 0 {
+            return;
+        }
+        XdnaBuf::with_mut_and_ref(dst, src, |d, s_opt| {
+            if let Some(s) = s_opt {
+                axpy_inplace(&mut d[..len], &s[..len], scale);
+            } else {
+                let s = d[..len].to_vec();
+                axpy_inplace(&mut d[..len], &s, scale);
+            }
+        });
     }
 
     fn conv2d(
@@ -1245,56 +1381,58 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
         if total == 0 {
             return XdnaBuf::zeroed(0);
         }
-        let in_data = input.0.lock().unwrap_or_else(|e| e.into_inner());
-        let w_data = weight.0.lock().unwrap_or_else(|e| e.into_inner());
-        let b_data = bias.0.lock().unwrap_or_else(|e| e.into_inner());
-        let in_per_group = spec.in_ch / spec.groups;
-        let out_per_group = spec.out_ch / spec.groups;
-        let plane_out = spec.h_out * spec.w_out;
-        let plane_in = spec.h_in * spec.w_in;
-        let k_plane = spec.kh * spec.kw;
+        XdnaBuf::with_read_bufs([input, weight, bias], |[in_data, w_data, b_data]| {
+            let in_per_group = spec.in_ch / spec.groups;
+            let out_per_group = spec.out_ch / spec.groups;
+            let plane_out = spec.h_out * spec.w_out;
+            let plane_in = spec.h_in * spec.w_in;
+            let k_plane = spec.kh * spec.kw;
 
-        let mut out = vec![0.0f32; total];
-        let out_ptr = out.as_mut_ptr() as usize;
+            let mut out = vec![0.0f32; total];
+            let out_ptr = out.as_mut_ptr() as usize;
 
-        maybe_par_for(spec.out_ch, |oc| {
-            let g = oc / out_per_group;
-            let bias_val = b_data[oc];
-            // SAFETY: distinct `oc` channels own disjoint `[oc * plane_out .. (oc+1) * plane_out]` output planes.
-            let out_plane = unsafe {
-                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(oc * plane_out), plane_out)
-            };
-            for oh in 0..spec.h_out {
-                let ih_base = (oh * spec.stride_h) as isize - spec.pad_h as isize;
-                for ow in 0..spec.w_out {
-                    let iw_base = (ow * spec.stride_w) as isize - spec.pad_w as isize;
-                    let mut acc = bias_val;
-                    for ic_local in 0..in_per_group {
-                        let ic = g * in_per_group + ic_local;
-                        let w_row = (oc * in_per_group + ic_local) * k_plane;
-                        let in_plane = ic * plane_in;
-                        for ki in 0..spec.kh {
-                            let ih = ih_base + ki as isize;
-                            if ih < 0 || ih >= spec.h_in as isize {
-                                continue;
-                            }
-                            let in_row = in_plane + ih as usize * spec.w_in;
-                            for kj in 0..spec.kw {
-                                let iw = iw_base + kj as isize;
-                                if iw < 0 || iw >= spec.w_in as isize {
+            maybe_par_for(spec.out_ch, |oc| {
+                let g = oc / out_per_group;
+                let bias_val = b_data[oc];
+                // SAFETY: distinct `oc` channels own disjoint `[oc * plane_out .. (oc+1) * plane_out]` output planes.
+                let out_plane = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (out_ptr as *mut f32).add(oc * plane_out),
+                        plane_out,
+                    )
+                };
+                for oh in 0..spec.h_out {
+                    let ih_base = (oh * spec.stride_h) as isize - spec.pad_h as isize;
+                    for ow in 0..spec.w_out {
+                        let iw_base = (ow * spec.stride_w) as isize - spec.pad_w as isize;
+                        let mut acc = bias_val;
+                        for ic_local in 0..in_per_group {
+                            let ic = g * in_per_group + ic_local;
+                            let w_row = (oc * in_per_group + ic_local) * k_plane;
+                            let in_plane = ic * plane_in;
+                            for ki in 0..spec.kh {
+                                let ih = ih_base + ki as isize;
+                                if ih < 0 || ih >= spec.h_in as isize {
                                     continue;
                                 }
-                                acc += w_data[w_row + ki * spec.kw + kj]
-                                    * in_data[in_row + iw as usize];
+                                let in_row = in_plane + ih as usize * spec.w_in;
+                                for kj in 0..spec.kw {
+                                    let iw = iw_base + kj as isize;
+                                    if iw < 0 || iw >= spec.w_in as isize {
+                                        continue;
+                                    }
+                                    acc += w_data[w_row + ki * spec.kw + kj]
+                                        * in_data[in_row + iw as usize];
+                                }
                             }
                         }
+                        out_plane[oh * spec.w_out + ow] = acc;
                     }
-                    out_plane[oh * spec.w_out + ow] = acc;
                 }
-            }
-        });
+            });
 
-        XdnaBuf::from_vec(out)
+            XdnaBuf::from_vec(out)
+        })
     }
 
     fn transpose_blocked(&self, src: &Self::Buf, a: usize, b: usize, k: usize) -> Self::Buf {
@@ -1327,8 +1465,11 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
         channels: usize,
         t: usize,
     ) {
-        let w_data = w.0.lock().unwrap_or_else(|e| e.into_inner());
-        let b_data = b.0.lock().unwrap_or_else(|e| e.into_inner());
+        if channels == 0 || t == 0 {
+            return;
+        }
+        let w_data = w.read_clone(channels);
+        let b_data = b.read_clone(channels);
         let mut x_data = x.0.lock().unwrap_or_else(|e| e.into_inner());
         for c in 0..channels {
             let wc = w_data[c];
@@ -1452,30 +1593,33 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
         n_samples: usize,
         n_frames: usize,
     ) -> Self::Buf {
-        let p = pcm.0.lock().unwrap_or_else(|e| e.into_inner());
-        let h = hann.0.lock().unwrap_or_else(|e| e.into_inner());
-        let pad = N_FFT / 2;
-        let mut frames = vec![0.0f32; n_frames * N_FFT];
-        for ti in 0..n_frames {
-            let base = ti * HOP_LEN;
-            let dst = &mut frames[ti * N_FFT..(ti + 1) * N_FFT];
-            for k in 0..N_FFT {
-                let idx = base + k;
-                if idx < pad || idx >= pad + n_samples {
-                    dst[k] = 0.0;
-                } else {
-                    let s = idx - pad;
-                    let cur = p[s];
-                    let sample = if s == 0 {
-                        cur
+        if n_frames == 0 {
+            return XdnaBuf::zeroed(0);
+        }
+        XdnaBuf::with_read_bufs([pcm, hann], |[p, h]| {
+            let pad = N_FFT / 2;
+            let mut frames = vec![0.0f32; n_frames * N_FFT];
+            for ti in 0..n_frames {
+                let base = ti * HOP_LEN;
+                let dst = &mut frames[ti * N_FFT..(ti + 1) * N_FFT];
+                for k in 0..N_FFT {
+                    let idx = base + k;
+                    if idx < pad || idx >= pad + n_samples {
+                        dst[k] = 0.0;
                     } else {
-                        cur - PREEMPH * p[s - 1]
-                    };
-                    dst[k] = sample * h[k];
+                        let s = idx - pad;
+                        let cur = p[s];
+                        let sample = if s == 0 {
+                            cur
+                        } else {
+                            cur - PREEMPH * p[s - 1]
+                        };
+                        dst[k] = sample * h[k];
+                    }
                 }
             }
-        }
-        XdnaBuf::from_vec(frames)
+            XdnaBuf::from_vec(frames)
+        })
     }
 
     fn power_spec(&self, frames: &Self::Buf, _twiddle: &Self::Buf, n_frames: usize) -> Self::Buf {
@@ -1503,22 +1647,25 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
         n_mel: usize,
         n_frames: usize,
     ) -> Self::Buf {
-        let p = power.0.lock().unwrap_or_else(|e| e.into_inner());
-        let f = filters.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut mel = vec![0.0f32; n_mel * n_frames];
-        for mi in 0..n_mel {
-            let f_row = &f[mi * N_FFT_BINS..(mi + 1) * N_FFT_BINS];
-            for ti in 0..n_frames {
-                let p_row = &p[ti * N_FFT_BINS..(ti + 1) * N_FFT_BINS];
-                let sum: f64 = p_row
-                    .iter()
-                    .zip(f_row.iter())
-                    .map(|(&pv, &fv)| (pv as f64) * (fv as f64))
-                    .sum();
-                mel[mi * n_frames + ti] = (sum + LOG_MEL_EPS as f64).ln() as f32;
-            }
+        if n_mel == 0 || n_frames == 0 {
+            return XdnaBuf::zeroed(0);
         }
-        XdnaBuf::from_vec(mel)
+        XdnaBuf::with_read_bufs([power, filters], |[p, f]| {
+            let mut mel = vec![0.0f32; n_mel * n_frames];
+            for mi in 0..n_mel {
+                let f_row = &f[mi * N_FFT_BINS..(mi + 1) * N_FFT_BINS];
+                for ti in 0..n_frames {
+                    let p_row = &p[ti * N_FFT_BINS..(ti + 1) * N_FFT_BINS];
+                    let sum: f64 = p_row
+                        .iter()
+                        .zip(f_row.iter())
+                        .map(|(&pv, &fv)| (pv as f64) * (fv as f64))
+                        .sum();
+                    mel[mi * n_frames + ti] = (sum + LOG_MEL_EPS as f64).ln() as f32;
+                }
+            }
+            XdnaBuf::from_vec(mel)
+        })
     }
 
     fn mel_norm(
@@ -1605,7 +1752,7 @@ impl AudioEncoderGpuOps for XdnaAudioOps {
         t: usize,
         n_embd: usize,
     ) -> Self::Buf {
-        if t == 0 {
+        if t == 0 || n_embd == 0 {
             return XdnaBuf::from_vec(Vec::new());
         }
         let bcx_guard = bcx.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -3206,5 +3353,541 @@ mod tests {
                 dt_cpu.as_secs_f64() * 1e3,
             );
         }
+    }
+
+    #[test]
+    fn xdna_vit_and_audio_lfm3_host_ops_match_cpu_reference() {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            let vops = XdnaVitOps::new(runner.clone());
+            let aops = XdnaAudioOps::new(runner);
+
+            // 1. Vit rmsnorm & silu_mul vs CPU primitives.
+            let (rows, dim) = (5usize, 16usize);
+            let src = det_vec(rows * dim, 10, 0.8);
+            let rw = det_vec(dim, 11, 0.4)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>();
+            let got_rms = vops.download(
+                &vops.rmsnorm(&vops.upload(&src), &vops.upload(&rw), 1e-5, rows, dim),
+                rows * dim,
+            );
+            let mut want_rms = src.clone();
+            for row in want_rms.chunks_exact_mut(dim) {
+                crate::backend::cpu::rmsnorm(row, &rw, 1e-5);
+            }
+            let rms_diff = got_rms
+                .iter()
+                .zip(want_rms.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(rms_diff < 1e-5, "rmsnorm diff {rms_diff}");
+
+            let gate = det_vec(rows * dim, 12, 0.7);
+            let up = det_vec(rows * dim, 13, 0.7);
+            let g_buf = vops.upload(&gate);
+            let u_buf = vops.upload(&up);
+            vops.silu_mul(&g_buf, &u_buf, rows * dim);
+            let got_silu_mul = vops.download(&g_buf, rows * dim);
+            let mut want_silu_mul = gate.clone();
+            silu_mul_inplace(&mut want_silu_mul, &up);
+            let sm_diff = got_silu_mul
+                .iter()
+                .zip(want_silu_mul.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(sm_diff < 1e-5, "silu_mul diff {sm_diff}");
+
+            // 2. Vit lfm3_conv_spatial (3*d double-gated with bias and 2*d single-gated without bias).
+            let (grid_w, grid_h, d, kernel_size) = (4usize, 3usize, 8usize, 3usize);
+            let n_tokens = grid_w * grid_h;
+            let dw = det_vec(d * kernel_size * kernel_size, 14, 0.3);
+            let db = det_vec(d, 15, 0.1);
+            for (proj_mult, bias_opt) in [(3usize, Some(db.as_slice())), (2usize, None)] {
+                let proj_rows = proj_mult * d;
+                let proj = det_vec(n_tokens * proj_rows, 16 + proj_mult, 0.5);
+                let got_conv = vops.download(
+                    &vops.lfm3_conv_spatial(
+                        &vops.upload(&proj),
+                        proj_rows,
+                        &dw,
+                        bias_opt,
+                        grid_w,
+                        grid_h,
+                        d,
+                        kernel_size,
+                    ),
+                    n_tokens * d,
+                );
+                let mut gated = vec![0.0f32; n_tokens * d];
+                for t in 0..n_tokens {
+                    let row = &proj[t * proj_rows..(t + 1) * proj_rows];
+                    for c in 0..d {
+                        let rhs = if proj_mult == 3 {
+                            row[2 * d + c]
+                        } else {
+                            row[d + c]
+                        };
+                        gated[t * d + c] = row[c] * rhs;
+                    }
+                }
+                let mut want_conv = vec![0.0f32; n_tokens * d];
+                depthwise_conv2d_same_into(
+                    &gated,
+                    &dw,
+                    bias_opt,
+                    grid_w,
+                    grid_h,
+                    d,
+                    kernel_size,
+                    &mut want_conv,
+                );
+                if proj_mult == 3 {
+                    for t in 0..n_tokens {
+                        let middle = &proj[t * 3 * d + d..t * 3 * d + 2 * d];
+                        for c in 0..d {
+                            want_conv[t * d + c] *= middle[c];
+                        }
+                    }
+                }
+                let cdiff = got_conv
+                    .iter()
+                    .zip(want_conv.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    cdiff < 1e-5,
+                    "lfm3_conv_spatial mult={proj_mult} diff {cdiff}"
+                );
+            }
+
+            // 3. Vit lfm3_gqa_mrope_attention vs CPU apply_2d_vision_mrope_qk + vit_attention_gqa.
+            let (gw, gh, n_head, n_head_kv, hd) = (5usize, 3usize, 8usize, 2usize, 8usize);
+            let toks = gw * gh;
+            let q_dim = n_head * hd;
+            let kv_dim = n_head_kv * hd;
+            let q = det_vec(toks * q_dim, 20, 0.35);
+            let k = det_vec(toks * kv_dim, 21, 0.35);
+            let v = det_vec(toks * kv_dim, 22, 0.35);
+            let got_gqa = vops.download(
+                &vops.lfm3_gqa_mrope_attention(
+                    &vops.upload(&q),
+                    &vops.upload(&k),
+                    &vops.upload(&v),
+                    gw,
+                    gh,
+                    n_head,
+                    n_head_kv,
+                    hd,
+                    1_000_000.0,
+                ),
+                toks * q_dim,
+            );
+            let mut q_ref = q;
+            let mut k_ref = k;
+            apply_2d_vision_mrope_qk(
+                &mut q_ref,
+                &mut k_ref,
+                gw,
+                gh,
+                n_head,
+                n_head_kv,
+                hd,
+                1_000_000.0,
+            );
+            let chunk_q = q_dim.saturating_sub(1).clamp(1, 32);
+            let mut heads_ref = vec![0.0f32; n_head * toks.next_multiple_of(chunk_q) * hd];
+            let mut want_gqa = vec![0.0f32; toks * q_dim];
+            vit_attention_gqa(
+                &q_ref,
+                &k_ref,
+                &v,
+                &mut want_gqa,
+                &mut heads_ref,
+                toks,
+                n_head,
+                n_head_kv,
+                hd,
+                1.0f32 / (hd as f32).sqrt(),
+            );
+            let gqa_diff = got_gqa
+                .iter()
+                .zip(want_gqa.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(gqa_diff < 1e-5, "lfm3_gqa_mrope_attention diff {gqa_diff}");
+
+            // 4. Audio lfm3a_conv_stem vs conv_stem_lfm3a_features.
+            let aw = synth_lfm3a_audio_weights(64, 128, 4, 2, 1, 1, 16);
+            let n_frames = 33usize;
+            let n_mel = aw.config.n_mel_bins;
+            let mel = det_vec(n_frames * n_mel, 30, 0.5);
+            let (stem_buf, got_t_out) =
+                aops.lfm3a_conv_stem(&aops.upload(&mel), n_frames, n_mel, &aw.conv_stem.layers);
+            let (want_stem, want_t_out, plane) =
+                conv_stem_lfm3a_features(&mel, n_frames, &aw.conv_stem.layers, n_mel);
+            assert_eq!(got_t_out, want_t_out);
+            let got_stem = aops.download(&stem_buf, got_t_out * plane);
+            assert_eq!(got_stem, want_stem);
+
+            // 5. Audio lfm3a_shortconv_dw vs scalar causal conv1d reference.
+            let (t_sc, d_sc, k_sc) = (7usize, 12usize, 3usize);
+            let bcx = det_vec(t_sc * 3 * d_sc, 31, 0.4);
+            let dw_w = det_vec(k_sc * d_sc, 32, 0.3);
+            let dw_b = det_vec(d_sc, 33, 0.1);
+            for use_bias in [true, false] {
+                let b_slice: &[f32] = if use_bias { &dw_b } else { &[] };
+                let got_sc = aops.download(
+                    &aops.lfm3a_shortconv_dw(&aops.upload(&bcx), &dw_w, b_slice, k_sc, t_sc, d_sc),
+                    t_sc * d_sc,
+                );
+                let mut want_sc = vec![0.0f32; t_sc * d_sc];
+                for ti in 0..t_sc {
+                    for ch in 0..d_sc {
+                        let mut acc = if use_bias { dw_b[ch] } else { 0.0 };
+                        for tap in 0..k_sc {
+                            if ti + tap >= k_sc - 1 {
+                                let src_t = ti + tap - (k_sc - 1);
+                                let row = &bcx[src_t * 3 * d_sc..(src_t + 1) * 3 * d_sc];
+                                let bx = row[ch] * row[2 * d_sc + ch];
+                                acc += bx * dw_w[ch * k_sc + tap];
+                            }
+                        }
+                        let c_val = bcx[ti * 3 * d_sc + d_sc + ch];
+                        want_sc[ti * d_sc + ch] = acc * c_val;
+                    }
+                }
+                let sc_diff = got_sc
+                    .iter()
+                    .zip(want_sc.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(sc_diff < 1e-5, "lfm3a_shortconv_dw diff {sc_diff}");
+            }
+
+            // 6. Audio lfm3a_swa_attention (None, head-gate, dim-gate) vs CPU math.
+            let (t_a, nh, nkv, dh, sw) = (9usize, 4usize, 2usize, 8usize, 4usize);
+            let da = nh * dh;
+            let dakv = nkv * dh;
+            let qa = det_vec(t_a * da, 40, 0.3);
+            let ka = det_vec(t_a * dakv, 41, 0.3);
+            let va = det_vec(t_a * dakv, 42, 0.3);
+            let qnw = det_vec(dh, 43, 0.2)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>();
+            let knw = det_vec(dh, 44, 0.2)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>();
+            for gate_rows in [0usize, nh, da] {
+                let gate_vec =
+                    (gate_rows > 0).then(|| det_vec(t_a * gate_rows, 45 + gate_rows, 0.4));
+                let gate_buf = gate_vec.as_deref().map(|g| aops.upload(g));
+                let got_swa = aops.download(
+                    &aops.lfm3a_swa_attention(
+                        &aops.upload(&qa),
+                        &aops.upload(&ka),
+                        &aops.upload(&va),
+                        gate_buf.as_ref(),
+                        gate_rows,
+                        &qnw,
+                        &knw,
+                        t_a,
+                        nh,
+                        nkv,
+                        dh,
+                        1e-5,
+                        10_000.0,
+                        sw,
+                    ),
+                    t_a * da,
+                );
+                let mut q_ref = qa.clone();
+                let mut k_ref = ka.clone();
+                for ti in 0..t_a {
+                    for h in 0..nh {
+                        let qh = &mut q_ref[ti * da + h * dh..ti * da + (h + 1) * dh];
+                        crate::backend::cpu::rmsnorm(qh, &qnw, 1e-5);
+                        apply_rope_neox_head(qh, ti, 10_000.0);
+                    }
+                    for hk in 0..nkv {
+                        let kh = &mut k_ref[ti * dakv + hk * dh..ti * dakv + (hk + 1) * dh];
+                        crate::backend::cpu::rmsnorm(kh, &knw, 1e-5);
+                        apply_rope_neox_head(kh, ti, 10_000.0);
+                    }
+                }
+                let mut want_swa = vec![0.0f32; t_a * da];
+                let n_rep = nh / nkv;
+                let scale = 1.0f32 / (dh as f32).sqrt();
+                for h in 0..nh {
+                    let hk = h / n_rep;
+                    for qt in 0..t_a {
+                        let k0 = qt.saturating_sub(sw - 1);
+                        let mut sc = vec![0.0f32; qt + 1 - k0];
+                        for (idx, kt) in (k0..=qt).enumerate() {
+                            sc[idx] = dot_f32(
+                                &q_ref[qt * da + h * dh..qt * da + (h + 1) * dh],
+                                &k_ref[kt * dakv + hk * dh..kt * dakv + (hk + 1) * dh],
+                            ) * scale;
+                        }
+                        softmax_inplace(&mut sc);
+                        let out_h = &mut want_swa[qt * da + h * dh..qt * da + (h + 1) * dh];
+                        for (idx, kt) in (k0..=qt).enumerate() {
+                            axpy_inplace(
+                                out_h,
+                                &va[kt * dakv + hk * dh..kt * dakv + (hk + 1) * dh],
+                                sc[idx],
+                            );
+                        }
+                    }
+                }
+                if let Some(gv) = &gate_vec {
+                    if gate_rows == nh {
+                        for ti in 0..t_a {
+                            for h in 0..nh {
+                                let sig = 1.0f32 / (1.0f32 + (-gv[ti * nh + h]).exp());
+                                for v in &mut want_swa[ti * da + h * dh..ti * da + (h + 1) * dh] {
+                                    *v *= sig;
+                                }
+                            }
+                        }
+                    } else {
+                        for (dst, &g) in want_swa.iter_mut().zip(gv.iter()) {
+                            *dst *= 1.0f32 / (1.0f32 + (-g).exp());
+                        }
+                    }
+                }
+                let swa_diff = got_swa
+                    .iter()
+                    .zip(want_swa.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    swa_diff < 1e-5,
+                    "lfm3a_swa_attention gate_rows={gate_rows} diff {swa_diff}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn xdna_multi_buffer_ops_handle_aliased_buffers_without_deadlock() {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            let vops = XdnaVitOps::new(runner.clone());
+            let aops = XdnaAudioOps::new(runner);
+
+            // add(a, a) doubles in place
+            let a = vops.upload(&[1.0, -2.0, 3.5, 4.0]);
+            vops.add(&a, &a, 4);
+            assert_eq!(vops.download(&a, 4), vec![2.0, -4.0, 7.0, 8.0]);
+
+            // bias_add(b, b, 2, 2) snapshots row 0 and adds to both rows
+            let b = vops.upload(&[1.0, 2.0, 10.0, 20.0]);
+            vops.bias_add(&b, &b, 2, 2);
+            assert_eq!(vops.download(&b, 4), vec![2.0, 4.0, 11.0, 22.0]);
+
+            // silu_mul(g, g, 4) computes silu(x) * x
+            let orig = [0.5f32, -1.0, 2.0, 0.0];
+            let g = vops.upload(&orig);
+            vops.silu_mul(&g, &g, 4);
+            let mut want_g = orig;
+            silu_mul_inplace(&mut want_g, &orig);
+            assert_eq!(vops.download(&g, 4), want_g);
+
+            // layernorm(c, c, c) & rmsnorm(c, c)
+            let c = vops.upload(&[1.0, 2.0, 3.0, 4.0]);
+            let ln = vops.layernorm(&c, &c, &c, 1e-5, 1, 4);
+            assert_eq!(vops.download(&ln, 4).len(), 4);
+            let rn = vops.rmsnorm(&c, &c, 1e-5, 1, 4);
+            assert_eq!(vops.download(&rn, 4).len(), 4);
+
+            // scaled_add(s, s, 4, 0.5) scales by 1.5
+            let s = aops.upload(&[2.0, -4.0, 6.0, 8.0]);
+            aops.scaled_add(&s, &s, 4, 0.5);
+            assert_eq!(aops.download(&s, 4), vec![3.0, -6.0, 9.0, 12.0]);
+
+            // chan_affine_silu(ca, ca, ca, 2, 2)
+            let ca = aops.upload(&[1.0, 2.0, 3.0, 4.0]);
+            aops.chan_affine_silu(&ca, &ca, &ca, 2, 2);
+            assert_eq!(aops.download(&ca, 4).len(), 4);
+
+            // conv2d(cv, cv, cv)
+            let cv = aops.upload(&[1.0; 16]);
+            let spec = Conv2dSpec::padded(1, 1, 2, 2, (1, 1), (1, 1), (0, 0), (0, 0), 1).unwrap();
+            let cv_out = aops.conv2d(&cv, &cv, &cv, &spec);
+            assert_eq!(aops.download(&cv_out, 4), vec![2.0; 4]);
+
+            // stft_frames & mel_project with aliased inputs
+            let pcm = aops.upload(&vec![0.1f32; N_FFT]);
+            let fr = aops.stft_frames(&pcm, &pcm, N_FFT, 1);
+            assert_eq!(aops.download(&fr, N_FFT).len(), N_FFT);
+            let pwr = aops.upload(&vec![0.5f32; N_FFT_BINS]);
+            let mp = aops.mel_project(&pwr, &pwr, 1, 1);
+            assert_eq!(aops.download(&mp, 1).len(), 1);
+        });
+    }
+
+    #[test]
+    fn fake_shim_split_k_matmul_f32_and_validation_errors() {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            // Split-K across 2 slices (`in_dim = 8256 > MAX_K_SLICE = 8192`).
+            let (rows, out_dim, in_dim) = (4usize, 32usize, 8256usize);
+            let x = det_vec(rows * in_dim, 51, 0.2);
+            let w_f32 = det_vec(out_dim * in_dim, 52, 0.1);
+            let w = runner
+                .upload_f32_weight(&w_f32, out_dim, in_dim)
+                .expect("split-K upload");
+            assert_eq!(w.k_slices.len(), 2);
+            assert_eq!(
+                (
+                    w.k_slices[0].k_start,
+                    w.k_slices[0].k_len,
+                    w.k_slices[0].k_chunks
+                ),
+                (0, 8192, 128)
+            );
+            assert_eq!(
+                (
+                    w.k_slices[1].k_start,
+                    w.k_slices[1].k_len,
+                    w.k_slices[1].k_chunks
+                ),
+                (8192, 64, 1)
+            );
+            let y = runner
+                .matmul_f32(&x, &w, rows, out_dim, in_dim)
+                .expect("split-K matmul");
+            assert_eq!(y.len(), rows * out_dim);
+
+            // `upload_mmap_weight` validation errors instead of panics.
+            let bad_u8 = MmapWeight::from_owned_bytes(vec![0u8; 64], DType::U8, 2, 32);
+            assert!(runner.upload_mmap_weight(&bad_u8).is_err());
+            let bad_i32 = MmapWeight::from_owned_bytes(vec![0u8; 64], DType::I32, 1, 16);
+            assert!(runner.upload_mmap_weight(&bad_i32).is_err());
+            let bad_q8_cols = MmapWeight::from_owned_bytes(vec![0u8; 68], DType::Q8_0, 1, 48);
+            assert!(runner.upload_mmap_weight(&bad_q8_cols).is_err());
+            let bad_short = MmapWeight::from_owned_bytes(vec![0u8; 16], DType::F32, 4, 4);
+            assert!(runner.upload_mmap_weight(&bad_short).is_err());
+
+            // `upload_f32_weight` checked_mul / length errors.
+            assert!(runner.upload_f32_weight(&[], usize::MAX, 2).is_err());
+            assert!(runner.upload_f32_weight(&[0.0; 3], 2, 2).is_err());
+
+            drop(w);
+            drop(runner);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+
+        // Error unwind inside runlist execution drops `runlist` before `runs` and leaks zero BOs.
+        let fail_cfg = FakeConfig {
+            fail_runlist_wait: true,
+            ..Default::default()
+        };
+        fake::with_shim(fail_cfg, || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            let w = runner
+                .upload_f32_weight(&vec![0.1f32; 32 * 64], 32, 64)
+                .expect("upload");
+            let err = runner
+                .matmul_f32(&vec![0.1f32; 4 * 64], &w, 4, 32, 64)
+                .expect_err("runlist wait error must surface");
+            assert!(err.to_string().contains("wait gemm_bf16 runlist"));
+            drop(w);
+            drop(runner);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn lfm3_and_lfm3a_malformed_weights_and_auto_routing() {
+        use crate::engine::BackendPreference as BP;
+        use crate::model::audio_encoder_gpu::{GpuAudioWeights, build_gpu_audio_encoder};
+        use crate::model::vision_encoder_gpu::{GpuVitWeights, build_gpu_vision_encoder};
+
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open().expect("open");
+            let vops = XdnaVitOps::new(runner.clone());
+            let aops = XdnaAudioOps::new(runner);
+
+            // Malformed LFM3 vision weights fail cleanly instead of panicking.
+            let mut bad_in_proj = synth_lfm3_vision_weights(64, 128, 4, 2, 1, 1);
+            if let Lfm3BlockOp::Conv(ref mut c) = bad_in_proj.lfm3_blocks[0].op {
+                c.in_proj_w = f32_weight(64, 64, 1, 0.1);
+            }
+            assert!(GpuVitWeights::try_build(&vops, &bad_in_proj).is_err());
+            assert!(try_xdna_vision_encoder(&bad_in_proj).is_none());
+
+            let mut bad_heads = synth_lfm3_vision_weights(64, 128, 4, 2, 1, 1);
+            bad_heads.config.n_head = 0;
+            assert!(GpuVitWeights::try_build(&vops, &bad_heads).is_err());
+
+            let mut bad_mm_norm = synth_lfm3_vision_weights(64, 128, 4, 2, 1, 1);
+            bad_mm_norm.mm_input_norm = Some(Lfm3NormWeights {
+                weight: vec![1.0; 12],
+                bias: None,
+            });
+            assert!(GpuVitWeights::try_build(&vops, &bad_mm_norm).is_err());
+
+            // Malformed LFM3A audio weights fail cleanly instead of panicking.
+            let mut bad_kv = synth_lfm3a_audio_weights(64, 128, 4, 2, 1, 1, 16);
+            bad_kv.layers[0].lfm3a.as_mut().unwrap().n_head_kv = 0;
+            assert!(GpuAudioWeights::build(&aops, &bad_kv).is_err());
+            let bad_kv = Arc::new(bad_kv);
+            assert!(try_xdna_audio_encoder(&bad_kv).is_none());
+
+            let mut bad_post_ln = synth_lfm3a_audio_weights(64, 128, 4, 2, 1, 1, 16);
+            bad_post_ln.layers[0].lfm3a.as_mut().unwrap().post_ln_w = vec![1.0; 7];
+            assert!(GpuAudioWeights::build(&aops, &bad_post_ln).is_err());
+
+            let mut bad_attn_b = synth_lfm3a_audio_weights(64, 128, 4, 2, 1, 1, 16);
+            bad_attn_b.layers[1].attn_q_b = vec![0.0; 3];
+            assert!(GpuAudioWeights::build(&aops, &bad_attn_b).is_err());
+
+            drop(vops);
+            drop(aops);
+
+            // Auto routing on LFM3 vision uses `lfm3_blocks.len()`, not empty `blocks`.
+            // 5 layers, n_embd=64 <= 768 -> worthwhile under Auto!
+            let vw_deep_narrow = synth_lfm3_vision_weights(64, 128, 4, 2, 3, 2);
+            let enc_auto = build_gpu_vision_encoder(&vw_deep_narrow, BP::Auto)
+                .expect("5-layer narrow LFM3 vision encoder must route to XDNA under Auto");
+            assert_eq!(enc_auto.backend_label(), "xdna");
+
+            // 3 layers, n_embd=64 <= 768 -> skipped under Auto, admitted under Npu.
+            let vw_short_narrow = synth_lfm3_vision_weights(64, 128, 4, 2, 2, 1);
+            assert!(build_gpu_vision_encoder(&vw_short_narrow, BP::Auto).is_none());
+            let enc_npu = build_gpu_vision_encoder(&vw_short_narrow, BP::Npu)
+                .expect("short narrow LFM3 vision encoder must route to XDNA under Npu");
+            assert_eq!(enc_npu.backend_label(), "xdna");
+
+            // 2 layers, n_embd=1024 > 768 -> worthwhile under Auto.
+            let vw_short_wide = synth_lfm3_vision_weights(1024, 1024, 8, 4, 1, 1);
+            let enc_wide = build_gpu_vision_encoder(&vw_short_wide, BP::Auto)
+                .expect("wide LFM3 vision encoder must route to XDNA under Auto");
+            assert_eq!(enc_wide.backend_label(), "xdna");
+
+            // Auto routing on LFM3A audio: 5 layers, n_embd=64 <= 512 -> routes to XDNA under Auto.
+            let aw_deep = Arc::new(synth_lfm3a_audio_weights(64, 128, 4, 2, 3, 2, 16));
+            let aenc_auto = build_gpu_audio_encoder(&aw_deep, BP::Auto)
+                .expect("5-layer narrow LFM3A audio encoder must route to XDNA under Auto");
+            let pcm: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+            let (aout, t_out) = aenc_auto.encode_pcm(&pcm).expect("auto encode_pcm");
+            assert!(t_out > 0 && aout.len() == t_out * 64);
+
+            // 3 layers, n_embd=64 <= 512 -> skipped under Auto, admitted under Npu.
+            let aw_short = Arc::new(synth_lfm3a_audio_weights(64, 128, 4, 2, 1, 2, 16));
+            assert!(build_gpu_audio_encoder(&aw_short, BP::Auto).is_none());
+            assert!(build_gpu_audio_encoder(&aw_short, BP::Npu).is_some());
+
+            drop(enc_auto);
+            drop(enc_npu);
+            drop(enc_wide);
+            drop(aenc_auto);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
     }
 }

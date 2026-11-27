@@ -919,6 +919,11 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
         );
         let d_head = n_embd / n_head;
         anyhow::ensure!(
+            n_ff > 0 && cfg.llm_hidden_size > 0,
+            "lfm3a n_ff ({n_ff}) and llm_hidden_size ({}) must be > 0",
+            cfg.llm_hidden_size
+        );
+        anyhow::ensure!(
             w.layers.len() == cfg.n_layer && !w.layers.is_empty(),
             "audio encoder config.n_layer ({}) != loaded blocks ({})",
             cfg.n_layer,
@@ -936,6 +941,16 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
             .map(|l| l.shape.as_slice())
             .collect();
         let (stem_ch, stem_f) = lfm3a_stem_geometry(&stem_shapes, cfg.n_mel_bins)?;
+        for (pos, l) in w.conv_stem.layers.iter().enumerate() {
+            let expected_w: usize = l.shape.iter().product();
+            anyhow::ensure!(
+                l.weight.len() == expected_w && l.bias.len() == l.shape[3],
+                "lfm3a conv stem layer {pos}: weight len ({}) / bias len ({}) mismatch shape {:?}",
+                l.weight.len(),
+                l.bias.len(),
+                l.shape
+            );
+        }
         anyhow::ensure!(
             w.conv_stem.pre_encode_out_w.rows == n_embd
                 && w.conv_stem.pre_encode_out_w.cols == stem_ch * stem_f
@@ -955,13 +970,18 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("lfm3a block 0 missing Lfm3aLayerExtras"))?;
         let rope_theta = first_extras.rope_theta;
-        let n_head_kv = first_extras.n_head_kv.max(1);
+        let n_head_kv = first_extras.n_head_kv;
         anyhow::ensure!(
-            n_head.is_multiple_of(n_head_kv),
-            "lfm3a n_head ({n_head}) not divisible by n_head_kv ({n_head_kv})"
+            n_head_kv > 0 && n_head.is_multiple_of(n_head_kv),
+            "lfm3a n_head ({n_head}) must be a positive multiple of n_head_kv ({n_head_kv})"
         );
         let n_embd_kv = n_head_kv * d_head;
         let sliding_window = first_extras.sliding_window;
+        anyhow::ensure!(
+            first_extras.post_ln_w.is_empty() || first_extras.post_ln_w.len() == n_embd,
+            "lfm3a post_ln_w len ({}) != n_embd ({n_embd})",
+            first_extras.post_ln_w.len()
+        );
         let post_ln_w = opt_audio_buf(ops, &first_extras.post_ln_w);
 
         let mut blocks = Vec::with_capacity(w.layers.len());
@@ -1013,6 +1033,15 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
                         && b.conv_pw2_w.cols == n_embd,
                     "lfm3a block {il} ShortConv pw1/pw2 shapes invalid for n_embd={n_embd}"
                 );
+                anyhow::ensure!(
+                    (b.conv_pw1_b.is_empty() || b.conv_pw1_b.len() == 3 * n_embd)
+                        && (b.conv_dw_b.is_empty() || b.conv_dw_b.len() == n_embd)
+                        && (b.conv_pw2_b.is_empty() || b.conv_pw2_b.len() == n_embd),
+                    "lfm3a block {il} ShortConv bias lens ({}, {}, {}) invalid for n_embd={n_embd}",
+                    b.conv_pw1_b.len(),
+                    b.conv_dw_b.len(),
+                    b.conv_pw2_b.len()
+                );
                 GpuLfm3aBlockOp::ShortConv {
                     conv_pw1_w: ops.upload_weight(&b.conv_pw1_w),
                     conv_pw1_b: opt_audio_buf(ops, &b.conv_pw1_b),
@@ -1025,6 +1054,11 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
                 }
             } else {
                 anyhow::ensure!(
+                    extras.n_head_kv == n_head_kv,
+                    "lfm3a block {il} n_head_kv ({}) != block 0 n_head_kv ({n_head_kv})",
+                    extras.n_head_kv
+                );
+                anyhow::ensure!(
                     b.attn_q_w.rows == n_embd
                         && b.attn_q_w.cols == n_embd
                         && b.attn_k_w.rows == n_embd_kv
@@ -1034,6 +1068,17 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
                         && b.attn_o_w.rows == n_embd
                         && b.attn_o_w.cols == n_embd,
                     "lfm3a block {il} attention projection shapes invalid for n_embd={n_embd}, kv={n_embd_kv}"
+                );
+                anyhow::ensure!(
+                    (b.attn_q_b.is_empty() || b.attn_q_b.len() == n_embd)
+                        && (b.attn_k_b.is_empty() || b.attn_k_b.len() == n_embd_kv)
+                        && (b.attn_v_b.is_empty() || b.attn_v_b.len() == n_embd_kv)
+                        && (b.attn_o_b.is_empty() || b.attn_o_b.len() == n_embd),
+                    "lfm3a block {il} attention bias lens ({}, {}, {}, {}) invalid for n_embd={n_embd}, kv={n_embd_kv}",
+                    b.attn_q_b.len(),
+                    b.attn_k_b.len(),
+                    b.attn_v_b.len(),
+                    b.attn_o_b.len()
                 );
                 anyhow::ensure!(
                     extras.q_norm_w.len() == d_head && extras.k_norm_w.len() == d_head,
@@ -3143,9 +3188,13 @@ fn try_metal_audio_encoder(
     None
 }
 
-#[cfg(all(test, feature = "gpu"))]
-mod tests {
+#[cfg(test)]
+mod routing_tests {
     use super::*;
+    use crate::model::audio_encoder::{
+        AudioMlpAdapterWeights, ConformerLayerWeights, ConvLayerWeights, ConvStemWeights,
+        Lfm3aLayerExtras,
+    };
 
     #[test]
     fn the_lfm3a_encoder_only_routes_to_xdna_on_npu_and_auto() {
@@ -3192,6 +3241,119 @@ mod tests {
         assert!(super::xdna_worthwhile_for_auto(17, 512));
         assert!(super::xdna_worthwhile_for_auto(4, 768));
     }
+
+    #[test]
+    fn build_gpu_audio_encoder_lfm3a_refuses_non_xdna_backends() {
+        use crate::engine::BackendPreference as BP;
+        let (n_embd, n_ff, n_head, n_head_kv, n_mel_bins, llm_hidden_size) =
+            (16usize, 32usize, 4usize, 2usize, 32usize, 16usize);
+        let d_head = n_embd / n_head;
+        let n_embd_kv = n_head_kv * d_head;
+        let stem_ch = 8usize;
+        let f32_w = |r: usize, c: usize| MmapWeight::from_owned_f32(vec![0.0; r * c], r, c);
+        let stem_shapes: [(&str, [usize; 4]); 3] = [
+            ("a.conv1d.0", [3, 3, 1, stem_ch]),
+            ("a.conv1d.1", [3, 3, 1, stem_ch]),
+            ("a.conv1d.2", [3, 3, 1, stem_ch]),
+        ];
+        let stem_layers = stem_shapes
+            .iter()
+            .map(|&(name, shape)| ConvLayerWeights {
+                name: name.into(),
+                weight: vec![0.0; shape.iter().product()],
+                bias: vec![0.0; shape[3]],
+                shape: shape.to_vec(),
+            })
+            .collect();
+        let dummy = || MmapWeight::from_owned_f32(Vec::new(), 0, 0);
+        let layer = ConformerLayerWeights {
+            ffn_norm_w: Vec::new(),
+            ffn_norm_b: Vec::new(),
+            ffn_up_w: f32_w(n_ff, n_embd),
+            ffn_up_b: Vec::new(),
+            ffn_down_w: f32_w(n_embd, n_ff),
+            ffn_down_b: Vec::new(),
+            ln1_w: vec![1.0; n_embd],
+            ln1_b: Vec::new(),
+            attn_q_w: f32_w(n_embd, n_embd),
+            attn_q_b: Vec::new(),
+            attn_k_w: f32_w(n_embd_kv, n_embd),
+            attn_k_b: Vec::new(),
+            attn_v_w: f32_w(n_embd_kv, n_embd),
+            attn_v_b: Vec::new(),
+            attn_o_w: f32_w(n_embd, n_embd),
+            attn_o_b: Vec::new(),
+            pos_bias_u: Vec::new(),
+            pos_bias_v: Vec::new(),
+            linear_pos_w: dummy(),
+            norm_conv_w: Vec::new(),
+            norm_conv_b: Vec::new(),
+            conv_pw1_w: dummy(),
+            conv_pw1_b: Vec::new(),
+            conv_dw_w: Vec::new(),
+            conv_dw_b: Vec::new(),
+            conv_dw_shape: Vec::new(),
+            conv_norm_w: Vec::new(),
+            conv_norm_b: Vec::new(),
+            conv_pw2_w: dummy(),
+            conv_pw2_b: Vec::new(),
+            ffn_norm_1_w: Vec::new(),
+            ffn_norm_1_b: Vec::new(),
+            ffn_up_1_w: f32_w(n_ff, n_embd),
+            ffn_up_1_b: Vec::new(),
+            ffn_down_1_w: dummy(),
+            ffn_down_1_b: Vec::new(),
+            ln2_w: vec![1.0; n_embd],
+            ln2_b: Vec::new(),
+            lfm3a: Some(Lfm3aLayerExtras {
+                q_norm_w: vec![1.0; d_head],
+                k_norm_w: vec![1.0; d_head],
+                attn_gate_w: None,
+                attn_post_norm_w: Vec::new(),
+                ffn_post_norm_w: Vec::new(),
+                post_ln_w: Vec::new(),
+                rope_theta: 10_000.0,
+                n_head_kv,
+                sliding_window: 32,
+            }),
+        };
+        let aw = std::sync::Arc::new(AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: 1,
+                n_embd,
+                n_ff,
+                n_head,
+                eps: 1e-5,
+                n_mel_bins,
+                llm_hidden_size,
+            },
+            conv_stem: ConvStemWeights {
+                layers: stem_layers,
+                pre_encode_out_w: f32_w(n_embd, stem_ch * 4),
+                pre_encode_out_b: vec![0.0; n_embd],
+            },
+            layers: vec![layer],
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: vec![1.0; n_embd],
+                norm_b: vec![0.0; n_embd],
+                up_w: f32_w(32, n_embd),
+                up_b: vec![0.0; 32],
+                down_w: f32_w(llm_hidden_size, 32),
+                down_b: vec![0.0; llm_hidden_size],
+            },
+        });
+        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Metal] {
+            assert!(
+                build_gpu_audio_encoder(&aw, backend).is_none(),
+                "LFM3A audio encoder must return None for {backend:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
 
     /// `conv_spec_runnable` admits what fits one dispatch and what the channel splitter can
     /// bind, and refuses a per-channel plane past `MAX_FLAT / 64`, which would round the

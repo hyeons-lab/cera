@@ -354,15 +354,118 @@ struct GpuLfm3Weights<O: VitGpuOps> {
     mm_input_norm: Option<(GpuLfm3Norm<O>, MmNormStage)>,
 }
 
+fn validate_lfm3_norm(name: &str, norm: &Lfm3NormWeights, allowed_lens: &[usize]) -> Result<()> {
+    if norm.weight.is_empty() {
+        anyhow::ensure!(
+            norm.bias.as_ref().is_none_or(|b| b.is_empty()),
+            "{name} has bias without weight"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        allowed_lens.contains(&norm.weight.len()),
+        "{name}.weight len ({}) not in allowed lengths {allowed_lens:?}",
+        norm.weight.len()
+    );
+    if let Some(bias) = &norm.bias {
+        anyhow::ensure!(
+            bias.len() == norm.weight.len(),
+            "{name}.bias len ({}) != weight len ({})",
+            bias.len(),
+            norm.weight.len()
+        );
+    }
+    Ok(())
+}
+
 impl<O: VitGpuOps> GpuLfm3Weights<O> {
-    fn build(ops: &O, w: &VisionEncoderWeights) -> Self {
+    fn build(ops: &O, w: &VisionEncoderWeights) -> Result<Self> {
         let cfg = &w.config;
-        let blocks = w
-            .lfm3_blocks
-            .iter()
-            .map(|b| {
-                let op = match &b.op {
-                    Lfm3BlockOp::Conv(c) => GpuLfm3BlockOp::Conv {
+        let d = cfg.n_embd;
+        anyhow::ensure!(
+            cfg.n_layer == w.lfm3_blocks.len() && !w.lfm3_blocks.is_empty(),
+            "lfm3 config.n_layer ({}) != loaded blocks ({})",
+            cfg.n_layer,
+            w.lfm3_blocks.len()
+        );
+        anyhow::ensure!(
+            cfg.n_head_kv > 0 && cfg.n_head.is_multiple_of(cfg.n_head_kv),
+            "lfm3 n_head ({}) must be a positive multiple of n_head_kv ({})",
+            cfg.n_head,
+            cfg.n_head_kv
+        );
+        anyhow::ensure!(
+            cfg.n_ff > 0 && cfg.projection_dim > 0,
+            "lfm3 n_ff ({}) and projection_dim ({}) must be > 0",
+            cfg.n_ff,
+            cfg.projection_dim
+        );
+        if let Some(emb_norm) = &w.embedding_norm {
+            validate_lfm3_norm("v.embedding_norm", emb_norm, &[d])?;
+        }
+        if !w.position_embed.is_empty() {
+            anyhow::ensure!(
+                cfg.n_trained_patches > 0 && w.position_embed.len() == cfg.n_trained_patches * d,
+                "lfm3 position_embed len ({}) != n_trained_patches ({}) * n_embd ({d})",
+                w.position_embed.len(),
+                cfg.n_trained_patches
+            );
+        }
+
+        let mut blocks = Vec::with_capacity(w.lfm3_blocks.len());
+        for (il, b) in w.lfm3_blocks.iter().enumerate() {
+            validate_lfm3_norm(&format!("v.blk.{il}.ln1"), &b.ln1, &[d])?;
+            validate_lfm3_norm(&format!("v.blk.{il}.ln2"), &b.ln2, &[d])?;
+
+            let op = match &b.op {
+                Lfm3BlockOp::Conv(c) => {
+                    anyhow::ensure!(
+                        c.in_proj_w.cols == d
+                            && (c.in_proj_w.rows == 3 * d || c.in_proj_w.rows == 2 * d),
+                        "lfm3 block {il} conv in_proj shape ({}, {}) invalid for n_embd={d}",
+                        c.in_proj_w.rows,
+                        c.in_proj_w.cols
+                    );
+                    if let Some(pb) = &c.in_proj_b {
+                        anyhow::ensure!(
+                            pb.is_empty() || pb.len() == c.in_proj_w.rows,
+                            "lfm3 block {il} conv in_proj_b len ({}) != {}",
+                            pb.len(),
+                            c.in_proj_w.rows
+                        );
+                    }
+                    anyhow::ensure!(
+                        c.kernel_size > 0 && c.kernel_size % 2 == 1,
+                        "lfm3 block {il} conv kernel_size ({}) must be odd and > 0",
+                        c.kernel_size
+                    );
+                    let want_dw = d * c.kernel_size * c.kernel_size;
+                    anyhow::ensure!(
+                        c.depthwise_w.len() == want_dw,
+                        "lfm3 block {il} conv depthwise_w len ({}) != {want_dw}",
+                        c.depthwise_w.len()
+                    );
+                    if let Some(db) = &c.depthwise_b {
+                        anyhow::ensure!(
+                            db.len() == d,
+                            "lfm3 block {il} conv depthwise_b len ({}) != {d}",
+                            db.len()
+                        );
+                    }
+                    anyhow::ensure!(
+                        c.out_proj_w.rows == d && c.out_proj_w.cols == d,
+                        "lfm3 block {il} conv out_proj shape ({}, {}) != ({d}, {d})",
+                        c.out_proj_w.rows,
+                        c.out_proj_w.cols
+                    );
+                    if let Some(ob) = &c.out_proj_b {
+                        anyhow::ensure!(
+                            ob.is_empty() || ob.len() == d,
+                            "lfm3 block {il} conv out_proj_b len ({}) != {d}",
+                            ob.len()
+                        );
+                    }
+                    GpuLfm3BlockOp::Conv {
                         in_proj_w: ops.upload_weight(&c.in_proj_w),
                         in_proj_b: c.in_proj_b.as_deref().and_then(|v| opt_buf(ops, v)),
                         in_proj_rows: c.in_proj_w.rows,
@@ -371,8 +474,59 @@ impl<O: VitGpuOps> GpuLfm3Weights<O> {
                         kernel_size: c.kernel_size,
                         out_proj_w: ops.upload_weight(&c.out_proj_w),
                         out_proj_b: c.out_proj_b.as_deref().and_then(|v| opt_buf(ops, v)),
-                    },
-                    Lfm3BlockOp::Attn(a) => GpuLfm3BlockOp::Attn {
+                    }
+                }
+                Lfm3BlockOp::Attn(a) => {
+                    anyhow::ensure!(
+                        a.n_head > 0 && a.n_head_kv > 0 && a.n_head.is_multiple_of(a.n_head_kv),
+                        "lfm3 block {il} n_head ({}) must be a positive multiple of n_head_kv ({})",
+                        a.n_head,
+                        a.n_head_kv
+                    );
+                    anyhow::ensure!(
+                        a.head_dim > 0 && a.head_dim.is_multiple_of(4),
+                        "lfm3 block {il} head_dim ({}) must be a positive multiple of 4",
+                        a.head_dim
+                    );
+                    let q_dim = a.n_head * a.head_dim;
+                    let kv_dim = a.n_head_kv * a.head_dim;
+                    anyhow::ensure!(
+                        a.q_w.rows == q_dim
+                            && a.q_w.cols == d
+                            && a.k_w.rows == kv_dim
+                            && a.k_w.cols == d
+                            && a.v_w.rows == kv_dim
+                            && a.v_w.cols == d
+                            && a.o_w.rows == d
+                            && a.o_w.cols == q_dim,
+                        "lfm3 block {il} attn projection shapes invalid for d={d}, q_dim={q_dim}, kv_dim={kv_dim}"
+                    );
+                    for (b_name, b_opt, want) in [
+                        ("q_b", &a.q_b, q_dim),
+                        ("k_b", &a.k_b, kv_dim),
+                        ("v_b", &a.v_b, kv_dim),
+                        ("o_b", &a.o_b, d),
+                    ] {
+                        if let Some(bv) = b_opt {
+                            anyhow::ensure!(
+                                bv.is_empty() || bv.len() == want,
+                                "lfm3 block {il} {b_name} len ({}) != {want}",
+                                bv.len()
+                            );
+                        }
+                    }
+                    validate_lfm3_norm(
+                        &format!("v.blk.{il}.attn_q_norm"),
+                        &a.q_norm,
+                        &[a.head_dim, q_dim],
+                    )?;
+                    validate_lfm3_norm(
+                        &format!("v.blk.{il}.attn_k_norm"),
+                        &a.k_norm,
+                        &[a.head_dim, kv_dim],
+                    )?;
+
+                    GpuLfm3BlockOp::Attn {
                         q_w: ops.upload_weight(&a.q_w),
                         q_b: a.q_b.as_deref().and_then(|v| opt_buf(ops, v)),
                         k_w: ops.upload_weight(&a.k_w),
@@ -386,34 +540,125 @@ impl<O: VitGpuOps> GpuLfm3Weights<O> {
                         n_head: a.n_head,
                         n_head_kv: a.n_head_kv,
                         head_dim: a.head_dim,
-                    },
-                };
-                GpuLfm3Block {
-                    ln1: upload_lfm3_norm(ops, &b.ln1),
-                    op,
-                    ln2: upload_lfm3_norm(ops, &b.ln2),
-                    gate_w: b.ffn.gate_w.as_ref().map(|gw| ops.upload_weight(gw)),
-                    gate_b: b.ffn.gate_b.as_deref().and_then(|v| opt_buf(ops, v)),
-                    up_w: ops.upload_weight(&b.ffn.up_w),
-                    up_b: b.ffn.up_b.as_deref().and_then(|v| opt_buf(ops, v)),
-                    down_w: ops.upload_weight(&b.ffn.down_w),
-                    down_b: b.ffn.down_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                    }
                 }
-            })
-            .collect();
+            };
 
+            anyhow::ensure!(
+                b.ffn.up_w.rows == cfg.n_ff
+                    && b.ffn.up_w.cols == d
+                    && b.ffn.down_w.rows == d
+                    && b.ffn.down_w.cols == cfg.n_ff,
+                "lfm3 block {il} FFN up/down shapes invalid for d={d}, n_ff={}",
+                cfg.n_ff
+            );
+            if let Some(ub) = &b.ffn.up_b {
+                anyhow::ensure!(
+                    ub.is_empty() || ub.len() == cfg.n_ff,
+                    "lfm3 block {il} ffn.up_b len ({}) != {}",
+                    ub.len(),
+                    cfg.n_ff
+                );
+            }
+            if let Some(db) = &b.ffn.down_b {
+                anyhow::ensure!(
+                    db.is_empty() || db.len() == d,
+                    "lfm3 block {il} ffn.down_b len ({}) != {d}",
+                    db.len()
+                );
+            }
+            if let Some(gw) = &b.ffn.gate_w {
+                anyhow::ensure!(
+                    gw.rows == cfg.n_ff && gw.cols == d,
+                    "lfm3 block {il} ffn.gate_w shape ({}, {}) != ({}, {d})",
+                    gw.rows,
+                    gw.cols,
+                    cfg.n_ff
+                );
+            }
+            if let Some(gb) = &b.ffn.gate_b {
+                anyhow::ensure!(
+                    gb.is_empty() || gb.len() == cfg.n_ff,
+                    "lfm3 block {il} ffn.gate_b len ({}) != {}",
+                    gb.len(),
+                    cfg.n_ff
+                );
+            }
+
+            blocks.push(GpuLfm3Block {
+                ln1: upload_lfm3_norm(ops, &b.ln1),
+                op,
+                ln2: upload_lfm3_norm(ops, &b.ln2),
+                gate_w: b.ffn.gate_w.as_ref().map(|gw| ops.upload_weight(gw)),
+                gate_b: b.ffn.gate_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                up_w: ops.upload_weight(&b.ffn.up_w),
+                up_b: b.ffn.up_b.as_deref().and_then(|v| opt_buf(ops, v)),
+                down_w: ops.upload_weight(&b.ffn.down_w),
+                down_b: b.ffn.down_b.as_deref().and_then(|v| opt_buf(ops, v)),
+            });
+        }
+
+        if !w.post_ln_w.is_empty() {
+            anyhow::ensure!(
+                w.post_ln_w.len() == d,
+                "lfm3 post_ln_w len ({}) != {d}",
+                w.post_ln_w.len()
+            );
+            anyhow::ensure!(
+                w.post_ln_b.is_empty() || w.post_ln_b.len() == d,
+                "lfm3 post_ln_b len ({}) != {d}",
+                w.post_ln_b.len()
+            );
+        } else {
+            anyhow::ensure!(
+                w.post_ln_b.is_empty(),
+                "lfm3 post_ln_b present without post_ln_w"
+            );
+        }
         let post_ln = (!w.post_ln_w.is_empty()).then(|| GpuLfm3Norm {
             len: w.post_ln_w.len(),
             weight: ops.upload(&w.post_ln_w),
             bias: opt_buf(ops, &w.post_ln_b),
         });
-        let merged_dim = cfg.n_embd * cfg.scale_factor * cfg.scale_factor;
-        let mm_input_norm = w.mm_input_norm.as_ref().and_then(|norm| {
-            let stage = mm_norm_stage(norm.weight.len(), cfg.n_embd, merged_dim)?;
-            upload_lfm3_norm(ops, norm).map(|gpu_norm| (gpu_norm, stage))
-        });
 
-        Self {
+        let merged_dim = d * cfg.scale_factor * cfg.scale_factor;
+        let mm_input_norm = if let Some(norm) = &w.mm_input_norm {
+            validate_lfm3_norm("mm.input_norm", norm, &[d, merged_dim])?;
+            let stage = mm_norm_stage(norm.weight.len(), d, merged_dim);
+            upload_lfm3_norm(ops, norm).and_then(|gpu_norm| stage.map(|s| (gpu_norm, s)))
+        } else {
+            None
+        };
+
+        anyhow::ensure!(
+            w.projector.mm1_w.rows > 0 && w.projector.mm1_w.cols == merged_dim,
+            "lfm3 projector mm1 shape ({}, {}) invalid for merged_dim={merged_dim}",
+            w.projector.mm1_w.rows,
+            w.projector.mm1_w.cols
+        );
+        anyhow::ensure!(
+            w.projector.mm1_b.is_empty() || w.projector.mm1_b.len() == w.projector.mm1_w.rows,
+            "lfm3 projector mm1_b len ({}) != {}",
+            w.projector.mm1_b.len(),
+            w.projector.mm1_w.rows
+        );
+        anyhow::ensure!(
+            w.projector.mm2_w.rows == cfg.projection_dim
+                && w.projector.mm2_w.cols == w.projector.mm1_w.rows,
+            "lfm3 projector mm2 shape ({}, {}) invalid for intermediate={}, projection_dim={}",
+            w.projector.mm2_w.rows,
+            w.projector.mm2_w.cols,
+            w.projector.mm1_w.rows,
+            cfg.projection_dim
+        );
+        anyhow::ensure!(
+            w.projector.mm2_b.is_empty() || w.projector.mm2_b.len() == cfg.projection_dim,
+            "lfm3 projector mm2_b len ({}) != {}",
+            w.projector.mm2_b.len(),
+            cfg.projection_dim
+        );
+
+        Ok(Self {
             embedding_norm: w
                 .embedding_norm
                 .as_ref()
@@ -421,7 +666,7 @@ impl<O: VitGpuOps> GpuLfm3Weights<O> {
             blocks,
             post_ln,
             mm_input_norm,
-        }
+        })
     }
 }
 
@@ -478,12 +723,35 @@ pub struct GpuVitWeights<O: VitGpuOps> {
 }
 
 impl<O: VitGpuOps> GpuVitWeights<O> {
-    /// Upload every encoder weight via `ops`. Run once per loaded model.
-    pub fn build(ops: &O, w: &VisionEncoderWeights) -> Self {
+    /// Upload every encoder weight via `ops`, validating shapes and dimensions.
+    pub(crate) fn try_build(ops: &O, w: &VisionEncoderWeights) -> Result<Self> {
         let cfg = w.config.clone();
         let p = cfg.patch_size;
+        anyhow::ensure!(p > 0, "vision encoder config has patch_size=0");
+        anyhow::ensure!(
+            cfg.scale_factor > 0,
+            "vision encoder config has scale_factor=0"
+        );
+        anyhow::ensure!(
+            cfg.n_embd > 0 && cfg.n_head > 0 && cfg.n_embd.is_multiple_of(cfg.n_head),
+            "vision encoder n_embd ({}) must be a positive multiple of n_head ({})",
+            cfg.n_embd,
+            cfg.n_head
+        );
         let in_dim = 3 * p * p;
         let out_dim = cfg.n_embd;
+        anyhow::ensure!(
+            w.patch_embed.conv_w.len() == in_dim * out_dim
+                && (w.patch_embed.conv_b.is_empty() || w.patch_embed.conv_b.len() == out_dim),
+            "patch_embed weight/bias shape mismatch for in_dim={in_dim}, n_embd={out_dim}"
+        );
+        if let Some(pe1) = &w.patch_embed_1 {
+            anyhow::ensure!(
+                pe1.conv_w.len() == in_dim * out_dim
+                    && (pe1.conv_b.is_empty() || pe1.conv_b.len() == out_dim),
+                "patch_embed_1 weight/bias shape mismatch for in_dim={in_dim}, n_embd={out_dim}"
+            );
+        }
 
         let (convt, conv_b) =
             combine_patch_embed(&w.patch_embed, w.patch_embed_1.as_ref(), in_dim, out_dim);
@@ -511,9 +779,13 @@ impl<O: VitGpuOps> GpuVitWeights<O> {
             })
             .collect();
 
-        let lfm3 = (w.is_lfm3() && ops.supports_lfm3()).then(|| GpuLfm3Weights::build(ops, w));
+        let lfm3 = if w.is_lfm3() && ops.supports_lfm3() {
+            Some(GpuLfm3Weights::build(ops, w)?)
+        } else {
+            None
+        };
 
-        GpuVitWeights {
+        Ok(GpuVitWeights {
             position_embed: w.position_embed.clone(),
             patch_conv_wt: ops.upload_weight_f32(&convt, out_dim, in_dim),
             patch_conv_b: opt_buf(ops, &conv_b),
@@ -527,7 +799,12 @@ impl<O: VitGpuOps> GpuVitWeights<O> {
             proj_intermediate: w.projector.mm1_w.rows,
             cfg,
             lfm3,
-        }
+        })
+    }
+
+    /// Upload every encoder weight via `ops`. Run once per loaded model.
+    pub fn build(ops: &O, w: &VisionEncoderWeights) -> Self {
+        Self::try_build(ops, w).unwrap_or_else(|e| panic!("GpuVitWeights::build: {e:#}"))
     }
 }
 
@@ -663,10 +940,15 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     );
 
     let p = cfg.patch_size;
+    anyhow::ensure!(p > 0, "vision encoder config has patch_size=0");
     let in_dim = 3 * p * p;
     let n_embd = cfg.n_embd;
     let n_ff = cfg.n_ff;
     let n_head = cfg.n_head;
+    anyhow::ensure!(
+        n_embd > 0 && n_head > 0 && n_embd.is_multiple_of(n_head),
+        "vision encoder n_embd ({n_embd}) must be a positive multiple of n_head ({n_head})"
+    );
     let head_dim = n_embd / n_head;
     let n_patches = grid_w * grid_h;
     let eps = cfg.eps;
@@ -1151,6 +1433,11 @@ pub async fn encode_image_gpu_wgpu_async(
     grid_h: usize,
 ) -> Result<Vec<f32>> {
     let cfg = &gpu_w.cfg;
+    if cfg.is_lfm3() {
+        anyhow::bail!(
+            "encode_image_gpu_wgpu_async: LFM3 hybrid vision encoder is not supported on wgpu"
+        );
+    }
     anyhow::ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
     anyhow::ensure!(
         cfg.scale_factor > 0,
@@ -1163,10 +1450,15 @@ pub async fn encode_image_gpu_wgpu_async(
     );
 
     let p = cfg.patch_size;
+    anyhow::ensure!(p > 0, "vision encoder config has patch_size=0");
     let in_dim = 3 * p * p;
     let n_embd = cfg.n_embd;
     let n_ff = cfg.n_ff;
     let n_head = cfg.n_head;
+    anyhow::ensure!(
+        n_embd > 0 && n_head > 0 && n_embd.is_multiple_of(n_head),
+        "vision encoder n_embd ({n_embd}) must be a positive multiple of n_head ({n_head})"
+    );
     let head_dim = n_embd / n_head;
     let n_patches = grid_w * grid_h;
     let eps = cfg.eps;
@@ -3655,7 +3947,8 @@ fn try_xdna_vision_encoder_for(
 }
 
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
-/// Returns `None` for `Cpu`, for an LFM3 encoder (CPU only, see `vision_encoder_candidates`),
+/// Returns `None` for `Cpu`, for unsupported backends on LFM3 (CPU fallback, see
+/// `vision_encoder_candidates`),
 /// when the chosen backend's feature isn't compiled,
 /// when the device/context can't be created, or (wgpu, native only) when the blank-image warm-up
 /// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon,
@@ -3671,8 +3964,13 @@ pub fn build_gpu_vision_encoder(
             "vision encoder: no accelerated encoder for {backend:?}; using the CPU encoder"
         );
     }
+    let n_layers = if is_lfm3 {
+        weights.lfm3_blocks.len()
+    } else {
+        weights.blocks.len()
+    };
     let allow_auto_xdna = backend != crate::engine::BackendPreference::Auto
-        || xdna_vit_worthwhile_for_auto(weights.blocks.len(), weights.config.n_embd);
+        || xdna_vit_worthwhile_for_auto(n_layers, weights.config.n_embd);
     candidates.iter().find_map(|accel| match accel {
         VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
         VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
@@ -3721,7 +4019,14 @@ pub fn build_wgpu_vision_encoder_with_context(
             return None;
         }
     };
-    let gpu_w = GpuVitWeights::build(&ops, weights);
+    let gpu_w = match GpuVitWeights::try_build(&ops, weights) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("vision encoder: wgpu weight validation failed: {e:#}");
+            eprintln!("[cera::wgpu] vision encoder: wgpu weight validation failed: {e:#}");
+            return None;
+        }
+    };
     let encoder = WgpuVisionEncoder {
         ops,
         weights: gpu_w,
@@ -3824,7 +4129,14 @@ fn try_metal_vision_encoder(
             return None;
         }
     };
-    let gpu_w = GpuVitWeights::build(&ops, weights);
+    let gpu_w = match GpuVitWeights::try_build(&ops, weights) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("vision encoder: Metal weight validation failed: {e:#}");
+            eprintln!("vision encoder: Metal weight validation failed: {e:#}");
+            return None;
+        }
+    };
     tracing::info!("vision encoder: using native Metal backend");
     Some(std::sync::Arc::new(MetalVisionEncoder {
         ops,
@@ -3840,15 +4152,14 @@ fn try_metal_vision_encoder(
     None
 }
 
-#[cfg(all(
-    test,
-    any(
-        feature = "gpu",
-        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
-    )
-))]
-mod tests {
+#[cfg(test)]
+mod routing_tests {
     use super::*;
+    use crate::model::vision_encoder::{
+        Lfm3AttnBlockWeights, Lfm3BlockOp, Lfm3FfnWeights, Lfm3NormWeights, Lfm3VisionBlockWeights,
+        PatchEmbedWeights, ProjectorWeights, VisionProjectorType,
+    };
+    use crate::model::weights::MmapWeight;
 
     #[test]
     fn the_lfm3_vision_encoder_only_routes_to_xdna_on_npu_and_auto() {
@@ -3894,6 +4205,99 @@ mod tests {
         assert!(super::xdna_vit_worthwhile_for_auto(27, 1152));
         assert!(super::xdna_vit_worthwhile_for_auto(4, 1152));
     }
+
+    #[test]
+    fn build_gpu_vision_encoder_lfm3_refuses_non_xdna_backends() {
+        use crate::engine::BackendPreference as BP;
+        let (d, ff, n_head, n_head_kv) = (16usize, 32usize, 4usize, 2usize);
+        let head_dim = d / n_head;
+        let kv_dim = n_head_kv * head_dim;
+        let p = 8usize;
+        let f32_w = |r: usize, c: usize| MmapWeight::from_owned_f32(vec![0.0; r * c], r, c);
+        let norm = |len: usize| Lfm3NormWeights {
+            weight: vec![1.0; len],
+            bias: None,
+        };
+        let cfg = VisionEncoderConfig {
+            projector_type: VisionProjectorType::Lfm3Vl,
+            n_layer: 5,
+            n_embd: d,
+            n_ff: ff,
+            n_head,
+            n_head_kv,
+            patch_size: p,
+            image_size: 32,
+            n_trained_patches: 16,
+            projection_dim: 16,
+            scale_factor: 2,
+            ..Default::default()
+        };
+        let block = || Lfm3VisionBlockWeights {
+            ln1: norm(d),
+            op: Lfm3BlockOp::Attn(Lfm3AttnBlockWeights {
+                q_w: f32_w(d, d),
+                q_b: None,
+                k_w: f32_w(kv_dim, d),
+                k_b: None,
+                v_w: f32_w(kv_dim, d),
+                v_b: None,
+                q_norm: norm(head_dim),
+                k_norm: norm(head_dim),
+                o_w: f32_w(d, d),
+                o_b: None,
+                n_head,
+                n_head_kv,
+                head_dim,
+            }),
+            ln2: norm(d),
+            ffn: Lfm3FfnWeights {
+                gate_w: None,
+                gate_b: None,
+                up_w: f32_w(ff, d),
+                up_b: None,
+                down_w: f32_w(d, ff),
+                down_b: None,
+            },
+        };
+        let vw = VisionEncoderWeights {
+            config: cfg,
+            patch_embed: PatchEmbedWeights {
+                conv_w: vec![0.0; 3 * p * p * d],
+                conv_b: vec![0.0; d],
+            },
+            patch_embed_1: None,
+            embedding_norm: None,
+            position_embed: Vec::new(),
+            blocks: Vec::new(),
+            lfm3_blocks: (0..5).map(|_| block()).collect(),
+            post_ln_w: Vec::new(),
+            post_ln_b: Vec::new(),
+            mm_input_norm: None,
+            projector: ProjectorWeights {
+                mm1_w: f32_w(32, d * 4),
+                mm1_b: vec![0.0; 32],
+                mm2_w: f32_w(16, 32),
+                mm2_b: vec![0.0; 16],
+            },
+        };
+        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Metal] {
+            assert!(
+                build_gpu_vision_encoder(&vw, backend).is_none(),
+                "LFM3 vision encoder must return None for {backend:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )
+))]
+mod tests {
+    use super::*;
 
     #[cfg(feature = "gpu")]
     use crate::backend::wgpu::{gpu_or_skip, require_flash_or_skip};
