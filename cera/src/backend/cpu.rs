@@ -7841,7 +7841,7 @@ fn attn_prefetch_distance() -> usize {
 /// position each) sit in L1/L2 already, there is no DRAM latency to hide, and the extra instructions cost a few
 /// percent (dense Llama-3.2-1B at 128 tokens: 66.3 to 63.8 tok/s).
 #[cfg(target_arch = "aarch64")]
-const ATTN_PREFETCH_MIN_SEQ: usize = 256;
+pub(crate) const ATTN_PREFETCH_MIN_SEQ: usize = 256;
 
 /// Default for `attn_prefetch_distance`, in cache positions (16 rows of a 1 KB-wide cache is 16 KB ahead).
 #[cfg(target_arch = "aarch64")]
