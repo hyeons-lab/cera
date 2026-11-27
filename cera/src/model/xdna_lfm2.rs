@@ -55,6 +55,20 @@ enum SyncErr {
     Device(String),
 }
 
+fn exec_owned_run(
+    stalled_runs: &mut Vec<XdnaRun>,
+    run: XdnaRun,
+    label: &str,
+) -> Result<(), String> {
+    run.start().map_err(|e| format!("{label}: {e}"))?;
+    if let Err(e) = run.wait(QUIESCE_TIMEOUT_MS) {
+        // Keep the run handle alive while hardware may still reference BOs.
+        stalled_runs.push(run);
+        return Err(format!("{label}: {e}"));
+    }
+    Ok(())
+}
+
 fn exec_cached_run_slot(
     slot: &mut Option<XdnaRun>,
     stalled_runs: &mut Vec<XdnaRun>,
@@ -1721,7 +1735,7 @@ impl XdnaLfm2Model {
                 false,
                 false,
             );
-            if cur_blk > 1 {
+            if cur_blk == 2 {
                 write_lfm3_params_at(
                     yb,
                     LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048,
@@ -1733,7 +1747,7 @@ impl XdnaLfm2Model {
                     0,
                     4,
                     eps,
-                    0,
+                    LFM2_MAX_KV_CHUNKS,
                     true,
                     false,
                 );
@@ -1764,7 +1778,7 @@ impl XdnaLfm2Model {
             .map_err(|e| format!("prefill >32K c={c} layer {l} phase_a params+rope sync: {e}"))?;
         bo_y.sync_range_to_device(64, (LFM2_PREFILL_SLOT_EXT_PARAMS_0 + 2048) * 4)
             .map_err(|e| format!("prefill >32K c={c} layer {l} fa_part0 params sync: {e}"))?;
-        if cur_blk > 1 {
+        if cur_blk == 2 {
             bo_y.sync_range_to_device(64, (LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048) * 4)
                 .map_err(|e| format!("prefill >32K c={c} layer {l} fa_part params sync: {e}"))?;
         }
@@ -1982,6 +1996,158 @@ impl XdnaLfm2Model {
             _runs: runs,
             runlist,
         })
+    }
+
+    /// Execute `>=64K` (`cur_blk >= 2`) extended decode for one attention layer with
+    /// distinct per-block `kv_start_chunk` and `has_fa_state` parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn run_decode_ext_attn_multi_block_layer(
+        kernels: &mut Lfm2Kernels,
+        l: usize,
+        layer_w: &XdnaBo,
+        layer_y: &mut XdnaBo,
+        y_next: &XdnaBo,
+        layer_kvo: &XdnaBo,
+        kv_blocks: &[XdnaBo],
+        stalled_runs: &mut Vec<XdnaRun>,
+        pos: usize,
+        eps: f32,
+        cur_blk: usize,
+        fin_bidx: usize,
+    ) -> Result<(), String> {
+        let run_a = kernels
+            .dec_phase_a()?
+            .create_run(&[layer_w, layer_y, y_next, &kv_blocks[0], layer_kvo])
+            .map_err(|e| format!("layer {l} ext dec phase_a create_run: {e}"))?;
+        exec_owned_run(
+            stalled_runs,
+            run_a,
+            &format!("layer {l} ext dec phase_a exec"),
+        )?;
+
+        let k_part = kernels.dec_fa_part()?;
+        for (blk, kv_blk) in kv_blocks.iter().enumerate().take(cur_blk) {
+            write_lfm3_params_at(
+                layer_y.as_mut_slice(),
+                LFM2_DEC_SLOT_NORM_1 + 4096,
+                pos,
+                1,
+                LFM2_DEC_MAX_KV_PKTS,
+                pos,
+                true,
+                0,
+                3,
+                eps,
+                blk * LFM2_DEC_MAX_KV_PKTS,
+                blk > 0,
+                true,
+            );
+            layer_y
+                .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_1 + 4096) * 4)
+                .map_err(|e| format!("layer {l} blk {blk} ext dec fa_part params sync: {e}"))?;
+            let run_p = k_part
+                .create_run(&[layer_w, layer_y, y_next, kv_blk, layer_kvo])
+                .map_err(|e| format!("layer {l} blk {blk} ext dec fa_part create_run: {e}"))?;
+            exec_owned_run(
+                stalled_runs,
+                run_p,
+                &format!("layer {l} blk {blk} ext dec fa_part exec"),
+            )?;
+        }
+
+        let run_f = kernels
+            .dec_fa_fin(fin_bidx)?
+            .create_run(&[layer_w, layer_y, y_next, &kv_blocks[cur_blk], layer_kvo])
+            .map_err(|e| format!("layer {l} ext dec fa_fin create_run: {e}"))?;
+        exec_owned_run(
+            stalled_runs,
+            run_f,
+            &format!("layer {l} ext dec fa_fin exec"),
+        )
+    }
+
+    /// Execute `>=96K` (`cur_blk >= 3`) extended prefill for one attention layer with
+    /// distinct per-block `kv_start_chunk` parameters across `b in 1..cur_blk`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_prefill_ext_attn_multi_block_layer(
+        kernels: &mut Lfm2Kernels,
+        l: usize,
+        c: usize,
+        layer_w: &XdnaBo,
+        layer_y: &mut XdnaBo,
+        y_next: &XdnaBo,
+        kv_blocks: &[XdnaBo],
+        layer_kvo: &XdnaBo,
+        stalled_runs: &mut Vec<XdnaRun>,
+        pos0: usize,
+        n_valid: usize,
+        eps: f32,
+        cur_blk: usize,
+        fin_bidx: usize,
+    ) -> Result<(), String> {
+        let run_a = kernels
+            .prefill_phase_a()?
+            .create_run(&[layer_w, layer_y, y_next, &kv_blocks[0], layer_kvo])
+            .map_err(|e| format!("prefill >96K c={c} layer {l} phase_a create_run: {e}"))?;
+        exec_owned_run(
+            stalled_runs,
+            run_a,
+            &format!("prefill >96K c={c} layer {l} phase_a exec"),
+        )?;
+
+        let run_p0 = kernels
+            .prefill_fa_part0()?
+            .create_run(&[layer_w, layer_y, y_next, &kv_blocks[0], layer_kvo])
+            .map_err(|e| format!("prefill >96K c={c} layer {l} blk=0 fa_part0 create_run: {e}"))?;
+        exec_owned_run(
+            stalled_runs,
+            run_p0,
+            &format!("prefill >96K c={c} layer {l} blk=0 fa_part0 exec"),
+        )?;
+
+        let k_part = kernels.prefill_fa_part()?;
+        for (b, kv_blk) in kv_blocks.iter().enumerate().take(cur_blk).skip(1) {
+            write_lfm3_params_at(
+                layer_y.as_mut_slice(),
+                LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048,
+                pos0,
+                n_valid,
+                LFM2_MAX_KV_CHUNKS,
+                pos0,
+                true,
+                0,
+                4,
+                eps,
+                b * LFM2_MAX_KV_CHUNKS,
+                true,
+                false,
+            );
+            layer_y
+                .sync_range_to_device(64, (LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048) * 4)
+                .map_err(|e| {
+                    format!("prefill >96K c={c} layer {l} blk={b} fa_part params sync: {e}")
+                })?;
+            let run_p = k_part
+                .create_run(&[layer_w, layer_y, y_next, kv_blk, layer_kvo])
+                .map_err(|e| {
+                    format!("prefill >96K c={c} layer {l} blk={b} fa_part create_run: {e}")
+                })?;
+            exec_owned_run(
+                stalled_runs,
+                run_p,
+                &format!("prefill >96K c={c} layer {l} blk={b} fa_part exec"),
+            )?;
+        }
+
+        let run_f = kernels
+            .prefill_fa_fin(fin_bidx)?
+            .create_run(&[layer_w, layer_y, y_next, &kv_blocks[cur_blk], layer_kvo])
+            .map_err(|e| format!("prefill >96K c={c} layer {l} fa_fin create_run: {e}"))?;
+        exec_owned_run(
+            stalled_runs,
+            run_f,
+            &format!("prefill >96K c={c} layer {l} fa_fin exec"),
+        )
     }
 
     fn validate_cpu_state_for_sync(
@@ -2669,7 +2835,7 @@ impl XdnaLfm2Model {
                     Self::ensure_paged_block(kernels, &mut layer_kv_blocks[l], cur_blk, l)?;
                 }
             }
-            if !self.host_ffn {
+            if !self.host_ffn && cur_blk <= 1 {
                 let key = (cur_blk, fin_bidx);
                 let Lfm2DecodeBuffers {
                     layer_bo_y: dec_bo_y,
@@ -2772,21 +2938,23 @@ impl XdnaLfm2Model {
                     eps,
                     Some(&cs),
                 );
-                write_lfm3_params_at(
-                    yb,
-                    LFM2_DEC_SLOT_NORM_1 + 4096,
-                    pos,
-                    1,
-                    LFM2_DEC_MAX_KV_PKTS,
-                    pos,
-                    true,
-                    0,
-                    3,
-                    eps,
-                    0,
-                    true,
-                    true,
-                );
+                if cur_blk <= 1 {
+                    write_lfm3_params_at(
+                        yb,
+                        LFM2_DEC_SLOT_NORM_1 + 4096,
+                        pos,
+                        1,
+                        LFM2_DEC_MAX_KV_PKTS,
+                        pos,
+                        true,
+                        0,
+                        3,
+                        eps,
+                        0,
+                        false,
+                        true,
+                    );
+                }
                 write_lfm3_params_at(
                     yb,
                     LFM2_DEC_SLOT_ROPE_PKT + 4096,
@@ -2808,9 +2976,11 @@ impl XdnaLfm2Model {
                         (LFM2_DEC_SLOT_NORM_0 + 4096) * 4,
                     )
                     .map_err(|e| format!("layer {l} ext dec phase A params+rope sync: {e}"))?;
-                dec.layer_bo_y[l]
-                    .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_1 + 4096) * 4)
-                    .map_err(|e| format!("layer {l} ext dec fa_part params sync: {e}"))?;
+                if cur_blk <= 1 {
+                    dec.layer_bo_y[l]
+                        .sync_range_to_device(64, (LFM2_DEC_SLOT_NORM_1 + 4096) * 4)
+                        .map_err(|e| format!("layer {l} ext dec fa_part params sync: {e}"))?;
+                }
                 dec.layer_bo_y[l]
                     .sync_range_to_device(64, (LFM2_DEC_SLOT_ROPE_PKT + 4096) * 4)
                     .map_err(|e| format!("layer {l} ext dec fa_fin params sync: {e}"))?;
@@ -2856,42 +3026,59 @@ impl XdnaLfm2Model {
                         &format!("layer {l} moe dec conv exec"),
                     )?;
                 } else if let Some((blk, fin_bidx)) = ext_key {
-                    if !dec.moe_ext_plans[parity_idx][l]
-                        .iter()
-                        .any(|(b, f, _)| *b == blk && *f == fin_bidx)
-                    {
-                        let plan = Self::build_decode_ext_layer_plan(
+                    if blk <= 1 {
+                        if !dec.moe_ext_plans[parity_idx][l]
+                            .iter()
+                            .any(|(b, f, _)| *b == blk && *f == fin_bidx)
+                        {
+                            let plan = Self::build_decode_ext_layer_plan(
+                                kernels,
+                                l,
+                                &layer_bo_w[l],
+                                &dec.layer_bo_y[l],
+                                &dec.bo_yn,
+                                &dec.layer_bo_kvo[l],
+                                &layer_kv_blocks[l],
+                                blk,
+                                fin_bidx,
+                            )?;
+                            dec.moe_ext_plans[parity_idx][l].push((blk, fin_bidx, plan));
+                        }
+                        let plan = dec.moe_ext_plans[parity_idx][l]
+                            .iter()
+                            .find(|(b, f, _)| *b == blk && *f == fin_bidx)
+                            .map(|(_, _, p)| p)
+                            .expect("initialized moe dec ext plan");
+                        *in_flight = Some(InFlightLfm2Run::DecMoeExt {
+                            parity_idx,
+                            l,
+                            blk,
+                            fin_bidx,
+                        });
+                        if let Err(e) = plan.runlist.execute() {
+                            *in_flight = None;
+                            return Err(format!("layer {l} moe dec ext exec: {e}"));
+                        }
+                        plan.runlist
+                            .wait(QUIESCE_TIMEOUT_MS)
+                            .map_err(|e| format!("layer {l} moe dec ext wait: {e}"))?;
+                        *in_flight = None;
+                    } else {
+                        Self::run_decode_ext_attn_multi_block_layer(
                             kernels,
                             l,
                             &layer_bo_w[l],
-                            &dec.layer_bo_y[l],
+                            &mut dec.layer_bo_y[l],
                             &dec.bo_yn,
                             &dec.layer_bo_kvo[l],
                             &layer_kv_blocks[l],
+                            stalled_runs,
+                            pos,
+                            eps,
                             blk,
                             fin_bidx,
                         )?;
-                        dec.moe_ext_plans[parity_idx][l].push((blk, fin_bidx, plan));
                     }
-                    let plan = dec.moe_ext_plans[parity_idx][l]
-                        .iter()
-                        .find(|(b, f, _)| *b == blk && *f == fin_bidx)
-                        .map(|(_, _, p)| p)
-                        .expect("initialized moe dec ext plan");
-                    *in_flight = Some(InFlightLfm2Run::DecMoeExt {
-                        parity_idx,
-                        l,
-                        blk,
-                        fin_bidx,
-                    });
-                    if let Err(e) = plan.runlist.execute() {
-                        *in_flight = None;
-                        return Err(format!("layer {l} moe dec ext exec: {e}"));
-                    }
-                    plan.runlist
-                        .wait(QUIESCE_TIMEOUT_MS)
-                        .map_err(|e| format!("layer {l} moe dec ext wait: {e}"))?;
-                    *in_flight = None;
                 } else {
                     if dec.moe_attn_runs[attn_bidx][l].is_none() {
                         dec.moe_attn_runs[attn_bidx][l] = Some(
@@ -2990,7 +3177,49 @@ impl XdnaLfm2Model {
             (t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6), sync_us)
         } else {
             let t_npu0 = prof.then(crate::time::Instant::now);
-            let mut pending_next = {
+            let mut pending_next = if matches!(ext_key, Some((blk, _)) if blk >= 2) {
+                let (blk, fin_bidx) = ext_key.expect("ext key");
+                let pending_next = pending_kv.prepare(pos, LFM2_D_CONV, LFM2_H, LFM2_KV_DIM);
+                if !pending_kv.flush_into(state) {
+                    *force_conv_sync = true;
+                }
+                for (l, layer) in self.layers.iter().enumerate() {
+                    let (cur_bo_y, y_next): (&mut XdnaBo, &XdnaBo) = if l + 1 < n_layers {
+                        let (head, tail) = dec.layer_bo_y.split_at_mut(l + 1);
+                        (&mut head[l], &tail[0])
+                    } else {
+                        (&mut dec.layer_bo_y[l], &dec.bo_yn)
+                    };
+                    if layer.is_conv {
+                        let (kv_in, kv_out) = if conv_kv_in_kvo {
+                            (&dec.layer_bo_kvo[l], &layer_kv_blocks[l][0])
+                        } else {
+                            (&layer_kv_blocks[l][0], &dec.layer_bo_kvo[l])
+                        };
+                        let run = kernels
+                            .dec_conv
+                            .create_run(&[&layer_bo_w[l], cur_bo_y, y_next, kv_in, kv_out])
+                            .map_err(|e| format!("layer {l} ext dec conv create_run: {e}"))?;
+                        exec_owned_run(stalled_runs, run, &format!("layer {l} ext dec conv exec"))?;
+                    } else {
+                        Self::run_decode_ext_attn_multi_block_layer(
+                            kernels,
+                            l,
+                            &layer_bo_w[l],
+                            cur_bo_y,
+                            y_next,
+                            &dec.layer_bo_kvo[l],
+                            &layer_kv_blocks[l],
+                            stalled_runs,
+                            pos,
+                            eps,
+                            blk,
+                            fin_bidx,
+                        )?;
+                    }
+                }
+                pending_next
+            } else {
                 let (plan, active_run) = if let Some(key) = ext_key {
                     let p = dec
                         .ext_plans
@@ -3850,6 +4079,7 @@ impl XdnaLfm2Model {
                             ref mut layer_kv_blocks,
                             ref mut prefill,
                             ref mut in_flight,
+                            ref mut stalled_runs,
                             ref mut prefill_embs_scratch,
                             ..
                         } = *npu;
@@ -3883,10 +4113,10 @@ impl XdnaLfm2Model {
                         }
                         let conv_kv_in_kvo = pre.conv_kv_in_kvo;
                         let parity_idx = usize::from(conv_kv_in_kvo);
-                        let chain_missing = pre.ext_runs.as_ref().expect("ext cache").chains
-                            [parity_idx]
-                            .iter()
-                            .all(|(b, f, _)| *b != cur_blk || *f != fin_bidx);
+                        let chain_missing = cur_blk <= 2
+                            && pre.ext_runs.as_ref().expect("ext cache").chains[parity_idx]
+                                .iter()
+                                .all(|(b, f, _)| *b != cur_blk || *f != fin_bidx);
                         if chain_missing {
                             match Self::build_prefill_ext_chain(
                                 kernels,
@@ -3999,38 +4229,127 @@ impl XdnaLfm2Model {
                         } else {
                             None
                         };
-                        let chain = &pre.ext_runs.as_ref().expect("ext cache").chains[parity_idx]
-                            .iter()
-                            .find(|(b, f, _)| *b == cur_blk && *f == fin_bidx)
-                            .expect("built ext chain")
-                            .2;
-                        match self.execute_prefill_chain_with_overlap(
-                            chain,
-                            in_flight,
-                            InFlightLfm2Run::PreExt {
-                                parity_idx,
-                                key: (cur_blk, fin_bidx),
-                            },
-                            next_rope_spec,
-                            &rem_src,
-                            c,
-                            n_chunks,
-                            rem_tokens,
-                            &mut pending_attn_mirrors,
-                            layer_kv_blocks,
-                            &mut state.layers,
-                            use_f16,
-                            &mut prefetched_rope,
-                            prefill_embs_scratch,
-                        ) {
-                            Ok((false, _)) => {
-                                return self.reject_input(
-                                    format!("token id out of range for vocab {vocab_size}"),
-                                    out_len,
-                                );
+                        if cur_blk >= 3 {
+                            Self::flush_pending_attn_mirrors(
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                            );
+                            for (l, layer) in self.layers.iter().enumerate() {
+                                let (cur_bo_y, y_next): (&mut XdnaBo, &XdnaBo) = if l + 1 < n_layers
+                                {
+                                    let (head, tail) = pre.layer_bo_y.split_at_mut(l + 1);
+                                    (&mut head[l], &tail[0])
+                                } else {
+                                    (&mut pre.layer_bo_y[l], &pre.bo_yn)
+                                };
+                                let layer_res = if layer.is_conv {
+                                    let (kv_in, kv_out) = if conv_kv_in_kvo {
+                                        (&pre.layer_bo_kvo[l], &layer_kv_blocks[l][0])
+                                    } else {
+                                        (&layer_kv_blocks[l][0], &pre.layer_bo_kvo[l])
+                                    };
+                                    kernels
+                                        .prefill_ext_conv()
+                                        .and_then(|k| {
+                                            k.create_run(&[
+                                                &layer_bo_w[l],
+                                                cur_bo_y,
+                                                y_next,
+                                                kv_in,
+                                                kv_out,
+                                            ])
+                                            .map_err(|e| {
+                                                format!(
+                                                    "prefill >96K c={c} layer {l} conv create_run: {e}"
+                                                )
+                                            })
+                                        })
+                                        .and_then(|run| {
+                                            exec_owned_run(
+                                                stalled_runs,
+                                                run,
+                                                &format!("prefill >96K c={c} layer {l} conv exec"),
+                                            )
+                                        })
+                                } else {
+                                    Self::run_prefill_ext_attn_multi_block_layer(
+                                        kernels,
+                                        l,
+                                        c,
+                                        &layer_bo_w[l],
+                                        cur_bo_y,
+                                        y_next,
+                                        &layer_kv_blocks[l],
+                                        &pre.layer_bo_kvo[l],
+                                        stalled_runs,
+                                        pos0,
+                                        n_valid,
+                                        eps,
+                                        cur_blk,
+                                        fin_bidx,
+                                    )
+                                };
+                                if let Err(e) = layer_res {
+                                    return self.record_device_fault(e, out_len);
+                                }
                             }
-                            Ok((true, swapped)) => swapped_next_embs = swapped,
-                            Err(e) => return self.record_device_fault(e, out_len),
+                            if let Some((np0, nnv, th)) = next_rope_spec {
+                                prefetched_rope =
+                                    Some((np0, nnv, th, fill_prefill_rope_cs(np0, nnv, th)));
+                            }
+                            if let PrefillSource::Tokens(toks) = rem_src
+                                && c + 1 < n_chunks
+                            {
+                                let next_off = (c + 1) * LFM2_PREFILL_CHUNK_T;
+                                let next_nv = (rem_tokens - next_off).min(LFM2_PREFILL_CHUNK_T);
+                                if !self.cpu.embed_token_rows_into(
+                                    &toks[next_off..next_off + next_nv],
+                                    &mut prefill_embs_scratch.0[..next_nv * LFM2_H],
+                                ) {
+                                    return self.reject_input(
+                                        format!("token id out of range for vocab {vocab_size}"),
+                                        out_len,
+                                    );
+                                }
+                            }
+                            swapped_next_embs = false;
+                        } else {
+                            let chain = &pre.ext_runs.as_ref().expect("ext cache").chains
+                                [parity_idx]
+                                .iter()
+                                .find(|(b, f, _)| *b == cur_blk && *f == fin_bidx)
+                                .expect("built ext chain")
+                                .2;
+                            match self.execute_prefill_chain_with_overlap(
+                                chain,
+                                in_flight,
+                                InFlightLfm2Run::PreExt {
+                                    parity_idx,
+                                    key: (cur_blk, fin_bidx),
+                                },
+                                next_rope_spec,
+                                &rem_src,
+                                c,
+                                n_chunks,
+                                rem_tokens,
+                                &mut pending_attn_mirrors,
+                                layer_kv_blocks,
+                                &mut state.layers,
+                                use_f16,
+                                &mut prefetched_rope,
+                                prefill_embs_scratch,
+                            ) {
+                                Ok((false, _)) => {
+                                    return self.reject_input(
+                                        format!("token id out of range for vocab {vocab_size}"),
+                                        out_len,
+                                    );
+                                }
+                                Ok((true, swapped)) => swapped_next_embs = swapped,
+                                Err(e) => return self.record_device_fault(e, out_len),
+                            }
                         }
                     }
                     if let Some(t) = pre_npu0 {
@@ -4081,6 +4400,7 @@ impl XdnaLfm2Model {
                         ref mut layer_kv_blocks,
                         ref mut prefill,
                         ref mut in_flight,
+                        ref mut stalled_runs,
                         ref mut prefill_embs_scratch,
                         ref mut moe_hidden_scratch,
                         ref mut moe_prefill_scratch,
@@ -4285,74 +4605,101 @@ impl XdnaLfm2Model {
                                 );
                                 return self.record_device_fault(e, out_len);
                             }
-                            let ext = pre.ext_runs.as_mut().expect("ext cache");
-                            let chain_missing = ext.attn_chains[l]
-                                .iter()
-                                .all(|(b, f, _)| *b != cur_blk || *f != fin_bidx);
-                            if chain_missing {
-                                match Self::build_prefill_ext_attn_layer_chain(
-                                    kernels,
-                                    l,
-                                    &layer_bo_w[l],
-                                    &pre.layer_bo_y[l],
-                                    &pre.bo_yn,
-                                    &layer_kv_blocks[l],
-                                    &pre.layer_bo_kvo[l],
-                                    cur_blk,
-                                    fin_bidx,
-                                ) {
-                                    Ok(ch) => ext.attn_chains[l].push((cur_blk, fin_bidx, ch)),
-                                    Err(e) => {
-                                        Self::flush_pending_attn_mirrors(
-                                            &mut pending_attn_mirrors,
-                                            layer_kv_blocks,
-                                            &mut state.layers,
-                                            use_f16,
-                                        );
-                                        return self.record_device_fault(e, out_len);
-                                    }
-                                }
-                            }
-                            let chain = &ext.attn_chains[l]
-                                .iter()
-                                .find(|(b, f, _)| *b == cur_blk && *f == fin_bidx)
-                                .expect("built attn layer ext chain")
-                                .2;
-                            *in_flight = Some(InFlightLfm2Run::PreExtAttn {
-                                l,
-                                blk: cur_blk,
-                                fin_bidx,
-                            });
-                            let exec_res = match chain.runlist.execute() {
-                                Ok(()) => {
-                                    Self::flush_pending_attn_mirrors(
-                                        &mut pending_attn_mirrors,
-                                        layer_kv_blocks,
-                                        &mut state.layers,
-                                        use_f16,
-                                    );
-                                    let w = chain.runlist.wait(QUIESCE_TIMEOUT_MS);
-                                    if w.is_ok() {
-                                        *in_flight = None;
-                                    }
-                                    w
-                                }
-                                Err(e) => {
-                                    *in_flight = None;
-                                    Err(e)
-                                }
-                            };
-                            if let Err(e) = exec_res {
+                            if cur_blk >= 3 {
                                 Self::flush_pending_attn_mirrors(
                                     &mut pending_attn_mirrors,
                                     layer_kv_blocks,
                                     &mut state.layers,
                                     use_f16,
                                 );
-                                return self.record_device_fault(
-                                    format!("prefill >32K c={c} layer {l} attn exec: {e}"),
-                                    out_len,
-                                );
+                                if let Err(e) = Self::run_prefill_ext_attn_multi_block_layer(
+                                    kernels,
+                                    l,
+                                    c,
+                                    &layer_bo_w[l],
+                                    &mut pre.layer_bo_y[l],
+                                    &pre.bo_yn,
+                                    &layer_kv_blocks[l],
+                                    &pre.layer_bo_kvo[l],
+                                    stalled_runs,
+                                    pos0,
+                                    n_valid,
+                                    eps,
+                                    cur_blk,
+                                    fin_bidx,
+                                ) {
+                                    return self.record_device_fault(e, out_len);
+                                }
+                            } else {
+                                let ext = pre.ext_runs.as_mut().expect("ext cache");
+                                let chain_missing = ext.attn_chains[l]
+                                    .iter()
+                                    .all(|(b, f, _)| *b != cur_blk || *f != fin_bidx);
+                                if chain_missing {
+                                    match Self::build_prefill_ext_attn_layer_chain(
+                                        kernels,
+                                        l,
+                                        &layer_bo_w[l],
+                                        &pre.layer_bo_y[l],
+                                        &pre.bo_yn,
+                                        &layer_kv_blocks[l],
+                                        &pre.layer_bo_kvo[l],
+                                        cur_blk,
+                                        fin_bidx,
+                                    ) {
+                                        Ok(ch) => ext.attn_chains[l].push((cur_blk, fin_bidx, ch)),
+                                        Err(e) => {
+                                            Self::flush_pending_attn_mirrors(
+                                                &mut pending_attn_mirrors,
+                                                layer_kv_blocks,
+                                                &mut state.layers,
+                                                use_f16,
+                                            );
+                                            return self.record_device_fault(e, out_len);
+                                        }
+                                    }
+                                }
+                                let chain = &ext.attn_chains[l]
+                                    .iter()
+                                    .find(|(b, f, _)| *b == cur_blk && *f == fin_bidx)
+                                    .expect("built attn layer ext chain")
+                                    .2;
+                                *in_flight = Some(InFlightLfm2Run::PreExtAttn {
+                                    l,
+                                    blk: cur_blk,
+                                    fin_bidx,
+                                });
+                                let exec_res = match chain.runlist.execute() {
+                                    Ok(()) => {
+                                        Self::flush_pending_attn_mirrors(
+                                            &mut pending_attn_mirrors,
+                                            layer_kv_blocks,
+                                            &mut state.layers,
+                                            use_f16,
+                                        );
+                                        let w = chain.runlist.wait(QUIESCE_TIMEOUT_MS);
+                                        if w.is_ok() {
+                                            *in_flight = None;
+                                        }
+                                        w
+                                    }
+                                    Err(e) => {
+                                        *in_flight = None;
+                                        Err(e)
+                                    }
+                                };
+                                if let Err(e) = exec_res {
+                                    Self::flush_pending_attn_mirrors(
+                                        &mut pending_attn_mirrors,
+                                        layer_kv_blocks,
+                                        &mut state.layers,
+                                        use_f16,
+                                    );
+                                    return self.record_device_fault(
+                                        format!("prefill >32K c={c} layer {l} attn exec: {e}"),
+                                        out_len,
+                                    );
+                                }
                             }
                             if let Err(e) =
                                 pre.layer_bo_kvo[l].sync_range_from_device(attn_kvo_sync_bytes, 0)
@@ -5269,9 +5616,9 @@ mod tests {
                 .unwrap();
             };
 
-            // Fast bucket covers up to 32767 (512 packets); single-runlist ext starts at 32768
-            // (`cur_blk = 1`) and scales across multiple blocks (`65536`, `cur_blk = 2`).
-            for pos in [32767usize, 32768, 65536] {
+            // Fast bucket covers up to 32767 (512 packets); single-runlist ext covers 32768..=65535
+            // (`cur_blk = 1`, `fin_past_pkts = 0..=512`).
+            for pos in [32767usize, 32768, 65535] {
                 seed_state_to_pos(&npu_model, &mut state, pos);
                 let out = model.forward_from_embedding(&emb, pos, &mut state);
                 assert_eq!(out.len(), vocab, "pos={pos}");
@@ -5335,6 +5682,153 @@ mod tests {
         assert!(
             has_ext_param_syncs,
             "expected ext decode step_params syncs at NORM_1 and ROPE_PKT"
+        );
+    }
+
+    #[test]
+    fn causal_lfm2_multi_block_64k_and_96k_decode_prefill_kv_start_on_fake_shim() {
+        let (_, events) = with_shim(FakeConfig::default(), || {
+            let gguf = tiny_lfm2_gguf_with_ctx(131072);
+            let npu_model = XdnaLfm2Model::from_gguf_with_id(gguf, 131072, "test".to_string())
+                .expect("load_model_xdna LFM2 at 128K context");
+            let model: &dyn Model = &npu_model;
+            let mut state = InferenceState::from_config_capped(
+                model.config(),
+                &crate::kv_cache::KvCompression::F16,
+                131072,
+            )
+            .unwrap();
+            let vocab = model.config().vocab_size;
+
+            let seed_state_to_pos = |st: &mut InferenceState, pos: usize| {
+                if let LayerState::Attention {
+                    key_cache_f16,
+                    value_cache_f16,
+                    ..
+                } = &mut st.layers[1]
+                {
+                    key_cache_f16.resize(pos * LFM2_KV_DIM, 0);
+                    value_cache_f16.resize(pos * LFM2_KV_DIM, 0);
+                }
+                if let LayerState::Conv { buffer, .. } = &mut st.layers[0] {
+                    buffer.resize(LFM2_D_CONV * LFM2_H, 0.25);
+                }
+                st.seq_len = pos;
+                let mut guard = npu_model.lock_npu();
+                guard.pending_kv.discard();
+                guard.synced_len = pos;
+                let max_blk = pos / LFM2_BLOCK_TOKENS;
+                let state_mut = &mut *guard;
+                XdnaLfm2Model::ensure_paged_block(
+                    &state_mut.kernels,
+                    &mut state_mut.layer_kv_blocks[1],
+                    max_blk,
+                    1,
+                )
+                .unwrap();
+            };
+
+            let read_i32 = |slice: &[u8], f32_idx: usize| -> i32 {
+                let off = f32_idx * 4;
+                i32::from_le_bytes(slice[off..off + 4].try_into().unwrap())
+            };
+
+            // 1. Multi-block decode at pos=65600 (cur_blk=2): per-block fa_part syncs blk=0 then blk=1 (kv_start=512, has_fa_state=1).
+            let emb = model.embed_token_rows(&[1]).unwrap();
+            seed_state_to_pos(&mut state, 65600);
+            let dec_out = model.forward_from_embedding(&emb, 65600, &mut state);
+            assert_eq!(dec_out.len(), vocab);
+            assert_eq!(state.seq_len, 65601);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let yb = guard.decode.as_ref().unwrap().layer_bo_y[1].as_slice();
+                assert_eq!(
+                    read_i32(yb, LFM2_DEC_SLOT_NORM_1 + 4096 + 8),
+                    LFM2_DEC_MAX_KV_PKTS as i32
+                );
+                assert_eq!(read_i32(yb, LFM2_DEC_SLOT_NORM_1 + 4096 + 9), 1);
+                assert_eq!(
+                    read_i32(yb, LFM2_DEC_SLOT_ROPE_PKT + 4096 + 8),
+                    (2 * LFM2_DEC_MAX_KV_PKTS) as i32
+                );
+            }
+
+            // 2. Single-runlist >64K prefill at pos0=65536 (cur_blk=2): EXT_PARAMS_1 must write kv_start_chunk=1024 (LFM2_MAX_KV_CHUNKS).
+            let embs4 = model.embed_token_rows(&[1, 2, 3, 4]).unwrap();
+            seed_state_to_pos(&mut state, 65536);
+            let pre_64k =
+                model.forward_prefill_from_embeddings_chunk(&embs4, 4, 65536, &mut state, true);
+            assert_eq!(pre_64k.len(), vocab);
+            assert_eq!(state.seq_len, 65540);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let yb = guard.prefill.as_ref().unwrap().layer_bo_y[1].as_slice();
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048 + 8),
+                    LFM2_MAX_KV_CHUNKS as i32
+                );
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 8),
+                    (2 * LFM2_MAX_KV_CHUNKS) as i32
+                );
+            }
+
+            // 3. Multi-block >96K prefill at pos0=98304 (cur_blk=3): per-block loop syncs b=1 (1024) then b=2 (2048).
+            seed_state_to_pos(&mut state, 98304);
+            let pre_96k =
+                model.forward_prefill_from_embeddings_chunk(&embs4, 4, 98304, &mut state, true);
+            assert_eq!(pre_96k.len(), vocab);
+            assert_eq!(state.seq_len, 98308);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let yb = guard.prefill.as_ref().unwrap().layer_bo_y[1].as_slice();
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048 + 8),
+                    (2 * LFM2_MAX_KV_CHUNKS) as i32
+                );
+                assert_eq!(
+                    read_i32(yb, LFM2_PREFILL_SLOT_EXT_PARAMS_2 + 2048 + 8),
+                    (3 * LFM2_MAX_KV_CHUNKS) as i32
+                );
+            }
+        });
+
+        let dec_part_syncs = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::BoSyncRange {
+                        to_device: true,
+                        offset,
+                        ..
+                    } if *offset == (LFM2_DEC_SLOT_NORM_1 + 4096) * 4
+                )
+            })
+            .count();
+        assert_eq!(
+            dec_part_syncs, 2,
+            "expected 2 dec fa_part syncs (blk 0 and blk 1 at pos=65600), got {dec_part_syncs}"
+        );
+        let pre_part1_syncs = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::BoSyncRange {
+                        to_device: true,
+                        offset,
+                        ..
+                    } if *offset == (LFM2_PREFILL_SLOT_EXT_PARAMS_1 + 2048) * 4
+                )
+            })
+            .count();
+        assert_eq!(
+            pre_part1_syncs, 3,
+            "expected 3 prefill EXT_PARAMS_1 syncs (1 for cur_blk=2 + 2 for cur_blk=3), got {pre_part1_syncs}"
         );
     }
 
