@@ -5229,6 +5229,7 @@ impl std::fmt::Debug for XdnaLfm2Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::xdna::kernels::ParityTally;
     use crate::backend::xdna::sys::fake::{Config as FakeConfig, Event, with_shim};
     use crate::gguf::GgufBuilder;
 
@@ -5375,6 +5376,18 @@ mod tests {
             .unwrap_or(0)
     }
 
+    const LFM2_5_1_2B_GGUF: &str = r"C:\Users\iamst\.cache\triage\models\huggingface.co\LiquidAI\LFM2.5-1.2B-Instruct-GGUF\resolve\main\LFM2.5-1.2B-Instruct-Q4_0.gguf";
+
+    fn hw_model_path(env: &str, fallback: &str) -> std::path::PathBuf {
+        let path = std::env::var_os(env).map_or_else(|| fallback.into(), std::path::PathBuf::from);
+        assert!(
+            path.exists(),
+            "missing GGUF at {} (set {env})",
+            path.display()
+        );
+        path
+    }
+
     #[test]
     fn causal_lfm2_load_prefill_decode_and_rewind_on_fake_shim() {
         let _ = with_shim(FakeConfig::default(), || {
@@ -5419,10 +5432,7 @@ mod tests {
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-1.2B-Instruct-Q4_0.gguf"]
     fn hw_gate_lfm2_causal_parity_and_throughput() {
-        let path = std::path::PathBuf::from(
-            r"C:\Users\iamst\.cache\triage\models\huggingface.co\LiquidAI\LFM2.5-1.2B-Instruct-GGUF\resolve\main\LFM2.5-1.2B-Instruct-Q4_0.gguf",
-        );
-        assert!(path.exists(), "missing GGUF at {}", path.display());
+        let path = hw_model_path("CERA_XDNA_LFM2_MODEL", LFM2_5_1_2B_GGUF);
 
         let gguf = GgufFile::open(&path).expect("open LFM2.5-1.2B-Instruct-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
@@ -5468,6 +5478,8 @@ mod tests {
             prefill_cos >= 0.985,
             "prefill cosine too low: {prefill_cos}"
         );
+        let mut tally = ParityTally::default();
+        tally.record(tokens.len() - 1, &cpu_logits, &npu_logits);
 
         let mut decode_coss = Vec::new();
         let mut top1_matches = 0usize;
@@ -5491,6 +5503,7 @@ mod tests {
             }
             decode_coss.push(c);
             eprintln!("  decode step {step:2} pos={pos:2}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            tally.record(pos, &cl, &nl);
             next_tok = ct as u32;
         }
         let mean_cos = decode_coss.iter().sum::<f32>() / decode_coss.len() as f32;
@@ -5500,15 +5513,18 @@ mod tests {
             (decode_secs * 1e3) / 16.0,
             16.0 / decode_secs
         );
+        eprintln!("LFM2.5 NPU {tally}");
         assert!(mean_cos >= 0.99, "mean decode cosine too low: {mean_cos}");
         assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
+        assert!(
+            tally.sure_mismatches.is_empty(),
+            "sure-step top-1 mismatches (pos, cpu margin): {:?}",
+            tally.sure_mismatches
+        );
     }
 
     fn run_hw_lfm2_long_context_parity(prompt_len: usize, ctx_len: usize, tag: &str) {
-        let path = std::path::PathBuf::from(
-            r"C:\Users\iamst\.cache\triage\models\huggingface.co\LiquidAI\LFM2.5-1.2B-Instruct-GGUF\resolve\main\LFM2.5-1.2B-Instruct-Q4_0.gguf",
-        );
-        assert!(path.exists(), "missing GGUF at {}", path.display());
+        let path = hw_model_path("CERA_XDNA_LFM2_MODEL", LFM2_5_1_2B_GGUF);
 
         let gguf = GgufFile::open(&path).expect("open LFM2.5-1.2B-Instruct-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
@@ -5546,6 +5562,8 @@ mod tests {
             pre_cos >= 0.985,
             "long-context prefill cosine too low: {pre_cos}"
         );
+        let mut tally = ParityTally::default();
+        tally.record(prompt_len - 1, &cpu_logits, &npu_logits);
 
         let mut decode_coss = Vec::new();
         let mut next_tok = cpu_top as u32;
@@ -5560,11 +5578,13 @@ mod tests {
             let nt = argmax_idx(&nl);
             let ct = argmax_idx(&cl);
             eprintln!("  {tag} decode pos={pos}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            tally.record(pos, &cl, &nl);
             decode_coss.push(c);
             next_tok = ct as u32;
         }
         let mean_cos = decode_coss.iter().sum::<f32>() / decode_coss.len() as f32;
         let min_cos = decode_coss.iter().copied().fold(f32::INFINITY, f32::min);
+        eprintln!("LFM2.5 NPU {tag} {tally}");
         assert!(
             mean_cos >= 0.99,
             "long-context mean decode cosine too low: {mean_cos}"
@@ -5572,6 +5592,11 @@ mod tests {
         assert!(
             min_cos >= 0.97,
             "long-context min decode cosine too low: {min_cos}"
+        );
+        assert!(
+            tally.sure_mismatches.is_empty(),
+            "{tag} sure-step top-1 mismatches (pos, cpu margin): {:?}",
+            tally.sure_mismatches
         );
     }
 
@@ -6469,10 +6494,10 @@ mod tests {
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2.5-24B-A2B-QAD-Q4_0.gguf"]
     fn hw_gate_lfm2moe_causal_parity_and_throughput() {
-        let path = std::path::PathBuf::from(
+        let path = hw_model_path(
+            "CERA_XDNA_LFM2MOE_MODEL",
             r"C:\Users\iamst\.cache\cera\huggingface.co\LiquidAI\LFM2.5-24B-A2B-GGUF\resolve\d790f111166905bfb36a81e12a403701ac23a1ca\LFM2.5-24B-A2B-QAD-Q4_0.gguf",
         );
-        assert!(path.exists(), "missing GGUF at {}", path.display());
 
         let gguf = GgufFile::open(&path).expect("open LFM2.5-24B-A2B-QAD-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
@@ -6522,6 +6547,8 @@ mod tests {
             prefill_cos >= 0.985,
             "prefill cosine too low: {prefill_cos}"
         );
+        let mut tally = ParityTally::default();
+        tally.record(tokens.len() - 1, &cpu_logits, &npu_logits);
 
         let mut decode_coss = Vec::new();
         let mut top1_matches = 0usize;
@@ -6548,6 +6575,7 @@ mod tests {
             }
             decode_coss.push(c);
             eprintln!("  decode step {step:2} pos={pos:2}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            tally.record(pos, &cl, &nl);
             next_tok = ct as u32;
         }
         let mean_cos = decode_coss.iter().sum::<f32>() / decode_coss.len() as f32;
@@ -6559,17 +6587,23 @@ mod tests {
             (cpu_decode_secs * 1e3) / 8.0,
             8.0 / cpu_decode_secs,
         );
+        eprintln!("LFM2.5-24B-A2B {tally}");
         assert!(mean_cos >= 0.985, "mean decode cosine too low: {mean_cos}");
         assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
+        assert!(
+            tally.sure_mismatches.is_empty(),
+            "sure-step top-1 mismatches (pos, cpu margin): {:?}",
+            tally.sure_mismatches
+        );
     }
 
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM2-2.6B-Q4_K_M.gguf"]
     fn hw_gate_lfm2_2_6b_q4_k_m_causal_parity_and_throughput() {
-        let path = std::path::PathBuf::from(
+        let path = hw_model_path(
+            "CERA_XDNA_LFM2_2_6B_MODEL",
             r"C:\Users\iamst\.cache\triage\models\huggingface.co\LiquidAI\LFM2-2.6B-GGUF\resolve\main\LFM2-2.6B-Q4_K_M.gguf",
         );
-        assert!(path.exists(), "missing GGUF at {}", path.display());
 
         let gguf = GgufFile::open(&path).expect("open LFM2-2.6B-Q4_K_M.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
@@ -6619,6 +6653,8 @@ mod tests {
             prefill_cos >= 0.985,
             "prefill cosine too low: {prefill_cos}"
         );
+        let mut tally = ParityTally::default();
+        tally.record(tokens.len() - 1, &cpu_logits, &npu_logits);
 
         let mut decode_coss = Vec::new();
         let mut top1_matches = 0usize;
@@ -6645,6 +6681,7 @@ mod tests {
             }
             decode_coss.push(c);
             eprintln!("  decode step {step:2} pos={pos:2}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            tally.record(pos, &cl, &nl);
             next_tok = ct as u32;
         }
         let mean_cos = decode_coss.iter().sum::<f32>() / decode_coss.len() as f32;
@@ -6656,7 +6693,13 @@ mod tests {
             (cpu_decode_secs * 1e3) / 8.0,
             8.0 / cpu_decode_secs,
         );
+        eprintln!("LFM2-2.6B-Q4_K_M {tally}");
         assert!(mean_cos >= 0.985, "mean decode cosine too low: {mean_cos}");
         assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
+        assert!(
+            tally.sure_mismatches.is_empty(),
+            "sure-step top-1 mismatches (pos, cpu margin): {:?}",
+            tally.sure_mismatches
+        );
     }
 }

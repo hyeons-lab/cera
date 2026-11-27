@@ -4992,6 +4992,7 @@ impl std::fmt::Debug for XdnaLfm3Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::xdna::kernels::ParityTally;
     use crate::backend::xdna::sys::fake::{Config as FakeConfig, Event, with_shim};
     use crate::gguf::GgufBuilder;
 
@@ -5241,12 +5242,24 @@ mod tests {
     }
 
     fn oracle_model_path(file: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("target")
-            .join("oracle")
-            .join("models")
-            .join(file)
+        let path = std::env::var_os("CERA_ORACLE_MODELS_DIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("..")
+                        .join("target")
+                        .join("oracle")
+                        .join("models")
+                },
+                std::path::PathBuf::from,
+            )
+            .join(file);
+        assert!(
+            path.exists(),
+            "missing GGUF at {} (set CERA_ORACLE_MODELS_DIR)",
+            path.display()
+        );
+        path
     }
 
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -5281,7 +5294,6 @@ mod tests {
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
     fn hw_gate3a_lfm3_causal_parity_and_throughput() {
         let path = oracle_model_path("LFM3-1.7B-QAD-Q4_0.gguf");
-        assert!(path.exists(), "missing GGUF at {}", path.display());
 
         let gguf = GgufFile::open(&path).expect("open LFM3-1.7B-QAD-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
@@ -5327,6 +5339,8 @@ mod tests {
             prefill_cos >= 0.985,
             "prefill cosine too low: {prefill_cos}"
         );
+        let mut tally = ParityTally::default();
+        tally.record(tokens.len() - 1, &cpu_logits, &npu_logits);
 
         // Test 2: 16 B=1 decode steps (crosses bucket/chunk boundaries too), teacher-forced from CPU
         let mut decode_coss = Vec::new();
@@ -5349,6 +5363,7 @@ mod tests {
             }
             decode_coss.push(c);
             eprintln!("  decode step {step:2} pos={pos:2}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            tally.record(pos, &cl, &nl);
             next_tok = ct as u32;
         }
         let mean_cos = decode_coss.iter().sum::<f32>() / decode_coss.len() as f32;
@@ -5358,8 +5373,6 @@ mod tests {
             (decode_secs * 1e3) / 16.0,
             16.0 / decode_secs
         );
-        assert!(mean_cos >= 0.99, "mean decode cosine too low: {mean_cos}");
-        assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
 
         // Test 3: Multi-turn unaligned continuation from current seq_len (=61 -> +19 = 80)
         let cont = &tokens[..19];
@@ -5373,14 +5386,22 @@ mod tests {
             argmax_idx(&npu_cont),
             argmax_idx(&cpu_cont)
         );
+        tally.record(start_pos + cont.len() - 1, &cpu_cont, &npu_cont);
+        eprintln!("Gate3a {tally}");
+        assert!(mean_cos >= 0.99, "mean decode cosine too low: {mean_cos}");
+        assert!(min_cos >= 0.97, "min decode cosine too low: {min_cos}");
         assert!(cont_cos >= 0.985, "continuation cosine too low: {cont_cos}");
+        assert!(
+            tally.sure_mismatches.is_empty(),
+            "sure-step top-1 mismatches (pos, cpu margin): {:?}",
+            tally.sure_mismatches
+        );
     }
 
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware and d1-2B-Q4_0.gguf"]
     fn hw_gate3b_d1_2b_bidirectional_parity_and_decide() {
         let path = oracle_model_path("d1-2B-Q4_0.gguf");
-        assert!(path.exists(), "missing GGUF at {}", path.display());
 
         let gguf = GgufFile::open(&path).expect("open d1-2B-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
@@ -5485,26 +5506,28 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
-    fn hw_gate3c_lfm3_long_context_parity() {
+    fn run_hw_lfm3_long_context_parity(
+        prompt_len: usize,
+        ctx_len: usize,
+        decode_steps: usize,
+        tag: &str,
+    ) {
         let path = oracle_model_path("LFM3-1.7B-QAD-Q4_0.gguf");
-        assert!(path.exists(), "missing GGUF at {}", path.display());
 
         let gguf = GgufFile::open(&path).expect("open LFM3-1.7B-QAD-Q4_0.gguf");
         let tok = crate::tokenizer::BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
-        let npu = crate::model::load_model_xdna(gguf, Some(&path), 16_384)
-            .expect("load LFM3 (16K) on XDNA");
-        let cpu = LfmModel::from_gguf(GgufFile::open(&path).expect("open CPU gguf"), 16_384)
-            .expect("load LFM3 (16K) on CPU");
+        let npu =
+            crate::model::load_model_xdna(gguf, Some(&path), ctx_len).expect("load LFM3 on XDNA");
+        let cpu = LfmModel::from_gguf(GgufFile::open(&path).expect("open CPU gguf"), ctx_len)
+            .expect("load LFM3 on CPU");
         assert_eq!(npu.backend_label(), "xdna");
 
         let seed_text = "The AMD Ryzen AI NPU executes paged online-softmax attention across \
                          arbitrary context lengths beyond 8192 tokens without host truncation. ";
         let seed = tok.encode(seed_text);
-        let mut tokens = Vec::with_capacity(8224);
-        while tokens.len() < 8224 {
-            let rem = 8224 - tokens.len();
+        let mut tokens = Vec::with_capacity(prompt_len);
+        while tokens.len() < prompt_len {
+            let rem = prompt_len - tokens.len();
             tokens.extend_from_slice(&seed[..seed.len().min(rem)]);
         }
 
@@ -5521,15 +5544,17 @@ mod tests {
         let npu_top = argmax_idx(&npu_logits);
         let cpu_top = argmax_idx(&cpu_logits);
         eprintln!(
-            "Gate3c >8K prefill (n=8224): cos={pre_cos:.6} top1_npu={npu_top} top1_cpu={cpu_top} time={pre_s:.2}s ({:.1} tok/s)",
-            tokens.len() as f64 / pre_s
+            "Gate3c {tag} prefill (n={prompt_len}): cos={pre_cos:.6} top1_npu={npu_top} top1_cpu={cpu_top} time={pre_s:.2}s ({:.1} tok/s)",
+            prompt_len as f64 / pre_s
         );
-        assert!(pre_cos >= 0.98, ">8K prefill cosine too low: {pre_cos}");
+        assert!(pre_cos >= 0.98, "{tag} prefill cosine too low: {pre_cos}");
+        let mut tally = ParityTally::default();
+        tally.record(prompt_len - 1, &cpu_logits, &npu_logits);
 
         let mut next_tok = cpu_top as u32;
         let mut dec_coss = Vec::new();
-        for step in 0..4usize {
-            let pos = tokens.len() + step;
+        for step in 0..decode_steps {
+            let pos = prompt_len + step;
             let nl = npu.forward(&[next_tok], pos, &mut npu_state);
             let cl = cpu.forward(&[next_tok], pos, &mut cpu_state);
             assert!(npu.take_decode_error().is_none());
@@ -5537,16 +5562,75 @@ mod tests {
             let nt = argmax_idx(&nl);
             let ct = argmax_idx(&cl);
             dec_coss.push(c);
-            eprintln!("  >8K decode step {step} pos={pos}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            eprintln!("  {tag} decode step {step} pos={pos}: cos={c:.6} npu_top={nt} cpu_top={ct}");
+            tally.record(pos, &cl, &nl);
             next_tok = ct as u32;
         }
         let mean_cos = dec_coss.iter().sum::<f32>() / dec_coss.len() as f32;
         let min_cos = dec_coss.iter().copied().fold(f32::INFINITY, f32::min);
+        eprintln!("Gate3c {tag} {tally}");
         assert!(
             mean_cos >= 0.985,
-            ">8K mean decode cosine too low: {mean_cos}"
+            "{tag} mean decode cosine too low: {mean_cos}"
         );
-        assert!(min_cos >= 0.97, ">8K min decode cosine too low: {min_cos}");
+        assert!(
+            min_cos >= 0.97,
+            "{tag} min decode cosine too low: {min_cos}"
+        );
+        assert!(
+            tally.sure_mismatches.is_empty(),
+            "{tag} sure-step top-1 mismatches (pos, cpu margin): {:?}",
+            tally.sure_mismatches
+        );
+    }
+
+    fn slow_gates_opted_in() -> bool {
+        let on = std::env::var("CERA_XDNA_SLOW_GATES").as_deref() == Ok("1");
+        if !on {
+            eprintln!("skip: set CERA_XDNA_SLOW_GATES=1 to run");
+        }
+        on
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
+    fn hw_gate3c_lfm3_long_context_parity() {
+        // Prefill reaches the cached two-block runlist (pos0 = 8192) with a 32-token tail.
+        run_hw_lfm3_long_context_parity(8224, 16_384, 4, ">8K");
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
+    fn hw_gate3c_lfm3_16k_ext_parity() {
+        // Decode leaves the cached runlist after pos 16352 and opens a third KV block at 16384.
+        run_hw_lfm3_long_context_parity(16_352, 16_512, 34, "16K-decode");
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware and LFM3-1.7B-QAD-Q4_0.gguf"]
+    fn hw_gate3c_lfm3_32k_plus_ext_parity() {
+        // Prefill runs per block from pos0 = 16384 (2 to 4 full blocks) and ends on a 4-token tail.
+        run_hw_lfm3_long_context_parity(32_900, 33_024, 4, "32k_plus_ext");
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware, LFM3-1.7B-QAD-Q4_0.gguf and CERA_XDNA_SLOW_GATES=1"]
+    fn hw_gate3c_lfm3_64k_parity() {
+        if !slow_gates_opted_in() {
+            return;
+        }
+        // Decode at exactly 8 full KV blocks (pos 65536), then over a 9th block (pos 65537).
+        run_hw_lfm3_long_context_parity(65_536, 65_664, 4, "64K");
+    }
+
+    #[test]
+    #[ignore = "requires physical AMD XDNA2 NPU2 hardware, LFM3-1.7B-QAD-Q4_0.gguf and CERA_XDNA_SLOW_GATES=1"]
+    fn hw_gate3c_lfm3_128k_parity() {
+        if !slow_gates_opted_in() {
+            return;
+        }
+        // The 128K benchmark prompt: 15 full KV blocks plus 252 chunks of a 16th.
+        run_hw_lfm3_long_context_parity(130_944, 131_072, 4, "128K");
     }
 
     #[test]
