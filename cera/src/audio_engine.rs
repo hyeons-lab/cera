@@ -546,11 +546,7 @@ impl<'a> AudioOutputDecoder<'a> {
                     let sampled =
                         a.sample_audio_frame_lfm3a(embed, self.audio_temperature, self.audio_top_k);
                     if let Some(e) = a.take_audio_error() {
-                        let detail = match e {
-                            crate::CeraError::Backend(detail) => detail,
-                            other => other.to_string(),
-                        };
-                        return FrameOutcome::Fault(detail);
+                        return FrameOutcome::Fault(format_cera_err_detail(e));
                     }
                     sampled.unwrap_or_else(|| {
                         sample_frame(
@@ -627,11 +623,7 @@ impl<'a> AudioOutputDecoder<'a> {
                     // Backend details round-trip exactly; anything else
                     // degrades to its display text (audio faults are
                     // `Backend` by construction: every recorder passes it).
-                    let detail = match e {
-                        crate::CeraError::Backend(detail) => detail,
-                        other => other.to_string(),
-                    };
-                    return FrameOutcome::Fault(detail);
+                    return FrameOutcome::Fault(format_cera_err_detail(e));
                 }
                 codes
             }
@@ -683,7 +675,10 @@ impl<'a> AudioOutputDecoder<'a> {
     /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
     pub async fn decode_frame_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameOutcome> {
         if self.weights.is_lfm3a_gen() {
-            return Ok(self.decode_frame(embed));
+            return match self.decode_frame(embed) {
+                FrameOutcome::Fault(detail) => Err(crate::CeraError::Backend(detail).into()),
+                outcome => Ok(outcome),
+            };
         }
         let t0 = Instant::now();
         let codes = match (self.use_accelerated_df, self.accelerator) {
@@ -2473,5 +2468,14 @@ pub(crate) mod tests {
             fault_dec.decode_frame(&[0.0; 4]),
             FrameOutcome::Fault("lfm3a df fault".into())
         );
+
+        let mut ok_async_dec = AudioOutputDecoder::new(&dec, &detok, Some(&ok_acc), 0.0, 1, false)
+            .with_streaming(false);
+        assert!(matches!(
+            block_on_ready(ok_async_dec.decode_frame_async(&[0.0; 4])).unwrap(),
+            FrameOutcome::Codes { .. }
+        ));
+        let async_err = block_on_ready(fault_dec.decode_frame_async(&[0.0; 4])).unwrap_err();
+        assert!(format!("{async_err:#}").contains("lfm3a df fault"));
     }
 }

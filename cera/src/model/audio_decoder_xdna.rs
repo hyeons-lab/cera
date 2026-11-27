@@ -112,6 +112,151 @@ struct XdnaDepthformer {
 
 impl XdnaDepthformer {
     fn new(runner: &XdnaGemmRunner, weights: &AudioDecoderWeights) -> Result<Self> {
+        let cfg = &weights.depthformer_config;
+        let dec = &weights.decoder_config;
+        let is_lfm3a = weights.is_lfm3a_gen();
+        anyhow::ensure!(
+            cfg.n_embd > 0
+                && cfg.n_head > 0
+                && cfg.n_head_kv > 0
+                && cfg.n_embd_head > 0
+                && cfg.ffn_dim > 0,
+            "XDNA depthformer config requires positive dimensions"
+        );
+        anyhow::ensure!(
+            cfg.n_head.is_multiple_of(cfg.n_head_kv),
+            "XDNA depthformer n_head ({}) must be a multiple of n_head_kv ({})",
+            cfg.n_head,
+            cfg.n_head_kv
+        );
+        anyhow::ensure!(
+            weights.depthformer_layers.len() == cfg.n_layer,
+            "XDNA depthformer layers len ({}) != depthformer_config.n_layer ({})",
+            weights.depthformer_layers.len(),
+            cfg.n_layer
+        );
+        anyhow::ensure!(
+            weights.depth_linear_w.rows > 0 && weights.depth_linear_w.cols > 0,
+            "XDNA depthformer depth_linear shape [{}, {}] must be positive",
+            weights.depth_linear_w.rows,
+            weights.depth_linear_w.cols
+        );
+        anyhow::ensure!(
+            weights.depth_linear_b.len() == weights.depth_linear_w.rows,
+            "XDNA depthformer depth_linear_b len ({}) != depth_linear_w.rows ({})",
+            weights.depth_linear_b.len(),
+            weights.depth_linear_w.rows
+        );
+        let required_cb = if is_lfm3a {
+            dec.n_codebook
+        } else {
+            dec.n_codebook.min(8)
+        };
+        anyhow::ensure!(
+            weights.depth_embeddings.len() >= required_cb,
+            "XDNA depthformer codebooks ({}) < required ({required_cb})",
+            weights.depth_embeddings.len()
+        );
+        let q_dim = cfg.n_head * cfg.n_embd_head;
+        let kv_dim = cfg.n_head_kv * cfg.n_embd_head;
+        let qkv_dim = q_dim + 2 * kv_dim;
+        for (il, lw) in weights.depthformer_layers.iter().enumerate() {
+            anyhow::ensure!(
+                lw.operator_norm.len() == cfg.n_embd && lw.ffn_norm.len() == cfg.n_embd,
+                "XDNA depthformer layer {il} norm lengths ({}, {}) != n_embd ({})",
+                lw.operator_norm.len(),
+                lw.ffn_norm.len(),
+                cfg.n_embd
+            );
+            anyhow::ensure!(
+                lw.w1.rows == cfg.ffn_dim
+                    && lw.w1.cols == cfg.n_embd
+                    && lw.w3.rows == cfg.ffn_dim
+                    && lw.w3.cols == cfg.n_embd
+                    && lw.w2.rows == cfg.n_embd
+                    && lw.w2.cols == cfg.ffn_dim,
+                "XDNA depthformer layer {il} FFN shapes w1=[{},{}], w2=[{},{}], w3=[{},{}] mismatch n_embd={}, ffn_dim={}",
+                lw.w1.rows,
+                lw.w1.cols,
+                lw.w2.rows,
+                lw.w2.cols,
+                lw.w3.rows,
+                lw.w3.cols,
+                cfg.n_embd,
+                cfg.ffn_dim
+            );
+            if is_lfm3a && lw.k_norm.is_empty() {
+                anyhow::ensure!(
+                    !lw.q_norm.is_empty() && lw.q_norm.len().is_multiple_of(cfg.n_embd),
+                    "XDNA depthformer ShortConv layer {il} q_norm len ({}) must be a positive multiple of n_embd ({})",
+                    lw.q_norm.len(),
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    lw.wqkv.rows == 3 * cfg.n_embd
+                        && lw.wqkv.cols == cfg.n_embd
+                        && lw.wo.rows == cfg.n_embd
+                        && lw.wo.cols == cfg.n_embd,
+                    "XDNA depthformer ShortConv layer {il} proj shapes in=[{},{}], out=[{},{}] mismatch n_embd={}",
+                    lw.wqkv.rows,
+                    lw.wqkv.cols,
+                    lw.wo.rows,
+                    lw.wo.cols,
+                    cfg.n_embd
+                );
+            } else {
+                anyhow::ensure!(
+                    lw.q_norm.len() == cfg.n_embd_head && lw.k_norm.len() == cfg.n_embd_head,
+                    "XDNA depthformer layer {il} q_norm/k_norm lens ({}, {}) != n_embd_head ({})",
+                    lw.q_norm.len(),
+                    lw.k_norm.len(),
+                    cfg.n_embd_head
+                );
+                let qkv_ok = if is_lfm3a {
+                    lw.wqkv.rows == qkv_dim
+                        || lw.wqkv.rows == qkv_dim + cfg.n_head
+                        || lw.wqkv.rows == qkv_dim + q_dim
+                } else {
+                    lw.wqkv.rows == qkv_dim
+                };
+                anyhow::ensure!(
+                    lw.wqkv.cols == cfg.n_embd && qkv_ok,
+                    "XDNA depthformer layer {il} wqkv shape [{}, {}] invalid for n_embd={}, qkv_dim={qkv_dim}",
+                    lw.wqkv.rows,
+                    lw.wqkv.cols,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    lw.wo.rows == cfg.n_embd && lw.wo.cols == q_dim,
+                    "XDNA depthformer layer {il} wo shape [{}, {}] != [{}, {q_dim}]",
+                    lw.wo.rows,
+                    lw.wo.cols,
+                    cfg.n_embd
+                );
+            }
+        }
+        for (j, cb) in weights.depth_embeddings.iter().enumerate() {
+            anyhow::ensure!(
+                cb.embedding.rows > 0 && cb.embedding.cols == cfg.n_embd,
+                "XDNA depthformer codebook {j} embedding shape [{}, {}] invalid for n_embd={}",
+                cb.embedding.rows,
+                cb.embedding.cols,
+                cfg.n_embd
+            );
+            anyhow::ensure!(
+                cb.norm.len() == cfg.n_embd,
+                "XDNA depthformer codebook {j} norm len ({}) != n_embd ({})",
+                cb.norm.len(),
+                cfg.n_embd
+            );
+            anyhow::ensure!(
+                cb.to_logits.cols == cfg.n_embd,
+                "XDNA depthformer codebook {j} to_logits cols ({}) != n_embd ({})",
+                cb.to_logits.cols,
+                cfg.n_embd
+            );
+        }
+
         let w_depth_linear = runner.upload_mmap_weight(&weights.depth_linear_w)?;
         let mut layers = Vec::with_capacity(weights.depthformer_layers.len());
         for lw in &weights.depthformer_layers {
@@ -761,6 +906,7 @@ struct XdnaDetokLayer {
     w_attn_gate: Option<(XdnaGemmWeight, usize)>,
 }
 
+#[derive(Clone)]
 struct XdnaDetokState {
     conv_bufs: Vec<Vec<f32>>,
     attn_kv: Vec<Option<(Vec<f32>, Vec<f32>)>>,
@@ -815,27 +961,197 @@ struct XdnaDetokenizer {
 impl XdnaDetokenizer {
     fn new(runner: &XdnaGemmRunner, weights: &DetokenizerWeights) -> Result<Self> {
         let lfm3_gen = weights.is_lfm3a_gen();
+        let cfg = &weights.config;
         anyhow::ensure!(
-            weights.config.n_embd > 0,
+            cfg.n_embd > 0,
             "XDNA detokenizer config requires n_embd > 0"
         );
         anyhow::ensure!(
-            weights.config.layer_is_conv.len() == weights.layers.len(),
+            cfg.ffn_dim > 0,
+            "XDNA detokenizer config requires ffn_dim > 0"
+        );
+        anyhow::ensure!(
+            cfg.layer_is_conv.len() == weights.layers.len(),
             "XDNA detokenizer layer_is_conv len ({}) != layers len ({})",
-            weights.config.layer_is_conv.len(),
+            cfg.layer_is_conv.len(),
             weights.layers.len()
         );
-        if weights.config.layer_is_conv.iter().any(|&c| !c) {
+        if cfg.layer_is_conv.iter().any(|&c| !c) {
             anyhow::ensure!(
-                weights.config.swa_window_size > 0,
+                cfg.swa_window_size > 0,
                 "XDNA detokenizer with attention layers requires swa_window_size > 0"
             );
             anyhow::ensure!(
-                weights.config.n_head > 0
-                    && weights.config.n_head_kv > 0
-                    && weights.config.n_embd_head > 0,
+                cfg.n_head > 0 && cfg.n_head_kv > 0 && cfg.n_embd_head > 0,
                 "XDNA detokenizer with attention layers requires positive head dimensions"
             );
+            anyhow::ensure!(
+                cfg.n_head.is_multiple_of(cfg.n_head_kv),
+                "XDNA detokenizer n_head ({}) must be a multiple of n_head_kv ({})",
+                cfg.n_head,
+                cfg.n_head_kv
+            );
+        }
+        anyhow::ensure!(
+            weights.output_norm.len() == cfg.n_embd,
+            "XDNA detokenizer output_norm len ({}) != n_embd ({})",
+            weights.output_norm.len(),
+            cfg.n_embd
+        );
+        anyhow::ensure!(
+            weights.lin_w.rows > 0 && weights.lin_w.cols == cfg.n_embd,
+            "XDNA detokenizer lin_w shape [{}, {}] invalid for n_embd={}",
+            weights.lin_w.rows,
+            weights.lin_w.cols,
+            cfg.n_embd
+        );
+        anyhow::ensure!(
+            weights.lin_b.len() == weights.lin_w.rows,
+            "XDNA detokenizer lin_b len ({}) != lin_w.rows ({})",
+            weights.lin_b.len(),
+            weights.lin_w.rows
+        );
+        let q_dim = cfg.n_head * cfg.n_embd_head;
+        let kv_dim = cfg.n_head_kv * cfg.n_embd_head;
+        for (il, lw) in weights.layers.iter().enumerate() {
+            let is_conv = cfg.layer_is_conv[il];
+            anyhow::ensure!(
+                lw.operator_norm.len() == cfg.n_embd && lw.ffn_norm.len() == cfg.n_embd,
+                "XDNA detokenizer layer {il} norm lengths ({}, {}) != n_embd ({})",
+                lw.operator_norm.len(),
+                lw.ffn_norm.len(),
+                cfg.n_embd
+            );
+            if let Some(pn) = &lw.attn_post_norm {
+                anyhow::ensure!(
+                    pn.len() == cfg.n_embd,
+                    "XDNA detokenizer layer {il} attn_post_norm len ({}) != n_embd ({})",
+                    pn.len(),
+                    cfg.n_embd
+                );
+            }
+            if let Some(pn) = &lw.ffn_post_norm {
+                anyhow::ensure!(
+                    pn.len() == cfg.n_embd,
+                    "XDNA detokenizer layer {il} ffn_post_norm len ({}) != n_embd ({})",
+                    pn.len(),
+                    cfg.n_embd
+                );
+            }
+            anyhow::ensure!(
+                lw.ffn_w1.rows == cfg.ffn_dim
+                    && lw.ffn_w1.cols == cfg.n_embd
+                    && lw.ffn_w3.rows == cfg.ffn_dim
+                    && lw.ffn_w3.cols == cfg.n_embd
+                    && lw.ffn_w2.rows == cfg.n_embd
+                    && lw.ffn_w2.cols == cfg.ffn_dim,
+                "XDNA detokenizer layer {il} FFN shapes w1=[{},{}], w2=[{},{}], w3=[{},{}] mismatch n_embd={}, ffn_dim={}",
+                lw.ffn_w1.rows,
+                lw.ffn_w1.cols,
+                lw.ffn_w2.rows,
+                lw.ffn_w2.cols,
+                lw.ffn_w3.rows,
+                lw.ffn_w3.cols,
+                cfg.n_embd,
+                cfg.ffn_dim
+            );
+            if is_conv {
+                let in_proj = lw.conv_in_proj.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer conv layer {il} missing conv_in_proj")
+                })?;
+                let out_proj = lw.conv_out_proj.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer conv layer {il} missing conv_out_proj")
+                })?;
+                let conv_w = lw.conv_weight.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer conv layer {il} missing conv_weight")
+                })?;
+                anyhow::ensure!(
+                    in_proj.rows == 3 * cfg.n_embd && in_proj.cols == cfg.n_embd,
+                    "XDNA detokenizer layer {il} conv_in_proj shape [{}, {}] != [{}, {}]",
+                    in_proj.rows,
+                    in_proj.cols,
+                    3 * cfg.n_embd,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    out_proj.rows == cfg.n_embd && out_proj.cols == cfg.n_embd,
+                    "XDNA detokenizer layer {il} conv_out_proj shape [{}, {}] != [{}, {}]",
+                    out_proj.rows,
+                    out_proj.cols,
+                    cfg.n_embd,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    conv_w.len() == (cfg.d_conv + 1) * cfg.n_embd,
+                    "XDNA detokenizer layer {il} conv_weight len ({}) != {}",
+                    conv_w.len(),
+                    (cfg.d_conv + 1) * cfg.n_embd
+                );
+            } else {
+                let wq = lw.wq.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer attn layer {il} missing wq")
+                })?;
+                let wk = lw.wk.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer attn layer {il} missing wk")
+                })?;
+                let wv = lw.wv.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer attn layer {il} missing wv")
+                })?;
+                let wo = lw.wo.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer attn layer {il} missing wo")
+                })?;
+                let q_norm = lw.q_norm.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer attn layer {il} missing q_norm")
+                })?;
+                let k_norm = lw.k_norm.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("XDNA detokenizer attn layer {il} missing k_norm")
+                })?;
+                anyhow::ensure!(
+                    wq.rows == q_dim && wq.cols == cfg.n_embd,
+                    "XDNA detokenizer layer {il} wq shape [{}, {}] != [{q_dim}, {}]",
+                    wq.rows,
+                    wq.cols,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    wk.rows == kv_dim && wk.cols == cfg.n_embd,
+                    "XDNA detokenizer layer {il} wk shape [{}, {}] != [{kv_dim}, {}]",
+                    wk.rows,
+                    wk.cols,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    wv.rows == kv_dim && wv.cols == cfg.n_embd,
+                    "XDNA detokenizer layer {il} wv shape [{}, {}] != [{kv_dim}, {}]",
+                    wv.rows,
+                    wv.cols,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    wo.rows == cfg.n_embd && wo.cols == q_dim,
+                    "XDNA detokenizer layer {il} wo shape [{}, {}] != [{}, {q_dim}]",
+                    wo.rows,
+                    wo.cols,
+                    cfg.n_embd
+                );
+                anyhow::ensure!(
+                    q_norm.len() == cfg.n_embd_head && k_norm.len() == cfg.n_embd_head,
+                    "XDNA detokenizer layer {il} q_norm/k_norm lens ({}, {}) != n_embd_head ({})",
+                    q_norm.len(),
+                    k_norm.len(),
+                    cfg.n_embd_head
+                );
+                if let Some(gw) = &lw.attn_gate {
+                    anyhow::ensure!(
+                        gw.cols == cfg.n_embd && (gw.rows == cfg.n_head || gw.rows == q_dim),
+                        "XDNA detokenizer layer {il} attn_gate shape [{}, {}] invalid for n_embd={}, n_head={}, q_dim={q_dim}",
+                        gw.rows,
+                        gw.cols,
+                        cfg.n_embd,
+                        cfg.n_head
+                    );
+                }
+            }
         }
         let mut layers = Vec::with_capacity(weights.layers.len());
         for (il, lw) in weights.layers.iter().enumerate() {
@@ -931,6 +1247,11 @@ impl XdnaDetokenizer {
         let cfg = &self.config;
         let n_embd = cfg.n_embd;
         anyhow::ensure!(n_embd > 0, "XDNA detokenizer requires n_embd > 0");
+        anyhow::ensure!(
+            cpu_weights.config.n_embd == n_embd,
+            "XDNA detokenizer cpu_weights n_embd ({}) != loaded n_embd ({n_embd})",
+            cpu_weights.config.n_embd
+        );
 
         let embedding = detok_embed_codes(cpu_weights, codes);
         let single_frame_bins = (cfg.n_fft / 2 + 1) * 2;
@@ -951,7 +1272,8 @@ impl XdnaDetokenizer {
         let mut op_out_mat = vec![0.0f32; n_tokens * n_embd];
 
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let n_past_base = st.n_past;
+        let mut next_st = st.clone();
+        let n_past_base = next_st.n_past;
 
         for (il, lw) in self.layers.iter().enumerate() {
             norm_mat.copy_from_slice(&hidden);
@@ -969,7 +1291,7 @@ impl XdnaDetokenizer {
                 {
                     let bcx_mat =
                         runner.matmul_f32(&norm_mat, in_proj, n_tokens, 3 * n_embd, n_embd)?;
-                    let conv_buf = &mut st.conv_bufs[il];
+                    let conv_buf = &mut next_st.conv_bufs[il];
                     let d_conv = cfg.d_conv;
                     let kernel_size = d_conv + 1;
                     let mut bx = vec![0.0f32; n_embd];
@@ -1021,7 +1343,7 @@ impl XdnaDetokenizer {
                 &lw.w_o,
                 &lw.q_norm,
                 &lw.k_norm,
-                st.attn_kv.get_mut(il).and_then(|o| o.as_mut()),
+                next_st.attn_kv.get_mut(il).and_then(|o| o.as_mut()),
             ) {
                 let n_head = cfg.n_head;
                 let n_kv = cfg.n_head_kv;
@@ -1165,7 +1487,7 @@ impl XdnaDetokenizer {
             add_inplace(&mut hidden, &down_mat);
         }
 
-        st.n_past += n_tokens;
+        next_st.n_past += n_tokens;
 
         for t in 0..n_tokens {
             rmsnorm(
@@ -1183,6 +1505,7 @@ impl XdnaDetokenizer {
                 &self.lin_b,
             );
         }
+        *st = next_st;
         Ok(spectrum)
     }
 }
@@ -1241,6 +1564,9 @@ impl XdnaAudioDecoder {
 impl AudioAccelerator for XdnaAudioDecoder {
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
         let Some(ref df) = self.depthformer else {
+            self.record_error(CeraError::Backend(
+                "XDNA audio depthformer weights were not loaded".to_string(),
+            ));
             return [0; 8];
         };
         if df.lfm3a_gen {
@@ -1964,6 +2290,874 @@ mod tests {
         });
     }
 
+    fn synth_lfm2a_gguf() -> Arc<GgufFile> {
+        let df_embd = 64usize;
+        let llm_dim = 32usize;
+        let hd = 2usize;
+        let qkv_out = (32 + 2 * 8) * hd;
+        let df_ffn = 64usize;
+        let detok_embd = 32usize;
+        let spec_bins = (1280 / 2 + 1) * 2;
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", "audio-fixture")
+            .kv_u32("depthformer_n_layer", 1)
+            .kv_u32("depthformer_n_embd", df_embd as u32)
+            .tensor_f32(
+                "depthformer.layers.0.operator_norm.weight",
+                &[df_embd],
+                &vec![1.0; df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.ffn_norm.weight",
+                &[df_embd],
+                &vec![1.0; df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.attention.q_layernorm.weight",
+                &[hd],
+                &vec![1.0; hd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.attention.k_layernorm.weight",
+                &[hd],
+                &vec![1.0; hd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.qkv_proj.weight",
+                &[df_embd, qkv_out],
+                &vec![0.01; df_embd * qkv_out],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.out_proj.weight",
+                &[32 * hd, df_embd],
+                &vec![0.01; 32 * hd * df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.feed_forward.w1.weight",
+                &[df_embd, df_ffn],
+                &vec![0.01; df_embd * df_ffn],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.feed_forward.w2.weight",
+                &[df_ffn, df_embd],
+                &vec![0.01; df_ffn * df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.feed_forward.w3.weight",
+                &[df_embd, df_ffn],
+                &vec![0.01; df_embd * df_ffn],
+            )
+            .tensor_f32(
+                "depth_linear.weight",
+                &[llm_dim, 8 * df_embd],
+                &vec![0.01; llm_dim * 8 * df_embd],
+            )
+            .tensor_f32("depth_linear.bias", &[8 * df_embd], &vec![0.0; 8 * df_embd]);
+        for j in 0..8 {
+            b = b
+                .tensor_f32(
+                    &format!("depth_embeddings.{j}.embedding.weight"),
+                    &[df_embd, 1],
+                    &vec![0.01; df_embd],
+                )
+                .tensor_f32(
+                    &format!("depth_embeddings.{j}.embedding_norm.weight"),
+                    &[df_embd],
+                    &vec![1.0; df_embd],
+                )
+                .tensor_f32(
+                    &format!("depth_embeddings.{j}.to_logits.weight"),
+                    &[df_embd, 1],
+                    &vec![0.01; df_embd],
+                );
+        }
+        b = b
+            .tensor_f32(
+                "audio_embedding.embedding.weight",
+                &[llm_dim, 8 * 2049],
+                &vec![0.01; llm_dim * 8 * 2049],
+            )
+            .tensor_f32(
+                "audio_embedding.embedding_norm.weight",
+                &[llm_dim],
+                &vec![1.0; llm_dim],
+            )
+            .tensor_f32(
+                "audio_embedding.to_logits.weight",
+                &[llm_dim, 1],
+                &vec![0.01; llm_dim],
+            )
+            .tensor_f32(
+                "emb.emb.weight",
+                &[detok_embd, 8 * 2048],
+                &vec![0.01; detok_embd * 8 * 2048],
+            )
+            .tensor_f32(
+                "lfm.embedding_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "lin.weight",
+                &[detok_embd, spec_bins],
+                &vec![0.01; detok_embd * spec_bins],
+            )
+            .tensor_f32("lin.bias", &[spec_bins], &vec![0.0; spec_bins]);
+        for i in 0..8 {
+            let p = format!("lfm.layers.{i}");
+            b = b
+                .tensor_f32(
+                    &format!("{p}.operator_norm.weight"),
+                    &[detok_embd],
+                    &vec![1.0; detok_embd],
+                )
+                .tensor_f32(
+                    &format!("{p}.ffn_norm.weight"),
+                    &[detok_embd],
+                    &vec![1.0; detok_embd],
+                )
+                .tensor_f32(
+                    &format!("{p}.feed_forward.w1.weight"),
+                    &[detok_embd, detok_embd],
+                    &vec![0.01; detok_embd * detok_embd],
+                )
+                .tensor_f32(
+                    &format!("{p}.feed_forward.w2.weight"),
+                    &[detok_embd, detok_embd],
+                    &vec![0.01; detok_embd * detok_embd],
+                )
+                .tensor_f32(
+                    &format!("{p}.feed_forward.w3.weight"),
+                    &[detok_embd, detok_embd],
+                    &vec![0.01; detok_embd * detok_embd],
+                );
+            if [0, 1, 3, 5, 7].contains(&i) {
+                b = b
+                    .tensor_f32(
+                        &format!("{p}.conv.in_proj.weight"),
+                        &[detok_embd, 3 * detok_embd],
+                        &vec![0.01; 3 * detok_embd * detok_embd],
+                    )
+                    .tensor_f32(
+                        &format!("{p}.conv.out_proj.weight"),
+                        &[detok_embd, detok_embd],
+                        &vec![0.01; detok_embd * detok_embd],
+                    )
+                    .tensor_f32(
+                        &format!("{p}.conv.conv.weight"),
+                        &[3, detok_embd],
+                        &vec![0.05; 3 * detok_embd],
+                    );
+            } else {
+                for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                    b = b.tensor_f32(
+                        &format!("{p}.self_attn.{proj}.weight"),
+                        &[detok_embd, detok_embd],
+                        &vec![0.01; detok_embd * detok_embd],
+                    );
+                }
+                for norm in ["q_layernorm", "k_layernorm"] {
+                    b = b.tensor_f32(
+                        &format!("{p}.self_attn.{norm}.weight"),
+                        &[detok_embd],
+                        &vec![1.0; detok_embd],
+                    );
+                }
+            }
+        }
+        Arc::new(b.build())
+    }
+
+    fn synth_lfm3a_gguf() -> Arc<GgufFile> {
+        let n_embd = 8usize;
+        let ffn_dim = 16usize;
+        let llm_dim = 12usize;
+        let n_cb = 12usize;
+        let n_vocab = 257usize;
+        let detok_embd = 8usize;
+        let detok_ffn = 16usize;
+        let fsq_proj_dim = 4usize;
+        let n_fft = 16usize;
+        let out_bins = 6 * (n_fft / 2 + 1) * 2;
+        let bytes = GgufBuilder::new()
+            .kv_str("general.architecture", "clip")
+            .kv_bool("clip.has_audio_encoder", true)
+            .kv_bool("clip.has_gen_audio_encoder", true)
+            .kv_str("clip.gen.audio.projector_type", "lfm3a_gen")
+            .kv_u32("clip.gen.audio.block_count", 2)
+            .kv_u32("clip.gen.audio.embedding_length", n_embd as u32)
+            .kv_u32("clip.gen.audio.feed_forward_length", ffn_dim as u32)
+            .kv_u32("clip.gen.audio.attention.head_count", 2)
+            .kv_u32("clip.gen.audio.attention.head_count_kv", 1)
+            .kv_f32("clip.gen.audio.attention.layer_norm_epsilon", 1e-5)
+            .kv_u32("clip.gen.audio.projection_dim", llm_dim as u32)
+            .kv_u32("clip.audio_gen.wav.n_fft", n_fft as u32)
+            .kv_u32("clip.audio_gen.wav.hop_length", 4)
+            .tensor_f32(
+                "a.gen.code.proj_in.weight",
+                &[llm_dim, n_cb * n_embd],
+                &vec![0.01; n_cb * n_embd * llm_dim],
+            )
+            .tensor_f32(
+                "a.gen.code.proj_in.bias",
+                &[n_cb * n_embd],
+                &vec![0.0; n_cb * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.embd.weight",
+                &[n_embd, n_vocab, n_cb],
+                &vec![0.01; n_cb * n_vocab * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.head_norm.weight",
+                &[n_embd, n_cb],
+                &vec![1.0; n_cb * n_embd],
+            )
+            .tensor_f32("a.gen.code.mask_embd", &[n_embd], &vec![0.2; n_embd])
+            .tensor_f32(
+                "a.gen.code.output_norm.weight",
+                &[n_embd],
+                &vec![1.0; n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.out_embd.weight",
+                &[llm_dim, n_cb * n_vocab],
+                &vec![0.01; n_cb * n_vocab * llm_dim],
+            )
+            // Block 0: ShortConv
+            .tensor_f32("a.gen.code.blk.0.ln1.weight", &[n_embd], &vec![1.0; n_embd])
+            .tensor_f32("a.gen.code.blk.0.ln2.weight", &[n_embd], &vec![1.0; n_embd])
+            .tensor_f32(
+                "a.gen.code.blk.0.conv_dw.weight",
+                &[3, n_embd],
+                &vec![0.1; 3 * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.conv_pw1.weight",
+                &[n_embd, 3 * n_embd],
+                &vec![0.01; 3 * n_embd * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.conv_pw2.weight",
+                &[n_embd, n_embd],
+                &vec![0.01; n_embd * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ffn_gate.weight",
+                &[n_embd, ffn_dim],
+                &vec![0.01; ffn_dim * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ffn_down.weight",
+                &[ffn_dim, n_embd],
+                &vec![0.01; n_embd * ffn_dim],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ffn_up.weight",
+                &[n_embd, ffn_dim],
+                &vec![0.01; ffn_dim * n_embd],
+            )
+            // Block 1: Attention
+            .tensor_f32("a.gen.code.blk.1.ln1.weight", &[n_embd], &vec![1.0; n_embd])
+            .tensor_f32("a.gen.code.blk.1.ln2.weight", &[n_embd], &vec![1.0; n_embd])
+            .tensor_f32(
+                "a.gen.code.blk.1.attn_q.weight",
+                &[n_embd, n_embd],
+                &vec![0.01; n_embd * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.1.attn_k.weight",
+                &[n_embd, 4],
+                &vec![0.01; 4 * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.1.attn_v.weight",
+                &[n_embd, 4],
+                &vec![0.01; 4 * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.1.attn_out.weight",
+                &[n_embd, n_embd],
+                &vec![0.01; n_embd * n_embd],
+            )
+            .tensor_f32("a.gen.code.blk.1.attn_q_norm.weight", &[4], &[1.0; 4])
+            .tensor_f32("a.gen.code.blk.1.attn_k_norm.weight", &[4], &[1.0; 4])
+            .tensor_f32(
+                "a.gen.code.blk.1.attn_gate.weight",
+                &[n_embd, 2],
+                &vec![0.01; 2 * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.1.ffn_gate.weight",
+                &[n_embd, ffn_dim],
+                &vec![0.01; ffn_dim * n_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.1.ffn_down.weight",
+                &[ffn_dim, n_embd],
+                &vec![0.01; n_embd * ffn_dim],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.1.ffn_up.weight",
+                &[n_embd, ffn_dim],
+                &vec![0.01; ffn_dim * n_embd],
+            )
+            // Detokenizer
+            .tensor_f32(
+                "a.gen.wav.quant.first.codebook.weight",
+                &[4, 256],
+                &vec![0.1; 256 * 4],
+            )
+            .tensor_f32(
+                "a.gen.wav.quant.first.out_proj.weight",
+                &[48, fsq_proj_dim],
+                &vec![0.01; fsq_proj_dim * 48],
+            )
+            .tensor_f32(
+                "a.gen.wav.quant.first.out_proj.bias",
+                &[fsq_proj_dim],
+                &vec![0.0; fsq_proj_dim],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.in_proj.weight",
+                &[fsq_proj_dim, detok_embd],
+                &vec![0.01; detok_embd * fsq_proj_dim],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.in_proj.bias",
+                &[detok_embd],
+                &vec![0.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.ln1.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.attn_post_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.ln2.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.ffn_post_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.conv_dw.weight",
+                &[3, detok_embd],
+                &vec![0.05; 3 * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.conv_pw1.weight",
+                &[detok_embd, 3 * detok_embd],
+                &vec![0.01; 3 * detok_embd * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.conv_pw2.weight",
+                &[detok_embd, detok_embd],
+                &vec![0.01; detok_embd * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.ffn_gate.weight",
+                &[detok_embd, detok_ffn],
+                &vec![0.01; detok_ffn * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.ffn_down.weight",
+                &[detok_ffn, detok_embd],
+                &vec![0.01; detok_embd * detok_ffn],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.0.ffn_up.weight",
+                &[detok_embd, detok_ffn],
+                &vec![0.01; detok_ffn * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.ln1.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.attn_post_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.ln2.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.ffn_post_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.attn_q.weight",
+                &[detok_embd, detok_embd],
+                &vec![0.01; detok_embd * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.attn_k.weight",
+                &[detok_embd, 4],
+                &vec![0.01; 4 * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.attn_v.weight",
+                &[detok_embd, 4],
+                &vec![0.01; 4 * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.attn_out.weight",
+                &[detok_embd, detok_embd],
+                &vec![0.01; detok_embd * detok_embd],
+            )
+            .tensor_f32("a.gen.wav.tfm.blk.1.attn_q_norm.weight", &[4], &[1.0; 4])
+            .tensor_f32("a.gen.wav.tfm.blk.1.attn_k_norm.weight", &[4], &[1.0; 4])
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.attn_gate.weight",
+                &[detok_embd, 2],
+                &vec![0.01; 2 * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.ffn_gate.weight",
+                &[detok_embd, detok_ffn],
+                &vec![0.01; detok_ffn * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.ffn_down.weight",
+                &[detok_ffn, detok_embd],
+                &vec![0.01; detok_embd * detok_ffn],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.blk.1.ffn_up.weight",
+                &[detok_embd, detok_ffn],
+                &vec![0.01; detok_ffn * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.output_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.out_proj.weight",
+                &[detok_embd, out_bins],
+                &vec![0.01; out_bins * detok_embd],
+            )
+            .tensor_f32(
+                "a.gen.wav.tfm.out_proj.bias",
+                &[out_bins],
+                &vec![0.0; out_bins],
+            )
+            .build_bytes();
+        Arc::new(GgufFile::from_bytes(Arc::from(bytes)).unwrap())
+    }
+
+    #[test]
+    fn fake_shim_build_audio_accelerator_on_synthetic_lfm2a_and_lfm3a_ggufs() {
+        use crate::engine::BackendPreference as BP;
+
+        fake::with_shim(FakeConfig::default(), || {
+            let lfm2a = synth_lfm2a_gguf();
+            assert!(build_audio_accelerator(&lfm2a, BP::Cpu).is_none());
+            let acc2 = build_audio_accelerator(&lfm2a, BP::Npu).expect("lfm2a Npu accelerator");
+            assert!(acc2.supports_depthformer());
+            assert!(!acc2.supports_lfm3a_gen_depthformer());
+            assert!(acc2.depthformer_default_on());
+            let acc2_auto =
+                build_audio_accelerator(&lfm2a, BP::Auto).expect("lfm2a Auto accelerator");
+            assert!(acc2_auto.supports_depthformer());
+            drop(acc2);
+            drop(acc2_auto);
+
+            let lfm3a = synth_lfm3a_gguf();
+            assert!(build_audio_accelerator(&lfm3a, BP::Cpu).is_none());
+            assert!(build_audio_accelerator(&lfm3a, BP::Gpu).is_none());
+            assert!(build_audio_accelerator(&lfm3a, BP::Metal).is_none());
+            let acc3 = build_audio_accelerator(&lfm3a, BP::Npu).expect("lfm3a Npu accelerator");
+            assert!(acc3.supports_depthformer());
+            assert!(acc3.supports_lfm3a_gen_depthformer());
+            assert!(acc3.supports_lfm3a_gen_detokenizer());
+            let codes = acc3
+                .sample_audio_frame_lfm3a(&vec![0.25; 12], 0.0, 1)
+                .expect("lfm3a sample");
+            assert_eq!(codes.len(), 12);
+            assert!(acc3.take_audio_error().is_none());
+            let acc3_auto =
+                build_audio_accelerator(&lfm3a, BP::Auto).expect("lfm3a Auto accelerator");
+            assert!(acc3_auto.supports_lfm3a_gen_detokenizer());
+            drop(acc3);
+            drop(acc3_auto);
+
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_depthformer_and_detokenizer_reject_mismatched_shapes_and_missing_df_records_error()
+    {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+
+            // Depthformer shape validations.
+            let (mut bad_layers, _) = synth_lfm2a_weights();
+            bad_layers.depthformer_layers.pop();
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), Some(&bad_layers), None)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("n_layer")
+            );
+
+            let (mut bad_qkv, _) = synth_lfm2a_weights();
+            bad_qkv.depthformer_layers[0].wqkv =
+                f32_w(8, bad_qkv.depthformer_config.n_embd, 1, 0.1);
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), Some(&bad_qkv), None)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("wqkv")
+            );
+
+            let (mut bad_wo, _) = synth_lfm2a_weights();
+            bad_wo.depthformer_layers[0].wo = f32_w(bad_wo.depthformer_config.n_embd, 8, 1, 0.1);
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), Some(&bad_wo), None)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("wo")
+            );
+
+            let (mut bad_ffn, _) = synth_lfm2a_weights();
+            bad_ffn.depthformer_layers[0].w1 = f32_w(8, bad_ffn.depthformer_config.n_embd, 1, 0.1);
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), Some(&bad_ffn), None)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("FFN")
+            );
+
+            let (mut bad_cb_emb, _) = synth_lfm3a_weights();
+            bad_cb_emb.depth_embeddings[0].embedding =
+                MmapWeight::from_owned_f32(Vec::new(), 0, bad_cb_emb.depthformer_config.n_embd);
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), Some(&bad_cb_emb), None)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("embedding")
+            );
+
+            // Detokenizer shape validations.
+            let (_, mut bad_conv_in) = synth_lfm2a_weights();
+            bad_conv_in.layers[0].conv_in_proj = Some(f32_w(8, bad_conv_in.config.n_embd, 1, 0.1));
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), None, Some(&bad_conv_in))
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conv_in_proj")
+            );
+
+            let (_, mut bad_wq) = synth_lfm2a_weights();
+            bad_wq.layers[1].wq = Some(f32_w(8, bad_wq.config.n_embd, 1, 0.1));
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), None, Some(&bad_wq))
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("wq")
+            );
+
+            let (_, mut bad_lin_b) = synth_lfm2a_weights();
+            bad_lin_b.lin_b.pop();
+            assert!(
+                XdnaAudioDecoder::from_parts(runner.clone(), None, Some(&bad_lin_b))
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("lin_b")
+            );
+
+            // Missing depthformer records an error on `sample_audio_frame`.
+            let (_, detok_w) = synth_lfm2a_weights();
+            let detok_only =
+                XdnaAudioDecoder::from_parts(runner, None, Some(&detok_w)).expect("detok-only");
+            assert_eq!(detok_only.sample_audio_frame(&[0.0; 64], 0.0, 1), [0; 8]);
+            let err = detok_only
+                .take_audio_error()
+                .expect("sample_audio_frame without depthformer must record error");
+            assert!(err.to_string().contains("depthformer"));
+            assert!(detok_only.take_audio_error().is_none());
+
+            drop(detok_only);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_detokenizer_preserves_state_on_mid_pass_gemm_error() {
+        let (dec_w, detok_w) = synth_lfm2a_weights();
+
+        // Reference uninterrupted 2-frame run.
+        let (ref_spec1, _) = fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let ref_xdna =
+                XdnaAudioDecoder::from_parts(runner, Some(&dec_w), Some(&detok_w)).unwrap();
+            let _ = ref_xdna.detokenize_to_spectrum(&detok_w, &[1; 8]);
+            let s1 = ref_xdna.detokenize_to_spectrum(&detok_w, &[2; 8]);
+            assert!(ref_xdna.take_audio_error().is_none());
+            s1
+        });
+
+        let (xdna, _) = fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let xdna = XdnaAudioDecoder::from_parts(runner, Some(&dec_w), Some(&detok_w)).unwrap();
+            let _ = xdna.detokenize_to_spectrum(&detok_w, &[1; 8]);
+            assert!(xdna.take_audio_error().is_none());
+            xdna
+        });
+
+        let snap = {
+            let detok = xdna.detokenizer.as_ref().unwrap();
+            let st = detok.state.lock().unwrap();
+            (st.n_past, st.conv_bufs.clone(), st.attn_kv.clone())
+        };
+        assert_eq!(snap.0, 6);
+
+        // 1. Runlist failure via fake shim preserves state.
+        fake::with_shim(
+            FakeConfig {
+                fail_runlist_wait: true,
+                ..FakeConfig::default()
+            },
+            || {
+                let out = xdna.detokenize_to_spectrum(&detok_w, &[2; 8]);
+                assert!(out.is_empty());
+                assert!(xdna.take_audio_error().is_some());
+            },
+        );
+        {
+            let detok = xdna.detokenizer.as_ref().unwrap();
+            let st = detok.state.lock().unwrap();
+            assert_eq!(st.n_past, snap.0);
+            assert_eq!(st.conv_bufs, snap.1);
+            assert_eq!(st.attn_kv, snap.2);
+        }
+
+        // 2. Late-pass failure on final `w_lin` after layers 0 & 1 ran also preserves state.
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let mut xdna2 =
+                XdnaAudioDecoder::from_parts(runner, Some(&dec_w), Some(&detok_w)).unwrap();
+            let _ = xdna2.detokenize_to_spectrum(&detok_w, &[1; 8]);
+            let saved_lin_cols = xdna2.detokenizer.as_ref().unwrap().lin_cols;
+            xdna2.detokenizer.as_mut().unwrap().lin_cols += 1;
+            let err_out = xdna2.detokenize_to_spectrum(&detok_w, &[2; 8]);
+            assert!(err_out.is_empty());
+            assert!(xdna2.take_audio_error().is_some());
+            {
+                let detok = xdna2.detokenizer.as_ref().unwrap();
+                let st = detok.state.lock().unwrap();
+                assert_eq!(st.n_past, snap.0);
+                assert_eq!(st.conv_bufs, snap.1);
+                assert_eq!(st.attn_kv, snap.2);
+            }
+            xdna2.detokenizer.as_mut().unwrap().lin_cols = saved_lin_cols;
+            let recovered_spec1 = xdna2.detokenize_to_spectrum(&detok_w, &[2; 8]);
+            assert!(xdna2.take_audio_error().is_none());
+            assert_eq!(recovered_spec1, ref_spec1);
+            drop(xdna2);
+        });
+        drop(xdna);
+        assert_eq!(fake::live_bo_count(), 0);
+    }
+
+    #[test]
+    fn fake_shim_session_lease_and_audio_output_decoder_try_finish() {
+        use crate::audio_engine::{AudioOutputDecoder, FrameOutcome};
+
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+
+            // 1. Direct try_acquire_session / release_session + LFM2A AudioOutputDecoder (streaming & batch).
+            let (dec2, detok2) = synth_lfm2a_weights();
+            let xdna2 = XdnaAudioDecoder::from_parts(runner.clone(), Some(&dec2), Some(&detok2))
+                .expect("lfm2a decoder");
+            assert!(xdna2.try_acquire_session());
+            assert!(!xdna2.try_acquire_session());
+            xdna2.release_session();
+            assert!(xdna2.try_acquire_session());
+            xdna2.release_session();
+
+            let embed2 = det_vec(dec2.decoder_config.n_embd, 7, 0.5);
+            {
+                let mut aod = AudioOutputDecoder::new(&dec2, &detok2, Some(&xdna2), 0.0, 1, false);
+                assert!(aod.supports_accelerated_depthformer());
+                assert!(!xdna2.try_acquire_session());
+                let mut total_pcm = Vec::new();
+                for _ in 0..2 {
+                    match aod.decode_frame(&embed2) {
+                        FrameOutcome::Codes { pcm, .. } => total_pcm.extend_from_slice(&pcm),
+                        other => panic!("unexpected frame outcome: {other:?}"),
+                    }
+                }
+                let n_streamed = aod
+                    .try_finish(|pcm, sr| {
+                        assert_eq!(sr, 24000);
+                        total_pcm.extend_from_slice(pcm);
+                    })
+                    .expect("try_finish streaming lfm2a");
+                assert_eq!(n_streamed, total_pcm.len());
+                assert!(!total_pcm.is_empty() && total_pcm.iter().all(|v| v.is_finite()));
+            }
+            assert!(xdna2.try_acquire_session());
+            xdna2.release_session();
+
+            {
+                let mut batch =
+                    AudioOutputDecoder::new(&dec2, &detok2, Some(&xdna2), 0.0, 1, false)
+                        .with_streaming(false);
+                for _ in 0..2 {
+                    assert!(matches!(
+                        batch.decode_frame(&embed2),
+                        FrameOutcome::Codes { pcm, .. } if pcm.is_empty()
+                    ));
+                }
+                let mut batch_pcm = Vec::new();
+                let n_batch = batch
+                    .try_finish(|pcm, sr| {
+                        assert_eq!(sr, 24000);
+                        batch_pcm.extend_from_slice(pcm);
+                    })
+                    .expect("try_finish batch lfm2a");
+                assert!(n_batch > 0 && n_batch == batch_pcm.len());
+                assert!(batch_pcm.iter().all(|v| v.is_finite()));
+            }
+            drop(xdna2);
+
+            // 2. LFM3A AudioOutputDecoder + XdnaAudioDecoder + try_finish (streaming).
+            let (dec3, detok3) = synth_lfm3a_weights();
+            let xdna3 =
+                XdnaAudioDecoder::from_parts(runner, Some(&dec3), Some(&detok3)).expect("lfm3a");
+            let embed3 = det_vec(dec3.decoder_config.n_embd, 19, 0.4);
+            {
+                let mut aod3 = AudioOutputDecoder::new(&dec3, &detok3, Some(&xdna3), 0.0, 1, false);
+                assert!(aod3.supports_accelerated_depthformer());
+                let mut pcm3 = Vec::new();
+                for _ in 0..2 {
+                    match aod3.decode_frame(&embed3) {
+                        FrameOutcome::Codes { pcm, .. } => pcm3.extend_from_slice(&pcm),
+                        other => panic!("unexpected lfm3a frame outcome: {other:?}"),
+                    }
+                }
+                let n3 = aod3
+                    .try_finish(|pcm, sr| {
+                        assert_eq!(sr, 24000);
+                        pcm3.extend_from_slice(pcm);
+                    })
+                    .expect("try_finish streaming lfm3a");
+                assert_eq!(n3, pcm3.len());
+                assert!(n3 > 0 && pcm3.iter().all(|v| v.is_finite()));
+            }
+            drop(xdna3);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_detokenizer_swa_ring_buffer_wraparound() {
+        fake::with_shim(FakeConfig::default(), || {
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+
+            // LFM2A: 6 tokens/frame, swa_window_size=16 -> 5 frames reaches n_past=30 >= 16.
+            let (dec2, detok2) = synth_lfm2a_weights();
+            let xdna2 = XdnaAudioDecoder::from_parts(runner.clone(), Some(&dec2), Some(&detok2))
+                .expect("lfm2a");
+            let spec0 = xdna2.detokenize_to_spectrum(&detok2, &[1; 8]);
+            for f in 1..5 {
+                let s = xdna2.detokenize_to_spectrum(&detok2, &[f; 8]);
+                assert!(xdna2.take_audio_error().is_none());
+                assert_eq!(s.len(), spec0.len());
+                assert!(s.iter().all(|v| v.is_finite()));
+            }
+            assert_eq!(
+                xdna2
+                    .detokenizer
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .n_past,
+                30
+            );
+            xdna2.reset_detokenizer();
+            assert_eq!(
+                xdna2
+                    .detokenizer
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .n_past,
+                0
+            );
+            assert_eq!(xdna2.detokenize_to_spectrum(&detok2, &[1; 8]), spec0);
+            drop(xdna2);
+
+            // LFM3A: 1 token/frame, swa_window_size=16 -> 20 frames reaches n_past=20 >= 16.
+            let (dec3, detok3) = synth_lfm3a_weights();
+            let xdna3 =
+                XdnaAudioDecoder::from_parts(runner, Some(&dec3), Some(&detok3)).expect("lfm3a");
+            let spec3_0 = xdna3.detokenize_to_spectrum(&detok3, &[3; 12]);
+            for f in 1..20 {
+                let s = xdna3.detokenize_to_spectrum(&detok3, &[3 + f; 12]);
+                assert!(xdna3.take_audio_error().is_none());
+                assert_eq!(s.len(), spec3_0.len());
+                assert!(s.iter().all(|v| v.is_finite()));
+            }
+            assert_eq!(
+                xdna3
+                    .detokenizer
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .n_past,
+                20
+            );
+            xdna3.reset_detokenizer();
+            assert_eq!(
+                xdna3
+                    .detokenizer
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .n_past,
+                0
+            );
+            assert_eq!(xdna3.detokenize_to_spectrum(&detok3, &[3; 12]), spec3_0);
+            drop(xdna3);
+
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
     #[test]
     #[ignore = "requires physical AMD XDNA2 NPU2 hardware"]
     fn hw_audio_decoder_lfm2a_and_lfm3a_parity() {
@@ -1981,8 +3175,23 @@ mod tests {
             assert!(xdna.take_audio_error().is_none());
             assert_eq!(npu_codes, cpu_codes, "NPU lfm2a depthformer greedy codes");
 
+            // Seeded stochastic sampling determinism & CPU parity.
+            df_state.seed_rng(42);
+            let cpu_stoch = sample_audio_frame(&dec_w, &mut df_state, &embed, 0.7, 4);
+            xdna.seed_rng(42);
+            let npu_stoch_a = xdna.sample_audio_frame(&embed, 0.7, 4);
+            xdna.seed_rng(42);
+            let npu_stoch_b = xdna.sample_audio_frame(&embed, 0.7, 4);
+            assert!(xdna.take_audio_error().is_none());
+            assert_eq!(
+                npu_stoch_a, npu_stoch_b,
+                "NPU lfm2a seeded stochastic determinism"
+            );
+            assert_eq!(npu_stoch_a, cpu_stoch, "NPU lfm2a seeded stochastic parity");
+
+            // 5 frames * 6 tokens = 30 >= swa_window_size (16) exercises SWA wraparound.
             let mut dt_state = DetokenizerState::new(&detok_w.config);
-            for frame_idx in 0..3 {
+            for frame_idx in 0..5 {
                 let mut f_codes = cpu_codes;
                 f_codes[0] = (f_codes[0] + frame_idx) % 16;
                 let cpu_spec = detokenize_to_spectrum(&detok_w, &dec_w, &mut dt_state, &f_codes);
@@ -2014,9 +3223,34 @@ mod tests {
                 );
             }
 
+            // Seeded stochastic MaskGIT determinism & CPU parity.
+            df_state.reset_history();
+            xdna.reset_depthformer();
+            df_state.seed_rng(42);
+            let cpu_stoch3 = sample_frame(&dec_w, &mut df_state, &embed, 0.7, 2);
+            xdna.seed_rng(42);
+            let npu_stoch3_a = xdna
+                .sample_audio_frame_lfm3a(&embed, 0.7, 2)
+                .expect("NPU lfm3a stochastic codes");
+            xdna.reset_depthformer();
+            xdna.seed_rng(42);
+            let npu_stoch3_b = xdna
+                .sample_audio_frame_lfm3a(&embed, 0.7, 2)
+                .expect("NPU lfm3a stochastic codes repeat");
+            assert!(xdna.take_audio_error().is_none());
+            assert_eq!(
+                npu_stoch3_a, npu_stoch3_b,
+                "NPU lfm3a seeded stochastic determinism"
+            );
+            assert_eq!(
+                npu_stoch3_a, cpu_stoch3,
+                "NPU lfm3a seeded stochastic parity"
+            );
+
+            // 20 frames * 1 token = 20 >= swa_window_size (16) exercises causal SWA wraparound.
             let mut dt_state = DetokenizerState::new(&detok_w.config);
             let seed_codes = sample_frame(&dec_w, &mut df_state, &embed, 0.0, 1);
-            for frame_idx in 0..3 {
+            for frame_idx in 0..20 {
                 let mut f_codes = seed_codes.clone();
                 f_codes[0] = (f_codes[0] + frame_idx) % 256;
                 let cpu_spec = detokenize_to_spectrum(&detok_w, &dec_w, &mut dt_state, &f_codes);

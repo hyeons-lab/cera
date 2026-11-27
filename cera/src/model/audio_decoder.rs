@@ -209,9 +209,12 @@ pub fn is_lfm3a_gen_gguf(gguf: &GgufFile) -> bool {
 
 /// Try to construct an accelerated audio decoder backend for the given vocoder GGUF file.
 ///
-/// For `lfm3a_gen` models, only the Hexagon NPU detokenizer path (`Hexagon`, `Npu`, or `Auto`)
-/// is probed; `Metal`, `Gpu`, and `Cpu` return `None`. Returns `None` when the chosen backend's
-/// feature is not compiled or when the device/context cannot be created.
+/// For `lfm3a_gen` models, only NPU backends (`Npu` and `Auto` probing AMD XDNA then Qualcomm
+/// Hexagon, and `Hexagon` probing Hexagon) are used; `Metal`, `Gpu`, and `Cpu` return `None`.
+/// For `lfm2a` models, `Auto` probes Metal -> XDNA -> Hexagon -> WGPU, while explicit
+/// preferences probe their corresponding backend (`Npu` probes XDNA -> Hexagon, `Cpu` returns
+/// `None`). Returns `None` when the chosen backend's feature is not compiled or when the
+/// device/context cannot be created.
 pub fn build_audio_accelerator(
     gguf: &Arc<GgufFile>,
     backend: crate::engine::BackendPreference,
