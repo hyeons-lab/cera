@@ -35,13 +35,15 @@ union ScratchUnion {
     alignas(64) bfloat16 xd_out[64];              // 16384..16511
   } gemm;
   struct {
-    alignas(64) float rope_cs[B_SUB][HEAD_DIM];    // 0..4095
+    alignas(64) bfloat16 rope_cs_bf[B_SUB][HEAD_DIM];  // 0..2047
+    uint8_t _pad_after_cs[4096 - 2048];                // 2048..4095
     alignas(64) bfloat16 k_buf[B_SUB][HEAD_DIM];   // 4096..6143
     alignas(64) bfloat16 v_buf[B_SUB][HEAD_DIM];   // 6144..8191
     alignas(64) float q_norm_w[HEAD_DIM];          // 8192..8703
     alignas(64) float k_norm_w[HEAD_DIM];          // 8704..9215
     alignas(64) float tmp_n[HEAD_DIM];             // 9216..9727
-    uint8_t _pad_after_rope[12288 - 9728];         // 9728..12287
+    alignas(64) bfloat16 tmp_bf[HEAD_DIM];         // 9728..9983
+    uint8_t _pad_after_rope[12288 - 9984];         // 9984..12287
     alignas(64) bfloat16 q_bf16[GQA_Q_HEADS * (HEAD_DIM / 8) * B_SUB * 8];   // 12288..16383
     alignas(64) bfloat16 q1_bf16[GQA_Q_HEADS * (HEAD_DIM / 8) * B_SUB * 8];  // 16384..20479
   } rope;
@@ -63,10 +65,9 @@ union ScratchUnion {
     alignas(64) bfloat16 q1_bf16[GQA_Q_HEADS * (HEAD_DIM / 8) * B_SUB * 8];  // 16384..20479
   } attn;
   struct {
-    alignas(64) float state[D_CONV][64];         // 0..1535
-    alignas(64) float bx[32 + D_CONV][64];       // 1536..11263
-    alignas(64) float wt[L_CACHE][64];           // 11264..13055
-    alignas(64) float conv_out[B_SUB * 64];       // 13056..15103
+    alignas(64) float ring[D_CONV + 32 + D_CONV][64];  // 0..11263 (0..5: state, 6..37: bx)
+    alignas(64) float wt[L_CACHE][64];                 // 11264..13055
+    alignas(64) float conv_out[B_SUB * 64];            // 13056..15103
   } conv;
 };
 
@@ -75,6 +76,13 @@ constexpr int ATTN_ST_M_OFF = 2080;
 constexpr int ATTN_ST_P_OFF = 2656;
 
 static_assert(sizeof(ScratchUnion) == 20480, "ScratchUnion size");
+static_assert(__builtin_offsetof(ScratchUnion, rope.k_buf) == 4096, "rope k_buf offset");
+static_assert(__builtin_offsetof(ScratchUnion, rope.v_buf) - __builtin_offsetof(ScratchUnion, rope.k_buf) == 2048, "v/k offset");
+static_assert(__builtin_offsetof(ScratchUnion, rope.q_norm_w) == 8192, "rope q_norm_w offset");
+static_assert(__builtin_offsetof(ScratchUnion, rope.tmp_bf) == 9728, "rope tmp_bf offset");
+static_assert(__builtin_offsetof(ScratchUnion, rope.q_bf16) == 12288, "rope q_bf16 offset");
+static_assert(__builtin_offsetof(ScratchUnion, conv.wt) == 11264, "conv wt offset");
+static_assert(__builtin_offsetof(ScratchUnion, conv.conv_out) == 13056, "conv_out offset");
 static_assert(__builtin_offsetof(ScratchUnion, attn.q1_bf16) - __builtin_offsetof(ScratchUnion, attn.q_bf16) == 4096, "q1/q offset");
 static_assert(__builtin_offsetof(ScratchUnion, attn.row_l) == ATTN_ST_L_OFF * 4, "row_l offset");
 static_assert(__builtin_offsetof(ScratchUnion, attn.row_m) == ATTN_ST_M_OFF * 4, "row_m offset");

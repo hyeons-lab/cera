@@ -23,18 +23,20 @@ __attribute__((noinline, cold, minsize)) void q4_fa_rescale_2h(
   aie::vector<float, 16> alpha16 = aie::accum<accfloat, 16>(eb).template to_vector<float>();
   float *__restrict rlp = &g_scratch.attn.row_l[h_idx][0];
   aie::store_v(rlp, q4_fmul_16(aie::load_v<16>(rlp), alpha16));
+  alignas(32) float abuf[16];
+  aie::store_v(abuf, alpha16);
   float *__restrict b0 = &g_scratch.attn.o_acc[h_idx][0][0];
   float *__restrict b1 = g_x_ptr + h_idx * 1024;
 #pragma clang loop unroll(disable)
   for (int idx = 0; idx < 16; ++idx) {
-    float a = alpha16.get(0);
-    alpha16 = aie::vector<float, 16>(::shift_bytes(alpha16, alpha16, 4));
     if (!((need >> idx) & 1U)) continue;
     float *__restrict p = ((idx < 8) ? b0 : b1) + (idx & 7) * 8;
-    aie::vector<float, 16> sv = aie::broadcast<float, 16>(a);
+    float a = abuf[idx];
 #pragma clang loop unroll(disable)
     for (int d16 = 0; d16 < (HEAD_DIM / 16); ++d16, p += 128) {
-      aie::vector<float, 16> o = q4_fmul_16(aie::concat(aie::load_v<8>(p), aie::load_v<8>(p + 64)), sv);
+      aie::vector<float, 16> o = q4_fmul_16(
+          aie::concat(aie::load_v<8>(p), aie::load_v<8>(p + 64)),
+          aie::broadcast<float, 16>(a));
       aie::store_v(p, o.template extract<8>(0));
       aie::store_v(p + 64, o.template extract<8>(1));
     }
@@ -81,39 +83,32 @@ extern "C" __attribute__((noinline, minsize)) void quantize_q8_2blk_8tok(
     uint8_t *__restrict q_dst1,
     bfloat16 *__restrict d_dst0) {
   const int32_t blk2_off = col2_off * 2;
-  bfloat16 *__restrict d_dst1 = d_dst0 + 8;
-  alignas(32) float sc_buf[16];
+  alignas(32) union {
+    float f[16];
+    bfloat16 b[32];
+  } sc_buf;
 #pragma clang loop unroll(disable)
-  for (int t = 0; t < 8; ++t) {
-    const float *__restrict r = src + t * row_stride;
-    const float *__restrict r2 = r + blk2_off;
-    sc_buf[t] = abs_max_32(r, r + col2_off);
-    sc_buf[8 + t] = abs_max_32(r2, r2 + col2_off);
+  for (int i = 0; i < 16; ++i) {
+    const float *__restrict r = src + (i & 7) * row_stride + (i >> 3) * blk2_off;
+    sc_buf.f[i] = abs_max_32(r, r + col2_off);
   }
-  aie::vector<float, 16> dv = q4_fmul_16(aie::load_v<16>(sc_buf), aie::broadcast<float, 16>(1.0f / 127.0f));
-  aie::vector<bfloat16, 16> dv_b = aie::accum<accfloat, 16>(dv).template to_vector<bfloat16>();
-  aie::store_v(d_dst0, dv_b.template extract<8>(0));
-  aie::store_v(d_dst1, dv_b.template extract<8>(1));
-  aie::vector<bfloat16, 16> idv_b = aie::accum<accfloat, 16>(q4_inv_16(dv)).template to_vector<bfloat16>();
+  aie::vector<float, 16> dv = q4_fmul_16(aie::load_v<16>(sc_buf.f), aie::broadcast<float, 16>(1.0f / 127.0f));
+  // All callers pass 32B-aligned xd_out with d_dst1 == d_dst0 + 8 contiguous.
+  aie::store_v(d_dst0, aie::accum<accfloat, 16>(dv).template to_vector<bfloat16>());
+  aie::store_v(sc_buf.b, aie::accum<accfloat, 16>(q4_inv_16(dv)).template to_vector<bfloat16>());
 #pragma clang loop unroll(disable)
-  for (int t = 0; t < 8; ++t) chess_prepare_for_pipelining chess_loop_count(8) {
-    const float *__restrict r = src + t * row_stride;
-    const float *__restrict r2 = r + blk2_off;
+  for (int i = 0; i < 16; ++i) {
+    const int b = i >> 3;
+    const int t = i & 7;
+    const float *__restrict r = src + t * row_stride + b * blk2_off;
     aie::vector<bfloat16, 32> r01 = aie::concat(
         aie::accum<accfloat, 16>(aie::load_v<16>(r)).template to_vector<bfloat16>(),
         aie::accum<accfloat, 16>(aie::load_v<16>(r + col2_off)).template to_vector<bfloat16>());
-    aie::vector<bfloat16, 32> r23 = aie::concat(
-        aie::accum<accfloat, 16>(aie::load_v<16>(r2)).template to_vector<bfloat16>(),
-        aie::accum<accfloat, 16>(aie::load_v<16>(r2 + col2_off)).template to_vector<bfloat16>());
-    aie::vector<float, 32> p01 = aie::mul<accfloat>(r01, aie::broadcast<bfloat16, 32>(idv_b[t])).template to_vector<float>();
-    aie::vector<float, 32> p23 = aie::mul<accfloat>(r23, aie::broadcast<bfloat16, 32>(idv_b[8 + t])).template to_vector<float>();
+    aie::vector<float, 32> p01 = aie::mul<accfloat>(r01, aie::broadcast<bfloat16, 32>(sc_buf.b[i])).template to_vector<float>();
     aie::vector<int8, 32> q01 = aie::to_fixed<int8>(p01, 0);
-    aie::vector<int8, 32> q23 = aie::to_fixed<int8>(p23, 0);
-    int off = (t >> 2) * 128 + (t & 3) * 16;
-    aie::store_v((int8_t *)(q_dst0 + off), q01.template extract<16>(0));
-    aie::store_v((int8_t *)(q_dst0 + off + 64), q01.template extract<16>(1));
-    aie::store_v((int8_t *)(q_dst1 + off), q23.template extract<16>(0));
-    aie::store_v((int8_t *)(q_dst1 + off + 64), q23.template extract<16>(1));
+    uint8_t *__restrict qd = (b ? q_dst1 : q_dst0) + (t >> 2) * 128 + (t & 3) * 16;
+    aie::store_v((int8_t *)qd, q01.template extract<16>(0));
+    aie::store_v((int8_t *)(qd + 64), q01.template extract<16>(1));
   }
 }
 

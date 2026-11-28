@@ -2827,7 +2827,7 @@ mod tests {
             x / (1.0 + (-x).exp())
         }
 
-        fn rel_rms(got: &[f32], ref_f64: &[f64], label: &str) {
+        fn rel_rms_within(got: &[f32], ref_f64: &[f64], label: &str, max_rel: f64) {
             assert_eq!(got.len(), ref_f64.len());
             let mut err2 = 0.0f64;
             let mut ref2 = 0.0f64;
@@ -2844,7 +2844,14 @@ mod tests {
             let rel = (err2 / ref2.max(1e-12)).sqrt();
             println!("{label}: nans={nans} rel_rms={rel:.5}");
             assert_eq!(nans, 0, "{label} produced NaN/Inf");
-            assert!(rel < 0.03, "{label} rel_rms too high: {rel:.5}");
+            assert!(
+                rel < max_rel,
+                "{label} rel_rms too high: {rel:.5} (limit {max_rel:.3})"
+            );
+        }
+
+        fn rel_rms(got: &[f32], ref_f64: &[f64], label: &str) {
+            rel_rms_within(got, ref_f64, label, 0.03);
         }
 
         let dev = XdnaDevice::open(0).expect("open NPU");
@@ -3016,6 +3023,10 @@ mod tests {
 
         // --- Test 2: q4prefill_lfm3_attn Mode 1 (c0 & c1 SWA) + Mode 2/3 (bidir 2 chunks = 64 tokens) ---
         if run_attn {
+            // `q4prefill_lfm3` attention uses bf16/bfp16ebs8 intermediates (`exp2`, RoPE, Q8,
+            // `gemm_half_step`), giving ~0.038 empirical margin on synthetic inputs vs >=0.149
+            // real-fault floor.
+            const ATTN_MAX_REL_RMS: f64 = 0.045;
             let k_m1_c0 = dev
                 .load_kernel(
                     Q4PREFILL_LFM3_XCLBIN,
@@ -3246,7 +3257,7 @@ mod tests {
                     t + 1,
                 ));
             }
-            rel_rms(&yn0, &cpu0, "attn_m1_c0_swa16");
+            rel_rms_within(&yn0, &cpu0, "attn_m1_c0_swa16", ATTN_MAX_REL_RMS);
 
             // 2b: Mode 1 c1 (pos0=27, n_past=27 past tokens in chunk 0 of bo_kv)
             // Copy kvo chunk from chunk 0 (only 27 valid past tokens needed) by creating 27 past tokens from k0/v0
@@ -3310,7 +3321,7 @@ mod tests {
                     gpos + 1,
                 ));
             }
-            rel_rms(&yn1, &cpu1, "attn_m1_c1_swa32");
+            rel_rms_within(&yn1, &cpu1, "attn_m1_c1_swa32", ATTN_MAX_REL_RMS);
 
             // 2c: Bidir Phase A (Mode 2) + Phase B (Mode 3, 2 chunks = 50 tokens -> kv_ch=1 per chunk? Wait chunk1 needs kv_ch=2! Test 32 tokens cleanly with c1 or test cross-chunk with 2 chunks? Note with bidir_b_c1 we can test 32 tokens attending globally to all 32 tokens!)
             //Wait: Mode 3 with kv_ch=1 reads chunk 0 (32 tokens) from bo_kv and ignores cur_kv! Let's run Phase A on 29 tokens -> copy kvo -> bo_kv[chunk 0] -> save q_bf16 & gate -> Phase B (kv_ch=1, n_past=29, is_causal=false) -> verify bidirectional attention on all 29 tokens!
@@ -3370,7 +3381,7 @@ mod tests {
                 ));
             }
             let _ = (SLOT_Q_BF16, SLOT_ATTN_GATE, bf16::ZERO);
-            rel_rms(&yn_b, &cpu_b, "attn_bidir_global");
+            rel_rms_within(&yn_b, &cpu_b, "attn_bidir_global", ATTN_MAX_REL_RMS);
         }
     }
 

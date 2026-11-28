@@ -474,7 +474,7 @@ full copyright lines and license texts are in `NOTICE.md` (see
 | `q4prefill_layer.xclbin` | `f5430e023ddc61af7b64aa2686a717a9ac7a21694ab3e352e617b2fa3bd24051` |
 | `q4prefill_lfm2.xclbin` | `56c54db77c245fe4e4297e6300a2ed83ffac09da0ba57d4e6a828614f786938d` |
 | `q4prefill_lfm2_ext.xclbin` | `b2f198c62dca1e68afd2f4b85ea7913b230fde289e1a55b3a72653f1b49f1693` |
-| `q4prefill_lfm3.xclbin` | `66c3878b3574d155b167561b47a5249009e8a2bb5967155b6a1e7570df018faf` |
+| `q4prefill_lfm3.xclbin` | `6a1bdf6e34d67cef91ea238bc91beb3560196f78edb98c22e6defeae94978385` |
 
 Weight and activation formats are the decision record's
 (`docs/XDNA_PHASE0_RESULTS.md` section 4): signed int4 weights (Q4_0's
