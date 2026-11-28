@@ -3693,7 +3693,8 @@ mod tests {
 
     #[test]
     fn forward_prefill_runlist_and_head_run_timeouts_quiesce_in_flight() {
-        // 1. Prefill bucket runlist timeout sets `InFlightXdnaOp::PrefillBucket(0)` and retains it on wait failure.
+        // 1. Prefill bucket runlist timeout at `pos0 = 1` sets `InFlightXdnaOp::PrefillBucket(1)`
+        // (`needed = 1.div_ceil(64) = 1`) and retains it on wait failure.
         with_shim(
             FakeConfig {
                 fail_runlist_wait: true,
@@ -3710,12 +3711,12 @@ mod tests {
                 assert!(model.take_decode_error().is_some());
                 assert_eq!(
                     model.lock_npu().in_flight,
-                    Some(InFlightXdnaOp::PrefillBucket(0))
+                    Some(InFlightXdnaOp::PrefillBucket(1))
                 );
                 assert!(quiesce_in_flight(&mut model.lock_npu()).is_err());
                 assert_eq!(
                     model.lock_npu().in_flight,
-                    Some(InFlightXdnaOp::PrefillBucket(0))
+                    Some(InFlightXdnaOp::PrefillBucket(1))
                 );
                 assert!(
                     model
@@ -3728,8 +3729,9 @@ mod tests {
             },
         );
 
-        // 2. Prefill `head_run` timeout sets `InFlightXdnaOp::PrefillHead` and retains it on wait failure.
-        with_shim(
+        // 2. Prefill `head_run` timeout after bucket 1 completes sets `InFlightXdnaOp::PrefillHead`
+        // and retains it on wait failure.
+        let (_, head_timeout_events) = with_shim(
             FakeConfig {
                 fail_runlist_wait: false,
                 run_wait_state: Some(0),
@@ -3762,17 +3764,39 @@ mod tests {
                 model.lock_npu().in_flight = None;
             },
         );
+        assert_eq!(
+            head_timeout_events
+                .iter()
+                .filter(|e| matches!(e, FakeEvent::RunListExecute(_)))
+                .count(),
+            1,
+            "expected prefill bucket runlist execution before PrefillHead timeout"
+        );
+        assert_eq!(
+            head_timeout_events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    FakeEvent::RunListWait {
+                        timeout_ms: QUIESCE_TIMEOUT_MS,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "expected prefill bucket runlist wait before PrefillHead timeout"
+        );
 
-        // 3. Healthy quiesce recovery drains pending `PrefillBucket` before `BoFree` on Drop and clears `try_reset_kv`.
+        // 3. Healthy quiesce recovery drains pending `PrefillBucket(1)` before `BoFree` on Drop and clears `try_reset_kv`.
         let (_, events) = with_shim(FakeConfig::default(), || {
             let (model, cfg) = make_llama_xdna_model_for_test(true);
             let mut state = seed_llama_f16_state(&cfg, 1);
             {
                 let mut guard = model.lock_npu();
-                guard.prefill.as_ref().unwrap().bucket_runlists[0]
+                guard.prefill.as_ref().unwrap().bucket_runlists[1]
                     .execute()
                     .unwrap();
-                guard.in_flight = Some(InFlightXdnaOp::PrefillBucket(0));
+                guard.in_flight = Some(InFlightXdnaOp::PrefillBucket(1));
             }
             model.state_torn.store(true, Ordering::SeqCst);
             model
@@ -3784,13 +3808,26 @@ mod tests {
             // Leave `PrefillHead` in-flight at Drop and assert Drop quiesces without error.
             model.lock_npu().in_flight = Some(InFlightXdnaOp::PrefillHead);
         });
-        assert!(events.iter().any(|e| matches!(
-            e,
-            FakeEvent::RunListWait {
-                timeout_ms: 30_000,
-                ..
-            }
-        )));
+        let wait_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    FakeEvent::RunListWait {
+                        timeout_ms: QUIESCE_TIMEOUT_MS,
+                        ..
+                    }
+                )
+            })
+            .expect("try_reset_kv must wait for in-flight prefill bucket runlist");
+        let first_bo_free = events
+            .iter()
+            .position(|e| matches!(e, FakeEvent::BoFree(_)))
+            .expect("BOs freed on Drop");
+        assert!(
+            wait_idx < first_bo_free,
+            "in-flight prefill bucket must quiesce before BOs are freed: {events:?}"
+        );
     }
 
     #[test]
