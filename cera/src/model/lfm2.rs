@@ -2892,8 +2892,8 @@ impl LfmModel {
                 &scratch.ffn_input[..n * hs],
                 hs,
                 n,
-                &mut scratch.bq_scales,
-                &mut scratch.bq_quants,
+                &mut scratch.bq_scales[..n * nb_hs],
+                &mut scratch.bq_quants[..n * hs],
             );
         }
 
@@ -3176,6 +3176,8 @@ impl LfmModel {
                     hs,
                 );
             if !fused_f32_ok {
+                let bq_scales = &mut bq_scales[..n * (hs / 32)];
+                let bq_quants = &mut bq_quants[..n * hs];
                 let t_q = crate::time::Instant::now();
                 transformer::quantize_rows(ffn_input, hs, n, bq_scales, bq_quants);
                 if let Some(d) = prof_quant.as_deref_mut() {
@@ -3285,6 +3287,8 @@ impl LfmModel {
                     *d += t_d.elapsed();
                 }
             } else {
+                let dq_scales = &mut dq_scales[..n * (is / 32)];
+                let dq_quants = &mut dq_quants[..n * is];
                 let t_q = crate::time::Instant::now();
                 transformer::quantize_rows(gate_mat, is, n, dq_scales, dq_quants);
                 if let Some(d) = prof_quant {

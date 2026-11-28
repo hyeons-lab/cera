@@ -1633,8 +1633,10 @@ impl XdnaLfm3Model {
             if bq_quants.len() < n * k {
                 bq_quants.resize(n * k, 0);
             }
-            transformer::quantize_rows(input, k, n, bq_scales, bq_quants);
-            if transformer::gemm_preq_rowmajor(gguf, wref, bq_scales, bq_quants, output, n, m, k) {
+            let b_scales = &mut bq_scales[..n * nb];
+            let b_quants = &mut bq_quants[..n * k];
+            transformer::quantize_rows(input, k, n, b_scales, b_quants);
+            if transformer::gemm_preq_rowmajor(gguf, wref, b_scales, b_quants, output, n, m, k) {
                 return;
             }
         }
@@ -7576,6 +7578,129 @@ mod tests {
                     err.contains("non-uniform SWA state"),
                     "unexpected error: {err}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn project_rowmajor_f32_reused_oversized_scratch_matches_gemv() {
+        with_shim(FakeConfig::default(), || {
+            let gguf = tiny_lfm3_nonzero_bidir_gguf(128);
+            let npu_model =
+                XdnaLfm3Model::from_gguf_with_id(gguf, 128, "rowmajor-slice".to_string())
+                    .expect("load LFM3");
+            let (_, _, _, wo) = npu_model.cpu.xdna_layer_attn_refs(1).unwrap();
+            let wo_unrepacked = WeightRef::new(wo.start, wo.size, wo.dtype, wo.m, wo.k);
+            let gguf_ref = npu_model.cpu.gguf();
+
+            let check_matches_gemv =
+                |wref: &WeightRef, input: &[f32], got: &[f32], n: usize, tag: &str| {
+                    let mut expected = vec![0.0f32; n * LFM3_H];
+                    for t in 0..n {
+                        transformer::gemv(
+                            gguf_ref,
+                            wref,
+                            &input[t * LFM3_Q_DIM..(t + 1) * LFM3_Q_DIM],
+                            &mut expected[t * LFM3_H..(t + 1) * LFM3_H],
+                        );
+                    }
+                    let cos = cosine_similarity(got, &expected);
+                    let max_err = got
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        cos >= 0.9999 && max_err < 0.05,
+                        "{tag} mismatch: cos={cos} max_err={max_err}"
+                    );
+                };
+
+            for (label, wref) in [("repacked", wo), ("unrepacked", &wo_unrepacked)] {
+                let mut bq_scales = Vec::new();
+                let mut bq_quants = Vec::new();
+                #[cfg(has_blas)]
+                let mut dequant_scratch = Vec::new();
+
+                // Grow persistent scratch at n = 64 (when preq path runs), then reuse at n = 32
+                // so `bq_scales` (`4096`) and `bq_quants` (`131072`) stay oversized for tail `n = 32`.
+                for (step, n) in [64usize, 32usize].into_iter().enumerate() {
+                    let input: Vec<f32> = (0..n * LFM3_Q_DIM)
+                        .map(|i| (((i * 19 + step * 7) % 31) as f32 - 15.0) * 0.0625)
+                        .collect();
+                    let mut got = vec![0.0f32; n * LFM3_H];
+                    XdnaLfm3Model::project_rowmajor_f32(
+                        gguf_ref,
+                        wref,
+                        &input,
+                        &mut got,
+                        n,
+                        LFM3_H,
+                        LFM3_Q_DIM,
+                        &mut bq_scales,
+                        &mut bq_quants,
+                        #[cfg(has_blas)]
+                        &mut dequant_scratch,
+                    );
+                    check_matches_gemv(
+                        wref,
+                        &input,
+                        &got,
+                        n,
+                        &format!("{label} project_rowmajor_f32 n={n}"),
+                    );
+                }
+
+                #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+                {
+                    let nb = LFM3_Q_DIM / 32;
+                    if label == "unrepacked" {
+                        assert_eq!(bq_scales.len(), 64 * nb);
+                        assert_eq!(bq_quants.len(), 64 * LFM3_Q_DIM);
+                    } else {
+                        // On AVX-512 VNNI, `lin16` takes the f32 path above and leaves `bq_*` empty;
+                        // populate oversized scratch explicitly so `gemm_preq_rowmajor` is tested on
+                        // repacked weights on every architecture as well.
+                        if bq_scales.len() < 64 * nb {
+                            bq_scales.resize(64 * nb, 0.0);
+                        }
+                        if bq_quants.len() < 64 * LFM3_Q_DIM {
+                            bq_quants.resize(64 * LFM3_Q_DIM, 0);
+                        }
+                    }
+                    let n = 32usize;
+                    let input: Vec<f32> = (0..n * LFM3_Q_DIM)
+                        .map(|i| (((i * 23 + 3) % 29) as f32 - 14.0) * 0.0625)
+                        .collect();
+                    transformer::quantize_rows(
+                        &input,
+                        LFM3_Q_DIM,
+                        n,
+                        &mut bq_scales[..n * nb],
+                        &mut bq_quants[..n * LFM3_Q_DIM],
+                    );
+                    let mut got_oversized = vec![0.0f32; n * LFM3_H];
+                    assert!(
+                        transformer::gemm_preq_rowmajor(
+                            gguf_ref,
+                            wref,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut got_oversized,
+                            n,
+                            LFM3_H,
+                            LFM3_Q_DIM,
+                        ),
+                        "{label} gemm_preq_rowmajor with oversized scratch should run"
+                    );
+                    check_matches_gemv(
+                        wref,
+                        &input,
+                        &got_oversized,
+                        n,
+                        &format!("{label} gemm_preq_rowmajor oversized"),
+                    );
+                }
             }
         });
     }

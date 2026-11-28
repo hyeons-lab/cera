@@ -2039,6 +2039,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_colmajor_dispatch(
                 && b_scales.len() >= n * nb
                 && out.len() == m * n
         );
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_colmajor_zmm(
                 packed, scales_f16, b_scales, b_quants, out, m, n, k,
@@ -2073,6 +2074,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
                 && b_scales.len() >= n * nb
                 && out.len() == m * n
         );
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_rowmajor_zmm(
                 packed, scales_f16, b_scales, b_quants, out, n, m, k,
@@ -2122,6 +2124,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_gate_up_silu_dispatch(
                 && b_scales.len() >= n * nb
                 && out.len() == m * n
         );
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_gate_up_silu_rowmajor_zmm(
                 gate_packed,
@@ -2339,6 +2342,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -2417,6 +2421,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -2496,6 +2501,8 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_gate_up_silu_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -2642,6 +2649,7 @@ pub(crate) fn gemm_preq_repacked_q4_1_smmla_dispatch(
         {
             return false;
         }
+        let (b_scales, b_quants) = (&b_scales[..n * (k / 32)], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::q4_1_min_correction(
                 mprime, b_scales, b_quants, out, m, n, k,
@@ -2694,6 +2702,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         let tiled = with_smmla_tiles(
             b_scales,
             b_quants,
@@ -2928,6 +2937,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         let tiled = with_smmla_tiles(
             b_scales,
             b_quants,
@@ -3015,6 +3025,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         let tiled = with_smmla_tiles(
             b_scales,
             b_quants,
@@ -3660,6 +3671,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
         "gemm_preq_repacked_q4_k_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -3734,6 +3746,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_smmla_8x4_q8_0(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
@@ -3781,6 +3794,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_8x8_q8_0_rowmajor(
                 packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
@@ -3828,6 +3842,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_smmla_8x4_q8_0_rowmajor(
                 packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
@@ -3878,6 +3893,7 @@ pub fn gemm_preq_repacked_q4_k_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_gate_up_silu_rowmajor(
                 gate_packed,
@@ -3940,6 +3956,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_smmla_gate_up_silu_rowmajor(
                 gate_packed,
@@ -3997,6 +4014,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_8x8_q8_0(
                 packed, scales, b_scales, b_quants, out, m, n, k,
@@ -4043,6 +4061,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_smmla_8x4_q8_0(
                 packed, scales, b_scales, b_quants, out, m, n, k,
@@ -4089,6 +4108,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_8x8_q8_0_rowmajor(
                 packed, scales, b_scales, b_quants, out, n, m, k,
@@ -4135,6 +4155,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_smmla_8x4_q8_0_rowmajor(
                 packed, scales, b_scales, b_quants, out, n, m, k,
@@ -4201,6 +4222,8 @@ pub fn gemm_preq_dispatch(
         out.len(),
         m * n
     );
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let (b_scales, b_quants) = (&b_scales[..n * (k / 32)], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -14810,6 +14833,14 @@ mod tests {
             let (data, bs, bq, mut out) = args();
             gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
         }
+
+        #[test]
+        fn oversized_b_scratch_is_accepted() {
+            let (data, mut bs, mut bq, mut out) = args();
+            bs.resize(bs.len() * 2, 0.0);
+            bq.resize(bq.len() * 2, 0);
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
+        }
     }
 
     /// Well-formed repacked-dispatcher args shared by the plain and fused
@@ -14941,6 +14972,16 @@ mod tests {
         #[test]
         fn plain_well_formed_call_is_accepted() {
             let (packed, scales, bs, bq, mut out) = plain_args();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        fn plain_oversized_b_scratch_is_accepted() {
+            let (packed, scales, mut bs, mut bq, mut out) = plain_args();
+            bs.resize(bs.len() * 2, 0.0);
+            bq.resize(bq.len() * 2, 0);
             gemm_preq_repacked_q4_0_rowmajor_dispatch(
                 &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
             );
@@ -15098,6 +15139,16 @@ mod tests {
         #[test]
         fn fused_well_formed_call_is_accepted() {
             let (gp, gs, up, us, bs, bq, mut out) = fused_args();
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        fn fused_oversized_b_scratch_is_accepted() {
+            let (gp, gs, up, us, mut bs, mut bq, mut out) = fused_args();
+            bs.resize(bs.len() * 2, 0.0);
+            bq.resize(bq.len() * 2, 0);
             gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
                 &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
             );
