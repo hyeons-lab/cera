@@ -6882,9 +6882,14 @@ mod tests {
                 let guard = npu_model.lock_npu();
                 let pre = guard.prefill.as_ref().unwrap();
                 let ext = pre.ext_runs.as_ref().expect("host_ffn >32K ext_runs");
-                let used_parity = usize::from(!pre.conv_kv_in_kvo);
-                assert!(ext.conv_groups[used_parity][0].is_some());
-                assert!(ext.conv_groups[used_parity][2].is_some());
+                assert!(
+                    !pre.conv_kv_in_kvo,
+                    "run_npu_prefill flushes conv ping-pong back to layer_kv_blocks on exit"
+                );
+                assert!(ext.conv_groups[0][0].is_some());
+                assert!(ext.conv_groups[0][2].is_some());
+                assert!(ext.conv_groups[1][0].is_none());
+                assert!(ext.conv_groups[1][2].is_none());
                 assert!(ext.attn_chains[1].iter().any(|(blk, _, _)| *blk == 1));
                 assert_eq!(
                     read_i32(
@@ -6928,6 +6933,25 @@ mod tests {
                     ),
                     7
                 );
+            }
+
+            // Multi-chunk (>64 tokens) >32K host_ffn prefill exercises both conv ping-pong parities (0 and 1).
+            let embs68 = model.embed_token_rows(&[1u32; 68]).unwrap();
+            seed_state_to_pos(&mut state, 32768);
+            let pre_32k_2chunks =
+                model.forward_prefill_from_embeddings_chunk(&embs68, 68, 32768, &mut state, true);
+            assert_eq!(pre_32k_2chunks.len(), vocab);
+            assert_eq!(state.seq_len, 32836);
+            assert!(model.take_decode_error().is_none());
+            {
+                let guard = npu_model.lock_npu();
+                let pre = guard.prefill.as_ref().unwrap();
+                let ext = pre.ext_runs.as_ref().unwrap();
+                assert!(!pre.conv_kv_in_kvo);
+                assert!(ext.conv_groups[0][0].is_some());
+                assert!(ext.conv_groups[0][2].is_some());
+                assert!(ext.conv_groups[1][0].is_some());
+                assert!(ext.conv_groups[1][2].is_some());
             }
 
             // 3. B=1 continuation across >32K and >64K boundaries (both unaligned prefill and direct decode).
