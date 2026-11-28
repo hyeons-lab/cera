@@ -255,12 +255,12 @@ pub fn configure_thread_pool() -> usize {
     1
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+use crate::quant::vec_dot_q6_k_f32;
 use crate::quant::{
-    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, f16_to_f32, vec_dot_q4_0_f32,
+    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, f16_to_f32, vec_dot_q4_0_f32,
     vec_dot_q4_1_f32, vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
 };
-#[cfg(not(target_arch = "aarch64"))]
-use crate::quant::{BlockQ6K, vec_dot_q6_k_f32};
 use crate::tensor::DType;
 use std::mem::size_of;
 

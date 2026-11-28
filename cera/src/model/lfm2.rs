@@ -3114,6 +3114,7 @@ impl LfmModel {
 
         #[cfg(has_blas)]
         {
+            let _ = &mut prof_quant;
             let t_gu = crate::time::Instant::now();
             let mut gu_rows = vec![0.0f32; 2 * is * hs];
             let g_data = transformer::weight_data(&self.gguf, &dense.gate);
