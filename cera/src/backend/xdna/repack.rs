@@ -330,6 +330,106 @@ pub fn pack_f32_stage_k1024(
     pack_f32_stage_with_chunk_k(dst, src, rows, cols, 1024)
 }
 
+/// f32 weights quantized into Q4_0 blocks via fast multi-scale + least-squares MSE search
+/// aligned to the exact BF16 scale stored for the XDNA2 AIE kernel.
+struct F32MseSource<'a> {
+    src: &'a [f32],
+    cols: usize,
+}
+
+impl WeightSource for F32MseSource<'_> {
+    fn quant_block(&self, row: usize, block: usize) -> ([i8; QBLK], f32) {
+        let slice = &self.src[row * self.cols + block * QBLK..][..QBLK];
+        let mut amax = 0.0f32;
+        let mut mx = 0.0f32;
+        for &v in slice {
+            if v.is_nan() {
+                return ([0i8; QBLK], f32::NAN);
+            }
+            let av = v.abs();
+            if av > amax {
+                amax = av;
+                mx = v;
+            }
+        }
+        if amax == 0.0 {
+            return ([0i8; QBLK], 0.0);
+        }
+        if !amax.is_finite() {
+            return ([0i8; QBLK], mx / -8.0);
+        }
+
+        let quant_eval = |d_raw: f32| -> ([i8; QBLK], f32, f64) {
+            let d_bf = f32::from_bits((f32_to_bf16(d_raw) as u32) << 16);
+            if d_bf == 0.0 || !d_bf.is_finite() {
+                return ([0i8; QBLK], 0.0, f64::INFINITY);
+            }
+            let mut q = [0i8; QBLK];
+            let mut err = 0.0f64;
+            for (dst, &v) in q.iter_mut().zip(slice.iter()) {
+                let qi = ((v / d_bf + 8.5).floor() as i32).clamp(0, 15) - 8;
+                *dst = qi as i8;
+                let diff = (v as f64) - (qi as f64) * (d_bf as f64);
+                err += diff * diff;
+            }
+            (q, d_bf, err)
+        };
+
+        let mut best = ([0i8; QBLK], 0.0f32, f64::INFINITY);
+        let d_base = mx / -8.0;
+        let candidates = [
+            d_base,
+            d_base * 0.90,
+            d_base * 0.80,
+            d_base * 0.72,
+            -d_base,
+            -d_base * 0.85,
+        ];
+        for cand in candidates {
+            let trial = quant_eval(cand);
+            if trial.2 < best.2 {
+                best = trial;
+            }
+            // One least-squares step `d = sum(x * q) / sum(q^2)` followed by re-quantization.
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for (&v, &qi) in slice.iter().zip(trial.0.iter()) {
+                let qf = qi as f64;
+                num += (v as f64) * qf;
+                den += qf * qf;
+            }
+            if den > 0.0 {
+                let refined = quant_eval((num / den) as f32);
+                if refined.2 < best.2 {
+                    best = refined;
+                }
+            }
+        }
+        (best.0, best.1)
+    }
+}
+
+/// Pack f32 weights (e.g. dequantized Q4_K/Q6_K/BF16 tensors) into 1024-K half-tiles
+/// using MSE-optimal BF16-aligned Q4_0 quantization.
+pub fn pack_f32_mse_stage_k1024(
+    dst: &mut [u8],
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<usize, String> {
+    check_shape(rows, cols)?;
+    let expect = rows
+        .checked_mul(cols)
+        .ok_or_else(|| format!("f32 element count overflow for {rows}x{cols}"))?;
+    if src.len() < expect {
+        return Err(format!(
+            "f32 tensor too small: need {expect} elements, have {}",
+            src.len()
+        ));
+    }
+    pack_stage_with_chunk_k(dst, &F32MseSource { src, cols }, rows, cols, 1024)
+}
+
 /// Pack f32 weights (e.g. a dequantized Q6_K head) into the stream layout,
 /// quantizing with the spike's Q4_0 rule.
 pub fn pack_f32_stage(
@@ -401,6 +501,65 @@ pub fn gemm_bf16_bucket_chunks(cols: usize) -> usize {
         .unwrap_or(128)
 }
 
+enum Bf16Dst<'a> {
+    Aligned(&'a mut [u16]),
+    Unaligned(&'a mut [u8]),
+}
+
+impl<'a> Bf16Dst<'a> {
+    fn with(dst_bytes: &'a mut [u8], f: impl FnOnce(&mut Bf16Dst<'_>)) {
+        if let Ok(words) = bytemuck::try_cast_slice_mut::<u8, u16>(dst_bytes) {
+            f(&mut Bf16Dst::Aligned(words));
+        } else {
+            f(&mut Bf16Dst::Unaligned(dst_bytes));
+        }
+    }
+
+    #[inline(always)]
+    fn write_word(&mut self, word_idx: usize, val: u16) {
+        match self {
+            Self::Aligned(words) => words[word_idx] = val.to_le(),
+            Self::Unaligned(bytes) => {
+                let off = word_idx * 2;
+                let le = val.to_le_bytes();
+                bytes[off] = le[0];
+                bytes[off + 1] = le[1];
+            }
+        }
+    }
+}
+
+#[inline]
+fn write_gemm_bf16_row(
+    dst: &mut Bf16Dst<'_>,
+    row: &[f32],
+    c: usize,
+    n_local: usize,
+    col_start: usize,
+    k_end: usize,
+    k_chunks: usize,
+) {
+    use super::kernels::GEMM_BF16_K_CHUNK;
+    let n8 = n_local / 8;
+    let n_in = n_local % 8;
+    for kc in 0..k_chunks {
+        let k_base = col_start + kc * GEMM_BF16_K_CHUNK;
+        if k_base >= k_end {
+            break;
+        }
+        for k8 in 0..8 {
+            let tile_base = ((((c * k_chunks + kc) * 8 + k8) * 4 + n8) * 8) * 8 + n_in;
+            for k_in in 0..8 {
+                let k = k_base + k8 * 8 + k_in;
+                if k >= k_end {
+                    break;
+                }
+                dst.write_word(tile_base + k_in * 8, f32_to_bf16(row[k]));
+            }
+        }
+    }
+}
+
 /// Pack one `[<=256, <=k_chunks*64]` sub-matrix of row-major `f32` weights (`[total_rows, total_cols]`)
 /// into `gemm_bf16`'s per-column `bfloat16` layout:
 /// `[8 cols][k_chunks][k8=8][n8=4][8_k][8_n]` (`u16` words as little-endian bytes).
@@ -419,37 +578,22 @@ pub fn pack_gemm_bf16_f32_slice(
 
     let want_bytes = GEMM_BF16_N_TILE * k_chunks * GEMM_BF16_K_CHUNK * 2;
     assert_eq!(dst_bytes.len(), want_bytes);
+    assert!(src_f32.len() >= total_rows * total_cols);
     dst_bytes.fill(0);
 
-    let k_end = (col_start + col_len).min(total_cols);
-    let words: &mut [u16] = bytemuck::cast_slice_mut(dst_bytes);
-    for c in 0..GEMM_BF16_N_COLS {
-        for n_local in 0..GEMM_BF16_N_CORE {
-            let n = row_start + c * GEMM_BF16_N_CORE + n_local;
-            if n >= total_rows {
-                break;
-            }
-            let row = &src_f32[n * total_cols..];
-            let n8 = n_local / 8;
-            let n_in = n_local % 8;
-            for kc in 0..k_chunks {
-                let k_base = col_start + kc * GEMM_BF16_K_CHUNK;
-                if k_base >= k_end {
+    let k_end = col_start.saturating_add(col_len).min(total_cols);
+    Bf16Dst::with(dst_bytes, |dst| {
+        for c in 0..GEMM_BF16_N_COLS {
+            for n_local in 0..GEMM_BF16_N_CORE {
+                let n = row_start + c * GEMM_BF16_N_CORE + n_local;
+                if n >= total_rows {
                     break;
                 }
-                for k8 in 0..8 {
-                    let tile_base = ((((c * k_chunks + kc) * 8 + k8) * 4 + n8) * 8) * 8 + n_in;
-                    for k_in in 0..8 {
-                        let k = k_base + k8 * 8 + k_in;
-                        if k >= k_end {
-                            break;
-                        }
-                        words[tile_base + k_in * 8] = f32_to_bf16(row[k]);
-                    }
-                }
+                let row = &src_f32[n * total_cols..(n + 1) * total_cols];
+                write_gemm_bf16_row(dst, row, c, n_local, col_start, k_end, k_chunks);
             }
         }
-    }
+    });
 }
 
 /// Pack one `[<=256, <=k_chunks*64]` sub-matrix of an [`crate::model::weights::MmapWeight`]
@@ -468,36 +612,20 @@ pub fn pack_gemm_bf16_weight_slice(
     assert_eq!(dst_bytes.len(), want_bytes);
     dst_bytes.fill(0);
 
-    let k_end = (col_start + col_len).min(weight.cols);
+    let k_end = col_start.saturating_add(col_len).min(weight.cols);
     let mut row_buf = vec![0.0f32; weight.cols];
-    let words: &mut [u16] = bytemuck::cast_slice_mut(dst_bytes);
-    for c in 0..GEMM_BF16_N_COLS {
-        for n_local in 0..GEMM_BF16_N_CORE {
-            let n = row_start + c * GEMM_BF16_N_CORE + n_local;
-            if n >= weight.rows {
-                break;
-            }
-            weight.dequantize_row(n, &mut row_buf);
-            let n8 = n_local / 8;
-            let n_in = n_local % 8;
-            for kc in 0..k_chunks {
-                let k_base = col_start + kc * GEMM_BF16_K_CHUNK;
-                if k_base >= k_end {
+    Bf16Dst::with(dst_bytes, |dst| {
+        for c in 0..GEMM_BF16_N_COLS {
+            for n_local in 0..GEMM_BF16_N_CORE {
+                let n = row_start + c * GEMM_BF16_N_CORE + n_local;
+                if n >= weight.rows {
                     break;
                 }
-                for k8 in 0..8 {
-                    let tile_base = ((((c * k_chunks + kc) * 8 + k8) * 4 + n8) * 8) * 8 + n_in;
-                    for k_in in 0..8 {
-                        let k = k_base + k8 * 8 + k_in;
-                        if k >= k_end {
-                            break;
-                        }
-                        words[tile_base + k_in * 8] = f32_to_bf16(row_buf[k]);
-                    }
-                }
+                weight.dequantize_row(n, &mut row_buf);
+                write_gemm_bf16_row(dst, &row_buf, c, n_local, col_start, k_end, k_chunks);
             }
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -680,6 +808,49 @@ mod tests {
     }
 
     #[test]
+    fn f32_mse_pack_reduces_outlier_block_error() {
+        let rows = 16;
+        let cols = 64;
+        let mut src = vec![0.0f32; rows * cols];
+        // One outlier (+3.1) alongside 31 values at +-0.47 (not a multiple of 3.1/8)
+        // in block 0 of row 0.
+        for (i, dst) in src.iter_mut().enumerate().take(32) {
+            *dst = if i % 2 == 0 { 0.47 } else { -0.47 };
+        }
+        src[0] = 3.1;
+
+        let mut naive = vec![0u8; stage_bytes(rows, cols).unwrap()];
+        let mut mse = vec![0u8; naive.len()];
+        pack_f32_stage_k1024(&mut naive, &src, rows, cols).unwrap();
+        pack_f32_mse_stage_k1024(&mut mse, &src, rows, cols).unwrap();
+
+        let block_err = |packed: &[u8]| -> f32 {
+            let nb_chunk = cols / QBLK;
+            let sp = nb_chunk * 256;
+            let scale_bits = u16::from_le_bytes([packed[sp], packed[sp + 1]]);
+            let d = f32::from_bits((scale_bits as u32) << 16);
+            let mut err = 0.0f32;
+            for (j, &orig) in src.iter().enumerate().take(32) {
+                let h = j / 16;
+                let kk = j % 16;
+                let e = kk * 16;
+                let b = packed[h * 128 + e / 2];
+                let nib = if e % 2 == 0 { b & 0xF } else { b >> 4 };
+                let q = if nib >= 8 { nib as i8 - 16 } else { nib as i8 };
+                let diff = orig - (q as f32) * d;
+                err += diff * diff;
+            }
+            err
+        };
+        let e_naive = block_err(&naive);
+        let e_mse = block_err(&mse);
+        assert!(
+            e_mse < e_naive * 0.6,
+            "MSE Q4_0 packing should substantially reduce outlier error: e_mse={e_mse} vs e_naive={e_naive}"
+        );
+    }
+
+    #[test]
     fn interleave_worker_stages_groups_worker_slices_contiguously() {
         let cols = 64;
         let tile = stage_bytes(ROWS, cols).unwrap(); // 576 bytes per 16-row tile at K=64
@@ -711,5 +882,220 @@ mod tests {
         let one_tile = vec![0u8; tile];
         assert!(interleave_worker_stages(&mut dst, &[&one_tile], cols).is_err());
         assert!(stage_bytes(usize::MAX - (usize::MAX % ROWS), 2048).is_err());
+    }
+
+    #[test]
+    fn gemm_bf16_bucket_chunks_selects_smallest_covering_bucket() {
+        assert_eq!(gemm_bf16_bucket_chunks(0), 1);
+        assert_eq!(gemm_bf16_bucket_chunks(1), 1);
+        assert_eq!(gemm_bf16_bucket_chunks(64), 1);
+        assert_eq!(gemm_bf16_bucket_chunks(65), 2);
+        assert_eq!(gemm_bf16_bucket_chunks(128), 2);
+        assert_eq!(gemm_bf16_bucket_chunks(129), 4);
+        assert_eq!(gemm_bf16_bucket_chunks(1024), 16);
+        assert_eq!(gemm_bf16_bucket_chunks(1025), 18);
+        assert_eq!(gemm_bf16_bucket_chunks(1152), 18);
+        assert_eq!(gemm_bf16_bucket_chunks(4304), 68);
+        assert_eq!(gemm_bf16_bucket_chunks(8192), 128);
+        assert_eq!(gemm_bf16_bucket_chunks(12000), 128);
+        for cols in [0usize, 1, 64, 65, 512, 1152, 4304, 8192] {
+            let c = gemm_bf16_bucket_chunks(cols);
+            assert!(GEMM_BF16_CHUNK_COUNTS.contains(&c));
+        }
+    }
+
+    #[test]
+    fn pack_gemm_bf16_f32_and_weight_slice_round_trip_and_unaligned() {
+        use super::super::kernels::{
+            GEMM_BF16_K_CHUNK, GEMM_BF16_N_COLS, GEMM_BF16_N_CORE, GEMM_BF16_N_TILE,
+        };
+        use crate::model::weights::MmapWeight;
+        use crate::tensor::DType;
+
+        let total_rows = 300usize;
+        let total_cols = 160usize;
+        let mut src_f32 = vec![0.0f32; total_rows * total_cols];
+        for r in 0..total_rows {
+            for c in 0..total_cols {
+                src_f32[r * total_cols + c] = (((r * 13 + c * 7) % 101) as f32 - 50.0) * 0.03125;
+            }
+        }
+
+        // Build Q8_0 MmapWeight for the weight-slice check (160 cols = 5 * 32 blocks).
+        let blocks_per_row = total_cols / 32;
+        let mut q8_bytes = Vec::with_capacity(total_rows * blocks_per_row * 34);
+        for r in 0..total_rows {
+            for b in 0..blocks_per_row {
+                let blk = &src_f32[r * total_cols + b * 32..r * total_cols + (b + 1) * 32];
+                let amax = blk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let d = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+                let d_f16 = half::f16::from_f32(d);
+                q8_bytes.extend_from_slice(&d_f16.to_le_bytes());
+                let d_real = d_f16.to_f32();
+                for &v in blk {
+                    q8_bytes.push((v / d_real).round().clamp(-127.0, 127.0) as i8 as u8);
+                }
+            }
+        }
+        let mmap_w = MmapWeight::from_owned_bytes(q8_bytes, DType::Q8_0, total_rows, total_cols);
+        let mut dq_ref = vec![0.0f32; total_rows * total_cols];
+        for r in 0..total_rows {
+            mmap_w.dequantize_row(r, &mut dq_ref[r * total_cols..(r + 1) * total_cols]);
+        }
+
+        for (row_start, col_start, col_len, k_chunks) in [
+            (0usize, 0usize, 128usize, 2usize),
+            (256usize, 128usize, 32usize, 1usize),
+        ] {
+            let want_bytes = GEMM_BF16_N_TILE * k_chunks * GEMM_BF16_K_CHUNK * 2;
+            let mut aligned_f32 = vec![0xAAu8; want_bytes];
+            let mut unaligned_f32_backing = vec![0xBBu8; want_bytes + 1];
+            pack_gemm_bf16_f32_slice(
+                &mut aligned_f32,
+                &src_f32,
+                total_rows,
+                total_cols,
+                row_start,
+                col_start,
+                col_len,
+                k_chunks,
+            );
+            pack_gemm_bf16_f32_slice(
+                &mut unaligned_f32_backing[1..],
+                &src_f32,
+                total_rows,
+                total_cols,
+                row_start,
+                col_start,
+                col_len,
+                k_chunks,
+            );
+            assert_eq!(aligned_f32, unaligned_f32_backing[1..]);
+
+            let mut aligned_w = vec![0xAAu8; want_bytes];
+            let mut unaligned_w_backing = vec![0xCCu8; want_bytes + 1];
+            pack_gemm_bf16_weight_slice(
+                &mut aligned_w,
+                &mmap_w,
+                row_start,
+                col_start,
+                col_len,
+                k_chunks,
+            );
+            pack_gemm_bf16_weight_slice(
+                &mut unaligned_w_backing[1..],
+                &mmap_w,
+                row_start,
+                col_start,
+                col_len,
+                k_chunks,
+            );
+            assert_eq!(aligned_w, unaligned_w_backing[1..]);
+
+            let k_end = (col_start + col_len).min(total_cols);
+            for c in 0..GEMM_BF16_N_COLS {
+                for n_local in 0..GEMM_BF16_N_CORE {
+                    let n = row_start + c * GEMM_BF16_N_CORE + n_local;
+                    let n8 = n_local / 8;
+                    let n_in = n_local % 8;
+                    for kc in 0..k_chunks {
+                        let k_base = col_start + kc * GEMM_BF16_K_CHUNK;
+                        for k8 in 0..8 {
+                            let tile_base =
+                                ((((c * k_chunks + kc) * 8 + k8) * 4 + n8) * 8) * 8 + n_in;
+                            for k_in in 0..8 {
+                                let k = k_base + k8 * 8 + k_in;
+                                let off = (tile_base + k_in * 8) * 2;
+                                let got_f32 =
+                                    u16::from_le_bytes([aligned_f32[off], aligned_f32[off + 1]]);
+                                let got_w =
+                                    u16::from_le_bytes([aligned_w[off], aligned_w[off + 1]]);
+                                if n < total_rows && k < k_end {
+                                    assert_eq!(
+                                        got_f32,
+                                        f32_to_bf16(src_f32[n * total_cols + k]),
+                                        "f32 mismatch at n={n} k={k}"
+                                    );
+                                    assert_eq!(
+                                        got_w,
+                                        f32_to_bf16(dq_ref[n * total_cols + k]),
+                                        "weight mismatch at n={n} k={k}"
+                                    );
+                                } else {
+                                    assert_eq!(got_f32, 0, "f32 pad non-zero at n={n} k={k}");
+                                    assert_eq!(got_w, 0, "weight pad non-zero at n={n} k={k}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f32_mse_pack_handles_extreme_finite_and_infinite_blocks() {
+        let rows = 16;
+        let cols = 64;
+        let mut src = vec![0.0f32; rows * cols];
+        // Row 0, block 0: finite values >= 1e20 (used to overflow f32 MSE `err` to Inf).
+        for (i, dst) in src.iter_mut().enumerate().take(32) {
+            *dst = ((i as f32) - 15.5) * 1.0e20;
+        }
+        // Row 1, block 0: near f32::MAX / 8.0 scale regime.
+        for i in 0..32 {
+            src[cols + i] = if i % 2 == 0 { 1.0e37 } else { -5.0e36 };
+        }
+        // Row 2, block 0: +Inf; Row 3, block 0: -Inf.
+        src[2 * cols] = f32::INFINITY;
+        src[3 * cols] = f32::NEG_INFINITY;
+
+        let mut packed = vec![0u8; stage_bytes(rows, cols).unwrap()];
+        pack_f32_mse_stage_k1024(&mut packed, &src, rows, cols).unwrap();
+
+        let nb_chunk = cols / QBLK;
+        let sp = nb_chunk * 256;
+        let read_scale = |row: usize| -> f32 {
+            let bits = u16::from_le_bytes([packed[sp + row * 2], packed[sp + row * 2 + 1]]);
+            f32::from_bits((bits as u32) << 16)
+        };
+        let read_q = |row: usize, col: usize| -> i8 {
+            let e = col * 16 + row;
+            let byte = packed[e / 2];
+            let nib = if e.is_multiple_of(2) {
+                byte & 0xF
+            } else {
+                byte >> 4
+            };
+            if nib >= 8 { nib as i8 - 16 } else { nib as i8 }
+        };
+
+        let d0 = read_scale(0);
+        assert!(
+            d0.is_finite() && d0 != 0.0,
+            "extreme 1e20 block collapsed: d0={d0}"
+        );
+        let rec0 = (read_q(0, 31) as f32) * d0;
+        assert!(
+            (rec0 - src[31]).abs() / src[31].abs() < 0.25,
+            "extreme 1e20 reconstruction drifted: got {rec0} vs {}",
+            src[31]
+        );
+
+        let d1 = read_scale(1);
+        assert!(
+            d1.is_finite() && d1 != 0.0,
+            "extreme 1e37 block collapsed: d1={d1}"
+        );
+        let rec1 = (read_q(1, 0) as f32) * d1;
+        assert!(
+            (rec1 - src[cols]).abs() / src[cols].abs() < 0.25,
+            "extreme 1e37 reconstruction drifted: got {rec1} vs {}",
+            src[cols]
+        );
+
+        // Non-finite amax preserves `mx / -8.0` like F32Source.
+        assert_eq!(read_scale(2), f32::NEG_INFINITY);
+        assert_eq!(read_scale(3), f32::INFINITY);
     }
 }

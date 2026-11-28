@@ -95,6 +95,7 @@ rm -f "$HERE"/insts_q4layer_c*.bin "$HERE"/insts_q4prefill_layer_c*.bin \
 # Build unified LFM3 B=64 prefill xclbin + Mode 0 (ShortConv), Mode 1 (causal/SWA),
 # Mode 2 (Phase A), Mode 3 (bidir Phase B), Mode 4 (FA partial), and Mode 5 (FA final).
 LFM3_ATTN_BUCKETS="0 1 2 4 8 12 16 24 32 48 64 96 128 192 255"
+LFM3_DEC_ATTN_BUCKETS="0 1 2 4 8 12 16 24 32 48 64 96 128 136 160 192 255 256 264 288 320 384 448 511"
 LFM3_BIDIR_B_BUCKETS="1 2 4 8 12 16 24 32 48 64 96 128 192 255 256"
 python3 "$DST/iron/q4prefill_lfm3/q4prefill_lfm3.py" --dev npu2 \
   --layer-mode=0 --kv-chunks=0 \
@@ -106,7 +107,7 @@ for c in $LFM3_ATTN_BUCKETS; do
     --xclbin-path="$OUT/tmp_lfm3_a_c${c}.xclbin" --insts-path="$OUT/insts_lfm3_pre_attn_c${c}.bin"
   rm -rf "$OUT/tmp_lfm3_a_c${c}.prj" "$OUT/tmp_lfm3_a_c${c}.xclbin"
   python3 "$DST/iron/q4prefill_lfm3/q4prefill_lfm3.py" --dev npu2 \
-    --layer-mode=5 --kv-chunks="$c" \
+    --layer-mode=5 --kv-chunks="$c" --param-slot=3 \
     --xclbin-path="$OUT/tmp_lfm3_f_c${c}.xclbin" --insts-path="$OUT/insts_lfm3_pre_fa_fin_c${c}.bin"
   rm -rf "$OUT/tmp_lfm3_f_c${c}.prj" "$OUT/tmp_lfm3_f_c${c}.xclbin"
 done
@@ -115,7 +116,11 @@ python3 "$DST/iron/q4prefill_lfm3/q4prefill_lfm3.py" --dev npu2 \
   --xclbin-path="$OUT/tmp_lfm3_phase_a.xclbin" --insts-path="$OUT/insts_lfm3_pre_phase_a.bin"
 rm -rf "$OUT/tmp_lfm3_phase_a.prj" "$OUT/tmp_lfm3_phase_a.xclbin"
 python3 "$DST/iron/q4prefill_lfm3/q4prefill_lfm3.py" --dev npu2 \
-  --layer-mode=4 --kv-chunks=256 \
+  --layer-mode=6 --kv-chunks=256 --param-slot=1 \
+  --xclbin-path="$OUT/tmp_lfm3_fa_part0.xclbin" --insts-path="$OUT/insts_lfm3_pre_fa_part0_c256.bin"
+rm -rf "$OUT/tmp_lfm3_fa_part0.prj" "$OUT/tmp_lfm3_fa_part0.xclbin"
+python3 "$DST/iron/q4prefill_lfm3/q4prefill_lfm3.py" --dev npu2 \
+  --layer-mode=4 --kv-chunks=256 --param-slot=2 \
   --xclbin-path="$OUT/tmp_lfm3_fa_part.xclbin" --insts-path="$OUT/insts_lfm3_pre_fa_part_c256.bin"
 rm -rf "$OUT/tmp_lfm3_fa_part.prj" "$OUT/tmp_lfm3_fa_part.xclbin"
 for c in $LFM3_BIDIR_B_BUCKETS; do
@@ -138,11 +143,13 @@ python3 "$DST/iron/q4layer_lfm3/q4layer_lfm3.py" --dev npu2 \
   --layer-mode=3 --kv-chunks=256 \
   --xclbin-path="$OUT/tmp_lfm3_dec_m3.xclbin" --insts-path="$OUT/insts_lfm3_dec_fa_part_c256.bin"
 rm -rf "$OUT/tmp_lfm3_dec_m3.prj" "$OUT/tmp_lfm3_dec_m3.xclbin"
-for c in $LFM3_ATTN_BUCKETS; do
+for c in $LFM3_DEC_ATTN_BUCKETS; do
   python3 "$DST/iron/q4layer_lfm3/q4layer_lfm3.py" --dev npu2 \
     --layer-mode=1 --kv-chunks="$c" \
     --xclbin-path="$OUT/tmp_lfm3_dec_c${c}.xclbin" --insts-path="$OUT/insts_lfm3_dec_attn_c${c}.bin"
   rm -rf "$OUT/tmp_lfm3_dec_c${c}.prj" "$OUT/tmp_lfm3_dec_c${c}.xclbin"
+done
+for c in $LFM3_ATTN_BUCKETS; do
   python3 "$DST/iron/q4layer_lfm3/q4layer_lfm3.py" --dev npu2 \
     --layer-mode=4 --kv-chunks="$c" \
     --xclbin-path="$OUT/tmp_lfm3_dec_f_c${c}.xclbin" --insts-path="$OUT/insts_lfm3_dec_fa_fin_c${c}.bin"
@@ -165,10 +172,13 @@ cp "$OUT/insts_lfm3_pre_conv.bin" "$HERE/insts_lfm3_pre_conv.bin"
 for c in $LFM3_ATTN_BUCKETS; do
   cp "$OUT/insts_lfm3_pre_attn_c${c}.bin" "$HERE/insts_lfm3_pre_attn_c${c}.bin"
   cp "$OUT/insts_lfm3_pre_fa_fin_c${c}.bin" "$HERE/insts_lfm3_pre_fa_fin_c${c}.bin"
-  cp "$OUT/insts_lfm3_dec_attn_c${c}.bin" "$HERE/insts_lfm3_dec_attn_c${c}.bin"
   cp "$OUT/insts_lfm3_dec_fa_fin_c${c}.bin" "$HERE/insts_lfm3_dec_fa_fin_c${c}.bin"
 done
+for c in $LFM3_DEC_ATTN_BUCKETS; do
+  cp "$OUT/insts_lfm3_dec_attn_c${c}.bin" "$HERE/insts_lfm3_dec_attn_c${c}.bin"
+done
 cp "$OUT/insts_lfm3_pre_phase_a.bin" "$HERE/insts_lfm3_pre_phase_a.bin"
+cp "$OUT/insts_lfm3_pre_fa_part0_c256.bin" "$HERE/insts_lfm3_pre_fa_part0_c256.bin"
 cp "$OUT/insts_lfm3_pre_fa_part_c256.bin" "$HERE/insts_lfm3_pre_fa_part_c256.bin"
 for c in $LFM3_BIDIR_B_BUCKETS; do
   cp "$OUT/insts_lfm3_pre_bidir_b_c${c}.bin" "$HERE/insts_lfm3_pre_bidir_b_c${c}.bin"

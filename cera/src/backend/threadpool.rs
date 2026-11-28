@@ -105,7 +105,7 @@
 use std::cell::UnsafeCell;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -122,6 +122,12 @@ const SPIN_BEFORE_PARK: u32 = 100_000;
 /// prefill workers warm at the same bounded spin as decode.
 #[cfg(all(not(miri), target_os = "windows"))]
 const PREFILL_SPIN_BEFORE_PARK: u32 = 100_000;
+/// Short prefill-pool spin budget while a Windows hybrid XDNA decode model is alive.
+/// Parks LM-head workers within ~30 us after each dispatch so CPU threads stay idle at 0 W
+/// during 13–25 ms NPU token compute, giving the NPU full socket PPT headroom while avoiding
+/// multi-thread busy-spin contention.
+#[cfg(all(any(feature = "xdna", test), not(miri), target_os = "windows"))]
+const XDNA_PREFILL_SPIN_BEFORE_PARK: u32 = 20_000;
 /// Shorter spin limit for prefill pools on non-Windows targets so workers park quickly
 /// when a chunk finishes or decode begins instead of contending for core clocks/TDP.
 #[cfg(all(not(miri), not(target_os = "windows")))]
@@ -243,6 +249,14 @@ struct Shared {
     /// as parking then re-waking workers costs more than it saves). Immutable
     /// after `build`.
     active_barrier: bool,
+    /// Baseline spin limit before parking (`CERA_SPIN` or pool default).
+    #[cfg(any(feature = "xdna", test))]
+    default_spin: u32,
+    /// Whether an explicit `CERA_SPIN` override prevents temporary warm-spin bumps.
+    #[cfg(any(feature = "xdna", test))]
+    spin_locked_by_env: bool,
+    /// Active spin budget polled by waiting workers before calling [`thread::park`].
+    spin_limit: AtomicU32,
     /// Packed `(epoch, active)` — see [`pack_state`]. Bumped once per dispatch;
     /// workers wake when the epoch changes and read `active` from the same load.
     state: AtomicU64,
@@ -744,7 +758,35 @@ impl RowPool {
         spread_mask: &'static [usize],
         active_barrier: bool,
     ) -> RowPool {
-        // `active` (≤ num_threads) is packed into the low `ACTIVE_BITS` of the
+        #[cfg(not(test))]
+        let env_spin = spin_limit_from_lookup(|name| std::env::var(name).ok());
+        #[cfg(test)]
+        let env_spin: Option<u32> = None;
+        #[cfg(any(feature = "xdna", test))]
+        let warm_leases = PREFILL_WARM_LEASES.load(Ordering::SeqCst);
+        #[cfg(not(any(feature = "xdna", test)))]
+        let warm_leases = 0;
+        Self::build_with_spin(
+            num_threads,
+            pin_cores,
+            core_weights,
+            spread_mask,
+            active_barrier,
+            env_spin,
+            warm_leases,
+        )
+    }
+
+    fn build_with_spin(
+        num_threads: usize,
+        pin_cores: &[usize],
+        core_weights: &[u32],
+        spread_mask: &'static [usize],
+        active_barrier: bool,
+        env_spin: Option<u32>,
+        warm_leases: usize,
+    ) -> RowPool {
+        // `active` (<= num_threads) is packed into the low `ACTIVE_BITS` of the
         // dispatch state; no real host has this many cores, but keep the pool
         // within the field rather than silently corrupt the epoch above it.
         let num_threads = num_threads.max(1).min(ACTIVE_MASK as usize);
@@ -755,10 +797,20 @@ impl RowPool {
         } else {
             SPIN_BEFORE_PARK
         };
-        let spin_limit = std::env::var("CERA_SPIN")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(default_spin);
+        #[cfg(any(feature = "xdna", test))]
+        let spin_locked_by_env = env_spin.is_some();
+        #[cfg(any(feature = "xdna", test))]
+        let initial_spin = match env_spin {
+            Some(spin) => spin,
+            None if active_barrier => {
+                resolved_prefill_spin(default_spin, warm_leases, xdna_warm_spin_target())
+            }
+            None => default_spin,
+        };
+        #[cfg(not(any(feature = "xdna", test)))]
+        let _ = warm_leases;
+        #[cfg(not(any(feature = "xdna", test)))]
+        let initial_spin = env_spin.unwrap_or(default_spin);
         // Only carry weights when at least one worker would actually scale down.
         // An all-`WEIGHT_FULL` vector (a host with no spread) would make
         // `worker_chunk_rows` do lookup work per dispatch to conclude nothing,
@@ -781,6 +833,11 @@ impl RowPool {
         };
         let shared = Arc::new(Shared {
             active_barrier,
+            #[cfg(any(feature = "xdna", test))]
+            default_spin,
+            #[cfg(any(feature = "xdna", test))]
+            spin_locked_by_env,
+            spin_limit: AtomicU32::new(initial_spin),
             state: AtomicU64::new(0),
             next_row: AtomicUsize::new(0),
             worker_weights,
@@ -799,7 +856,7 @@ impl RowPool {
             let pin = pin_cores.get(id).copied();
             match thread::Builder::new()
                 .name(format!("cera-rowpool-{id}"))
-                .spawn(move || worker_loop(shared, id, pin, spread_mask, spin_limit))
+                .spawn(move || worker_loop(shared, id, pin, spread_mask))
             {
                 Ok(handle) => workers.push(handle),
                 // Couldn't spawn: cap the pool at what we have, loudly. The
@@ -1141,6 +1198,14 @@ fn swap_rebuilt_pool(
         entry.pool.num_threads(),
         new.num_threads(),
     );
+    #[cfg(any(feature = "xdna", test))]
+    if new.shared.active_barrier {
+        apply_prefill_spin_target(
+            &new,
+            PREFILL_WARM_LEASES.load(Ordering::SeqCst),
+            xdna_warm_spin_target(),
+        );
+    }
     *entry = PoolSlot {
         pool: Arc::new(new),
         usable: usable.clone(),
@@ -1225,6 +1290,158 @@ pub fn set_macos_thread_qos_interactive() {
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
     unsafe {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+fn spin_limit_from_lookup<F>(lookup: F) -> Option<u32>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let raw = lookup("CERA_SPIN")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<u32>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!("cera: ignoring invalid CERA_SPIN={trimmed:?}; expected u32");
+            eprintln!("cera: ignoring invalid CERA_SPIN={trimmed:?}; expected u32");
+            None
+        }
+    }
+}
+
+/// Opt the process and hot pool threads out of Windows EcoQoS/timer throttling
+/// and raise thread priority above background work so decode barriers and hybrid
+/// NPU->CPU handoffs do not stall for multi-millisecond OS scheduler quanta.
+#[cfg(target_os = "windows")]
+mod win_qos {
+    pub(super) const THREAD_PRIORITY_HIGHEST: i32 = 2;
+    pub(super) const THREAD_PRIORITY_ERROR_RETURN: i32 = i32::MAX;
+    pub(super) const THREAD_POWER_THROTTLING: u32 = 3;
+    pub(super) const THREAD_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    pub(super) const THREAD_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    const PROCESS_POWER_THROTTLING: u32 = 4;
+    const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    const PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION: u32 = 0x4;
+
+    #[repr(C)]
+    pub(super) struct PowerThrottlingState {
+        pub(super) version: u32,
+        pub(super) control_mask: u32,
+        pub(super) state_mask: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn GetCurrentProcess() -> isize;
+        pub(super) fn GetCurrentThread() -> isize;
+        pub(super) fn GetThreadPriority(thread: isize) -> i32;
+        pub(super) fn SetProcessInformation(
+            process: isize,
+            process_information_class: u32,
+            process_information: *const std::ffi::c_void,
+            process_information_size: u32,
+        ) -> i32;
+        pub(super) fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        pub(super) fn SetThreadInformation(
+            thread: isize,
+            thread_information_class: u32,
+            thread_information: *const std::ffi::c_void,
+            thread_information_size: u32,
+        ) -> i32;
+    }
+
+    pub(super) fn disable_process_throttling_once() {
+        static PROCESS_QOS_INIT: std::sync::Once = std::sync::Once::new();
+        PROCESS_QOS_INIT.call_once(|| {
+            let full = PowerThrottlingState {
+                version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                    | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                state_mask: 0,
+            };
+            // SAFETY: `GetCurrentProcess()` returns a valid pseudo-handle and `full` is an
+            // initialized `PROCESS_POWER_THROTTLING_STATE`.
+            let ok = unsafe {
+                SetProcessInformation(
+                    GetCurrentProcess(),
+                    PROCESS_POWER_THROTTLING,
+                    (&full as *const PowerThrottlingState).cast(),
+                    std::mem::size_of::<PowerThrottlingState>() as u32,
+                )
+            };
+            if ok == 0 {
+                let speed_only = PowerThrottlingState {
+                    version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                    control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                    state_mask: 0,
+                };
+                // SAFETY: same as above, falling back to `EXECUTION_SPEED` on older Windows builds.
+                unsafe {
+                    let _ = SetProcessInformation(
+                        GetCurrentProcess(),
+                        PROCESS_POWER_THROTTLING,
+                        (&speed_only as *const PowerThrottlingState).cast(),
+                        std::mem::size_of::<PowerThrottlingState>() as u32,
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn set_windows_thread_interactive() -> Option<i32> {
+    win_qos::disable_process_throttling_once();
+    elevate_windows_thread()
+}
+
+#[cfg(target_os = "windows")]
+fn elevate_windows_thread() -> Option<i32> {
+    let state = win_qos::PowerThrottlingState {
+        version: win_qos::THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        control_mask: win_qos::THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        state_mask: 0,
+    };
+    // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread
+    // and `state` points to a valid initialized `THREAD_POWER_THROTTLING_STATE`.
+    unsafe {
+        let thread = win_qos::GetCurrentThread();
+        let prev = win_qos::GetThreadPriority(thread);
+        let _ = win_qos::SetThreadInformation(
+            thread,
+            win_qos::THREAD_POWER_THROTTLING,
+            (&state as *const win_qos::PowerThrottlingState).cast(),
+            std::mem::size_of::<win_qos::PowerThrottlingState>() as u32,
+        );
+        let _ = win_qos::SetThreadPriority(thread, win_qos::THREAD_PRIORITY_HIGHEST);
+        (prev != win_qos::THREAD_PRIORITY_ERROR_RETURN).then_some(prev)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_windows_thread_interactive(prev_priority: Option<i32>) {
+    let state = win_qos::PowerThrottlingState {
+        version: win_qos::THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        control_mask: 0,
+        state_mask: 0,
+    };
+    // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread
+    // and `state` points to a valid initialized `THREAD_POWER_THROTTLING_STATE`.
+    unsafe {
+        let thread = win_qos::GetCurrentThread();
+        let _ = win_qos::SetThreadInformation(
+            thread,
+            win_qos::THREAD_POWER_THROTTLING,
+            (&state as *const win_qos::PowerThrottlingState).cast(),
+            std::mem::size_of::<win_qos::PowerThrottlingState>() as u32,
+        );
+        if let Some(prev) = prev_priority {
+            let _ = win_qos::SetThreadPriority(thread, prev);
+        }
     }
 }
 
@@ -1348,10 +1565,10 @@ pub(crate) fn debug_set_caller_pin_for_test(owner: i64, core: usize) -> impl Dro
 }
 
 /// The caller-pin claim one thread holds. Dropping it releases the claim (if the thread still
-/// owns it) and, on Linux and Android, puts back the affinity mask the thread had before it was
-/// pinned, provided the thread's mask is still exactly our pin. That happens when the thread
-/// exits or when [`release_caller_pin`] is called. A thread whose pin another thread took over
-/// was already widened by the taker, and is left alone.
+/// owns it) and, on Linux, Android, and Windows, puts back the affinity mask the thread had before
+/// it was pinned (on Linux/Android, provided the thread's mask is still exactly our pin). That
+/// happens when the thread exits or when [`release_caller_pin`] is called. A thread whose pin
+/// another thread took over was already widened by the taker, and is left alone.
 struct ClaimGuard {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     tid: i64,
@@ -1360,10 +1577,45 @@ struct ClaimGuard {
     /// whatever it runs afterwards, including threads that code spawns, inherits that mask.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     saved: Option<libc::cpu_set_t>,
+    /// Prior Windows `DWORD_PTR` thread affinity mask returned by `SetThreadAffinityMask` when
+    /// pinning a claimed host caller thread.
+    #[cfg(target_os = "windows")]
+    win_prev_affinity: Option<usize>,
+    /// Test-only guard flag so synthetic `ClaimGuard` drop tests do not clear another concurrent
+    /// test's `CALLER_PIN_CLAIMED` state.
+    #[cfg(all(test, target_os = "windows"))]
+    release_claim: bool,
+}
+
+/// RAII guard restoring Windows caller thread EcoQoS/priority elevation independently of core
+/// affinity pinning (`CERA_PIN=0` or contended caller pin).
+#[cfg(target_os = "windows")]
+struct WinQosGuard {
+    prev_priority: Option<i32>,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WinQosGuard {
+    fn drop(&mut self) {
+        restore_windows_thread_interactive(self.prev_priority);
+    }
 }
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(prev_mask) = self.win_prev_affinity
+                && set_windows_thread_affinity_mask(prev_mask).is_none()
+            {
+                let _ = set_current_thread_affinity(pinned_cores());
+            }
+            #[cfg(test)]
+            if !self.release_claim {
+                return;
+            }
+            CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // Put the mask back first, while the claim still describes it: the allowance probe
@@ -1393,7 +1645,7 @@ impl Drop for ClaimGuard {
                 CALLER_PIN_CLAIMED.store(false, Ordering::Release);
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
         {
             CALLER_PIN_CLAIMED.store(false, Ordering::Release);
         }
@@ -1402,6 +1654,8 @@ impl Drop for ClaimGuard {
 
 struct CallerClaim {
     guard: Option<ClaimGuard>,
+    #[cfg(target_os = "windows")]
+    win_qos_guard: Option<WinQosGuard>,
     /// Dispatches to skip before re-attempting a refused pin.
     retry_cooldown: u32,
 }
@@ -1410,6 +1664,8 @@ thread_local! {
     static CLAIM: std::cell::RefCell<CallerClaim> = const {
         std::cell::RefCell::new(CallerClaim {
             guard: None,
+            #[cfg(target_os = "windows")]
+            win_qos_guard: None,
             retry_cooldown: 0,
         })
     };
@@ -1432,6 +1688,10 @@ pub fn release_caller_pin() {
     let _ = CLAIM.try_with(|c| {
         if let Ok(mut claim) = c.try_borrow_mut() {
             claim.guard = None;
+            #[cfg(target_os = "windows")]
+            {
+                claim.win_qos_guard = None;
+            }
             claim.retry_cooldown = 0;
         }
     });
@@ -1457,7 +1717,110 @@ fn restore_current_thread_affinity(set: &libc::cpu_set_t) -> bool {
     unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) == 0 }
 }
 
+#[cfg(any(feature = "xdna", test))]
+static PREFILL_WARM_LEASES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(feature = "xdna", test))]
+const fn xdna_warm_spin_target() -> u32 {
+    #[cfg(all(not(miri), target_os = "windows"))]
+    {
+        XDNA_PREFILL_SPIN_BEFORE_PARK
+    }
+    #[cfg(any(miri, not(target_os = "windows")))]
+    {
+        PREFILL_SPIN_BEFORE_PARK
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+const fn resolved_prefill_spin(default_spin: u32, leases: usize, warm_target: u32) -> u32 {
+    if leases > 0 {
+        warm_target
+    } else {
+        default_spin
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+fn apply_prefill_spin_target(pool: &RowPool, leases: usize, warm_target: u32) {
+    if !pool.shared.spin_locked_by_env {
+        let target = resolved_prefill_spin(pool.shared.default_spin, leases, warm_target);
+        pool.shared.spin_limit.store(target, Ordering::Release);
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+fn sync_slot_spin_limit_in(slot: &Mutex<Option<PoolSlot>>, leases: &AtomicUsize, warm_target: u32) {
+    let guard = match slot.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let count = leases.load(Ordering::SeqCst);
+    if let Some(entry) = guard.as_ref() {
+        apply_prefill_spin_target(&entry.pool, count, warm_target);
+    }
+}
+
+#[cfg(any(feature = "xdna", test))]
+fn acquire_warm_spin_lease(slot: &Mutex<Option<PoolSlot>>, leases: &AtomicUsize, warm_target: u32) {
+    leases.fetch_add(1, Ordering::SeqCst);
+    sync_slot_spin_limit_in(slot, leases, warm_target);
+}
+
+#[cfg(any(feature = "xdna", test))]
+fn release_warm_spin_lease(slot: &Mutex<Option<PoolSlot>>, leases: &AtomicUsize, warm_target: u32) {
+    leases.fetch_sub(1, Ordering::SeqCst);
+    sync_slot_spin_limit_in(slot, leases, warm_target);
+}
+
+/// RAII lease tightening [`RowPool::prefill`] workers' spin budget to
+/// [`XDNA_PREFILL_SPIN_BEFORE_PARK`] (`20_000`, ~30 us) on Windows while a hybrid
+/// NPU decode model is live until dropped (or bypassed by an explicit `CERA_SPIN`).
+#[cfg(any(feature = "xdna", test))]
+#[derive(Debug)]
+pub(crate) struct PrefillWarmGuard {
+    _private: (),
+}
+
+#[cfg(any(feature = "xdna", test))]
+impl Drop for PrefillWarmGuard {
+    fn drop(&mut self) {
+        release_warm_spin_lease(&PREFILL_SLOT, &PREFILL_WARM_LEASES, xdna_warm_spin_target());
+    }
+}
+
 impl RowPool {
+    /// Acquire a refcounted lease that sets [`RowPool::prefill`]'s spin budget to
+    /// [`xdna_warm_spin_target()`] (`20_000` on Windows to eliminate NPU PPT contention)
+    /// while a hybrid XDNA decode model is live, restoring the baseline budget on drop.
+    #[cfg(any(feature = "xdna", test))]
+    pub(crate) fn acquire_prefill_warm_spin() -> PrefillWarmGuard {
+        acquire_warm_spin_lease(&PREFILL_SLOT, &PREFILL_WARM_LEASES, xdna_warm_spin_target());
+        PrefillWarmGuard { _private: () }
+    }
+
+    /// Build, pin workers, and wake up to `max_active` threads in [`RowPool::prefill`] once
+    /// up front so the first hybrid XDNA logits projection avoids cold
+    /// thread-creation and OS priority-setup latency without claiming caller affinity.
+    #[cfg(feature = "xdna")]
+    pub(crate) fn warm_prefill(max_active: usize) {
+        #[cfg(not(miri))]
+        {
+            let pool = RowPool::prefill();
+            let requested = if max_active == 0 {
+                pool.num_threads()
+            } else {
+                max_active
+            };
+            let active = requested.min(pool.num_threads());
+            if active > 1 {
+                // Skip `pin_caller_once` so model loading never steals `CALLER_PIN_CLAIMED`
+                // from the thread that later drives decode.
+                pool.dispatch_range_inner_with_pin(active, 1, active, active, false, &|_, _| {});
+            }
+        }
+    }
+
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
     /// every host thread that ever dispatches would be permanently pinned to
@@ -1487,6 +1850,21 @@ impl RowPool {
             if !q.get() {
                 set_macos_thread_qos_interactive();
                 q.set(true);
+            }
+        });
+        #[cfg(target_os = "windows")]
+        CLAIM.with(|c| {
+            let mut claim = c.borrow_mut();
+            if claim.win_qos_guard.is_none() {
+                // Opt the process out of EcoQoS/timer throttling in non-test builds even when
+                // `CERA_PIN=0` leaves `caller_pin == None`, and keep caller priority/QoS elevated
+                // until `release_caller_pin()` or thread exit.
+                let prev_priority = if cfg!(not(test)) || self.caller_pin.is_some() {
+                    set_windows_thread_interactive()
+                } else {
+                    elevate_windows_thread()
+                };
+                claim.win_qos_guard = Some(WinQosGuard { prev_priority });
             }
         });
         let Some(core) = self.caller_pin else {
@@ -1533,7 +1911,13 @@ impl RowPool {
             {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 let saved = current_thread_affinity();
-                if pin_current_thread_to_core(core) {
+                #[cfg(target_os = "windows")]
+                let win_prev = pin_current_thread_to_core_with_prev(core);
+                #[cfg(target_os = "windows")]
+                let pinned = win_prev.is_some();
+                #[cfg(not(target_os = "windows"))]
+                let pinned = pin_current_thread_to_core(core);
+                if pinned {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let tid = unsafe { libc::gettid() } as i64;
                     claim.guard = Some(ClaimGuard {
@@ -1541,6 +1925,10 @@ impl RowPool {
                         tid,
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         saved,
+                        #[cfg(target_os = "windows")]
+                        win_prev_affinity: win_prev,
+                        #[cfg(all(test, target_os = "windows"))]
+                        release_claim: true,
                     });
                     // Record the claim for the allowance probe (see
                     // `thread_self_pinned`): the pinning thread's tid and
@@ -1632,10 +2020,33 @@ impl RowPool {
     ) where
         F: Fn(usize, usize) + Sync,
     {
+        self.dispatch_range_inner_with_pin(
+            total_rows,
+            min_rows,
+            min_chunk_rows,
+            max_active,
+            true,
+            f,
+        );
+    }
+
+    fn dispatch_range_inner_with_pin<F>(
+        &self,
+        total_rows: usize,
+        min_rows: usize,
+        min_chunk_rows: usize,
+        max_active: usize,
+        pin_caller: bool,
+        f: &F,
+    ) where
+        F: Fn(usize, usize) + Sync,
+    {
         if total_rows == 0 {
             return;
         }
-        self.pin_caller_once();
+        if pin_caller {
+            self.pin_caller_once();
+        }
         let min_rows = min_rows.max(1);
         let rows_per_worker = total_rows.div_ceil(self.num_threads).max(min_rows);
         let mut active = total_rows.div_ceil(rows_per_worker).min(self.num_threads);
@@ -2159,7 +2570,6 @@ fn worker_loop(
     worker_id: usize,
     pin_core: Option<usize>,
     spread_mask: &'static [usize],
-    spin_limit: u32,
 ) {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
@@ -2169,6 +2579,22 @@ fn worker_loop(
         WORKER_QOS_SET.with(|q| {
             if !q.get() {
                 set_macos_thread_qos_interactive();
+                q.set(true);
+            }
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        thread_local! {
+            static WIN_WORKER_QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        WIN_WORKER_QOS_SET.with(|q| {
+            if !q.get() {
+                if cfg!(not(test)) || pin_core.is_some() || !spread_mask.is_empty() {
+                    let _ = set_windows_thread_interactive();
+                } else {
+                    let _ = elevate_windows_thread();
+                }
                 q.set(true);
             }
         });
@@ -2214,6 +2640,7 @@ fn worker_loop(
     };
 
     let mut last_state = 0u64;
+    let mut skip_spin = false;
     loop {
         // Wait for a new dispatch (or shutdown). Every dispatch changes the
         // `state` word — the active-sized barrier bumps the epoch in the high bits
@@ -2237,7 +2664,7 @@ fn worker_loop(
             // builds — a panic here would wedge the pool (`pending` never hits
             // 0). Matches the `DrainGuard` counter.
             spins = spins.saturating_add(1);
-            if spins < spin_limit {
+            if !skip_spin && spins < shared.spin_limit.load(Ordering::Relaxed) {
                 std::hint::spin_loop();
             } else {
                 let _guard = ParkedGuard::enter(&shared.parked_count);
@@ -2274,16 +2701,19 @@ fn worker_loop(
             // Active-sized barrier: `active` rides the same atomic as the epoch
             // (see [`pack_state`]), so it can't name a newer dispatch whose `job`
             // the dispatcher has retired. An idle worker (`id >= active`) skips
-            // *entirely* — no `job` read, no `pending` touch — so its `fetch_sub`
-            // never bounces the barrier line across the CCD fabric.
+            // *entirely* — no `job` read, no `pending` touch, and no spin reset —
+            // so it parks immediately instead of burning cycles across NPU gaps.
             if worker_id >= state_active(state) {
+                skip_spin = true;
                 continue;
             }
+            skip_spin = false;
             if let Some(job) = unsafe { *shared.job.get() } {
                 run_job(&shared, &job);
             }
             shared.pending.fetch_sub(1, Ordering::Release);
         } else {
+            skip_spin = false;
             // Full barrier: byte-identical to the pre-active-barrier pool. Every
             // worker reads `job`, runs iff `id < job.active`, and decrements — so
             // the dispatcher's `pending == num_threads - 1` wait covers every
@@ -2312,7 +2742,12 @@ pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
-    set_current_thread_affinity(&[core])
+    pin_current_thread_to_core_with_prev(core).is_some()
+}
+
+#[cfg(target_os = "windows")]
+fn pin_current_thread_to_core_with_prev(core: usize) -> Option<usize> {
+    set_windows_thread_affinity_mask(build_windows_affinity_mask(&[core]))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
@@ -2439,15 +2874,7 @@ fn set_thread_affinity_for_tid(tid: libc::pid_t, cores: &[usize]) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
-    if cores.is_empty() {
-        return false;
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn SetThreadAffinityMask(thread: isize, thread_affinity_mask: usize) -> usize;
-    }
+fn build_windows_affinity_mask(cores: &[usize]) -> usize {
     let capacity = usize::BITS as usize;
     let mut mask = 0usize;
     for &core in cores {
@@ -2455,12 +2882,31 @@ pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
             mask |= 1usize << core;
         }
     }
+    mask
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_thread_affinity_mask(mask: usize) -> Option<usize> {
     if mask == 0 {
-        return false;
+        return None;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadAffinityMask(thread: isize, thread_affinity_mask: usize) -> usize;
     }
     // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the calling thread,
     // and `mask` is non-zero within processor group 0's KAFFINITY bit width.
-    unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) != 0 }
+    let prev = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
+    (prev != 0).then_some(prev)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
+    if cores.is_empty() {
+        return false;
+    }
+    set_windows_thread_affinity_mask(build_windows_affinity_mask(cores)).is_some()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
@@ -3214,6 +3660,9 @@ mod tests {
         // A Tensor G5's three tiers: prime 1024, A725 824, A520 207, rescaled.
         let shared = Shared {
             active_barrier: true,
+            default_spin: 0,
+            spin_locked_by_env: false,
+            spin_limit: AtomicU32::new(0),
             state: AtomicU64::new(0),
             next_row: AtomicUsize::new(0),
             worker_weights: vec![full, 206, 52],
@@ -3257,6 +3706,9 @@ mod tests {
     fn weight_scaling_floors_at_one_row() {
         let shared = Shared {
             active_barrier: true,
+            default_spin: 0,
+            spin_locked_by_env: false,
+            spin_limit: AtomicU32::new(0),
             state: AtomicU64::new(0),
             next_row: AtomicUsize::new(0),
             worker_weights: vec![super::super::cpu_features::WEIGHT_FULL, 1],
@@ -3615,5 +4067,303 @@ mod tests {
         let mut z = vec![0.0f32; 4096];
         pool.dispatch_rows(&mut z, 1, 1, |row, slice| slice[0] = row as f32);
         assert!(z.iter().enumerate().all(|(i, &v)| v == i as f32));
+    }
+
+    #[test]
+    fn xdna_spin_limit_from_lookup_parses_bounds_and_ignores_invalid() {
+        assert_eq!(spin_limit_from_lookup(|_| None), None);
+        assert_eq!(
+            spin_limit_from_lookup(|k| (k == "CERA_SPIN").then(|| "   ".to_string())),
+            None
+        );
+        assert_eq!(
+            spin_limit_from_lookup(|k| (k == "CERA_SPIN").then(|| " 250000 ".to_string())),
+            Some(250_000)
+        );
+        assert_eq!(
+            spin_limit_from_lookup(|k| (k == "CERA_SPIN").then(|| "0".to_string())),
+            Some(0)
+        );
+        assert_eq!(
+            spin_limit_from_lookup(|k| (k == "CERA_SPIN").then(|| "not-a-u32".to_string())),
+            None
+        );
+        assert_eq!(
+            spin_limit_from_lookup(|k| (k == "OTHER_ENV").then(|| "42".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn xdna_prefill_warm_spin_updates_and_respects_env_override() {
+        assert_eq!(resolved_prefill_spin(100_000, 0, 20_000), 100_000);
+        assert_eq!(resolved_prefill_spin(100_000, 1, 20_000), 20_000);
+        assert_eq!(resolved_prefill_spin(30_000_000, 1, 20_000), 20_000);
+
+        // Pin `build_with_spin` across baseline, prefill-warm, decode-pool, and CERA_SPIN-locked paths.
+        let cold_pool = RowPool::build_with_spin(1, &[], &[], &[], true, None, 0);
+        let baseline = cold_pool.shared.spin_limit.load(Ordering::Acquire);
+        assert!(!cold_pool.shared.spin_locked_by_env);
+        assert_eq!(baseline, PREFILL_SPIN_BEFORE_PARK);
+        apply_prefill_spin_target(&cold_pool, 1, 20_000);
+        assert_eq!(cold_pool.shared.spin_limit.load(Ordering::Acquire), 20_000);
+        apply_prefill_spin_target(&cold_pool, 0, 20_000);
+        assert_eq!(
+            cold_pool.shared.spin_limit.load(Ordering::Acquire),
+            baseline
+        );
+
+        let warm_rebuilt = RowPool::build_with_spin(1, &[], &[], &[], true, None, 1);
+        assert!(!warm_rebuilt.shared.spin_locked_by_env);
+        assert_eq!(
+            warm_rebuilt.shared.spin_limit.load(Ordering::Acquire),
+            xdna_warm_spin_target()
+        );
+
+        let non_prefill = RowPool::build_with_spin(1, &[], &[], &[], false, None, 1);
+        assert_eq!(
+            non_prefill.shared.spin_limit.load(Ordering::Acquire),
+            SPIN_BEFORE_PARK
+        );
+
+        let locked_pool = RowPool::build_with_spin(1, &[], &[], &[], true, Some(42), 1);
+        assert!(locked_pool.shared.spin_locked_by_env);
+        assert_eq!(locked_pool.shared.spin_limit.load(Ordering::Acquire), 42);
+        apply_prefill_spin_target(&locked_pool, 2, 24_000_000);
+        assert_eq!(locked_pool.shared.spin_limit.load(Ordering::Acquire), 42);
+        apply_prefill_spin_target(&locked_pool, 0, 24_000_000);
+        assert_eq!(locked_pool.shared.spin_limit.load(Ordering::Acquire), 42);
+    }
+
+    #[test]
+    fn xdna_acquire_prefill_warm_spin_refcounts_isolated_slot() {
+        let leases = AtomicUsize::new(0);
+        let pool = Arc::new(RowPool::build_with_spin(1, &[], &[], &[], true, None, 0));
+        let baseline = pool.shared.default_spin;
+        assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), baseline);
+        let slot = Mutex::new(Some(PoolSlot {
+            pool: Arc::clone(&pool),
+            usable: crate::backend::cpu_features::UsableCpus::CountOnly(1),
+        }));
+        let warm_target = 24_000_000;
+
+        acquire_warm_spin_lease(&slot, &leases, warm_target);
+        assert_eq!(leases.load(Ordering::Acquire), 1);
+        assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), warm_target);
+
+        acquire_warm_spin_lease(&slot, &leases, warm_target);
+        assert_eq!(leases.load(Ordering::Acquire), 2);
+        assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), warm_target);
+
+        release_warm_spin_lease(&slot, &leases, warm_target);
+        assert_eq!(leases.load(Ordering::Acquire), 1);
+        assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), warm_target);
+
+        release_warm_spin_lease(&slot, &leases, warm_target);
+        assert_eq!(leases.load(Ordering::Acquire), 0);
+        assert_eq!(pool.shared.spin_limit.load(Ordering::Acquire), baseline);
+
+        // Exercise global RAII lease acquire + drop without assuming exclusive global ownership.
+        let g = RowPool::acquire_prefill_warm_spin();
+        assert!(PREFILL_WARM_LEASES.load(Ordering::Acquire) >= 1);
+        drop(g);
+    }
+
+    #[test]
+    fn warm_dispatch_skips_caller_pin_claim() {
+        // Spawn on a fresh thread so thread-local `CLAIM` starts isolated, seed `retry_cooldown = 1`
+        // (thread-local state checked at top of `pin_caller_once` before any global atomic), then
+        // run `dispatch_range_inner_with_pin(..., false, ...)` + `warm_prefill` (must keep cooldown 1)
+        // and a positive control `pin_caller = true` (must decrement cooldown 1 -> 0).
+        let (ran, has_guard, cooldown, ctrl_cooldown) = thread::spawn(|| {
+            let ran = AtomicBool::new(false);
+            let pool = RowPool::build_with_spin(2, &[0, 1], &[], &[], true, None, 0);
+            CLAIM.with(|c| c.borrow_mut().retry_cooldown = 1);
+            pool.dispatch_range_inner_with_pin(2, 1, 2, 2, false, &|_, _| {
+                ran.store(true, Ordering::Release);
+            });
+            #[cfg(feature = "xdna")]
+            {
+                RowPool::warm_prefill(2);
+                RowPool::warm_prefill(0);
+            }
+            let (has_guard, cooldown) =
+                CLAIM.with(|c| (c.borrow().guard.is_some(), c.borrow().retry_cooldown));
+            pool.dispatch_range_inner_with_pin(2, 1, 2, 2, true, &|_, _| {});
+            let ctrl_cooldown = CLAIM.with(|c| c.borrow().retry_cooldown);
+            (
+                ran.load(Ordering::Acquire),
+                has_guard,
+                cooldown,
+                ctrl_cooldown,
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(ran, "warm-up dispatch must invoke body");
+        assert!(
+            !has_guard && cooldown == 1,
+            "warm-up dispatch must not call pin_caller_once (has_guard={has_guard}, cooldown={cooldown})"
+        );
+        assert_eq!(
+            ctrl_cooldown, 0,
+            "positive-control pin_caller=true dispatch must enter pin_caller_once and decrement retry_cooldown"
+        );
+    }
+
+    /// Probe the current thread's affinity mask using a valid bit from `GetProcessAffinityMask`
+    /// and return `(initial_mask, c0, c1, multi_mask)` when at least two logical CPUs are allowed.
+    #[cfg(all(target_os = "windows", not(miri)))]
+    fn windows_probe_two_core_affinity() -> Option<(usize, usize, usize, usize)> {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessAffinityMask(
+                process: isize,
+                process_affinity_mask: *mut usize,
+                system_affinity_mask: *mut usize,
+            ) -> i32;
+        }
+        let mut process_mask = 0usize;
+        let mut system_mask = 0usize;
+        // SAFETY: `GetCurrentProcess()` returns a valid pseudo-handle and both out pointers target
+        // initialized `usize` locals (`DWORD_PTR`).
+        let ok = unsafe {
+            GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask)
+        };
+        assert_ne!(ok, 0, "GetProcessAffinityMask must succeed");
+        if process_mask == 0 {
+            return None;
+        }
+        let probe_bit = 1usize << process_mask.trailing_zeros();
+        let initial_mask = set_windows_thread_affinity_mask(probe_bit)
+            .expect("SetThreadAffinityMask with valid process-mask bit must return prior mask");
+        set_windows_thread_affinity_mask(initial_mask)
+            .expect("restoring initial thread affinity mask");
+        if initial_mask.count_ones() < 2 {
+            return None;
+        }
+        let c0 = initial_mask.trailing_zeros() as usize;
+        let rem = initial_mask & !(1usize << c0);
+        let c1 = rem.trailing_zeros() as usize;
+        let multi_mask = (1usize << c0) | (1usize << c1);
+        Some((initial_mask, c0, c1, multi_mask))
+    }
+
+    #[cfg(all(target_os = "windows", not(miri)))]
+    #[test]
+    fn windows_claim_guard_restores_affinity_mask_on_drop() {
+        let result = thread::spawn(|| {
+            let (initial_mask, c0, _c1, multi_mask) = windows_probe_two_core_affinity()?;
+
+            set_windows_thread_affinity_mask(multi_mask)
+                .expect("setting two-core mask before ClaimGuard test");
+            let prev = pin_current_thread_to_core_with_prev(c0)
+                .expect("pinning to c0 should return previous mask");
+            assert_eq!(prev, multi_mask);
+            let pinned_live =
+                set_windows_thread_affinity_mask(1usize << c0).expect("probing pinned mask");
+            assert_eq!(pinned_live, 1usize << c0);
+
+            let guard = ClaimGuard {
+                win_prev_affinity: Some(prev),
+                release_claim: false,
+            };
+            drop(guard);
+
+            let restored_live =
+                set_windows_thread_affinity_mask(initial_mask).expect("probing restored mask");
+            Some((restored_live, multi_mask))
+        })
+        .join()
+        .unwrap();
+
+        if let Some((restored_live, multi_mask)) = result {
+            assert_eq!(
+                restored_live, multi_mask,
+                "ClaimGuard::drop must restore prior Windows DWORD_PTR affinity mask"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "windows", not(miri)))]
+    #[test]
+    fn windows_real_dispatch_pins_and_release_caller_pin_restores_mask() {
+        thread::spawn(|| {
+            let Some((initial_mask, c0, c1, multi_mask)) = windows_probe_two_core_affinity() else {
+                return;
+            };
+            set_windows_thread_affinity_mask(multi_mask).expect("setting multi-core baseline");
+
+            let pool = RowPool::build_with_spin(2, &[c0, c1], &[], &[], true, None, 0);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            let mut claimed = false;
+            while Instant::now() < deadline {
+                CLAIM.with(|c| c.borrow_mut().retry_cooldown = 0);
+                pool.dispatch_range(4, 1, |_, _| {});
+                if CLAIM.with(|c| c.borrow().guard.is_some()) {
+                    claimed = true;
+                    break;
+                }
+                thread::yield_now();
+            }
+            assert!(
+                claimed,
+                "caller should eventually acquire Windows caller pin"
+            );
+
+            let pinned_live =
+                set_windows_thread_affinity_mask(1usize << c0).expect("probing pinned mask");
+            assert_eq!(pinned_live, 1usize << c0);
+
+            release_caller_pin();
+            assert!(CLAIM.with(|c| c.borrow().guard.is_none()));
+            let restored_live = set_windows_thread_affinity_mask(initial_mask)
+                .expect("probing restored mask after release_caller_pin");
+            assert_eq!(
+                restored_live, multi_mask,
+                "release_caller_pin must restore Windows affinity mask from ClaimGuard"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(all(target_os = "windows", not(miri)))]
+    #[test]
+    fn windows_caller_qos_elevates_and_restores_without_caller_pin() {
+        thread::spawn(|| {
+            // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the current thread.
+            let initial_prio = unsafe { win_qos::GetThreadPriority(win_qos::GetCurrentThread()) };
+            assert_ne!(initial_prio, win_qos::THREAD_PRIORITY_ERROR_RETURN);
+
+            // Empty `pin_cores` yields `caller_pin == None` (same as `CERA_PIN=0` or widened prefill).
+            let pool = RowPool::build_with_spin(1, &[], &[], &[], true, None, 0);
+            pool.dispatch_range(4, 1, |_, _| {});
+
+            let (has_guard, has_qos) = CLAIM.with(|c| {
+                (
+                    c.borrow().guard.is_some(),
+                    c.borrow().win_qos_guard.is_some(),
+                )
+            });
+            assert!(!has_guard, "caller_pin == None must not acquire ClaimGuard");
+            assert!(
+                has_qos,
+                "caller QoS guard must be acquired independently of caller_pin"
+            );
+
+            // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the current thread.
+            let elevated_prio = unsafe { win_qos::GetThreadPriority(win_qos::GetCurrentThread()) };
+            assert_eq!(elevated_prio, win_qos::THREAD_PRIORITY_HIGHEST);
+
+            release_caller_pin();
+            assert!(CLAIM.with(|c| c.borrow().win_qos_guard.is_none()));
+            // SAFETY: `GetCurrentThread()` returns a pseudo-handle to the current thread.
+            let restored_prio = unsafe { win_qos::GetThreadPriority(win_qos::GetCurrentThread()) };
+            assert_eq!(restored_prio, initial_prio);
+        })
+        .join()
+        .unwrap();
     }
 }

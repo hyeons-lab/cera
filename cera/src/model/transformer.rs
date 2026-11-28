@@ -829,15 +829,18 @@ pub(crate) fn gemv(gguf: &GgufFile, wref: &WeightRef, x: &[f32], y: &mut [f32]) 
 }
 
 #[cfg(feature = "xdna")]
-pub(crate) fn gemv_active(
+pub(crate) fn gemv_active_with_scratch(
     max_active: usize,
     gguf: &GgufFile,
     wref: &WeightRef,
     x: &[f32],
     y: &mut [f32],
+    q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
 ) {
     let data = weight_data(gguf, wref);
-    cpu::gemv_dispatch_active(max_active, wref.dtype, data, x, y, wref.m, wref.k, None);
+    cpu::gemv_dispatch_active(
+        max_active, wref.dtype, data, x, y, wref.m, wref.k, q8_scratch,
+    );
 }
 
 /// GEMV with pre-quantized Q8_0 input (skips re-quantizing x for each weight
@@ -1328,6 +1331,29 @@ pub(crate) fn try_blas_prefill_gemm_rowmajor(
     }
 }
 
+/// Validate Q8_0 activation block alignment and slice potentially oversized
+/// persistent scratch buffers to exact `[n * (k / 32)]` / `[n * k]` bounds.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(dead_code)]
+#[inline]
+fn slice_preq_inputs<'a>(
+    caller: &str,
+    b_scales: &'a [f32],
+    b_quants: &'a [i8],
+    n: usize,
+    k: usize,
+) -> (&'a [f32], &'a [i8]) {
+    debug_assert_eq!(k % 32, 0, "{caller}: k ({k}) must be a multiple of 32");
+    let nb = k / 32;
+    debug_assert!(
+        b_scales.len() >= n * nb && b_quants.len() >= n * k,
+        "{caller}: input scratch too small (need {} scales / {} quants for n={n}, k={k})",
+        n * nb,
+        n * k,
+    );
+    (&b_scales[..n * nb], &b_quants[..n * k])
+}
+
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_repacked_gemm_rowmajor(
@@ -1341,6 +1367,8 @@ pub(crate) fn try_repacked_gemm_rowmajor(
 ) -> bool {
     debug_assert_eq!(wref.m, m, "try_repacked_gemm_rowmajor: weight m mismatch");
     debug_assert_eq!(wref.k, k, "try_repacked_gemm_rowmajor: weight k mismatch");
+    let (b_scales, b_quants) =
+        slice_preq_inputs("try_repacked_gemm_rowmajor", b_scales, b_quants, n, k);
     if let Some(rp) = &wref.repacked {
         let ran = match &rp.kind {
             Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
@@ -1469,6 +1497,9 @@ pub(crate) fn gemm_preq_rowmajor(
     m: usize,
     k: usize,
 ) -> bool {
+    debug_assert_eq!(wref.m, m, "gemm_preq_rowmajor: weight m mismatch");
+    debug_assert_eq!(wref.k, k, "gemm_preq_rowmajor: weight k mismatch");
+    let (b_scales, b_quants) = slice_preq_inputs("gemm_preq_rowmajor", b_scales, b_quants, n, k);
     if try_repacked_gemm_rowmajor(wref, b_scales, b_quants, out, n, m, k) {
         return true;
     }
@@ -1507,6 +1538,13 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
     );
     debug_assert_eq!(up.m, m, "try_repacked_gate_up_silu_rowmajor: up m mismatch");
     debug_assert_eq!(up.k, k, "try_repacked_gate_up_silu_rowmajor: up k mismatch");
+    let (b_scales, b_quants) = slice_preq_inputs(
+        "try_repacked_gate_up_silu_rowmajor",
+        b_scales,
+        b_quants,
+        n,
+        k,
+    );
     #[allow(clippy::collapsible_if)]
     if let (Some(g_rp), Some(u_rp)) = (&gate.repacked, &up.repacked) {
         if let (
@@ -1616,21 +1654,13 @@ pub(crate) fn gemm_preq(
     // exactly n*k quants / n*(k/32) scales; enforce both at the wrapper boundary
     // so misuse (a non-32 k or an under-sized scratch) fails loudly in debug
     // rather than silently truncating (k/32) or producing wrong results.
-    debug_assert_eq!(k % 32, 0, "gemm_preq: k ({k}) must be a multiple of 32");
-    debug_assert!(
-        b_scales.len() >= n * (k / 32) && b_quants.len() >= n * k,
-        "gemm_preq: input scratch too small (need {} scales / {} quants for n={n}, k={k})",
-        n * (k / 32),
-        n * k,
-    );
-    let data = weight_data(gguf, wref);
     // The input scratch may be sized to the largest GEMM k-dim and shared across
     // projections with differing k; the NEON kernels require exactly `n*k`
     // quants / `n*(k/32)` scales, so slice to this GEMM's k. The buffer is
     // always ≥ the needed length (a no-op for exactly-sized callers), and
     // `quantize_columns` packs column j at the matching `k`-strided offset.
-    let b_scales = &b_scales[..n * (k / 32)];
-    let b_quants = &b_quants[..n * k];
+    let (b_scales, b_quants) = slice_preq_inputs("gemm_preq", b_scales, b_quants, n, k);
+    let data = weight_data(gguf, wref);
     // Same treatment for `out`, and for a sharper reason than tidiness: the
     // kernels derive their row/strip index from `out.len()`, not from `m`, so an
     // over-long buffer walks past row `m` and reads weights out of bounds.
@@ -4449,5 +4479,51 @@ mod repack_flag_tests {
             col_out.iter().any(|&v| v != 7.0),
             "column dispatch wrote nothing"
         );
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+    #[test]
+    fn gemm_preq_rowmajor_accepts_oversized_b_scratch() {
+        let (m, k, n) = (32usize, 64usize, 4usize);
+        let (gguf, start, size) = synth_q4_0_gguf(m, k);
+        if !cpu::q4_0_repack_supported(m, k) {
+            return;
+        }
+        let b: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.01 - 0.5).collect();
+        let mut scales = vec![0.0f32; n * (k / 32)];
+        let mut quants = vec![0i8; n * k];
+        quantize_rows(&b, k, n, &mut scales, &mut quants);
+        let mut over_scales = scales.clone();
+        over_scales.resize(scales.len() * 2, 1.0);
+        let mut over_quants = quants.clone();
+        over_quants.resize(quants.len() * 2, 1);
+
+        let full = WeightRef::new(start, size, DType::Q4_0, m, k).with_repack_if(&gguf, true);
+        let plain = WeightRef::new(start, size, DType::Q4_0, m, k);
+        for wref in [&full, &plain] {
+            let mut exact_out = vec![0.0f32; n * m];
+            let mut over_out = vec![0.0f32; n * m];
+            assert!(gemm_preq_rowmajor(
+                &gguf,
+                wref,
+                &scales,
+                &quants,
+                &mut exact_out,
+                n,
+                m,
+                k,
+            ));
+            assert!(gemm_preq_rowmajor(
+                &gguf,
+                wref,
+                &over_scales,
+                &over_quants,
+                &mut over_out,
+                n,
+                m,
+                k,
+            ));
+            assert_eq!(over_out, exact_out);
+        }
     }
 }

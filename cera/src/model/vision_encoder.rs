@@ -65,7 +65,7 @@ const MAX_IMAGE_PIXELS: usize = 64 << 20;
 
 /// Where in the LFM3 projector the optional `mm.input_norm` applies, by its width.
 #[derive(Debug, PartialEq, Eq)]
-enum MmNormStage {
+pub(crate) enum MmNormStage {
     /// Over the encoder width, on the tokens before the spatial merge.
     PreMerge,
     /// Over the merged width (`n_embd * scale_factor^2`), after the merge.
@@ -74,7 +74,7 @@ enum MmNormStage {
 
 /// The one stage a norm of `len` entries applies at. With `scale_factor == 1` the merged width
 /// equals `n_embd`, and both stages would match: the norm must still run once.
-fn mm_norm_stage(len: usize, n_embd: usize, merged_dim: usize) -> Option<MmNormStage> {
+pub(crate) fn mm_norm_stage(len: usize, n_embd: usize, merged_dim: usize) -> Option<MmNormStage> {
     if len == n_embd {
         Some(MmNormStage::PreMerge)
     } else if len == merged_dim {
@@ -85,7 +85,7 @@ fn mm_norm_stage(len: usize, n_embd: usize, merged_dim: usize) -> Option<MmNormS
 }
 
 /// LayerNorm epsilon used by `mm.input_norm` in the LFM3 vision projector.
-const LFM3_MM_INPUT_NORM_EPS: f32 = 1e-6;
+pub(crate) const LFM3_MM_INPUT_NORM_EPS: f32 = 1e-6;
 
 /// Vision start boundary token emitted before projected image tokens for `lfm3o`.
 pub const VISION_START_TOKEN: &str = "<|vision_start|>";
@@ -1735,31 +1735,15 @@ impl VisionEncoderWeights {
             cfg.rope_theta,
         );
 
-        // Expand KV heads in-place if GQA (n_head_kv < n_head) so vit_attention can run directly.
-        if n_head_kv < n_head {
-            let n_rep = n_head / n_head_kv;
-            for t in (0..n_tokens).rev() {
-                for h in (0..n_head).rev() {
-                    let kv_h = h / n_rep;
-                    let src_off = t * kv_dim + kv_h * head_dim;
-                    let dst_off = t * d + h * head_dim;
-                    if src_off != dst_off {
-                        scratch.k.copy_within(src_off..src_off + head_dim, dst_off);
-                        scratch.v.copy_within(src_off..src_off + head_dim, dst_off);
-                    }
-                }
-            }
-        }
-
-        vit_attention(
+        vit_attention_gqa(
             &scratch.q[..n_tokens * d],
-            &scratch.k[..n_tokens * d],
-            &scratch.v[..n_tokens * d],
+            &scratch.k[..n_tokens * kv_dim],
+            &scratch.v[..n_tokens * kv_dim],
             &mut scratch.attn_out[..n_tokens * d],
             &mut scratch.attn_heads,
-            &mut scratch.attn_kt,
             n_tokens,
             n_head,
+            n_head_kv,
             head_dim,
             scale,
         );
@@ -2169,6 +2153,84 @@ fn attn_heads_len(n_tokens: usize, n_head: usize, head_dim: usize) -> usize {
 /// head's whole K and V (about 400 KB) from L2 for every query, which made attention memory-bound at
 /// about 90 GFLOP/s. `heads` receives each head's output in the kernel's `[head][token][head_dim]`
 /// layout before it is scattered into `out`.
+/// Bidirectional grouped-query self-attention (`n_head` query heads, `n_head_kv` KV heads).
+/// `q` is `[n_tokens, n_head * head_dim]`, `k`/`v` are `[n_tokens, n_head_kv * head_dim]`,
+/// and `out` is `[n_tokens, n_head * head_dim]`. Reuses the vectorized flash-attention kernel
+/// directly without expanding KV heads in memory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vit_attention_gqa(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    heads: &mut [f32],
+    n_tokens: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    let n_embd = n_head * head_dim;
+    let kv_dim = n_head_kv * head_dim;
+    let n_rep = (n_head / n_head_kv).max(1);
+    let chunk_q = attn_q_chunk(n_embd);
+    let padded = n_tokens.next_multiple_of(chunk_q);
+    let n_chunks = padded / chunk_q;
+    let heads = &mut heads[..attn_heads_len(n_tokens, n_head, head_dim)];
+
+    par_rows_n(heads, chunk_q * head_dim, |r, chunk| {
+        let (h, c) = (r / n_chunks, r % n_chunks);
+        let h_kv = h / n_rep;
+        let t0 = c * chunk_q;
+        let nq = (n_tokens - t0).min(chunk_q);
+        #[cfg(target_arch = "aarch64")]
+        crate::backend::cpu::flash_attention_gqa_cpu_opt(
+            &q[t0 * n_embd..],
+            k,
+            v,
+            &mut chunk[..nq * head_dim],
+            h,
+            1,
+            nq,
+            n_embd,
+            kv_dim,
+            h_kv * head_dim,
+            head_dim,
+            scale,
+            n_tokens - nq,
+            false,
+        );
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut q_t = vec![0.0f32; head_dim * nq];
+            for j in 0..nq {
+                let src = &q[(t0 + j) * n_embd + h * head_dim..][..head_dim];
+                for (d, &x) in src.iter().enumerate() {
+                    q_t[d * nq + j] = x;
+                }
+            }
+            crate::backend::cpu::flash_attention_gqa_cpu_opt(
+                &q_t,
+                k,
+                v,
+                &mut chunk[..nq * head_dim],
+                0,
+                1,
+                nq,
+                nq,
+                kv_dim,
+                h_kv * head_dim,
+                head_dim,
+                scale,
+                n_tokens - nq,
+                false,
+            );
+        }
+    });
+
+    scatter_heads(heads, out, padded, n_tokens, n_head, head_dim);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn vit_attention(
     q: &[f32],

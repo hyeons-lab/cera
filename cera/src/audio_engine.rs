@@ -358,6 +358,29 @@ fn format_cera_err_detail(err: crate::CeraError) -> String {
     }
 }
 
+enum FrameCodes {
+    Fixed([i32; 8]),
+    Var(Vec<i32>),
+}
+
+impl FrameCodes {
+    fn as_slice(&self) -> &[i32] {
+        match self {
+            Self::Fixed(codes) => codes,
+            Self::Var(codes) => codes,
+        }
+    }
+}
+
+enum PreparedFrame {
+    Ready(FrameOutcome),
+    NeedsDetok {
+        audio_embedding: Vec<f32>,
+        codes: [i32; 8],
+        detok_codes: FrameCodes,
+    },
+}
+
 impl<'a> AudioOutputDecoder<'a> {
     /// Total audio frames decoded so far in this session.
     pub fn audio_frames(&self) -> usize {
@@ -500,14 +523,18 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_accelerated_df: !weights.is_lfm3a_gen()
-                && active_accelerator.is_some_and(|a| {
-                    crate::model::audio_decoder::accelerated_depthformer_enabled(
-                        a.supports_depthformer(),
-                        a.depthformer_default_on(),
-                        gpu_depthformer,
-                    )
-                }),
+            use_accelerated_df: active_accelerator.is_some_and(|a| {
+                let df_ok = if weights.is_lfm3a_gen() {
+                    a.supports_lfm3a_gen_depthformer()
+                } else {
+                    a.supports_depthformer()
+                };
+                crate::model::audio_decoder::accelerated_depthformer_enabled(
+                    df_ok,
+                    a.depthformer_default_on(),
+                    gpu_depthformer,
+                )
+            }),
             detok_fallback_cpu: false,
             streaming: true,
             all_codes: Vec::new(),
@@ -534,188 +561,44 @@ impl<'a> AudioOutputDecoder<'a> {
     /// this frame on (the audio_start token embedding on the first
     /// frame, or the prior frame's feedback embedding afterward).
     pub fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
-        if self.weights.is_lfm3a_gen() {
-            let t0 = Instant::now();
-            let codes_vec = sample_frame(
-                self.weights,
-                &mut self.df_state,
-                embed,
-                self.audio_temperature,
-                self.audio_top_k,
-            );
-            self.time_depthformer += t0.elapsed();
-
-            if codes_vec
-                .first()
-                .copied()
-                .is_some_and(|c| self.is_end_code(c))
-            {
-                self.last_codes.clone_from(&codes_vec);
-                return FrameOutcome::End;
-            }
-
-            self.audio_frames += 1;
-            self.last_codes.clone_from(&codes_vec);
-            let mut codes = [0i32; 8];
-            for (dst, &src) in codes.iter_mut().zip(codes_vec.iter()) {
-                *dst = src;
-            }
-            let audio_embedding = embed_audio_codes(self.weights, &codes_vec);
-
-            if !self.streaming {
-                self.all_codes.extend_from_slice(&codes_vec);
-                return FrameOutcome::Codes {
-                    audio_embedding,
-                    pcm: vec![],
-                    codes,
-                };
-            }
-
-            let t1 = Instant::now();
-            let spectrum = match self.detokenize_frame_sync(&codes_vec) {
-                Ok(s) => s,
-                Err(detail) => return FrameOutcome::Fault(detail),
-            };
-            self.time_detokenizer += t1.elapsed();
-
-            let pcm = self.streamer.feed_frames(&spectrum);
-            self.streamed_samples += pcm.len();
-
-            return FrameOutcome::Codes {
-                audio_embedding,
-                pcm,
-                codes,
-            };
-        }
-
-        let t0 = Instant::now();
-        let codes = match (self.use_accelerated_df, self.accelerator) {
-            (true, Some(a)) => {
-                // Drain the backend fault slot around the bare sample:
-                // a fault here must abort (the async path `?`s it), since
-                // CPU state went cold while the accelerator drove sampling.
-                let _ = a.take_audio_error();
-                let codes = a.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k);
-                if let Some(e) = a.take_audio_error() {
-                    // Backend details round-trip exactly; anything else
-                    // degrades to its display text (audio faults are
-                    // `Backend` by construction: every recorder passes it).
-                    let detail = match e {
-                        crate::CeraError::Backend(detail) => detail,
-                        other => other.to_string(),
-                    };
-                    return FrameOutcome::Fault(detail);
-                }
-                codes
-            }
-            _ => sample_audio_frame(
-                self.weights,
-                &mut self.df_state,
-                embed,
-                self.audio_temperature,
-                self.audio_top_k,
-            ),
-        };
-        self.time_depthformer += t0.elapsed();
-
-        if codes[0] == AUDIO_END_CODE {
-            return FrameOutcome::End;
-        }
-
-        self.audio_frames += 1;
-        self.last_codes.clear();
-        self.last_codes.extend_from_slice(&codes);
-        let audio_embedding = embed_audio_token(self.weights, &codes);
-
-        if !self.streaming {
-            self.all_codes.extend_from_slice(&codes);
-            return FrameOutcome::Codes {
-                audio_embedding,
-                pcm: vec![],
-                codes,
-            };
-        }
-
-        let t1 = Instant::now();
-        let spectrum = match self.detokenize_frame_sync(&codes) {
-            Ok(s) => s,
+        let frame_codes = match self.sample_frame_codes_sync(embed) {
+            Ok(codes) => codes,
             Err(detail) => return FrameOutcome::Fault(detail),
         };
-        self.time_detokenizer += t1.elapsed();
-
-        let pcm = self.streamer.feed_frames(&spectrum);
-        self.streamed_samples += pcm.len();
-
-        FrameOutcome::Codes {
-            audio_embedding,
-            pcm,
-            codes,
+        match self.prepare_decoded_frame(frame_codes) {
+            PreparedFrame::Ready(outcome) => outcome,
+            PreparedFrame::NeedsDetok {
+                audio_embedding,
+                codes,
+                detok_codes,
+            } => {
+                let t1 = Instant::now();
+                let spectrum = match self.detokenize_frame_sync(detok_codes.as_slice()) {
+                    Ok(s) => s,
+                    Err(detail) => return FrameOutcome::Fault(detail),
+                };
+                self.time_detokenizer += t1.elapsed();
+                self.finish_streamed_frame(audio_embedding, codes, &spectrum)
+            }
         }
     }
 
     /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
     pub async fn decode_frame_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameOutcome> {
-        if self.weights.is_lfm3a_gen() {
-            return Ok(self.decode_frame(embed));
-        }
-        let t0 = Instant::now();
-        let codes = match (self.use_accelerated_df, self.accelerator) {
-            (true, Some(a)) => {
-                a.sample_audio_frame_async(embed, self.audio_temperature, self.audio_top_k)
-                    .await?
-            }
-            _ => sample_audio_frame(
-                self.weights,
-                &mut self.df_state,
-                embed,
-                self.audio_temperature,
-                self.audio_top_k,
-            ),
-        };
-        self.time_depthformer += t0.elapsed();
-
-        if codes[0] == AUDIO_END_CODE {
-            return Ok(FrameOutcome::End);
-        }
-
-        self.audio_frames += 1;
-        self.last_codes.clear();
-        self.last_codes.extend_from_slice(&codes);
-        let audio_embedding = embed_audio_token(self.weights, &codes);
-
-        if !self.streaming {
-            self.all_codes.extend_from_slice(&codes);
-            return Ok(FrameOutcome::Codes {
+        let frame_codes = self.sample_frame_codes_async(embed).await?;
+        match self.prepare_decoded_frame(frame_codes) {
+            PreparedFrame::Ready(outcome) => Ok(outcome),
+            PreparedFrame::NeedsDetok {
                 audio_embedding,
-                pcm: vec![],
                 codes,
-            });
+                detok_codes,
+            } => {
+                let t1 = Instant::now();
+                let spectrum = self.detokenize_frame_async(detok_codes.as_slice()).await?;
+                self.time_detokenizer += t1.elapsed();
+                Ok(self.finish_streamed_frame(audio_embedding, codes, &spectrum))
+            }
         }
-
-        let t1 = Instant::now();
-        let spectrum = if !self.detok_fallback_cpu
-            && let Some(a) = self.accelerator
-        {
-            a.detokenize_to_spectrum_async(self.detok_weights, &codes)
-                .await?
-        } else {
-            detokenize_to_spectrum(
-                self.detok_weights,
-                self.weights,
-                &mut self.detok_state,
-                &codes,
-            )
-        };
-        self.time_detokenizer += t1.elapsed();
-
-        let pcm = self.streamer.feed_frames(&spectrum);
-        self.streamed_samples += pcm.len();
-
-        Ok(FrameOutcome::Codes {
-            audio_embedding,
-            pcm,
-            codes,
-        })
     }
 
     /// Async version of [`Self::decode_frame_async`] taking a GPU hidden buffer directly.
@@ -737,48 +620,208 @@ impl<'a> AudioOutputDecoder<'a> {
         };
         self.time_depthformer += t0.elapsed();
 
-        if codes[0] == AUDIO_END_CODE {
-            return Ok(FrameOutcome::End);
+        match self.prepare_decoded_frame(FrameCodes::Fixed(codes)) {
+            PreparedFrame::Ready(outcome) => Ok(outcome),
+            PreparedFrame::NeedsDetok {
+                audio_embedding,
+                codes,
+                detok_codes,
+            } => {
+                let t1 = Instant::now();
+                let spectrum = self.detokenize_frame_async(detok_codes.as_slice()).await?;
+                self.time_detokenizer += t1.elapsed();
+                Ok(self.finish_streamed_frame(audio_embedding, codes, &spectrum))
+            }
+        }
+    }
+
+    fn sample_frame_codes_sync(&mut self, embed: &[f32]) -> Result<FrameCodes, String> {
+        let t0 = Instant::now();
+        let frame_codes = if self.weights.is_lfm3a_gen() {
+            let codes_vec = match (self.use_accelerated_df, self.accelerator) {
+                (true, Some(a)) => {
+                    let _ = a.take_audio_error();
+                    let sampled =
+                        a.sample_audio_frame_lfm3a(embed, self.audio_temperature, self.audio_top_k);
+                    if let Some(e) = a.take_audio_error() {
+                        return Err(format_cera_err_detail(e));
+                    }
+                    sampled.unwrap_or_else(|| {
+                        sample_frame(
+                            self.weights,
+                            &mut self.df_state,
+                            embed,
+                            self.audio_temperature,
+                            self.audio_top_k,
+                        )
+                    })
+                }
+                _ => sample_frame(
+                    self.weights,
+                    &mut self.df_state,
+                    embed,
+                    self.audio_temperature,
+                    self.audio_top_k,
+                ),
+            };
+            FrameCodes::Var(codes_vec)
+        } else {
+            let codes = match (self.use_accelerated_df, self.accelerator) {
+                (true, Some(a)) => {
+                    // Drain the backend fault slot around the bare sample:
+                    // a fault here must abort (the async path `?`s it), since
+                    // CPU state went cold while the accelerator drove sampling.
+                    let _ = a.take_audio_error();
+                    let codes =
+                        a.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k);
+                    if let Some(e) = a.take_audio_error() {
+                        // Backend details round-trip exactly; anything else
+                        // degrades to its display text (audio faults are
+                        // `Backend` by construction: every recorder passes it).
+                        return Err(format_cera_err_detail(e));
+                    }
+                    codes
+                }
+                _ => sample_audio_frame(
+                    self.weights,
+                    &mut self.df_state,
+                    embed,
+                    self.audio_temperature,
+                    self.audio_top_k,
+                ),
+            };
+            FrameCodes::Fixed(codes)
+        };
+        self.time_depthformer += t0.elapsed();
+        Ok(frame_codes)
+    }
+
+    async fn sample_frame_codes_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameCodes> {
+        let t0 = Instant::now();
+        let frame_codes = if self.weights.is_lfm3a_gen() {
+            let codes_vec = match (self.use_accelerated_df, self.accelerator) {
+                (true, Some(a)) => a
+                    .sample_audio_frame_lfm3a_async(embed, self.audio_temperature, self.audio_top_k)
+                    .await?
+                    .unwrap_or_else(|| {
+                        sample_frame(
+                            self.weights,
+                            &mut self.df_state,
+                            embed,
+                            self.audio_temperature,
+                            self.audio_top_k,
+                        )
+                    }),
+                _ => sample_frame(
+                    self.weights,
+                    &mut self.df_state,
+                    embed,
+                    self.audio_temperature,
+                    self.audio_top_k,
+                ),
+            };
+            FrameCodes::Var(codes_vec)
+        } else {
+            let codes = match (self.use_accelerated_df, self.accelerator) {
+                (true, Some(a)) => {
+                    a.sample_audio_frame_async(embed, self.audio_temperature, self.audio_top_k)
+                        .await?
+                }
+                _ => sample_audio_frame(
+                    self.weights,
+                    &mut self.df_state,
+                    embed,
+                    self.audio_temperature,
+                    self.audio_top_k,
+                ),
+            };
+            FrameCodes::Fixed(codes)
+        };
+        self.time_depthformer += t0.elapsed();
+        Ok(frame_codes)
+    }
+
+    fn prepare_decoded_frame(&mut self, frame_codes: FrameCodes) -> PreparedFrame {
+        let slice = frame_codes.as_slice();
+        let is_end = match &frame_codes {
+            FrameCodes::Var(codes_vec) => {
+                if codes_vec
+                    .first()
+                    .copied()
+                    .is_some_and(|c| self.is_end_code(c))
+                {
+                    self.last_codes.clone_from(codes_vec);
+                    true
+                } else {
+                    false
+                }
+            }
+            FrameCodes::Fixed(codes) => codes[0] == AUDIO_END_CODE,
+        };
+        if is_end {
+            return PreparedFrame::Ready(FrameOutcome::End);
         }
 
         self.audio_frames += 1;
         self.last_codes.clear();
-        self.last_codes.extend_from_slice(&codes);
-        let audio_embedding = embed_audio_token(self.weights, &codes);
+        self.last_codes.extend_from_slice(slice);
+
+        let (codes, audio_embedding) = match &frame_codes {
+            FrameCodes::Var(codes_vec) => {
+                let mut packed = [0i32; 8];
+                for (dst, &src) in packed.iter_mut().zip(codes_vec.iter()) {
+                    *dst = src;
+                }
+                (packed, embed_audio_codes(self.weights, codes_vec))
+            }
+            FrameCodes::Fixed(fixed) => (*fixed, embed_audio_token(self.weights, fixed)),
+        };
 
         if !self.streaming {
-            self.all_codes.extend_from_slice(&codes);
-            return Ok(FrameOutcome::Codes {
+            self.all_codes.extend_from_slice(slice);
+            return PreparedFrame::Ready(FrameOutcome::Codes {
                 audio_embedding,
                 pcm: vec![],
                 codes,
             });
         }
 
-        let t1 = Instant::now();
-        let spectrum = if !self.detok_fallback_cpu
-            && let Some(a) = self.accelerator
-        {
-            a.detokenize_to_spectrum_async(self.detok_weights, &codes)
-                .await?
-        } else {
-            detokenize_to_spectrum(
-                self.detok_weights,
-                self.weights,
-                &mut self.detok_state,
-                &codes,
-            )
-        };
-        self.time_detokenizer += t1.elapsed();
+        PreparedFrame::NeedsDetok {
+            audio_embedding,
+            codes,
+            detok_codes: frame_codes,
+        }
+    }
 
-        let pcm = self.streamer.feed_frames(&spectrum);
+    fn finish_streamed_frame(
+        &mut self,
+        audio_embedding: Vec<f32>,
+        codes: [i32; 8],
+        spectrum: &[f32],
+    ) -> FrameOutcome {
+        let pcm = self.streamer.feed_frames(spectrum);
         self.streamed_samples += pcm.len();
-
-        Ok(FrameOutcome::Codes {
+        FrameOutcome::Codes {
             audio_embedding,
             pcm,
             codes,
-        })
+        }
+    }
+
+    async fn detokenize_frame_async(&mut self, codes: &[i32]) -> anyhow::Result<Vec<f32>> {
+        if !self.detok_fallback_cpu
+            && let Some(a) = self.accelerator
+        {
+            a.detokenize_to_spectrum_async(self.detok_weights, codes)
+                .await
+        } else {
+            Ok(detokenize_to_spectrum(
+                self.detok_weights,
+                self.weights,
+                &mut self.detok_state,
+                codes,
+            ))
+        }
     }
 
     /// Drain any remaining audio through the ISTFT pass, returning an error if
@@ -2362,5 +2405,289 @@ pub(crate) mod tests {
         assert!(dec2.all_spectrum.is_empty());
         assert!(dec2.all_codes.is_empty());
         assert_eq!(dec2.finish(|_, _| {}), 0);
+    }
+
+    #[test]
+    fn lfm3a_gen_accelerated_depthformer_and_fault_handling() {
+        struct MockLfm3aAccel {
+            fail: bool,
+            calls: std::sync::atomic::AtomicUsize,
+            err: std::sync::Mutex<Option<crate::CeraError>>,
+        }
+        impl crate::model::audio_decoder::AudioAccelerator for MockLfm3aAccel {
+            fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+                unreachable!("lfm3a_gen path must call sample_audio_frame_lfm3a");
+            }
+            fn supports_lfm3a_gen_depthformer(&self) -> bool {
+                true
+            }
+            fn sample_audio_frame_lfm3a(&self, _: &[f32], _: f32, _: usize) -> Option<Vec<i32>> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.fail {
+                    *self.err.lock().unwrap() =
+                        Some(crate::CeraError::Backend("lfm3a df fault".into()));
+                    None
+                } else {
+                    Some(vec![12; 12])
+                }
+            }
+            fn detokenize_to_spectrum(
+                &self,
+                _: &crate::model::audio_decoder::DetokenizerWeights,
+                _: &[i32],
+            ) -> Vec<f32> {
+                vec![0.0; 10]
+            }
+            fn reset_depthformer(&self) {}
+            fn reset_detokenizer(&self) {}
+            fn supports_depthformer(&self) -> bool {
+                true
+            }
+            fn supports_lfm3a_gen_detokenizer(&self) -> bool {
+                true
+            }
+            fn depthformer_default_on(&self) -> bool {
+                true
+            }
+            fn take_audio_error(&self) -> Option<crate::CeraError> {
+                self.err.lock().unwrap().take()
+            }
+        }
+
+        let (mut dec, mut detok) = empty_vocoder_weights();
+        dec.lfm3a_gen = true;
+        dec.decoder_config.n_codebook = 12;
+        dec.decoder_config.n_vocab = 257;
+        dec.audio_embedding.embedding =
+            crate::model::weights::MmapWeight::from_owned_f32(vec![0.1; 12 * 257 * 4], 12 * 257, 4);
+        detok.config.n_codes = 12;
+        detok.emb_weight =
+            crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 12 * 257 * 4], 12 * 257, 4);
+
+        let ok_acc = MockLfm3aAccel {
+            fail: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            err: std::sync::Mutex::new(None),
+        };
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&ok_acc), 0.0, 1, false)
+            .with_streaming(false);
+        assert!(decoder.supports_accelerated_depthformer());
+        assert!(matches!(
+            decoder.decode_frame(&[0.0; 4]),
+            FrameOutcome::Codes { .. }
+        ));
+        assert_eq!(ok_acc.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let err_acc = MockLfm3aAccel {
+            fail: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            err: std::sync::Mutex::new(None),
+        };
+        let mut fault_dec = AudioOutputDecoder::new(&dec, &detok, Some(&err_acc), 0.0, 1, false);
+        assert_eq!(
+            fault_dec.decode_frame(&[0.0; 4]),
+            FrameOutcome::Fault("lfm3a df fault".into())
+        );
+
+        let mut ok_async_dec = AudioOutputDecoder::new(&dec, &detok, Some(&ok_acc), 0.0, 1, false)
+            .with_streaming(false);
+        assert!(matches!(
+            block_on_ready(ok_async_dec.decode_frame_async(&[0.0; 4])).unwrap(),
+            FrameOutcome::Codes { .. }
+        ));
+        let async_err = block_on_ready(fault_dec.decode_frame_async(&[0.0; 4])).unwrap_err();
+        assert!(format!("{async_err:#}").contains("lfm3a df fault"));
+    }
+
+    #[test]
+    fn lfm3a_gen_streaming_decode_frame_async_uses_async_sample_and_detok() {
+        use crate::model::audio_decoder::{CodebookWeights, DetokenizerWeights};
+        use crate::model::weights::MmapWeight;
+        use std::collections::VecDeque;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AsyncOnlyLfm3aAccel {
+            sample_results: Mutex<VecDeque<anyhow::Result<Option<Vec<i32>>>>>,
+            detok_results: Mutex<VecDeque<anyhow::Result<Vec<f32>>>>,
+            async_sample_calls: AtomicUsize,
+            async_detok_calls: AtomicUsize,
+        }
+
+        impl crate::model::audio_decoder::AudioAccelerator for AsyncOnlyLfm3aAccel {
+            fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+                unreachable!("lfm3a_gen must not call sync sample_audio_frame");
+            }
+            fn sample_audio_frame_lfm3a(&self, _: &[f32], _: f32, _: usize) -> Option<Vec<i32>> {
+                panic!(
+                    "decode_frame_async must call sample_audio_frame_lfm3a_async, not sync sample_audio_frame_lfm3a"
+                );
+            }
+            #[allow(clippy::type_complexity)]
+            fn sample_audio_frame_lfm3a_async<'a>(
+                &'a self,
+                _: &'a [f32],
+                _: f32,
+                _: usize,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Vec<i32>>>> + Send + 'a>>
+            {
+                self.async_sample_calls.fetch_add(1, Ordering::Relaxed);
+                let next = self
+                    .sample_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted sample_audio_frame_lfm3a_async result");
+                Box::pin(async move { next })
+            }
+            fn detokenize_to_spectrum(&self, _: &DetokenizerWeights, _: &[i32]) -> Vec<f32> {
+                panic!(
+                    "decode_frame_async must call detokenize_to_spectrum_async, not sync detokenize_to_spectrum"
+                );
+            }
+            fn detokenize_to_spectrum_async<'a>(
+                &'a self,
+                _: &'a DetokenizerWeights,
+                codes: &'a [i32],
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<f32>>> + Send + 'a>> {
+                assert_eq!(codes.len(), 12);
+                self.async_detok_calls.fetch_add(1, Ordering::Relaxed);
+                let next = self
+                    .detok_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted detokenize_to_spectrum_async result");
+                Box::pin(async move { next })
+            }
+            fn reset_depthformer(&self) {}
+            fn reset_detokenizer(&self) {}
+            fn supports_depthformer(&self) -> bool {
+                true
+            }
+            fn supports_lfm3a_gen_depthformer(&self) -> bool {
+                true
+            }
+            fn supports_lfm3a_gen_detokenizer(&self) -> bool {
+                true
+            }
+            fn depthformer_default_on(&self) -> bool {
+                true
+            }
+        }
+
+        let (mut dec, mut detok) = empty_vocoder_weights();
+        dec.lfm3a_gen = true;
+        dec.decoder_config.n_codebook = 12;
+        dec.decoder_config.n_vocab = 257;
+        dec.depth_linear_w = MmapWeight::from_owned_f32(vec![0.0; 4 * 4], 4, 4);
+        dec.depth_linear_b = vec![0.0; 4];
+        dec.depth_embeddings = (0..12)
+            .map(|_| CodebookWeights {
+                embedding: MmapWeight::from_owned_f32(vec![0.0; 257 * 4], 257, 4),
+                norm: vec![1.0; 4],
+                to_logits: MmapWeight::from_owned_f32(vec![0.0; 257 * 4], 257, 4),
+            })
+            .collect();
+        dec.audio_embedding.embedding =
+            MmapWeight::from_owned_f32(vec![0.1; 12 * 257 * 4], 12 * 257, 4);
+        detok.config.n_codes = 12;
+        detok.emb_weight = MmapWeight::from_owned_f32(vec![0.0; 12 * 257 * 4], 12 * 257, 4);
+
+        // `empty_vocoder_weights()` uses `n_fft = 8, hop_length = 2` -> `frame_size = 10`.
+        // Feeding 60 floats (6 frames) yields non-empty streamed PCM.
+        let acc = AsyncOnlyLfm3aAccel {
+            sample_results: Mutex::new(VecDeque::from([
+                Ok(Some(vec![12; 12])),
+                Ok(None),
+                Err(anyhow::anyhow!("async lfm3a sample fault")),
+                Ok(Some(vec![13; 12])),
+                Ok(Some(vec![256; 12])),
+            ])),
+            detok_results: Mutex::new(VecDeque::from([
+                Ok(vec![0.0; 60]),
+                Ok(vec![0.0; 60]),
+                Err(anyhow::anyhow!("async lfm3a detok fault")),
+            ])),
+            async_sample_calls: AtomicUsize::new(0),
+            async_detok_calls: AtomicUsize::new(0),
+        };
+
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&acc), 0.0, 1, false);
+        assert!(decoder.supports_accelerated_depthformer());
+
+        // 1. Accelerated async sample + async streaming detokenize.
+        match block_on_ready(decoder.decode_frame_async(&[0.0; 4])).unwrap() {
+            FrameOutcome::Codes { pcm, codes, .. } => {
+                assert_eq!(codes, [12; 8]);
+                assert!(!pcm.is_empty());
+            }
+            other => panic!("expected Codes, got {other:?}"),
+        }
+        assert_eq!(decoder.audio_frames(), 1);
+        assert_eq!(decoder.last_frame_codes(), &[12; 12]);
+        assert_eq!(acc.async_sample_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(acc.async_detok_calls.load(Ordering::Relaxed), 1);
+
+        // 2. `Ok(None)` falls back to CPU `sample_frame` while still using async detok.
+        assert!(matches!(
+            block_on_ready(decoder.decode_frame_async(&[0.0; 4])).unwrap(),
+            FrameOutcome::Codes { .. }
+        ));
+        assert_eq!(decoder.audio_frames(), 2);
+        assert_eq!(decoder.last_frame_codes(), &[0; 12]);
+        assert_eq!(acc.async_sample_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(acc.async_detok_calls.load(Ordering::Relaxed), 2);
+
+        // 3. Sampling fault propagates Err without touching `df_state` or detokenizer.
+        let sample_err = block_on_ready(decoder.decode_frame_async(&[0.0; 4])).unwrap_err();
+        assert!(format!("{sample_err:#}").contains("async lfm3a sample fault"));
+        assert_eq!(decoder.audio_frames(), 2);
+        assert_eq!(decoder.last_frame_codes(), &[0; 12]);
+        assert_eq!(acc.async_sample_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(acc.async_detok_calls.load(Ordering::Relaxed), 2);
+
+        // Verify `df_state` (`rng_state` and `code_history`) was untouched by an `Err` sample:
+        // a stochastic fallback after a sampling fault matches a clean seeded `DepthformerState`.
+        let stoch_acc = AsyncOnlyLfm3aAccel {
+            sample_results: Mutex::new(VecDeque::from([
+                Err(anyhow::anyhow!("fault before fallback")),
+                Ok(None),
+            ])),
+            detok_results: Mutex::new(VecDeque::from([Ok(vec![0.0; 60])])),
+            async_sample_calls: AtomicUsize::new(0),
+            async_detok_calls: AtomicUsize::new(0),
+        };
+        let mut stoch_dec = AudioOutputDecoder::new(&dec, &detok, Some(&stoch_acc), 0.8, 4, false);
+        stoch_dec.seed_rng(99);
+        assert!(block_on_ready(stoch_dec.decode_frame_async(&[0.0; 4])).is_err());
+        assert!(matches!(
+            block_on_ready(stoch_dec.decode_frame_async(&[0.0; 4])).unwrap(),
+            FrameOutcome::Codes { .. }
+        ));
+        let mut ref_df_state =
+            crate::model::audio_decoder::DepthformerState::new(&dec.depthformer_config);
+        ref_df_state.seed_rng(99);
+        let expected_cpu_codes =
+            crate::model::audio_decoder::sample_frame(&dec, &mut ref_df_state, &[0.0; 4], 0.8, 4);
+        assert_eq!(stoch_dec.last_frame_codes(), expected_cpu_codes.as_slice());
+
+        // 4. Streaming detokenizer fault propagates Err.
+        let detok_err = block_on_ready(decoder.decode_frame_async(&[0.0; 4])).unwrap_err();
+        assert!(format!("{detok_err:#}").contains("async lfm3a detok fault"));
+        assert_eq!(acc.async_sample_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(acc.async_detok_calls.load(Ordering::Relaxed), 3);
+
+        // 5. End code terminates cleanly without calling detokenizer.
+        assert_eq!(
+            block_on_ready(decoder.decode_frame_async(&[0.0; 4])).unwrap(),
+            FrameOutcome::End
+        );
+        assert_eq!(decoder.last_frame_codes(), &[256; 12]);
+        assert_eq!(acc.async_sample_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(acc.async_detok_calls.load(Ordering::Relaxed), 3);
     }
 }

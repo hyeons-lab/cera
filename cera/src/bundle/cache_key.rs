@@ -42,7 +42,40 @@ pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
         _ => "Q8_0",
     };
 
+    let text_manifest =
+        |model: String, temperature: f32, top_k: Option<u32>, repetition_penalty: f32| Manifest {
+            inference_type: InferenceType::LlamaCppTextToText,
+            schema_version: "1.0.0".to_string(),
+            files: ManifestFiles {
+                model,
+                multimodal_projector: None,
+                audio_decoder: None,
+                audio_tokenizer: None,
+                draft_model: None,
+                extras: HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: GenerationDefaults::Text {
+                temperature: Some(temperature),
+                min_p: None,
+                top_p: None,
+                top_k,
+                repetition_penalty: Some(repetition_penalty),
+            },
+            raw: serde_json::Value::Null,
+        };
+
     match clean_id {
+        "LFM2.5-24B-A2B-GGUF" => {
+            let model_quant = match clean_quant {
+                "QAD-Q2_K" => "QAD-Q2_K_L",
+                other => other,
+            };
+            let model = format!(
+                "https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/main/LFM2.5-24B-A2B-{model_quant}.gguf"
+            );
+            Some(text_manifest(model, 0.1, Some(50), 1.05))
+        }
         "LFM2.5-VL-3B-GGUF" => {
             let mmproj = if clean_quant == "F16" || clean_quant == "BF16" {
                 "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-F16.gguf"
@@ -82,27 +115,7 @@ pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
             let model = format!(
                 "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-{model_quant}.gguf"
             );
-            Some(Manifest {
-                inference_type: InferenceType::LlamaCppTextToText,
-                schema_version: "1.0.0".to_string(),
-                files: ManifestFiles {
-                    model,
-                    multimodal_projector: None,
-                    audio_decoder: None,
-                    audio_tokenizer: None,
-                    draft_model: None,
-                    extras: HashMap::new(),
-                },
-                chat_template: None,
-                generation_defaults: GenerationDefaults::Text {
-                    temperature: Some(0.1),
-                    min_p: None,
-                    top_p: None,
-                    top_k: Some(50),
-                    repetition_penalty: Some(1.1),
-                },
-                raw: serde_json::Value::Null,
-            })
+            Some(text_manifest(model, 0.1, Some(50), 1.1))
         }
         "LFM3-VL-2B-GGUF" => {
             let model_quant = match clean_quant {
@@ -212,6 +225,20 @@ pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
 /// ascending `name` order.
 pub fn supplement_known_bundles(entries: &mut Vec<LeapBundleEntry>) {
     const KNOWN_BUNDLES: &[(&str, &[&str])] = &[
+        (
+            "LFM2.5-24B-A2B-GGUF",
+            &[
+                "BF16",
+                "F16",
+                "Q4_0",
+                "Q4_K_M",
+                "Q5_K_M",
+                "Q6_K",
+                "Q8_0",
+                "QAD-Q2_K_L",
+                "QAD-Q4_0",
+            ],
+        ),
         (
             "LFM2.5-VL-3B-GGUF",
             &["BF16", "F16", "Q4_0", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"],
@@ -783,6 +810,24 @@ mod tests {
 
     #[test]
     fn known_bundle_manifest_resolves_lfm3_and_d1_bundles() {
+        let lfm25_24b = known_bundle_manifest("LiquidAI/LFM2.5-24B-A2B-GGUF", "QAD-Q4_0").unwrap();
+        assert_eq!(lfm25_24b.inference_type, InferenceType::LlamaCppTextToText);
+        assert!(
+            lfm25_24b
+                .files
+                .model
+                .ends_with("LFM2.5-24B-A2B-QAD-Q4_0.gguf")
+        );
+        assert!(lfm25_24b.files.multimodal_projector.is_none());
+
+        let lfm25_24b_q4 = known_bundle_manifest("LFM2.5-24B-A2B-GGUF", "Q4_0").unwrap();
+        assert!(
+            lfm25_24b_q4
+                .files
+                .model
+                .ends_with("LFM2.5-24B-A2B-Q4_0.gguf")
+        );
+
         let lfm3_text = known_bundle_manifest("LiquidAI/LFM3-1.7B-GGUF", "Q4_0").unwrap();
         assert_eq!(lfm3_text.inference_type, InferenceType::LlamaCppTextToText);
         assert!(lfm3_text.files.model.ends_with("LFM3-1.7B-QAD-Q4_0.gguf"));
@@ -878,6 +923,7 @@ mod tests {
             quants: vec!["Q4_0".to_string()],
         }];
         supplement_known_bundles(&mut entries);
+        assert!(entries.iter().any(|e| e.name == "LFM2.5-24B-A2B-GGUF"));
         assert!(entries.iter().any(|e| e.name == "LFM3-1.7B-GGUF"));
         assert!(entries.iter().any(|e| e.name == "LFM3-VL-2B-GGUF"));
         assert!(entries.iter().any(|e| e.name == "LFM3-Audio-2B-GGUF"));

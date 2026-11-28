@@ -1,15 +1,23 @@
 # Unified Fused B=64 Q4_0 LFM3 Prefill Layer (32 cores: 4 rows x 8 cols, npu2).
-# K_HALF=1024, W_L2L1 depth=2, X_ELEMS=4608, Y_CORE_ELEMS=64.
+# K_HALF=1024, W_L3L2 depth=4, W_L2L1 depth=2, N_X_SHIMS=2, X_ELEMS=4608, Y_CORE_ELEMS=64.
 # Modes via g_params[6]:
-#   0 = ShortConv (d_conv=6, l_cache=7) + SwiGLU FFN (8192)
-#   1 = Causal / SWA GQA (16 Q heads, 4 KV heads, head_dim=128) + QK-norm + NeoX RoPE + Gate + SwiGLU FFN
-#   2 = Phase A (QKV + Gate + Q/K Norm + RoPE -> SLOT_FA_Q + kvo_buf + SLOT_ATTN_GATE)
-#   3 = Bidir Global Phase B (Reload SLOT_FA_Q + Gate -> FA -> O -> FFN tail)
-#   4 = FA Partial (Reload SLOT_FA_Q + SLOT_FA_STATE -> FA -> Drain SLOT_FA_STATE)
-#   5 = FA Final (Reload SLOT_FA_Q + SLOT_FA_STATE + Gate -> FA + cur_kv -> O -> FFN tail)
+#   0 = ShortConv (d_conv=6, l_cache=7) + SwiGLU FFN (7680, padded 8192)
+#   1 = Causal / SWA GQA (16 Q heads, 4 KV heads, head_dim=128) + Single-Pass FA + in-L1 Q RoPE
+#   2 = Phase A (K/V + Gate + in-L1 Q RoPE -> SLOT_FA_Q + kvo_buf + SLOT_ATTN_GATE)
+#   3 = Bidir Global Phase B (Single-Pass: Reload q0/q1 + Gate -> FA -> O -> FFN tail)
+#   4 = FA Partial (Reload q0/q1 + SLOT_FA_STATE -> FA -> Drain SLOT_FA_STATE)
+#   5 = FA Final (Reload q0/q1 + SLOT_FA_STATE + Gate -> FA + cur_kv -> O -> FFN tail)
+#   6 = FA Partial blk==0 (Reload q0/q1 only, skip SLOT_FA_STATE preload -> FA -> Drain SLOT_FA_STATE)
 
 import argparse
+import sys
 from pathlib import Path
+
+_IRON_ROOT = str(Path(__file__).resolve().parent.parent)
+if _IRON_ROOT not in sys.path:
+    sys.path.insert(0, _IRON_ROOT)
+
+from compile_params import validate_compile_params
 
 import aie.iron as iron
 import numpy as np
@@ -99,6 +107,21 @@ KV_CHUNK_F32 = 2 * W_ELEMS  # 4608
 KV_TOTAL = MAX_KV_CHUNKS * N_KV_HEADS * KV_CHUNK_F32
 KV_OUT_TOTAL = 2 * N_KV_HEADS * KV_CHUNK_F32  # 8 * 4608
 
+VALID_MODES = (0, 1, 2, 3, 4, 5, 6)
+VALID_PARAM_SLOTS = (0, 1, 2, 3)
+
+
+def _validate_compile_params(layer_mode: int, kv_chunks: int, param_slot: int = 0) -> None:
+    validate_compile_params(
+        layer_mode,
+        kv_chunks,
+        valid_modes=VALID_MODES,
+        nonzero_kv_modes=(3, 4, 6),
+        max_kv_chunks=MAX_KV_CHUNKS,
+        param_slot=param_slot,
+        valid_param_slots=VALID_PARAM_SLOTS,
+    )
+
 
 @iron.jit(use_cache=False)
 def q4prefill_lfm3(
@@ -111,6 +134,7 @@ def q4prefill_lfm3(
     kv_chunks: CompileTime[int] = 0,
     param_slot: CompileTime[int] = 0,
 ):
+    _validate_compile_params(layer_mode, kv_chunks, param_slot)
     here = Path(__file__).resolve().parent
     cxx_inc = cxx_header_path()
 
@@ -126,9 +150,10 @@ def q4prefill_lfm3(
     y_core_ty = np.ndarray[(Y_CORE_ELEMS,), np.dtype[np.float32]]
     y_col_ty = np.ndarray[(Y_COL_ELEMS,), np.dtype[np.float32]]
 
-    fa_flags = ["-I", str(here), "-I", str(cxx_inc), "-Os", "-fno-unroll-loops", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1"]
-    oz_flags = ["-I", str(here), "-I", str(cxx_inc), "-Oz", "-fno-unroll-loops"]
-    gemm_flags = oz_flags
+    base_flags = ["-I", str(here), "-I", str(cxx_inc), "-fno-unroll-loops", "-fno-jump-tables", "-mllvm", "-aie-enable-tail-merge"]
+    oz_flags = base_flags + ["-Oz", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1"]
+    fa_flags = base_flags + ["-O2", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1"]
+    gemm_flags = base_flags + ["-O2", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1"]
 
     q4_gemm_fn = ExternalFunction(
         "q4_lfm3_pre_gemm_op",
@@ -155,16 +180,20 @@ def q4prefill_lfm3(
         compile_flags=oz_flags,
     )
 
-    W_L3L2 = [ObjectFifo(w_pkt_ty, depth=2, name=f"W_L3L2_{c}") for c in range(N_COLS)]
+    W_L3L2 = [ObjectFifo(w_pkt_ty, depth=4, name=f"W_L3L2_{c}") for c in range(N_COLS)]
     W_L2L1 = [W_L3L2[c].cons().forward(obj_type=w_pkt_ty, depth=2, name=f"W_L2L1_{c}") for c in range(N_COLS)]
 
-    X_L3L2 = ObjectFifo(x_l3l2_ty, depth=2, name="X_L3L2_0")
-    X_L2L1 = X_L3L2.cons().split(
-        offsets=[r * X_ELEMS for r in range(N_ROWS)],
-        obj_types=[x_pkt_ty] * N_ROWS,
-        names=[f"X_L2L1_0_{r}" for r in range(N_ROWS)],
-        depths=[1] * N_ROWS,
-    )
+    N_X_SHIMS = 2
+    X_L3L2 = [ObjectFifo(x_l3l2_ty, depth=2, name=f"X_L3L2_{x}") for x in range(N_X_SHIMS)]
+    X_L2L1 = [
+        X_L3L2[x].cons().split(
+            offsets=[r * X_ELEMS for r in range(N_ROWS)],
+            obj_types=[x_pkt_ty] * N_ROWS,
+            names=[f"X_L2L1_{x}_{r}" for r in range(N_ROWS)],
+            depths=[1] * N_ROWS,
+        )
+        for x in range(N_X_SHIMS)
+    ]
 
     Y_L2L3 = [ObjectFifo(y_col_ty, depth=2, name=f"Y_L2L3_{c}") for c in range(N_COLS)]
     Y_L1L2 = [
@@ -188,12 +217,13 @@ def q4prefill_lfm3(
     M3 = 8
     M4 = 16
     M5 = 32
+    M6 = 64
     M012 = M0 | M1 | M2
     M12 = M1 | M2
     M135 = M1 | M3 | M5
-    M345 = M3 | M4 | M5
+    M3456 = M3 | M4 | M5 | M6
     M45 = M4 | M5
-    M35 = M3 | M5
+    M46 = M4 | M6
     M0135 = M0 | M1 | M3 | M5
 
     def build_worker_sched(c, r):
@@ -229,9 +259,9 @@ def q4prefill_lfm3(
         emit_rms_2sub(-1, 0, M012)
 
         # Mode 0: ShortConv (d_conv=6, l_cache=7)
-        emit_gemm(2, 8, 2, 0, M0)  # B
-        emit_gemm(2, 8, 2, 0, M0)  # C
-        emit_gemm(2, 8, 2, 0, M0)  # X
+        emit_gemm(1, 16, 2, 0, M0)  # B
+        emit_gemm(1, 16, 2, 0, M0)  # C
+        emit_gemm(1, 16, 2, 0, M0)  # X
         emit(KIND_W, 1, 3, r, 15, 0, M0)  # WT
         emit(KIND_W, 1, 3, r, 0, 0, M0)   # STATE
         for st_b, st_x, st_c in [(1, 5, 9), (16, 5, 9)]:
@@ -242,45 +272,49 @@ def q4prefill_lfm3(
                 emit(KIND_Y, 8, 8, 0, 0, 0, M0)
         emit(KIND_Y, 6, 8, 8, 0, 0, M0)  # drain 6-tap state -> kvo_buf
         emit_rms_2sub(-1, 0, M0, skip_norm=1)
-        emit_gemm(2, 8, 2, 0, M0)        # OUT_PROJ
+        emit_gemm(1, 16, 2, 0, M0)        # OUT_PROJ
 
-        # Modes 1, 2: Q, K, V, ATTN_GATE + KV RoPE & drain
-        emit_gemm(2, 8, 2, 0, M12)       # Q
-        emit_gemm(1, 4, 2, 0, M12)       # K
-        emit_gemm(1, 4, 2, 0, M12)       # V
-        emit(KIND_GEMM, 2, 0, 1, 0, 0, M12)  # ATTN_GATE (1 tile, 2 K-halves)
-        emit(KIND_Y, 4, 11, 0, 0, 0, M12 if c == 0 else 0)  # drain gate -> SLOT_ATTN_GATE
+        # Modes 1, 2: Q (16 tiles -> SLOT_Q overlapped), K, V, ATTN_GATE -> KV + Q RoPE -> q0/q1
+        emit_gemm(1, 16, 2, 1, M12)           # Q -> SLOT_Q
+        emit_gemm(1, 4, 2, 1, M12)            # K -> SLOT_K
+        emit_gemm(1, 4, 2, 1, M12)            # V -> SLOT_V
+        emit(KIND_GEMM, 2, 0, 1, 0, 0, M12)   # ATTN_GATE
+        emit(KIND_Y, 4, 11, 0, 0, 0, M12 if c == 0 else 0)
 
         kv_drain_mask = M12 if (c % 2) == 0 else 0
         for sub in range(2):
-            emit(KIND_W, 2, 1, r, 0, 0, M12)               # ROPE_PKT_{sub}A/B
-            emit(KIND_X, 4, 1, c, 0, 1, M12)               # K norm + RoPE
-            emit(KIND_X, 4, 1, c, 0, 2, M12)               # V convert
+            emit(KIND_W, 2, 1, r, 0, 0, M12)                          # ROPE_PKT_{sub}A/B
+            emit(KIND_X, 4, 1, c, 0, 1, M12)                          # K norm + RoPE
+            emit(KIND_X, 4, 1, c, 0, 2, M12)                          # V convert
             emit(KIND_Y, 8, 2, 0, 0, 0, kv_drain_mask)
             emit(KIND_Y, 8, 2, 8, 0, 0, kv_drain_mask)
-            emit(KIND_X, 4, 1, c, 0, 0, M12)               # Q{sub} norm + RoPE
-            emit(KIND_Y, 16, 7, 0, 0, 0, M2)               # M2: drain Q{sub} -> SLOT_FA_Q
-            emit(KIND_W, 1, 2, r * 64 + c, sub, 0, M1)     # M1: ATTN_GATE sub
-            emit(KIND_W, 1, 16 + sub * 4 + r, 0, 0, 0, M1) # M1: FA{sub}
-            emit(KIND_Y, 9, 3, 0, 0, 0, M1)                # M1: drain FA{sub} Q8 -> SLOT_XQ
+            emit(KIND_X, 4, 1, c, 0, 5 if sub else 0, M12)            # Q{sub} norm + RoPE -> q_bf16 / q1_bf16
+            emit(KIND_Y, 16, 7, sub * 16, 0, 0, M2)                   # M2: drain q{sub} -> SLOT_FA_Q
 
-        # Modes 3, 4, 5: Reload Q0/Q1 + FA_STATE (M4/M5) + GATE (M3/M5) -> FA -> drain FA_STATE (M4) / Q8 (M3/M5)
-        for sub in range(2):
-            emit(KIND_X, 2, 1, c, 0, 3, M345)                   # Reload q_bf16
-            emit(KIND_X, 4, 1, c, 0, 4, M45)                    # Reload o_acc+row_l+row_m
-            emit(KIND_W, 1, 2, r * 64 + c, sub, 0, M35)         # ATTN_GATE sub
-            emit(KIND_W, 1, 16 + sub * 4 + r, 0, 0, 0, M345)    # FA
-            emit(KIND_Y, 33, 10, 0, 0, 0, M4)                   # M4: drain state
-            emit(KIND_Y, 9, 3, 0, 0, 0, M35)                    # M3/M5: drain FA Q8
+        # Modes 3, 4, 5, 6: Reload q0+q1 (4 X pkts) + State1 (4 X pkts) + State0 (4 W pkts)
+        emit(KIND_X, 4, 1, c, 0, 3, M3456)
+        emit(KIND_X, 4, 1, c, 0, 4, M45)
+        emit(KIND_W, 4, 5, r, 0, 0, M45)
 
-        emit_gemm(2, 8, 2, 1, M135, xd_mode=0)  # O_PROJ
+        # Single-Pass FA for Modes 1, 3, 4, 5, 6 (both sub=0 & sub=1 per kv_pkt!)
+        emit(KIND_W, 1, 2, r * 64 + c, 2, 0, M135)          # Load gate_sig[0..1]
+        emit(KIND_W, 1, 16 + r, 0, 0, 2, M1 | M5)          # Single-Pass FA M1/M5 (kv_ch + 2)
+        emit(KIND_W, 1, 16 + r, 0, 0, 0, M3 | M46)         # Single-Pass FA M3/M4/M6 (kv_ch)
+        emit(KIND_Y, 32, 6, 0, 0, 0, M46)                  # M4/M6: drain State1 -> SLOT_FA_STATE
+        emit(KIND_Y, 33, 10, 0, 0, 0, M46)                 # M4/M6: drain State0 -> SLOT_FA_STATE + 73728
+        emit(KIND_Y, 9, 3, 0, 0, 0, M135)                  # sub=0 Q8 -> SLOT_XQ
+        emit(KIND_Y, 9, 13, 0, 0, 0, M135)                 # sub=1 Q8 -> SLOT_XQ
 
-        # Shared sandwich tail (Modes 0, 1, 3, 5): Post-Attn Norm + Res1 -> FFN Norm -> SwiGLU -> Post-FFN Norm + Res2
-        emit_post_norm_res_2sub(1, M0135)  # SLOT_NORM_1 = post_attn_norm
-        emit_rms_2sub(4, 2, M0135)         # SLOT_NORM_2 = ffn_norm
-        emit(KIND_GEMM, 32, 0, 8, 1, 0, M0135)
-        emit_gemm(2, 8, 8, 0, M0135, xd_mode=1)  # FFN_DOWN (8 K_HALF chunks)
-        emit_post_norm_res_2sub(3, M0135)  # SLOT_NORM_3 = post_ffn_norm
+        emit_gemm(1, 16, 2, 1, M135, xd_mode=0)  # O_PROJ
+
+        # Shared sandwich tail (Modes 0, 1, 3, 5)
+        emit_post_norm_res_2sub(1, M0135)
+        emit_rms_2sub(4, 2, M0135)
+        for _kc in range(8):
+            emit(KIND_GEMM, 2, 0, 16, 0, 0, M0135)
+            emit(KIND_Y, 9, 9, 0, 0, 0, M0135)
+        emit_gemm(1, 16, 8, 0, M0135, xd_mode=1)  # FFN_DOWN
+        emit_post_norm_res_2sub(3, M0135)
 
         packed = [
             (k | (cn << 8) | (op << 16) | (a0 << 24), a1 | (a2 << 8) | (mk << 16))
@@ -310,9 +344,7 @@ def q4prefill_lfm3(
             i32_3 = arith.constant(i32_ty, 3)
             i32_4 = arith.constant(i32_ty, 4)
             i32_8 = arith.constant(i32_ty, 8)
-            i32_9 = arith.constant(i32_ty, 9)
             i32_16 = arith.constant(i32_ty, 16)
-            i32_20 = arith.constant(i32_ty, 20)
             i32_24 = arith.constant(i32_ty, 24)
             i32_255 = arith.constant(i32_ty, 255)
 
@@ -326,10 +358,6 @@ def q4prefill_lfm3(
             w_fifo.release(1)
 
             lmode_bit = arith.shli(i32_1, lmode)
-            is_m34 = arith.ori(
-                arith.cmpi(arith.CmpIPredicate.eq, lmode, i32_3),
-                arith.cmpi(arith.CmpIPredicate.eq, lmode, i32_4),
-            )
 
             for s in range_(n_steps):
                 base = arith.shli(s, idx1)
@@ -348,9 +376,7 @@ def q4prefill_lfm3(
                     is_w = arith.cmpi(arith.CmpIPredicate.eq, kind, i32_0)
                     with if_(is_w, hasElse=True) as if_w:
                         is_fa0 = arith.cmpi(arith.CmpIPredicate.sge, op, i32_16)
-                        is_fa1 = arith.cmpi(arith.CmpIPredicate.sge, op, i32_20)
-                        extra_kv = arith.select(is_m34, i32_0, arith.select(is_fa1, i32_2, i32_1))
-                        fa_cnt = arith.shli(arith.addi(kv_ch, extra_kv), i32_1)
+                        fa_cnt = arith.shli(arith.addi(kv_ch, a2), i32_1)
                         n_w = arith.select(is_fa0, fa_cnt, cnt)
                         for i in range_(n_w):
                             wp = w_fifo.acquire(1)
@@ -371,29 +397,15 @@ def q4prefill_lfm3(
                                     q4_y_fn(yp, op, arith.addi(a0, i32(i)))
                                     y_fifo.release(1)
                             with else_(if_y):
-                                is_fused_ffn = arith.cmpi(arith.CmpIPredicate.eq, a1, i32_1)
                                 for p in range_(cnt):
-                                    kh = arith.andi(i32(p), i32_1)
                                     is_sub = arith.cmpi(arith.CmpIPredicate.ne, p, idx0)
-                                    norm_flag = arith.ori(arith.select(is_sub, i32_1, i32_0), arith.shli(op, i32_1))
-                                    flag = arith.select(is_fused_ffn, kh, norm_flag)
+                                    flag = arith.ori(arith.select(is_sub, i32_1, i32_0), arith.shli(op, i32_1))
                                     xp = x_fifo.acquire(1)
                                     for pt in range_(a0):
                                         wp = w_fifo.acquire(1)
                                         q4_gemm_fn(xp, wp, i32(pt), flag)
                                         w_fifo.release(1)
                                     x_fifo.release(1)
-                                    do_drain = arith.andi(is_fused_ffn, arith.cmpi(arith.CmpIPredicate.eq, kh, i32_1))
-                                    with if_(do_drain, hasElse=False):
-                                        j = arith.andi(arith.shrui(i32(p), i32_1), i32_1)
-                                        arg0 = arith.shli(j, i32_2)
-                                        sb_cnt = arith.index_cast(idx_ty, arith.addi(arith.addi(kh, i32_3), j))
-                                        for sb in range_(sb_cnt):
-                                            is_xd = arith.cmpi(arith.CmpIPredicate.eq, i32(sb), i32_4)
-                                            y_arg = arith.select(is_xd, i32_8, arith.addi(arg0, i32(sb)))
-                                            yp = y_fifo.acquire(1)
-                                            q4_y_fn(yp, i32_9, y_arg)
-                                            y_fifo.release(1)
 
         return core_body
 
@@ -402,7 +414,7 @@ def q4prefill_lfm3(
             make_worker_body(c),
             fn_args=[
                 W_L2L1[c].cons(),
-                X_L2L1[r].cons(),
+                X_L2L1[c // 4][r].cons(),
                 Y_L1L2[c][r].prod(),
                 sched_bufs[c][r],
                 q4_gemm_fn,
@@ -412,6 +424,7 @@ def q4prefill_lfm3(
             ],
             tile=Tile(c, 2 + r),
             stack_size=2880,
+            data_size=21056,
             while_true=True,
         )
         for c in range(N_COLS)
@@ -419,13 +432,13 @@ def q4prefill_lfm3(
     ]
 
     w_prods = [W_L3L2[c].prod() for c in range(N_COLS)]
-    x_prods = [X_L3L2.prod()]
+    x_prods = [X_L3L2[x].prod() for x in range(N_X_SHIMS)]
     y_cons = [Y_L2L3[c].cons() for c in range(N_COLS)]
 
     def seq_fn(w_buf, y_buf, yn_buf, kv_buf, kvo_buf, *fifos):
         wp_h = fifos[0:N_COLS]
-        xp_h = fifos[N_COLS]
-        yc_h = fifos[N_COLS + 1 : N_COLS + 1 + N_COLS]
+        xp_h = fifos[N_COLS : N_COLS + N_X_SHIMS]
+        yc_h = fifos[N_COLS + N_X_SHIMS : N_COLS + N_X_SHIMS + N_COLS]
 
         def fill_w_1d(src_buf, tdims, off_per_col, tg, wait=False):
             for c in range(N_COLS):
@@ -442,44 +455,45 @@ def q4prefill_lfm3(
             fill_w_1d(src_buf, tdims, [off] * N_COLS, tg, wait=wait)
 
         def fill_x_2d(src_buf, tdims, off, row_stride, tg, wait=False):
-            xp_h.fill(
-                src_buf,
-                tap=TensorAccessPattern(
-                    tensor_dims=tdims, offset=off, sizes=[N_ROWS, 8, 576], strides=[row_stride, 576, 1]
-                ),
-                wait=wait,
-                group=tg,
-            )
+            for x in range(N_X_SHIMS):
+                xp_h[x].fill(
+                    src_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=tdims, offset=off, sizes=[N_ROWS, 8, 576], strides=[row_stride, 576, 1]
+                    ),
+                    wait=wait,
+                    group=tg,
+                )
 
         def fill_x_xq(tg, kc=0, wait=False, x_slot=SLOT_XQ):
             xq_off = x_slot + kc * (N_ROWS * X_ELEMS)
-            xp_h.fill(
-                y_buf,
-                tap=TensorAccessPattern(
-                    tensor_dims=[ACT_TOTAL], offset=xq_off, sizes=[1, N_ROWS * X_ELEMS], strides=[0, 1]
-                ),
-                wait=wait,
-                group=tg,
-            )
+            for x in range(N_X_SHIMS):
+                xp_h[x].fill(
+                    y_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=[ACT_TOTAL], offset=xq_off, sizes=[1, N_ROWS * X_ELEMS], strides=[0, 1]
+                    ),
+                    wait=wait,
+                    group=tg,
+                )
 
-        def drain_xq_sub(tg, sub, wait_last=True):
+        def drain_xq_sub(tg, sub, wait_last=True, do_finish=True):
             xq_base = sub * 2048
             xd_base = 4096 + sub * 256
-            for part0 in (0, 4):
-                for c in range(N_COLS):
-                    kh_slot = SLOT_XQ_K0 if c < 4 else SLOT_XQ_K1
-                    c_kh = c & 3
-                    yc_h[c].drain(
-                        y_buf,
-                        tap=TensorAccessPattern(
-                            tensor_dims=[ACT_TOTAL],
-                            offset=kh_slot + xq_base + c_kh * 512 + part0 * Y_CORE_ELEMS,
-                            sizes=[4, N_ROWS, Y_CORE_ELEMS],
-                            strides=[Y_CORE_ELEMS, X_ELEMS, 1],
-                        ),
-                        wait=False,
-                        group=tg,
-                    )
+            for c in range(N_COLS):
+                kh_slot = SLOT_XQ_K0 if c < 4 else SLOT_XQ_K1
+                c_kh = c & 3
+                yc_h[c].drain(
+                    y_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=[ACT_TOTAL],
+                        offset=kh_slot + xq_base + c_kh * 512,
+                        sizes=[8, N_ROWS, Y_CORE_ELEMS],
+                        strides=[Y_CORE_ELEMS, X_ELEMS, 1],
+                    ),
+                    wait=False,
+                    group=tg,
+                )
             for c in range(N_COLS):
                 kh_slot = SLOT_XQ_K0 if c < 4 else SLOT_XQ_K1
                 c_kh = c & 3
@@ -494,60 +508,86 @@ def q4prefill_lfm3(
                     wait=wait_last,
                     group=tg,
                 )
-            tg.finish()
+            if do_finish:
+                tg.finish()
 
-        def drain_y_contig_rows(dst_buf, dst_tdims, dst_off, sub, tg):
+        def drain_y_contig_rows(dst_buf, dst_tdims, dst_off, sub, tg, do_finish=True):
             sub_off = sub * (8 * H)
-            for tl0 in (0, 4):
-                for c in range(N_COLS):
-                    yc_h[c].drain(
-                        dst_buf,
-                        tap=TensorAccessPattern(
-                            tensor_dims=dst_tdims,
-                            offset=dst_off + sub_off + tl0 * H + c * 256,
-                            sizes=[4, 4, N_ROWS, Y_CORE_ELEMS],
-                            strides=[H, Y_CORE_ELEMS, B_CORE * H, 1],
-                        ),
-                        wait=(tl0 == 4),
-                        group=tg,
-                    )
-            tg.finish()
+            for c in range(N_COLS):
+                yc_h[c].drain(
+                    dst_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=dst_tdims,
+                        offset=dst_off + sub_off + c * 256,
+                        sizes=[8, 4, N_ROWS, Y_CORE_ELEMS],
+                        strides=[H, Y_CORE_ELEMS, B_CORE * H, 1],
+                    ),
+                    wait=True,
+                    group=tg,
+                )
+            if do_finish:
+                tg.finish()
 
         def drain_gemm_64(tg, out_slot, pass_off, pass_tiles, N_total, wait=True, fa_perm=False):
             col_ch = N_total // N_COLS
             n_p4 = pass_tiles // 4
-            sizes = [2, B_SUB, N_ROWS, Y_CORE_ELEMS] if fa_perm else [B_CORE, N_ROWS, Y_CORE_ELEMS]
-            strides = [32 * N_total, N_total, B_SUB * N_total, 1] if fa_perm else [N_total, B_CORE * N_total, 1]
-            for p4 in range(n_p4):
-                is_last = wait and (p4 == n_p4 - 1)
+            if fa_perm or n_p4 == 1:
+                sizes = [2, B_SUB, N_ROWS, Y_CORE_ELEMS] if fa_perm else [B_CORE, N_ROWS, Y_CORE_ELEMS]
+                strides = [32 * N_total, N_total, B_SUB * N_total, 1] if fa_perm else [N_total, B_CORE * N_total, 1]
+                for p4 in range(n_p4):
+                    is_last = wait and (p4 == n_p4 - 1)
+                    for c in range(N_COLS):
+                        yc_h[c].drain(
+                            y_buf,
+                            tap=TensorAccessPattern(
+                                tensor_dims=[ACT_TOTAL],
+                                offset=out_slot + c * col_ch + pass_off + p4 * 64,
+                                sizes=sizes,
+                                strides=strides,
+                            ),
+                            wait=is_last,
+                            group=tg,
+                        )
+            else:
                 for c in range(N_COLS):
                     yc_h[c].drain(
                         y_buf,
                         tap=TensorAccessPattern(
                             tensor_dims=[ACT_TOTAL],
-                            offset=out_slot + c * col_ch + pass_off + p4 * 64,
-                            sizes=sizes,
-                            strides=strides,
+                            offset=out_slot + c * col_ch + pass_off,
+                            sizes=[n_p4, B_CORE, N_ROWS, Y_CORE_ELEMS],
+                            strides=[Y_CORE_ELEMS, N_total, B_CORE * N_total, 1],
                         ),
-                        wait=is_last,
+                        wait=wait,
                         group=tg,
                     )
 
-        def run_rms_to_xq(norm_off, x_slot, x_stride):
-            for sub in range(2):
-                sub_off = x_slot + sub * (B_SUB * H)
-                tg = TaskGroup()
-                if sub == 0 and norm_off is not None:
-                    fill_w_broadcast(y_buf, [ACT_TOTAL], norm_off, tg, wait=True)
-                for p in range(4):
-                    fill_x_2d(y_buf, [ACT_TOTAL], sub_off + p * (2 * H), x_stride, tg, wait=(p == 3))
-                drain_xq_sub(tg, sub)
+        def run_rms_to_xq(norm_off, x_slot, x_stride, fa_perm=False):
+            sub1_off = x_slot + (32 * H if fa_perm else B_SUB * H)
+            tg0 = TaskGroup()
+            if norm_off is not None:
+                fill_w_broadcast(y_buf, [ACT_TOTAL], norm_off, tg0, wait=True)
+            for p in range(4):
+                fill_x_2d(y_buf, [ACT_TOTAL], x_slot + p * (2 * H), x_stride, tg0, wait=(p == 3))
+            tg0.finish()
+            tg_d0 = TaskGroup()
+            drain_xq_sub(tg_d0, 0, wait_last=True, do_finish=False)
 
-        def run_post_norm_res(norm_off, res_slot, dest_buf, dest_tdims, dest_slot):
+            tg1 = TaskGroup()
+            for p in range(4):
+                fill_x_2d(y_buf, [ACT_TOTAL], sub1_off + p * (2 * H), x_stride, tg1, wait=(p == 3))
+            tg_d0.finish()
+            drain_xq_sub(tg1, 1, wait_last=True, do_finish=True)
+
+        def run_post_norm_res(norm_off, res_slot, dest_buf, dest_tdims, dest_slot, prev_drain=None):
+            cur_drain = prev_drain
             for sub in range(2):
                 tg = TaskGroup()
                 if sub == 0:
                     fill_w_broadcast(y_buf, [ACT_TOTAL], norm_off, tg, wait=True)
+                if cur_drain is not None:
+                    cur_drain.finish()
+                    cur_drain = None
                 sub_x = res_slot + sub * (B_SUB * H)
                 for p in range(4):
                     fill_x_2d(y_buf, [ACT_TOTAL], sub_x + p * (2 * H), B_CORE * H, tg, wait=(p == 3))
@@ -566,8 +606,9 @@ def q4prefill_lfm3(
                     )
                 drain_y_contig_rows(dest_buf, dest_tdims, dest_slot, sub, tg)
 
-        def run_gemm_2d(w_off, n_passes, pass_tiles, k_chunks, out_slot, N_total, x_slot=SLOT_XQ, fa_perm=False):
+        def run_gemm_2d(w_off, n_passes, pass_tiles, k_chunks, out_slot, N_total, x_slot=SLOT_XQ, fa_perm=False, prev_drain=None, defer_drain=False):
             tpc = n_passes * pass_tiles
+            cur_drain = prev_drain
             for p in range(n_passes):
                 for kc0 in range(0, k_chunks, 4):
                     kc1 = min(kc0 + 4, k_chunks)
@@ -589,9 +630,19 @@ def q4prefill_lfm3(
                                 wait=is_last_kc,
                                 group=tg,
                             )
+                    if cur_drain is not None:
+                        cur_drain.finish()
+                        cur_drain = None
                     if is_last_blk:
-                        drain_gemm_64(tg, out_slot, p * pass_tiles * ROWS, pass_tiles, N_total, wait=True, fa_perm=fa_perm)
+                        if defer_drain:
+                            tg.finish()
+                            cur_drain = TaskGroup()
+                            drain_gemm_64(cur_drain, out_slot, p * pass_tiles * ROWS, pass_tiles, N_total, wait=True, fa_perm=fa_perm)
+                            return cur_drain
+                        else:
+                            drain_gemm_64(tg, out_slot, p * pass_tiles * ROWS, pass_tiles, N_total, wait=True, fa_perm=fa_perm)
                     tg.finish()
+            return cur_drain
 
         # Peeled metadata + param slot broadcast for all modes
         param_off = (SLOT_NORM_0, SLOT_NORM_1, SLOT_NORM_2, SLOT_NORM_3)[param_slot]
@@ -600,29 +651,14 @@ def q4prefill_lfm3(
         tg0.finish()
 
         if layer_mode in (0, 1, 2):
-            run_rms_to_xq(None, SLOT_HIDDEN_IN, B_CORE * H)
+            is_attn_m = layer_mode in (1, 2)
+            run_rms_to_xq(None, SLOT_HIDDEN_IN, (B_SUB * H if is_attn_m else B_CORE * H), fa_perm=is_attn_m)
 
+        post_res_prev_drain = None
         if layer_mode == 0:
-            for mat_off, out_slot in [(W_CONV_IN_B, SLOT_CONV_B), (W_CONV_IN_C, SLOT_CONV_C), (W_CONV_IN_X, SLOT_CONV_X)]:
-                for p in range(2):
-                    tg = TaskGroup()
-                    for kh in range(2):
-                        fill_x_xq(tg, kh, wait=(kh == 1))
-                        for c in range(N_COLS):
-                            tile0 = c * 16 + p * 8
-                            wp_h[c].fill(
-                                w_buf,
-                                tap=TensorAccessPattern(
-                                    tensor_dims=[W_TOTAL],
-                                    offset=mat_off + (tile0 * 2 + kh) * W_ELEMS,
-                                    sizes=[8, 9, 256],
-                                    strides=[2 * W_ELEMS, 256, 1],
-                                ),
-                                wait=(kh == 1),
-                                group=tg,
-                            )
-                    drain_gemm_64(tg, out_slot, p * 128, 8, H, wait=True)
-                    tg.finish()
+            dg = run_gemm_2d(W_CONV_IN_B, 1, 16, 2, SLOT_CONV_B, H, defer_drain=True)
+            dg = run_gemm_2d(W_CONV_IN_C, 1, 16, 2, SLOT_CONV_C, H, prev_drain=dg, defer_drain=True)
+            dg = run_gemm_2d(W_CONV_IN_X, 1, 16, 2, SLOT_CONV_X, H, prev_drain=dg, defer_drain=True)
 
             def fill_conv_4(slot_base, q0, tg, wait=False):
                 off = slot_base + q0 * (8 * H)
@@ -643,6 +679,8 @@ def q4prefill_lfm3(
             fill_w_1d(w_buf, [W_TOTAL], [W_CONV_WT + c * KV_CHUNK_F32 for c in range(N_COLS)], tg_sc_a)
             fill_w_1d(kv_buf, [KV_TOTAL], [c * KV_CHUNK_F32 for c in range(N_COLS)], tg_sc_a)
             fill_conv_4(SLOT_CONV_B, 0, tg_sc_a)
+            if dg is not None:
+                dg.finish()
             fill_conv_4(SLOT_CONV_X, 0, tg_sc_a, wait=True)
             tg_sc_a.finish()
 
@@ -679,27 +717,9 @@ def q4prefill_lfm3(
             tg_sc_b.finish()
 
             run_rms_to_xq(None, SLOT_ATTN_OUT, B_CORE * H)
-            run_gemm_2d(W_CONV_OUT, 2, 8, 2, SLOT_RES_TMP, H)
+            post_res_prev_drain = run_gemm_2d(W_CONV_OUT, 1, 16, 2, SLOT_RES_TMP, H, defer_drain=True)
         elif layer_mode in (1, 2):
-            for p in range(2):
-                tg_q = TaskGroup()
-                for kh in range(2):
-                    fill_x_xq(tg_q, kh, wait=(kh == 1))
-                    for c in range(N_COLS):
-                        tile0 = c * 16 + p * 8
-                        wp_h[c].fill(
-                            w_buf,
-                            tap=TensorAccessPattern(
-                                tensor_dims=[W_TOTAL],
-                                offset=W_ATTN_Q + (tile0 * 2 + kh) * W_ELEMS,
-                                sizes=[8, 9, 256],
-                                strides=[2 * W_ELEMS, 256, 1],
-                            ),
-                            wait=(kh == 1),
-                            group=tg_q,
-                        )
-                drain_gemm_64(tg_q, SLOT_Q, p * 8 * ROWS, 8, Q_DIM, wait=True)
-                tg_q.finish()
+            dg_q = run_gemm_2d(W_ATTN_Q, 1, 16, 2, SLOT_Q, Q_DIM, fa_perm=True, defer_drain=True)
 
             tg_kv = TaskGroup()
             for mat_off, out_sl in [(W_ATTN_K, SLOT_K), (W_ATTN_V, SLOT_V)]:
@@ -719,7 +739,10 @@ def q4prefill_lfm3(
                             wait=(is_v and kh == 1),
                             group=tg_kv,
                         )
-                drain_gemm_64(tg_kv, out_sl, 0, 4, KV_DIM, wait=is_v)
+                if not is_v and dg_q is not None:
+                    dg_q.finish()
+                    dg_q = None
+                drain_gemm_64(tg_kv, out_sl, 0, 4, KV_DIM, wait=is_v, fa_perm=True)
             tg_kv.finish()
 
             tg_ag = TaskGroup()
@@ -732,88 +755,12 @@ def q4prefill_lfm3(
                     tensor_dims=[ACT_TOTAL],
                     offset=SLOT_ATTN_GATE,
                     sizes=[2, 2, N_ROWS, Y_CORE_ELEMS],
-                    strides=[128, Y_CORE_ELEMS, 256, 1],
+                    strides=[512, Y_CORE_ELEMS, 128, 1],
                 ),
                 wait=True,
                 group=tg_ag,
             )
             tg_ag.finish()
-
-            def run_q_and_fa(sub):
-                q_off = SLOT_Q + sub * (32 * Q_DIM)
-                if layer_mode == 2:
-                    tg_rq = TaskGroup()
-                    for p in range(4):
-                        fill_x_2d(y_buf, [ACT_TOTAL], q_off + p * (2 * Q_DIM), B_SUB * Q_DIM, tg_rq, wait=(p == 3))
-                    tg_rq.finish()
-                    tg_qd = TaskGroup()
-                    for c in range(N_COLS):
-                        yc_h[c].drain(
-                            y_buf,
-                            tap=TensorAccessPattern(
-                                tensor_dims=[ACT_TOTAL],
-                                offset=SLOT_FA_Q + sub * (2 * N_ROWS * X_ELEMS) + (c // 4) * (N_ROWS * X_ELEMS) + (c & 3) * 1024,
-                                sizes=[16, N_ROWS, Y_CORE_ELEMS],
-                                strides=[Y_CORE_ELEMS, X_ELEMS, 1],
-                            ),
-                            wait=True,
-                            group=tg_qd,
-                        )
-                    tg_qd.finish()
-                    return
-
-                w_tasks = []
-                w_tasks.append((y_buf, [ACT_TOTAL], lambda _c: SLOT_ATTN_GATE, [1, W_ELEMS], [0, 1]))
-                for chk0 in range(0, kv_chunks, 128):
-                    cnt = min(128, kv_chunks - chk0)
-                    w_tasks.append((
-                        kv_buf,
-                        [KV_TOTAL],
-                        lambda c, s=chk0: ((c // 2) * MAX_KV_CHUNKS + s) * KV_CHUNK_F32,
-                        [cnt, 18, 256],
-                        [KV_CHUNK_F32, 256, 1],
-                    ))
-                w_tasks.append((
-                    kvo_buf,
-                    [KV_OUT_TOTAL],
-                    lambda c: (c // 2) * KV_CHUNK_F32,
-                    [1, 18, 256],
-                    [KV_CHUNK_F32, 256, 1],
-                ))
-                if sub == 1:
-                    w_tasks.append((
-                        kvo_buf,
-                        [KV_OUT_TOTAL],
-                        lambda c: (N_KV_HEADS + (c // 2)) * KV_CHUNK_F32,
-                        [1, 18, 256],
-                        [KV_CHUNK_F32, 256, 1],
-                    ))
-
-                tg_rq = TaskGroup()
-                for p in range(4):
-                    fill_x_2d(y_buf, [ACT_TOTAL], q_off + p * (2 * Q_DIM), B_SUB * Q_DIM, tg_rq, wait=(p == 3))
-                tg_rq.finish()
-
-                for b0 in range(0, len(w_tasks), 3):
-                    b1 = min(b0 + 3, len(w_tasks))
-                    is_last_b = b1 == len(w_tasks)
-                    cur_tg = TaskGroup()
-                    for wi in range(b0, b1):
-                        buf, tdims, off_fn, sz, st = w_tasks[wi]
-                        do_wait = wi == b1 - 1
-                        for c in range(N_COLS):
-                            wp_h[c].fill(
-                                buf,
-                                tap=TensorAccessPattern(
-                                    tensor_dims=tdims, offset=off_fn(c), sizes=sz, strides=st
-                                ),
-                                wait=do_wait,
-                                group=cur_tg,
-                            )
-                    if is_last_b:
-                        drain_xq_sub(cur_tg, sub)
-                    else:
-                        cur_tg.finish()
 
             for sub in range(2):
                 rope_a = SLOT_ROPE_PKT_0A if sub == 0 else SLOT_ROPE_PKT_1A
@@ -852,133 +799,143 @@ def q4prefill_lfm3(
                         group=tg_kv_v,
                     )
                 tg_kv_v.finish()
-                run_q_and_fa(sub)
 
-            if layer_mode == 1:
-                run_gemm_2d(W_ATTN_O, 2, 8, 2, SLOT_RES_TMP, H, fa_perm=True)
-        else:
-            # Modes 3, 4, 5
-            for sub in range(2):
                 tg_rq = TaskGroup()
-                for half in range(2):
-                    xp_h.fill(
-                        y_buf,
-                        tap=TensorAccessPattern(
-                            tensor_dims=[ACT_TOTAL],
-                            offset=SLOT_FA_Q + sub * (2 * N_ROWS * X_ELEMS) + half * (N_ROWS * X_ELEMS),
-                            sizes=[1, N_ROWS * X_ELEMS],
-                            strides=[0, 1],
-                        ),
-                        wait=(half == 1),
-                        group=tg_rq,
-                    )
-                tg_rq.finish()
-
-                if layer_mode in (4, 5):
-                    tg_fs = TaskGroup()
-                    for cp in range(4):
-                        xp_h.fill(
+                q_off = SLOT_Q + sub * (32 * Q_DIM)
+                for p in range(4):
+                    fill_x_2d(y_buf, [ACT_TOTAL], q_off + p * (2 * Q_DIM), B_SUB * Q_DIM, tg_rq, wait=(layer_mode == 1 and p == 3))
+                if layer_mode == 2:
+                    for c in range(N_COLS):
+                        yc_h[c].drain(
                             y_buf,
                             tap=TensorAccessPattern(
                                 tensor_dims=[ACT_TOTAL],
-                                offset=SLOT_FA_STATE + sub * (4 * N_ROWS * X_ELEMS) + cp * (N_ROWS * X_ELEMS),
-                                sizes=[1, N_ROWS * X_ELEMS],
-                                strides=[0, 1],
+                                offset=SLOT_FA_Q + sub * (2 * N_ROWS * X_ELEMS) + (c // 4) * (N_ROWS * X_ELEMS) + (c & 3) * 1024,
+                                sizes=[16, N_ROWS, Y_CORE_ELEMS],
+                                strides=[Y_CORE_ELEMS, X_ELEMS, 1],
                             ),
-                            wait=(cp == 3),
-                            group=tg_fs,
+                            wait=True,
+                            group=tg_rq,
                         )
-                    tg_fs.finish()
+                tg_rq.finish()
 
-                w_tasks = []
-                if layer_mode in (3, 5):
-                    w_tasks.append((y_buf, [ACT_TOTAL], lambda _c: SLOT_ATTN_GATE, [1, W_ELEMS], [0, 1]))
-                for chk0 in range(0, kv_chunks, 128):
-                    cnt = min(128, kv_chunks - chk0)
-                    w_tasks.append((
-                        kv_buf,
-                        [KV_TOTAL],
-                        lambda c, s=chk0: ((c // 2) * MAX_KV_CHUNKS + s) * KV_CHUNK_F32,
-                        [cnt, 18, 256],
-                        [KV_CHUNK_F32, 256, 1],
-                    ))
-                if layer_mode == 5:
-                    w_tasks.append((
-                        kvo_buf,
-                        [KV_OUT_TOTAL],
-                        lambda c: (c // 2) * KV_CHUNK_F32,
-                        [1, 18, 256],
-                        [KV_CHUNK_F32, 256, 1],
-                    ))
-                    if sub == 1:
-                        w_tasks.append((
-                            kvo_buf,
-                            [KV_OUT_TOTAL],
-                            lambda c: (N_KV_HEADS + (c // 2)) * KV_CHUNK_F32,
-                            [1, 18, 256],
-                            [KV_CHUNK_F32, 256, 1],
-                        ))
+            if layer_mode == 1:
+                # Mode 1: Single-Pass FA (reads kv_buf + kvo_buf ONCE across both subs!)
+                w_tasks = [(y_buf, [ACT_TOTAL], lambda _c: SLOT_ATTN_GATE, [1, W_ELEMS], [0, 1])]
+                n128 = kv_chunks // 128
+                rem = kv_chunks % 128
+                if n128 > 0:
+                    w_tasks.append((kv_buf, [KV_TOTAL], lambda c: ((c // 2) * MAX_KV_CHUNKS) * KV_CHUNK_F32, [n128, 128, 18, 256], [128 * KV_CHUNK_F32, KV_CHUNK_F32, 256, 1]))
+                if rem > 0:
+                    w_tasks.append((kv_buf, [KV_TOTAL], lambda c, s=n128 * 128: ((c // 2) * MAX_KV_CHUNKS + s) * KV_CHUNK_F32, [rem, 18, 256], [KV_CHUNK_F32, 256, 1]))
+                w_tasks.append((kvo_buf, [KV_OUT_TOTAL], lambda c: (c // 2) * KV_CHUNK_F32, [2, 18, 256], [N_KV_HEADS * KV_CHUNK_F32, 256, 1]))
+                cur_tg = TaskGroup()
+                for wi, (buf, tdims, off_fn, sz, st) in enumerate(w_tasks):
+                    do_wait = wi == len(w_tasks) - 1
+                    for c in range(N_COLS):
+                        wp_h[c].fill(buf, tap=TensorAccessPattern(tensor_dims=tdims, offset=off_fn(c), sizes=sz, strides=st), wait=do_wait, group=cur_tg)
+                drain_xq_sub(cur_tg, 0, wait_last=False, do_finish=False)
+                drain_xq_sub(cur_tg, 1, wait_last=True, do_finish=False)
+                cur_tg.finish()
 
-                for b0 in range(0, len(w_tasks), 3):
-                    b1 = min(b0 + 3, len(w_tasks))
-                    is_last_b = b1 == len(w_tasks)
-                    cur_tg = TaskGroup()
-                    for wi in range(b0, b1):
-                        buf, tdims, off_fn, sz, st = w_tasks[wi]
-                        do_wait = wi == b1 - 1
+                post_res_prev_drain = run_gemm_2d(W_ATTN_O, 1, 16, 2, SLOT_RES_TMP, H, fa_perm=True, defer_drain=True)
+        else:
+            # Modes 3, 4, 5, 6: Single-Pass FA (q0+q1 [+ State1+State0])
+            n_x_pkts = 4 if layer_mode in (3, 6) else 8
+            w_tasks = []
+            if layer_mode in (4, 5):
+                w_tasks.append((y_buf, [ACT_TOTAL], lambda c: SLOT_FA_STATE + 73728 + c * (N_ROWS * W_ELEMS), [N_ROWS, W_ELEMS], [W_ELEMS, 1]))
+            if layer_mode in (3, 5):
+                w_tasks.append((y_buf, [ACT_TOTAL], lambda _c: SLOT_ATTN_GATE, [1, W_ELEMS], [0, 1]))
+            n128 = kv_chunks // 128
+            rem = kv_chunks % 128
+            if n128 > 0:
+                w_tasks.append((kv_buf, [KV_TOTAL], lambda c: ((c // 2) * MAX_KV_CHUNKS) * KV_CHUNK_F32, [n128, 128, 18, 256], [128 * KV_CHUNK_F32, KV_CHUNK_F32, 256, 1]))
+            if rem > 0:
+                w_tasks.append((kv_buf, [KV_TOTAL], lambda c, s=n128 * 128: ((c // 2) * MAX_KV_CHUNKS + s) * KV_CHUNK_F32, [rem, 18, 256], [KV_CHUNK_F32, 256, 1]))
+            if layer_mode == 5:
+                w_tasks.append((kvo_buf, [KV_OUT_TOTAL], lambda c: (c // 2) * KV_CHUNK_F32, [2, 18, 256], [N_KV_HEADS * KV_CHUNK_F32, 256, 1]))
+
+            for b0 in range(0, len(w_tasks), 4):
+                b1 = min(b0 + 4, len(w_tasks))
+                is_last_b = b1 == len(w_tasks)
+                cur_tg = TaskGroup()
+                if b0 == 0:
+                    for x in range(N_X_SHIMS):
+                        xp_h[x].fill(
+                            y_buf,
+                            tap=TensorAccessPattern(
+                                tensor_dims=[ACT_TOTAL],
+                                offset=SLOT_FA_Q,
+                                sizes=[n_x_pkts, N_ROWS * X_ELEMS],
+                                strides=[N_ROWS * X_ELEMS, 1],
+                            ),
+                            wait=True,
+                            group=cur_tg,
+                        )
+                for wi in range(b0, b1):
+                    buf, tdims, off_fn, sz, st = w_tasks[wi]
+                    do_wait = wi == b1 - 1
+                    for c in range(N_COLS):
+                        wp_h[c].fill(buf, tap=TensorAccessPattern(tensor_dims=tdims, offset=off_fn(c), sizes=sz, strides=st), wait=do_wait, group=cur_tg)
+                if is_last_b:
+                    if layer_mode in (4, 6):
                         for c in range(N_COLS):
-                            wp_h[c].fill(
-                                buf,
+                            yc_h[c].drain(
+                                y_buf,
                                 tap=TensorAccessPattern(
-                                    tensor_dims=tdims, offset=off_fn(c), sizes=sz, strides=st
+                                    tensor_dims=[ACT_TOTAL],
+                                    offset=SLOT_FA_STATE + (c // 2) * (N_ROWS * X_ELEMS) + (c & 1) * 2048,
+                                    sizes=[32, N_ROWS, Y_CORE_ELEMS],
+                                    strides=[Y_CORE_ELEMS, X_ELEMS, 1],
                                 ),
-                                wait=do_wait,
+                                wait=False,
                                 group=cur_tg,
                             )
-                    if is_last_b:
-                        if layer_mode == 4:
-                            for c in range(N_COLS):
-                                yc_h[c].drain(
-                                    y_buf,
-                                    tap=TensorAccessPattern(
-                                        tensor_dims=[ACT_TOTAL],
-                                        offset=SLOT_FA_STATE + sub * (4 * N_ROWS * X_ELEMS) + (c // 2) * (N_ROWS * X_ELEMS) + (c & 1) * 2112,
-                                        sizes=[33, N_ROWS, Y_CORE_ELEMS],
-                                        strides=[Y_CORE_ELEMS, X_ELEMS, 1],
-                                    ),
-                                    wait=True,
-                                    group=cur_tg,
-                                )
-                            cur_tg.finish()
-                        else:
-                            drain_xq_sub(cur_tg, sub)
+                        for c in range(N_COLS):
+                            yc_h[c].drain(
+                                y_buf,
+                                tap=TensorAccessPattern(
+                                    tensor_dims=[ACT_TOTAL],
+                                    offset=SLOT_FA_STATE + 73728 + c * (N_ROWS * W_ELEMS),
+                                    sizes=[33, N_ROWS, Y_CORE_ELEMS],
+                                    strides=[Y_CORE_ELEMS, W_ELEMS, 1],
+                                ),
+                                wait=True,
+                                group=cur_tg,
+                            )
                     else:
-                        cur_tg.finish()
+                        drain_xq_sub(cur_tg, 0, wait_last=False, do_finish=False)
+                        drain_xq_sub(cur_tg, 1, wait_last=True, do_finish=False)
+                cur_tg.finish()
+
             if layer_mode in (3, 5):
-                run_gemm_2d(W_ATTN_O, 2, 8, 2, SLOT_RES_TMP, H, fa_perm=True)
+                post_res_prev_drain = run_gemm_2d(W_ATTN_O, 1, 16, 2, SLOT_RES_TMP, H, fa_perm=True, defer_drain=True)
 
         if layer_mode not in (0, 1, 3, 5):
             return
 
-        # Shared tail: Post-Attn Norm + Res1 -> FFN_NORM -> SwiGLU FFN(8192) -> DOWN -> Post-FFN Norm + Res2
-        run_post_norm_res(SLOT_NORM_1, SLOT_RES_TMP, y_buf, [ACT_TOTAL], SLOT_HIDDEN_IN)
+        # Shared tail: Post-Attn Norm + Res1 -> FFN_NORM -> SwiGLU FFN(7680/8192) -> DOWN -> Post-FFN Norm + Res2
+        run_post_norm_res(SLOT_NORM_1, SLOT_RES_TMP, y_buf, [ACT_TOTAL], SLOT_HIDDEN_IN, prev_drain=post_res_prev_drain)
         run_rms_to_xq(SLOT_NORM_2, SLOT_HIDDEN_IN, B_CORE * H)
 
         ffn_g_base = W_CONV_FFN_GATE if layer_mode == 0 else W_ATTN_FFN_GATE
         ffn_u_base = W_CONV_FFN_UP if layer_mode == 0 else W_ATTN_FFN_UP
         ffn_d_base = W_CONV_FFN_DOWN if layer_mode == 0 else W_ATTN_FFN_DOWN
 
+        tg_ffn_drain = None
         for kc in range(8):
             xq_base = SLOT_FFN_XQ + kc * (N_ROWS * X_ELEMS)
-            for j in range(2):
-                p = kc * 2 + j
+            for kh in range(2):
                 tgp = TaskGroup()
-                for kh in range(2):
-                    fill_x_xq(tgp, kh, wait=(kh == 1))
+                fill_x_xq(tgp, kh, wait=True)
+                for p_half in (0, 32):
+                    p = kc * 2 + (1 if p_half else 0)
+                    is_pad_p = p == 15
                     for base_off in (ffn_g_base, ffn_u_base):
+                        do_wait = (p_half == 32 and base_off == ffn_u_base)
                         for c in range(N_COLS):
                             tile0 = p * 32 + c * 4
-                            is_pad_p = p == 15
                             wp_h[c].fill(
                                 w_buf,
                                 tap=TensorAccessPattern(
@@ -987,38 +944,40 @@ def q4prefill_lfm3(
                                     sizes=[4, 9, 256],
                                     strides=[(W_ELEMS if is_pad_p else (2 * W_ELEMS)), 256, 1],
                                 ),
-                                wait=(kh == 1) and (base_off == ffn_u_base),
+                                wait=do_wait,
                                 group=tgp,
                             )
-                for c in range(N_COLS):
-                    yc_h[c].drain(
-                        y_buf,
-                        tap=TensorAccessPattern(
-                            tensor_dims=[ACT_TOTAL],
-                            offset=xq_base + j * 1024 + c * (2 * Y_CORE_ELEMS),
-                            sizes=[2, 2, N_ROWS, Y_CORE_ELEMS],
-                            strides=[2048, Y_CORE_ELEMS, X_ELEMS, 1],
-                        ),
-                        wait=(j == 0),
-                        group=tgp,
-                    )
-                if j == 1:
-                    for c in range(N_COLS):
-                        yc_h[c].drain(
-                            y_buf,
-                            tap=TensorAccessPattern(
-                                tensor_dims=[ACT_TOTAL],
-                                offset=xq_base + 4096 + c * Y_CORE_ELEMS,
-                                sizes=[N_ROWS, Y_CORE_ELEMS],
-                                strides=[X_ELEMS, 1],
-                            ),
-                            wait=True,
-                            group=tgp,
-                        )
+                if kh == 0 and tg_ffn_drain is not None:
+                    tg_ffn_drain.finish()
+                    tg_ffn_drain = None
                 tgp.finish()
+            tg_ffn_drain = TaskGroup()
+            for c in range(N_COLS):
+                yc_h[c].drain(
+                    y_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=[ACT_TOTAL],
+                        offset=xq_base + c * (2 * Y_CORE_ELEMS),
+                        sizes=[4, 2, N_ROWS, Y_CORE_ELEMS],
+                        strides=[1024, Y_CORE_ELEMS, X_ELEMS, 1],
+                    ),
+                    wait=False,
+                    group=tg_ffn_drain,
+                )
+                yc_h[c].drain(
+                    y_buf,
+                    tap=TensorAccessPattern(
+                        tensor_dims=[ACT_TOTAL],
+                        offset=xq_base + 4096 + c * Y_CORE_ELEMS,
+                        sizes=[N_ROWS, Y_CORE_ELEMS],
+                        strides=[X_ELEMS, 1],
+                    ),
+                    wait=True,
+                    group=tg_ffn_drain,
+                )
 
-        run_gemm_2d(ffn_d_base, 2, 8, 8, SLOT_RES_TMP, H, x_slot=SLOT_FFN_XQ)
-        run_post_norm_res(SLOT_NORM_3, SLOT_RES_TMP, yn_buf, [YN_TOTAL], 0)
+        ffn_down_drain = run_gemm_2d(ffn_d_base, 1, 16, 8, SLOT_RES_TMP, H, x_slot=SLOT_FFN_XQ, prev_drain=tg_ffn_drain, defer_drain=True)
+        run_post_norm_res(SLOT_NORM_3, SLOT_RES_TMP, yn_buf, [YN_TOTAL], 0, prev_drain=ffn_down_drain)
 
     rt = Runtime(seq_fn, fn_args=[w_ty, y_ty, yn_ty, kv_ty, kvo_ty, *w_prods, *x_prods, *y_cons])
     return Program(get_current_device(), rt, workers).resolve_program()
@@ -1027,10 +986,11 @@ def q4prefill_lfm3(
 def main():
     parser = argparse.ArgumentParser()
     add_compile_args(parser)
-    parser.add_argument("--layer-mode", type=int, default=1)
+    parser.add_argument("--layer-mode", type=int, default=1, choices=VALID_MODES)
     parser.add_argument("--kv-chunks", type=int, default=0)
-    parser.add_argument("--param-slot", type=int, default=0)
+    parser.add_argument("--param-slot", type=int, default=0, choices=VALID_PARAM_SLOTS)
     opts = parser.parse_args()
+    _validate_compile_params(opts.layer_mode, opts.kv_chunks, opts.param_slot)
     run_design_cli(
         q4prefill_lfm3,
         opts,

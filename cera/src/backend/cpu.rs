@@ -255,12 +255,12 @@ pub fn configure_thread_pool() -> usize {
     1
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+use crate::quant::vec_dot_q6_k_f32;
 use crate::quant::{
-    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, f16_to_f32, vec_dot_q4_0_f32,
+    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, f16_to_f32, vec_dot_q4_0_f32,
     vec_dot_q4_1_f32, vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
 };
-#[cfg(not(target_arch = "aarch64"))]
-use crate::quant::{BlockQ6K, vec_dot_q6_k_f32};
 use crate::tensor::DType;
 use std::mem::size_of;
 
@@ -2039,6 +2039,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_colmajor_dispatch(
                 && b_scales.len() >= n * nb
                 && out.len() == m * n
         );
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_colmajor_zmm(
                 packed, scales_f16, b_scales, b_quants, out, m, n, k,
@@ -2073,6 +2074,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_rowmajor_dispatch(
                 && b_scales.len() >= n * nb
                 && out.len() == m * n
         );
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_rowmajor_zmm(
                 packed, scales_f16, b_scales, b_quants, out, n, m, k,
@@ -2122,6 +2124,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_lin16_gate_up_silu_dispatch(
                 && b_scales.len() >= n * nb
                 && out.len() == m * n
         );
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::avx512_vnni::gemm_q4_0_lin16_gate_up_silu_rowmajor_zmm(
                 gate_packed,
@@ -2339,6 +2342,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -2417,6 +2421,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -2496,6 +2501,8 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_gate_up_silu_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -2642,6 +2649,7 @@ pub(crate) fn gemm_preq_repacked_q4_1_smmla_dispatch(
         {
             return false;
         }
+        let (b_scales, b_quants) = (&b_scales[..n * (k / 32)], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::q4_1_min_correction(
                 mprime, b_scales, b_quants, out, m, n, k,
@@ -2694,6 +2702,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         let tiled = with_smmla_tiles(
             b_scales,
             b_quants,
@@ -2928,6 +2937,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         let tiled = with_smmla_tiles(
             b_scales,
             b_quants,
@@ -3015,6 +3025,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb], &b_quants[..n * k]);
         let tiled = with_smmla_tiles(
             b_scales,
             b_quants,
@@ -3660,6 +3671,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
         "gemm_preq_repacked_q4_k_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
@@ -3734,6 +3746,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_smmla_8x4_q8_0(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
@@ -3781,6 +3794,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_8x8_q8_0_rowmajor(
                 packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
@@ -3828,6 +3842,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_smmla_8x4_q8_0_rowmajor(
                 packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
@@ -3878,6 +3893,7 @@ pub fn gemm_preq_repacked_q4_k_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_gate_up_silu_rowmajor(
                 gate_packed,
@@ -3940,6 +3956,7 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q4_k_smmla_gate_up_silu_rowmajor(
                 gate_packed,
@@ -3997,6 +4014,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_8x8_q8_0(
                 packed, scales, b_scales, b_quants, out, m, n, k,
@@ -4043,6 +4061,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_smmla_8x4_q8_0(
                 packed, scales, b_scales, b_quants, out, m, n, k,
@@ -4089,6 +4108,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if crate::backend::simd::neon::k_quant_gemm_available() {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_8x8_q8_0_rowmajor(
                 packed, scales, b_scales, b_quants, out, n, m, k,
@@ -4135,6 +4155,7 @@ pub(crate) fn gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        let (b_scales, b_quants) = (&b_scales[..n * nb32], &b_quants[..n * k]);
         unsafe {
             crate::backend::simd::neon::gemm_q6_k_smmla_8x4_q8_0_rowmajor(
                 packed, scales, b_scales, b_quants, out, n, m, k,
@@ -4201,6 +4222,8 @@ pub fn gemm_preq_dispatch(
         out.len(),
         m * n
     );
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let (b_scales, b_quants) = (&b_scales[..n * (k / 32)], &b_quants[..n * k]);
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -5772,12 +5795,40 @@ pub fn gemv_dispatch_active(
     k: usize,
     q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
 ) {
-    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-    if dtype == DType::Q6K && max_active > 0 && vnni_int8_available() {
-        with_gemv_scratch(q8_scratch, |s, q| unsafe {
-            crate::backend::simd::avx512_vnni::gemv_q6k_f32_active(
-                data, x, y, m, k, s, q, max_active,
-            );
+    if dtype == DType::Q6K {
+        assert_eq!(x.len(), k, "gemv_dispatch_active: x must have k elements");
+        assert!(y.len() >= m, "gemv_dispatch_active: y buffer too small");
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_dispatch_active: k must be divisible by 256 for Q6K"
+        );
+        let row_bytes = (k / 256) * size_of::<BlockQ6K>();
+        let needed_bytes = m
+            .checked_mul(row_bytes)
+            .expect("gemv_dispatch_active: matrix byte size overflow");
+        assert!(
+            data.len() >= needed_bytes,
+            "gemv_dispatch_active: a_quant buffer too small"
+        );
+        let data = &data[..needed_bytes];
+        let y = &mut y[..m];
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if max_active > 0 && vnni_int8_available() {
+            with_gemv_scratch(q8_scratch, |s, q| {
+                // SAFETY: `vnni_int8_available()` confirmed AVX-512 VNNI/VL/AVX2/FMA support,
+                // and the assertions above guarantee `x.len() == k`, `k % 256 == 0`,
+                // `data.len() == m * row_bytes`, and `y.len() == m`.
+                unsafe {
+                    crate::backend::simd::avx512_vnni::gemv_q6k_f32_active(
+                        data, x, y, m, k, s, q, max_active,
+                    );
+                }
+            });
+            return;
+        }
+        with_gemv_max_active(max_active, || {
+            gemv_dispatch(dtype, data, x, y, m, k, q8_scratch)
         });
         return;
     }
@@ -12902,6 +12953,100 @@ pub fn f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
     }
 }
 
+/// Convert `n` little-endian BF16 bit patterns in `src_le` (`2 * n` bytes) to F16 in `dst`
+/// using AVX2 + F16C.
+///
+/// # Safety
+/// - The CPU must support `f16c` and `avx2`.
+/// - `src_le` must be valid for reads of `2 * n` bytes, and `dst` must be valid for
+///   non-overlapping writes of `n` `u16` values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx2")]
+unsafe fn bf16_le_bytes_to_f16_f16c(src_le: *const u8, dst: *mut u16, n: usize) {
+    use core::arch::x86_64::*;
+    // SAFETY: Caller guarantees `f16c` + `avx2`, `2 * n` readable bytes at `src_le`, and `n`
+    // writable `u16`s at `dst`; the SIMD loop only accesses `i..i + 8` while `i + 8 <= n`, and
+    // the tail loop accesses `i < n`.
+    unsafe {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let bf = _mm_loadu_si128(src_le.add(i * 2) as *const __m128i);
+            let f32_bits = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(bf));
+            let f16_bits =
+                _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_castsi256_ps(f32_bits));
+            _mm_storeu_si128(dst.add(i) as *mut __m128i, f16_bits);
+            i += 8;
+        }
+        while i < n {
+            let b = core::ptr::read_unaligned(src_le.add(i * 2) as *const u16).to_le();
+            *dst.add(i) = crate::quant::f32_to_f16(f32::from_bits((b as u32) << 16));
+            i += 1;
+        }
+    }
+}
+
+/// Convert `n` little-endian BF16 bit patterns in `src_le` (`2 * n` bytes) to f32 in `dst`
+/// using AVX2.
+///
+/// # Safety
+/// - The CPU must support `avx2`.
+/// - `src_le` must be valid for reads of `2 * n` bytes, and `dst` must be valid for
+///   non-overlapping writes of `n` `f32` values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bf16_le_bytes_to_f32_avx2(src_le: *const u8, dst: *mut f32, n: usize) {
+    use core::arch::x86_64::*;
+    // SAFETY: Caller guarantees `avx2`, `2 * n` readable bytes at `src_le`, and `n` writable
+    // `f32`s at `dst`; the SIMD loop only accesses `i..i + 8` while `i + 8 <= n`, and the tail
+    // loop accesses `i < n`.
+    unsafe {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let bf = _mm_loadu_si128(src_le.add(i * 2) as *const __m128i);
+            let f32_bits = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(bf));
+            _mm256_storeu_ps(dst.add(i), _mm256_castsi256_ps(f32_bits));
+            i += 8;
+        }
+        while i < n {
+            let b = core::ptr::read_unaligned(src_le.add(i * 2) as *const u16).to_le();
+            *dst.add(i) = f32::from_bits((b as u32) << 16);
+            i += 1;
+        }
+    }
+}
+
+/// Convert little-endian BF16 bytes (`src_le`) to IEEE-754 binary16 bit patterns (`dst`).
+#[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+pub fn bf16_le_bytes_to_f16_into(src_le: &[u8], dst: &mut [u16]) {
+    let n = (src_le.len() / 2).min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx2") {
+        // SAFETY: `f16c` + `avx2` checked; `src_le` covers `2 * n` bytes and `dst` covers `n` elements.
+        unsafe { bf16_le_bytes_to_f16_f16c(src_le.as_ptr(), dst.as_mut_ptr(), n) };
+        return;
+    }
+    for (d, pair) in dst[..n].iter_mut().zip(src_le[..n * 2].as_chunks::<2>().0) {
+        let bits = u16::from_le_bytes(*pair);
+        *d = crate::quant::f32_to_f16(f32::from_bits((bits as u32) << 16));
+    }
+}
+
+/// Convert little-endian BF16 bytes (`src_le`) to `f32` values (`dst`).
+#[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+pub fn bf16_le_bytes_to_f32_into(src_le: &[u8], dst: &mut [f32]) {
+    let n = (src_le.len() / 2).min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: `avx2` checked; `src_le` covers `2 * n` bytes and `dst` covers `n` elements.
+        unsafe { bf16_le_bytes_to_f32_avx2(src_le.as_ptr(), dst.as_mut_ptr(), n) };
+        return;
+    }
+    for (d, pair) in dst[..n].iter_mut().zip(src_le[..n * 2].as_chunks::<2>().0) {
+        let bits = u16::from_le_bytes(*pair);
+        *d = f32::from_bits((bits as u32) << 16);
+    }
+}
+
 /// Convert `src` f32 values to IEEE-754 binary16 bit patterns in `dst`, parallelized when large.
 pub fn par_f32_slice_to_f16_into(src: &[f32], dst: &mut [u16]) {
     let n = src.len().min(dst.len());
@@ -14688,6 +14833,14 @@ mod tests {
             let (data, bs, bq, mut out) = args();
             gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
         }
+
+        #[test]
+        fn oversized_b_scratch_is_accepted() {
+            let (data, mut bs, mut bq, mut out) = args();
+            bs.resize(bs.len() * 2, 0.0);
+            bq.resize(bq.len() * 2, 0);
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
+        }
     }
 
     /// Well-formed repacked-dispatcher args shared by the plain and fused
@@ -14819,6 +14972,16 @@ mod tests {
         #[test]
         fn plain_well_formed_call_is_accepted() {
             let (packed, scales, bs, bq, mut out) = plain_args();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        fn plain_oversized_b_scratch_is_accepted() {
+            let (packed, scales, mut bs, mut bq, mut out) = plain_args();
+            bs.resize(bs.len() * 2, 0.0);
+            bq.resize(bq.len() * 2, 0);
             gemm_preq_repacked_q4_0_rowmajor_dispatch(
                 &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
             );
@@ -14976,6 +15139,16 @@ mod tests {
         #[test]
         fn fused_well_formed_call_is_accepted() {
             let (gp, gs, up, us, bs, bq, mut out) = fused_args();
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        fn fused_oversized_b_scratch_is_accepted() {
+            let (gp, gs, up, us, mut bs, mut bq, mut out) = fused_args();
+            bs.resize(bs.len() * 2, 0.0);
+            bq.resize(bq.len() * 2, 0);
             gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
                 &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
             );
@@ -18595,6 +18768,99 @@ mod tests {
 }
 
 #[cfg(test)]
+mod bf16_le_tests {
+    use super::*;
+
+    #[test]
+    fn bf16_le_bytes_conversions_match_scalar() {
+        let mut bf_u16: Vec<u16> = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -3.5,
+            0.000123,
+            42.25,
+            -1024.5,
+            1e-4,
+            6.5,
+            -0.125,
+            19.75,
+            0.333,
+            // F16 subnormal / overflow boundary cases
+            6.097_555e-5,
+            5.960_464_5e-8,
+            -5.960_464_5e-8,
+            65504.0,
+            65520.0,
+            -65520.0,
+        ]
+        .into_iter()
+        .map(|v| half::bf16::from_f32(v).to_bits())
+        .collect();
+        // Raw BF16 subnormals, +/-Inf, qNaN, and sNaN (27 elements: 3x8 SIMD + 3 tail).
+        bf_u16.extend_from_slice(&[
+            0x0001, // smallest positive BF16 subnormal
+            0x007F, // largest positive BF16 subnormal
+            0x8001, // smallest negative BF16 subnormal
+            0x807F, // largest negative BF16 subnormal
+            0x7F80, // +Inf
+            0xFF80, // -Inf
+            0x7FC0, // +qNaN
+            0xFFC0, // -qNaN
+            0x7F81, // +sNaN
+        ]);
+        assert_eq!(bf_u16.len() % 2, 1, "exercise odd element count");
+
+        let mut src_le = Vec::with_capacity(bf_u16.len() * 2 + 1);
+        for &bits in &bf_u16 {
+            src_le.extend_from_slice(&bits.to_le_bytes());
+        }
+        // Append an odd trailing byte to verify odd byte-length slicing ignores the trailing byte.
+        src_le.push(0xAB);
+
+        let sentinel_f16 = 0xBEEFu16;
+        let sentinel_f32 = f32::from_bits(0xDEAD_BEEF);
+        let mut got_f16 = vec![sentinel_f16; bf_u16.len() + 3];
+        let mut got_f32 = vec![sentinel_f32; bf_u16.len() + 3];
+        bf16_le_bytes_to_f16_into(&src_le, &mut got_f16);
+        bf16_le_bytes_to_f32_into(&src_le, &mut got_f32);
+        for (i, &b) in bf_u16.iter().enumerate() {
+            let want_f32 = f32::from_bits((b as u32) << 16);
+            let want_f16 = crate::quant::f32_to_f16(want_f32);
+            assert_eq!(
+                got_f32[i].to_bits(),
+                want_f32.to_bits(),
+                "f32[{i}] ({b:#06x})"
+            );
+            assert_eq!(got_f16[i], want_f16, "f16[{i}] ({b:#06x})");
+        }
+        for tail in bf_u16.len()..got_f16.len() {
+            assert_eq!(got_f16[tail], sentinel_f16, "f16 tail[{tail}]");
+            assert_eq!(
+                got_f32[tail].to_bits(),
+                sentinel_f32.to_bits(),
+                "f32 tail[{tail}]"
+            );
+        }
+
+        // Shorter `dst` must limit conversion to `dst.len()`.
+        let short_n = 5;
+        let mut short_f16 = vec![0u16; short_n];
+        let mut short_f32 = vec![0.0f32; short_n];
+        bf16_le_bytes_to_f16_into(&src_le, &mut short_f16);
+        bf16_le_bytes_to_f32_into(&src_le, &mut short_f32);
+        for i in 0..short_n {
+            assert_eq!(short_f16[i], got_f16[i], "short f16[{i}]");
+            assert_eq!(
+                short_f32[i].to_bits(),
+                got_f32[i].to_bits(),
+                "short f32[{i}]"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod f16_gemv_tests {
     use super::*;
 
@@ -19215,5 +19481,92 @@ mod gemv_active_tests {
             });
             assert_eq!(current_gemv_max_active(), 0);
         }
+    }
+
+    #[test]
+    fn gemv_dispatch_active_q6k_allows_oversized_buffers_zero_rows_and_large_k() {
+        // Exercises oversized `y` / `data`, `m == 0` with non-empty `y`, and `k = 8448 > 8192`
+        // (`heap_buf` path in `gemm_q6_k_n1_drive_512` when AVX-512 VNNI is available).
+        let (m, k) = (5usize, 8448usize);
+        let row_bytes = (k / 256) * size_of::<BlockQ6K>();
+        let mut q6_bytes = vec![0x11u8; m * row_bytes + 64];
+        for (bi, chunk) in q6_bytes[..m * row_bytes]
+            .as_chunks_mut::<{ size_of::<BlockQ6K>() }>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let d = half::f16::from_f32(0.01 + 0.002 * (bi % 5) as f32);
+            chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+        }
+        let x: Vec<f32> = (0..k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+
+        let mut expected = vec![0.0f32; m];
+        gemv_dispatch(
+            DType::Q6K,
+            &q6_bytes[..m * row_bytes],
+            &x,
+            &mut expected,
+            m,
+            k,
+            None,
+        );
+
+        let sentinel = -999.25f32;
+        let mut got = vec![sentinel; m + 9];
+        gemv_dispatch_active(2, DType::Q6K, &q6_bytes, &x, &mut got, m, k, None);
+        for i in 0..m {
+            assert!(
+                (got[i] - expected[i]).abs() <= 1e-3 * (1.0 + expected[i].abs()),
+                "row {i}: {} vs {}",
+                got[i],
+                expected[i]
+            );
+        }
+        assert!(got[m..].iter().all(|&v| v == sentinel));
+
+        let mut zero_y = vec![sentinel; 4];
+        gemv_dispatch_active(2, DType::Q6K, &q6_bytes, &x, &mut zero_y, 0, k, None);
+        assert!(zero_y.iter().all(|&v| v == sentinel));
+    }
+
+    #[test]
+    #[should_panic(expected = "x must have k elements")]
+    fn gemv_dispatch_active_q6k_panics_on_x_len_mismatch() {
+        let (m, k) = (2usize, 256usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>()];
+        let x = vec![0.0f32; k - 1];
+        let mut y = vec![0.0f32; m];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "y buffer too small")]
+    fn gemv_dispatch_active_q6k_panics_on_short_y() {
+        let (m, k) = (4usize, 256usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>()];
+        let x = vec![0.0f32; k];
+        let mut y = vec![0.0f32; m - 1];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "k must be divisible by 256")]
+    fn gemv_dispatch_active_q6k_panics_on_unaligned_k() {
+        let (m, k) = (2usize, 128usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>()];
+        let x = vec![0.0f32; k];
+        let mut y = vec![0.0f32; m];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a_quant buffer too small")]
+    fn gemv_dispatch_active_q6k_panics_on_short_a_quant() {
+        let (m, k) = (2usize, 256usize);
+        let q6_bytes = vec![0u8; m * size_of::<BlockQ6K>() - 1];
+        let x = vec![0.0f32; k];
+        let mut y = vec![0.0f32; m];
+        gemv_dispatch_active(1, DType::Q6K, &q6_bytes, &x, &mut y, m, k, None);
     }
 }

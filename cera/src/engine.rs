@@ -254,8 +254,9 @@ struct AuxWeights {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Parsed detokenizer, for audio-out bundles.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
-    /// Parsed hardware audio accelerator backend, for audio-out bundles.
-    audio_accelerator: Option<Arc<dyn crate::model::audio_decoder::AudioAccelerator>>,
+    /// Parsed vocoder (or audio-gen mmproj) GGUF used to build `audio_accelerator` inside
+    /// `from_gguf` after `aux_backend` routing and dimension checks.
+    audio_vocoder_gguf: Option<Arc<GgufFile>>,
     /// Pre-parsed speculative decoding drafter (e.g. from in-memory bytes).
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
@@ -528,7 +529,7 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let (audio_decoder, detok_weights, audio_accelerator) = {
+        let (audio_decoder, detok_weights, audio_vocoder_gguf) = {
             let voc_arc = parts
                 .audio_decoder
                 .and_then(|b| parse_audio_sidecar(b, "audio decoder"));
@@ -585,15 +586,13 @@ impl CeraEngine {
                         .map(Arc::new)
                 });
 
-            let acc = if dec.is_some() && detok.is_some() {
-                voc_arc.as_ref().or(mmproj.as_ref()).and_then(|g| {
-                    crate::model::audio_decoder::build_audio_accelerator(g, cfg.backend)
-                })
+            let vocoder_gguf = if dec.is_some() && detok.is_some() {
+                voc_arc.or_else(|| mmproj.as_ref().map(Arc::clone))
             } else {
                 None
             };
 
-            (dec, detok, acc)
+            (dec, detok, vocoder_gguf)
         };
 
         let mut aux = match (&inference_type, mmproj) {
@@ -602,7 +601,7 @@ impl CeraEngine {
                 audio_encoder: None,
                 audio_decoder: None,
                 detok_weights: None,
-                audio_accelerator: None,
+                audio_vocoder_gguf: None,
                 drafter: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
@@ -611,14 +610,14 @@ impl CeraEngine {
                 audio_encoder: try_parse_audio_encoder(&g, None),
                 audio_decoder: None,
                 detok_weights: None,
-                audio_accelerator: None,
+                audio_vocoder_gguf: None,
                 drafter: None,
             },
             _ => AuxWeights::default(),
         };
         aux.audio_decoder = audio_decoder;
         aux.detok_weights = detok_weights;
-        aux.audio_accelerator = audio_accelerator;
+        aux.audio_vocoder_gguf = audio_vocoder_gguf;
         aux.drafter = parts
             .draft_model
             .as_ref()
@@ -859,19 +858,13 @@ impl CeraEngine {
         // device is available. Uploading the mmproj to the GPU here (once)
         // keeps it off the per-image hot path. Falls back to `None` (CPU
         // encode) for `Cpu`, disabled features, or device-init failure.
-        // Under `Auto` the vision encoder goes where the trunk went, so a model on the NPU does
-        // not end up with its tower on another accelerator when the NPU has no room for it.
-        let vision_backend = match (cfg.backend, model.backend_label()) {
-            (BackendPreference::Auto, "metal") => BackendPreference::Metal,
-            (BackendPreference::Auto, "hexagon") => BackendPreference::Hexagon,
-            (BackendPreference::Auto, "xdna") => BackendPreference::Npu,
-            (BackendPreference::Auto, "wgpu") => BackendPreference::Gpu,
-            (other, _) => other,
-        };
+        // Under `Auto` auxiliary towers go where the trunk went, so a model on the NPU does
+        // not end up with a tower on another accelerator when the NPU has no room for it.
+        let aux_backend = resolve_aux_backend(cfg.backend, model.backend_label());
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
             crate::model::vision_encoder_gpu::build_gpu_vision_encoder(
                 w,
-                encoder_backend("CERA_VISION_BACKEND", vision_backend),
+                encoder_backend("CERA_VISION_BACKEND", aux_backend),
             )
         });
         if gpu_vision_encoder.is_none()
@@ -882,33 +875,23 @@ impl CeraEngine {
         let gpu_audio_encoder = audio_encoder.as_ref().and_then(|w| {
             crate::model::audio_encoder_gpu::build_gpu_audio_encoder(
                 w,
-                encoder_backend("CERA_AUDIO_ENCODER_BACKEND", vision_backend),
+                encoder_backend("CERA_AUDIO_ENCODER_BACKEND", aux_backend),
             )
         });
-        let (eager_audio_decoder, eager_detok_weights, eager_audio_accelerator) =
+        let (eager_audio_decoder, eager_detok_weights, eager_vocoder_gguf) =
             if path.is_some() && aux.audio_decoder.is_none() {
-                try_load_audio_decoder_and_detok(&manifest, cfg.backend)
+                try_load_audio_decoder_and_detok(&manifest)
             } else {
-                (aux.audio_decoder, aux.detok_weights, aux.audio_accelerator)
+                (aux.audio_decoder, aux.detok_weights, aux.audio_vocoder_gguf)
             };
 
-        let audio_decoder = eager_audio_decoder.filter(|dec| {
-            let model_dim = model.config().hidden_size;
-            let vocoder_dim = dec.depth_linear_w.cols;
-            if vocoder_dim != model_dim {
-                tracing::warn!(
-                    "audio decoder embedding dimension ({vocoder_dim}) does not match model hidden size ({model_dim}); ignoring mismatched vocoder"
-                );
-                false
-            } else {
-                true
-            }
-        });
-        let (detok_weights, audio_accelerator) = if audio_decoder.is_some() {
-            (eager_detok_weights, eager_audio_accelerator)
-        } else {
-            (None, None)
-        };
+        let (audio_decoder, detok_weights, audio_accelerator) = resolve_vocoder_and_accelerator(
+            model.config().hidden_size,
+            aux_backend,
+            eager_audio_decoder,
+            eager_detok_weights,
+            eager_vocoder_gguf,
+        );
         let engine = Self {
             audio_profile: std::sync::OnceLock::new(),
             manifest,
@@ -2146,18 +2129,60 @@ fn parse_aux_gguf(bytes: &Arc<[u8]>, kind: &str) -> Option<Arc<GgufFile>> {
     }
 }
 
-type LoadedAudioDecoderParts = (
+fn resolve_aux_backend(requested: BackendPreference, trunk_backend: &str) -> BackendPreference {
+    match (requested, trunk_backend) {
+        (BackendPreference::Auto, "metal") => BackendPreference::Metal,
+        (BackendPreference::Auto, "hexagon") => BackendPreference::Hexagon,
+        (BackendPreference::Auto, "xdna") => BackendPreference::Npu,
+        (BackendPreference::Auto, "wgpu") => BackendPreference::Gpu,
+        (other, _) => other,
+    }
+}
+
+type ResolvedAudioDecoder = (
     Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
     Option<Arc<dyn crate::model::audio_decoder::AudioAccelerator>>,
 );
 
+fn resolve_vocoder_and_accelerator(
+    model_dim: usize,
+    aux_backend: BackendPreference,
+    eager_audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    eager_detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    eager_vocoder_gguf: Option<Arc<GgufFile>>,
+) -> ResolvedAudioDecoder {
+    let audio_decoder = eager_audio_decoder.filter(|dec| {
+        let vocoder_dim = dec.depth_linear_w.cols;
+        if vocoder_dim != model_dim {
+            tracing::warn!(
+                "audio decoder embedding dimension ({vocoder_dim}) does not match model hidden size ({model_dim}); ignoring mismatched vocoder"
+            );
+            false
+        } else {
+            true
+        }
+    });
+    if audio_decoder.is_some() {
+        let acc = eager_detok_weights
+            .as_ref()
+            .and(eager_vocoder_gguf.as_ref())
+            .and_then(|g| crate::model::audio_decoder::build_audio_accelerator(g, aux_backend));
+        (audio_decoder, eager_detok_weights, acc)
+    } else {
+        (None, None, None)
+    }
+}
+
+type LoadedAudioDecoderParts = (
+    Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    Option<Arc<GgufFile>>,
+);
+
 /// Eager audio decoder & detokenizer GGUF loader for audio-out bundles.
 #[cfg(feature = "mmap")]
-fn try_load_audio_decoder_and_detok(
-    manifest: &Manifest,
-    backend: crate::engine::BackendPreference,
-) -> LoadedAudioDecoderParts {
+fn try_load_audio_decoder_and_detok(manifest: &Manifest) -> LoadedAudioDecoderParts {
     if !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1) {
         return (None, None, None);
     }
@@ -2260,23 +2285,17 @@ fn try_load_audio_decoder_and_detok(
                 .map(Arc::new)
         });
 
-    let acc = if dec.is_some() && detok.is_some() {
-        voc_gguf
-            .as_ref()
-            .or(mmproj_gguf.as_ref())
-            .and_then(|g| crate::model::audio_decoder::build_audio_accelerator(g, backend))
+    let vocoder_gguf = if dec.is_some() && detok.is_some() {
+        voc_gguf.or(mmproj_gguf)
     } else {
         None
     };
 
-    (dec, detok, acc)
+    (dec, detok, vocoder_gguf)
 }
 
 #[cfg(not(feature = "mmap"))]
-fn try_load_audio_decoder_and_detok(
-    _manifest: &Manifest,
-    _backend: crate::engine::BackendPreference,
-) -> LoadedAudioDecoderParts {
+fn try_load_audio_decoder_and_detok(_manifest: &Manifest) -> LoadedAudioDecoderParts {
     (None, None, None)
 }
 
@@ -2642,7 +2661,7 @@ fn load_text_model_auto(
     path: Option<&Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
-    // Metal -> Hexagon -> wgpu -> CPU.
+    // Metal -> Hexagon -> XDNA -> wgpu -> CPU.
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
         let gguf_for_metal = gguf.clone();
@@ -2673,6 +2692,20 @@ fn load_text_model_auto(
                 // (unsupported arch or quant, or a DSP probe failure) is an
                 // ordinary fallthrough logged at debug.
                 tracing::debug!("cera::engine: Hexagon unavailable ({e}); trying next backend");
+            }
+        }
+    }
+
+    #[cfg(feature = "xdna")]
+    {
+        let gguf_for_xdna = gguf.clone();
+        match model::load_model_xdna(gguf_for_xdna, path, context_size) {
+            Ok(m) => {
+                tracing::debug!("cera::engine: using AMD XDNA2 NPU backend (auto)");
+                return Ok(m);
+            }
+            Err(e) => {
+                tracing::debug!("cera::engine: XDNA unavailable ({e}); trying next backend");
             }
         }
     }
@@ -3364,5 +3397,401 @@ mod tests {
             ),
             BackendPreference::Hexagon
         );
+    }
+
+    #[test]
+    fn resolve_aux_backend_routes_auto_to_trunk_and_preserves_explicit() {
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Auto, "metal"),
+            BackendPreference::Metal
+        );
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Auto, "hexagon"),
+            BackendPreference::Hexagon
+        );
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Auto, "xdna"),
+            BackendPreference::Npu
+        );
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Auto, "wgpu"),
+            BackendPreference::Gpu
+        );
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Auto, "cpu"),
+            BackendPreference::Auto
+        );
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Cpu, "xdna"),
+            BackendPreference::Cpu
+        );
+        assert_eq!(
+            resolve_aux_backend(BackendPreference::Npu, "wgpu"),
+            BackendPreference::Npu
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    fn synth_test_lfm2_primary(hidden: usize) -> Arc<[u8]> {
+        use crate::gguf::GgufBuilder;
+
+        let ones_hidden = vec![1.0f32; hidden];
+        let w_sq = vec![0.01f32; hidden * hidden];
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_string_array(
+                "tokenizer.ggml.tokens",
+                vec!["a".to_string(), "b".to_string()],
+            )
+            .kv_u32("lfm2.block_count", 1)
+            .kv_u32("lfm2.embedding_length", hidden as u32)
+            .kv_u32("lfm2.feed_forward_length", hidden as u32)
+            .kv_u32("lfm2.attention.head_count", 1)
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![1])
+            .kv_u32("lfm2.vocab_size", 2)
+            .kv_u32("lfm2.context_length", 128)
+            .tensor_f32("token_embd.weight", &[hidden, 2], &vec![0.01; hidden * 2])
+            .tensor_f32("token_embd_norm.weight", &[hidden], &ones_hidden)
+            .tensor_f32("blk.0.attn_norm.weight", &[hidden], &ones_hidden)
+            .tensor_f32("blk.0.ffn_norm.weight", &[hidden], &ones_hidden)
+            .tensor_f32("blk.0.attn_q_norm.weight", &[hidden], &ones_hidden)
+            .tensor_f32("blk.0.attn_k_norm.weight", &[hidden], &ones_hidden);
+        for name in [
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ] {
+            b = b.tensor_f32(format!("blk.0.{name}.weight"), &[hidden, hidden], &w_sq);
+        }
+        Arc::from(b.build_bytes())
+    }
+
+    #[cfg(feature = "xdna")]
+    fn synth_test_lfm2a_vocoder_gguf(llm_dim: usize) -> Arc<[u8]> {
+        use crate::gguf::GgufBuilder;
+
+        let df_embd = 64usize;
+        let hd = 2usize;
+        let qkv_out = (32 + 2 * 8) * hd;
+        let df_ffn = 64usize;
+        let detok_embd = 32usize;
+        let spec_bins = (1280 / 2 + 1) * 2;
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", "audio-fixture")
+            .kv_u32("depthformer_n_layer", 1)
+            .kv_u32("depthformer_n_embd", df_embd as u32)
+            .tensor_f32(
+                "depthformer.layers.0.operator_norm.weight",
+                &[df_embd],
+                &vec![1.0; df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.ffn_norm.weight",
+                &[df_embd],
+                &vec![1.0; df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.attention.q_layernorm.weight",
+                &[hd],
+                &vec![1.0; hd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.attention.k_layernorm.weight",
+                &[hd],
+                &vec![1.0; hd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.qkv_proj.weight",
+                &[df_embd, qkv_out],
+                &vec![0.01; df_embd * qkv_out],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.operator.out_proj.weight",
+                &[32 * hd, df_embd],
+                &vec![0.01; 32 * hd * df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.feed_forward.w1.weight",
+                &[df_embd, df_ffn],
+                &vec![0.01; df_embd * df_ffn],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.feed_forward.w2.weight",
+                &[df_ffn, df_embd],
+                &vec![0.01; df_ffn * df_embd],
+            )
+            .tensor_f32(
+                "depthformer.layers.0.feed_forward.w3.weight",
+                &[df_embd, df_ffn],
+                &vec![0.01; df_embd * df_ffn],
+            )
+            .tensor_f32(
+                "depth_linear.weight",
+                &[llm_dim, 8 * df_embd],
+                &vec![0.01; llm_dim * 8 * df_embd],
+            )
+            .tensor_f32("depth_linear.bias", &[8 * df_embd], &vec![0.0; 8 * df_embd]);
+        for j in 0..8 {
+            b = b
+                .tensor_f32(
+                    format!("depth_embeddings.{j}.embedding.weight"),
+                    &[df_embd, 1],
+                    &vec![0.01; df_embd],
+                )
+                .tensor_f32(
+                    format!("depth_embeddings.{j}.embedding_norm.weight"),
+                    &[df_embd],
+                    &vec![1.0; df_embd],
+                )
+                .tensor_f32(
+                    format!("depth_embeddings.{j}.to_logits.weight"),
+                    &[df_embd, 1],
+                    &vec![0.01; df_embd],
+                );
+        }
+        b = b
+            .tensor_f32(
+                "audio_embedding.embedding.weight",
+                &[llm_dim, 8 * 2049],
+                &vec![0.01; llm_dim * 8 * 2049],
+            )
+            .tensor_f32(
+                "audio_embedding.embedding_norm.weight",
+                &[llm_dim],
+                &vec![1.0; llm_dim],
+            )
+            .tensor_f32(
+                "audio_embedding.to_logits.weight",
+                &[llm_dim, 1],
+                &vec![0.01; llm_dim],
+            )
+            .tensor_f32(
+                "emb.emb.weight",
+                &[detok_embd, 8 * 2048],
+                &vec![0.01; detok_embd * 8 * 2048],
+            )
+            .tensor_f32(
+                "lfm.embedding_norm.weight",
+                &[detok_embd],
+                &vec![1.0; detok_embd],
+            )
+            .tensor_f32(
+                "lin.weight",
+                &[detok_embd, spec_bins],
+                &vec![0.01; detok_embd * spec_bins],
+            )
+            .tensor_f32("lin.bias", &[spec_bins], &vec![0.0; spec_bins]);
+        for i in 0..8 {
+            let p = format!("lfm.layers.{i}");
+            b = b
+                .tensor_f32(
+                    format!("{p}.operator_norm.weight"),
+                    &[detok_embd],
+                    &vec![1.0; detok_embd],
+                )
+                .tensor_f32(
+                    format!("{p}.ffn_norm.weight"),
+                    &[detok_embd],
+                    &vec![1.0; detok_embd],
+                )
+                .tensor_f32(
+                    format!("{p}.feed_forward.w1.weight"),
+                    &[detok_embd, detok_embd],
+                    &vec![0.01; detok_embd * detok_embd],
+                )
+                .tensor_f32(
+                    format!("{p}.feed_forward.w2.weight"),
+                    &[detok_embd, detok_embd],
+                    &vec![0.01; detok_embd * detok_embd],
+                )
+                .tensor_f32(
+                    format!("{p}.feed_forward.w3.weight"),
+                    &[detok_embd, detok_embd],
+                    &vec![0.01; detok_embd * detok_embd],
+                );
+            if [0, 1, 3, 5, 7].contains(&i) {
+                b = b
+                    .tensor_f32(
+                        format!("{p}.conv.in_proj.weight"),
+                        &[detok_embd, 3 * detok_embd],
+                        &vec![0.01; 3 * detok_embd * detok_embd],
+                    )
+                    .tensor_f32(
+                        format!("{p}.conv.out_proj.weight"),
+                        &[detok_embd, detok_embd],
+                        &vec![0.01; detok_embd * detok_embd],
+                    )
+                    .tensor_f32(
+                        format!("{p}.conv.conv.weight"),
+                        &[3, detok_embd],
+                        &vec![0.05; 3 * detok_embd],
+                    );
+            } else {
+                for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                    b = b.tensor_f32(
+                        format!("{p}.self_attn.{proj}.weight"),
+                        &[detok_embd, detok_embd],
+                        &vec![0.01; detok_embd * detok_embd],
+                    );
+                }
+                for norm in ["q_layernorm", "k_layernorm"] {
+                    b = b.tensor_f32(
+                        format!("{p}.self_attn.{norm}.weight"),
+                        &[detok_embd],
+                        &vec![1.0; detok_embd],
+                    );
+                }
+            }
+        }
+        Arc::from(b.build_bytes())
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn resolve_vocoder_and_accelerator_respects_aux_backend_and_dim_filter() {
+        use crate::backend::xdna::sys::fake::{self, Config as FakeConfig, Event};
+
+        let voc_bytes = synth_test_lfm2a_vocoder_gguf(32);
+        let voc_gguf = Arc::new(GgufFile::from_bytes(voc_bytes).unwrap());
+        let dec = Arc::new(
+            crate::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap(),
+        );
+        let detok = Arc::new(
+            crate::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf).unwrap(),
+        );
+
+        // 1. Trunk on "wgpu" under Auto routes audio accelerator to Gpu (no XDNA upload).
+        let (acc_wgpu, events_wgpu) = fake::with_shim(FakeConfig::default(), || {
+            let aux_backend = resolve_aux_backend(BackendPreference::Auto, "wgpu");
+            assert_eq!(aux_backend, BackendPreference::Gpu);
+            let (_d, _dt, acc) = resolve_vocoder_and_accelerator(
+                32,
+                aux_backend,
+                Some(Arc::clone(&dec)),
+                Some(Arc::clone(&detok)),
+                Some(Arc::clone(&voc_gguf)),
+            );
+            acc
+        });
+        #[cfg(not(feature = "gpu"))]
+        assert!(acc_wgpu.is_none());
+        let _ = acc_wgpu;
+        assert!(
+            !events_wgpu
+                .iter()
+                .any(|e| matches!(e, Event::BoAlloc { .. } | Event::KernelLoad(_))),
+            "wgpu trunk under Auto must not upload audio weights to XDNA"
+        );
+
+        // 2. Vocoder dim mismatch (model_dim = 64 != 32) drops vocoder before NPU upload.
+        let (acc_mismatch, events_mismatch) = fake::with_shim(FakeConfig::default(), || {
+            let aux_backend = resolve_aux_backend(BackendPreference::Auto, "xdna");
+            resolve_vocoder_and_accelerator(
+                64,
+                aux_backend,
+                Some(Arc::clone(&dec)),
+                Some(Arc::clone(&detok)),
+                Some(Arc::clone(&voc_gguf)),
+            )
+        });
+        assert!(acc_mismatch.0.is_none());
+        assert!(acc_mismatch.1.is_none());
+        assert!(acc_mismatch.2.is_none());
+        assert!(
+            !events_mismatch
+                .iter()
+                .any(|e| matches!(e, Event::BoAlloc { .. } | Event::KernelLoad(_))),
+            "mismatched vocoder dim must not pay XDNA weight upload"
+        );
+
+        // 3. Matching vocoder dim with trunk on "xdna" builds XdnaAudioDecoder and frees cleanly.
+        let (_, events_match) = fake::with_shim(FakeConfig::default(), || {
+            let aux_backend = resolve_aux_backend(BackendPreference::Auto, "xdna");
+            let (d, dt, acc) = resolve_vocoder_and_accelerator(
+                32,
+                aux_backend,
+                Some(dec),
+                Some(detok),
+                Some(voc_gguf),
+            );
+            assert!(d.is_some() && dt.is_some() && acc.is_some());
+            drop(acc);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+        assert!(
+            events_match
+                .iter()
+                .any(|e| matches!(e, Event::BoAlloc { .. })),
+            "matching vocoder on NPU must upload XDNA weights"
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn from_parts_skips_audio_accelerator_on_vocoder_dim_mismatch_and_builds_on_match() {
+        use crate::backend::xdna::sys::fake::{self, Config as FakeConfig, Event};
+
+        let primary = synth_test_lfm2_primary(32);
+        let matching_vocoder = synth_test_lfm2a_vocoder_gguf(32);
+        let mismatched_vocoder = synth_test_lfm2a_vocoder_gguf(64);
+        let cfg = EngineConfig {
+            context_size: 64,
+            backend: BackendPreference::Auto,
+            ..EngineConfig::default()
+        };
+
+        // 1. Mismatched vocoder dimension must drop vocoder without uploading weights to XDNA.
+        let mut mismatch_parts = ModelBytes::text(Arc::clone(&primary));
+        mismatch_parts.inference_type = Some(InferenceType::LlamaCppLfm2AudioV1);
+        mismatch_parts.audio_decoder = Some(mismatched_vocoder);
+        let (engine_mismatch, events_mismatch) = fake::with_shim(FakeConfig::default(), || {
+            CeraEngine::from_parts(mismatch_parts, cfg.clone()).expect("from_parts mismatch")
+        });
+        assert!(!engine_mismatch.has_audio_accelerator());
+        assert!(engine_mismatch.audio_decoder.is_none());
+        assert!(engine_mismatch.detok_weights.is_none());
+        assert!(
+            !events_mismatch
+                .iter()
+                .any(|e| matches!(e, Event::BoAlloc { .. } | Event::KernelLoad(_))),
+            "from_parts with mismatched vocoder must not upload XDNA BOs"
+        );
+        drop(engine_mismatch);
+        assert_eq!(fake::live_bo_count(), 0);
+
+        // 2. Matching vocoder builds audio_accelerator via `from_gguf` and attaches to sessions.
+        let mut match_parts = ModelBytes::text(primary);
+        match_parts.inference_type = Some(InferenceType::LlamaCppLfm2AudioV1);
+        match_parts.audio_decoder = Some(matching_vocoder);
+        let (matched_trunk_backend, events_match) = fake::with_shim(FakeConfig::default(), || {
+            let matched_engine =
+                CeraEngine::from_parts(match_parts, cfg).expect("from_parts match");
+            assert!(matched_engine.audio_decoder.is_some());
+            assert!(matched_engine.detok_weights.is_some());
+            assert!(matched_engine.has_audio_accelerator());
+            let session = matched_engine
+                .new_session(SessionConfig::default())
+                .unwrap();
+            assert!(session.has_audio_accelerator());
+            let trunk_backend = matched_engine.model.backend_label();
+            drop(session);
+            drop(matched_engine);
+            assert_eq!(fake::live_bo_count(), 0);
+            trunk_backend
+        });
+        if resolve_aux_backend(BackendPreference::Auto, matched_trunk_backend)
+            == BackendPreference::Auto
+        {
+            assert!(
+                events_match
+                    .iter()
+                    .any(|e| matches!(e, Event::BoAlloc { .. })),
+                "from_parts with matching vocoder under Auto must build XdnaAudioDecoder"
+            );
+        }
     }
 }

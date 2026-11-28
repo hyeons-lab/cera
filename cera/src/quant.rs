@@ -171,7 +171,7 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
 
 /// Convert one bf16 (raw bits) directly to IEEE-754 half (raw bits), matching
 /// `f32_to_f16(bf16_to_f32(bits))` across all 65536 patterns without float branching.
-#[cfg_attr(not(any(feature = "xdna", test)), allow(dead_code))]
+#[cfg(test)]
 #[inline(always)]
 pub(crate) fn bf16_to_f16(bits: u16) -> u16 {
     let sign = bits & 0x8000;

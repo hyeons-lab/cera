@@ -10,6 +10,42 @@ pub mod threadpool;
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub use threadpool::release_caller_pin;
 
+#[cfg(all(feature = "xdna", feature = "parallel", not(target_arch = "wasm32")))]
+pub(crate) use threadpool::PrefillWarmGuard;
+
+#[cfg(all(
+    feature = "xdna",
+    not(all(feature = "parallel", not(target_arch = "wasm32")))
+))]
+#[derive(Debug)]
+pub(crate) struct PrefillWarmGuard;
+
+/// Acquire an RAII keep-warm lease on [`RowPool::prefill`] for hybrid XDNA decode.
+#[cfg(all(feature = "xdna", feature = "parallel", not(target_arch = "wasm32")))]
+pub(crate) fn acquire_prefill_warm_spin() -> PrefillWarmGuard {
+    threadpool::RowPool::acquire_prefill_warm_spin()
+}
+
+#[cfg(all(
+    feature = "xdna",
+    not(all(feature = "parallel", not(target_arch = "wasm32")))
+))]
+pub(crate) fn acquire_prefill_warm_spin() -> PrefillWarmGuard {
+    PrefillWarmGuard
+}
+
+/// Spawn, pin, and warm up to `max_active` threads in [`RowPool::prefill`] up front at model load.
+#[cfg(all(feature = "xdna", feature = "parallel", not(target_arch = "wasm32")))]
+pub(crate) fn warm_prefill_pool(max_active: usize) {
+    threadpool::RowPool::warm_prefill(max_active);
+}
+
+#[cfg(all(
+    feature = "xdna",
+    not(all(feature = "parallel", not(target_arch = "wasm32")))
+))]
+pub(crate) fn warm_prefill_pool(_max_active: usize) {}
+
 /// Give back the CPU pin the calling thread took while it ran the engine; see
 /// `threadpool::release_caller_pin`. A no-op where there is no row pool (no `parallel` feature,
 /// or wasm32), so a host can call it unconditionally.

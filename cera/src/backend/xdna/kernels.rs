@@ -204,7 +204,7 @@ pub const Q4PREFILL_LFM3_BIDIR_B_BUCKETS: [(usize, &[u8]); 15] = [
     (256, Q4PREFILL_LFM3_BIDIR_B_INSTS_C256),
 ];
 
-/// Mode-4 (FA partial, first block `blk == 0`, reading `SLOT_NORM_1`) prefill instruction stream.
+/// Mode-6 (FA partial, first block `blk == 0`, reading `SLOT_NORM_1` and skipping `SLOT_FA_STATE` preload) prefill instruction stream.
 pub const Q4PREFILL_LFM3_FA_PART0_C256_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm3_pre_fa_part0_c256.bin");
 /// Mode-4 (FA partial, subsequent blocks `blk >= 1`, reading `SLOT_NORM_2`) prefill instruction stream over one full `256`-chunk KV block.
@@ -313,15 +313,42 @@ pub const Q4LAYER_LFM3_ATTN_INSTS_C96: &[u8] =
 /// Mode-1 (Attention + FFN) decode instruction stream with `128` past KV chunks.
 pub const Q4LAYER_LFM3_ATTN_INSTS_C128: &[u8] =
     include_bytes!("kernels/insts_lfm3_dec_attn_c128.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `136` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C136: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c136.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `160` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C160: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c160.bin");
 /// Mode-1 (Attention + FFN) decode instruction stream with `192` past KV chunks.
 pub const Q4LAYER_LFM3_ATTN_INSTS_C192: &[u8] =
     include_bytes!("kernels/insts_lfm3_dec_attn_c192.bin");
 /// Mode-1 (Attention + FFN) decode instruction stream with `255` past KV chunks.
 pub const Q4LAYER_LFM3_ATTN_INSTS_C255: &[u8] =
     include_bytes!("kernels/insts_lfm3_dec_attn_c255.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `256` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C256: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c256.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `264` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C264: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c264.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `288` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C288: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c288.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `320` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C320: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c320.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `384` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C384: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c384.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `448` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C448: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c448.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `511` past KV chunks.
+pub const Q4LAYER_LFM3_ATTN_INSTS_C511: &[u8] =
+    include_bytes!("kernels/insts_lfm3_dec_attn_c511.bin");
 
 /// Ascending `(kv_chunks, inst_bytes)` buckets for LFM3 single-token attention decode.
-pub const Q4LAYER_LFM3_KV_BUCKETS: [(usize, &[u8]); 15] = [
+pub const Q4LAYER_LFM3_KV_BUCKETS: [(usize, &[u8]); 24] = [
     (0, Q4LAYER_LFM3_ATTN_INSTS_C0),
     (1, Q4LAYER_LFM3_ATTN_INSTS_C1),
     (2, Q4LAYER_LFM3_ATTN_INSTS_C2),
@@ -335,8 +362,17 @@ pub const Q4LAYER_LFM3_KV_BUCKETS: [(usize, &[u8]); 15] = [
     (64, Q4LAYER_LFM3_ATTN_INSTS_C64),
     (96, Q4LAYER_LFM3_ATTN_INSTS_C96),
     (128, Q4LAYER_LFM3_ATTN_INSTS_C128),
+    (136, Q4LAYER_LFM3_ATTN_INSTS_C136),
+    (160, Q4LAYER_LFM3_ATTN_INSTS_C160),
     (192, Q4LAYER_LFM3_ATTN_INSTS_C192),
     (255, Q4LAYER_LFM3_ATTN_INSTS_C255),
+    (256, Q4LAYER_LFM3_ATTN_INSTS_C256),
+    (264, Q4LAYER_LFM3_ATTN_INSTS_C264),
+    (288, Q4LAYER_LFM3_ATTN_INSTS_C288),
+    (320, Q4LAYER_LFM3_ATTN_INSTS_C320),
+    (384, Q4LAYER_LFM3_ATTN_INSTS_C384),
+    (448, Q4LAYER_LFM3_ATTN_INSTS_C448),
+    (511, Q4LAYER_LFM3_ATTN_INSTS_C511),
 ];
 
 /// Mode-2 (Attention Phase A) decode instruction stream for [`Q4LAYER_LFM3_XCLBIN`].
@@ -409,10 +445,26 @@ pub const Q4LAYER_LFM3_FA_FIN_BUCKETS: [(usize, &[u8]); 15] = [
     (255, Q4LAYER_LFM3_FA_FIN_INSTS_C255),
 ];
 
-/// Unified fused B=32 Q4 LFM2 / LFM2.5 prefill layer (`ShortConv` mode 0 + `GQA` mode 1).
+/// Unified fused B=64 Q4 LFM2 / LFM2.5 prefill layer (`ShortConv` modes 0/5 + `GQA` modes 1/6).
 pub const Q4PREFILL_LFM2_XCLBIN: &[u8] = include_bytes!("kernels/q4prefill_lfm2.xclbin");
+/// Unified `B=64` LFM2 / LFM2.5 `>32K` paged prefill XCLBIN (Modes 0/2/3/4/5/6/7).
+pub const Q4PREFILL_LFM2_EXT_XCLBIN: &[u8] = include_bytes!("kernels/q4prefill_lfm2_ext.xclbin");
+
+/// Define an ascending `(kv_chunks_or_pkts, inst_bytes)` bucket table for LFM2 kernels.
+macro_rules! lfm2_insts_buckets {
+    ($(#[$meta:meta])* $name:ident, $len:expr, $prefix:literal, [$($k:literal),+ $(,)?]) => {
+        $(#[$meta])*
+        pub const $name: [(usize, &[u8]); $len] = [
+            $(($k, include_bytes!(concat!("kernels/", $prefix, "_c", stringify!($k), ".bin"))),)+
+        ];
+    };
+}
+
 /// Mode-0 (ShortConv + FFN) prefill instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
 pub const Q4PREFILL_LFM2_CONV_INSTS: &[u8] = include_bytes!("kernels/insts_lfm2_pre_conv.bin");
+/// Mode-5 (ShortConv without FFN) prefill instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
+pub const Q4PREFILL_LFM2_CONV_NO_FFN_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_conv_no_ffn.bin");
 
 /// Mode-1 (causal Attention + FFN) prefill instruction stream with `0` past KV chunks.
 pub const Q4PREFILL_LFM2_ATTN_INSTS_C0: &[u8] =
@@ -447,21 +499,144 @@ pub const Q4PREFILL_LFM2_ATTN_INSTS_C48: &[u8] =
 /// Mode-1 (causal Attention + FFN) prefill instruction stream with `64` past KV chunks.
 pub const Q4PREFILL_LFM2_ATTN_INSTS_C64: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_attn_c64.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `80` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C80: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c80.bin");
 /// Mode-1 (causal Attention + FFN) prefill instruction stream with `96` past KV chunks.
 pub const Q4PREFILL_LFM2_ATTN_INSTS_C96: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_attn_c96.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `112` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C112: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c112.bin");
 /// Mode-1 (causal Attention + FFN) prefill instruction stream with `128` past KV chunks.
 pub const Q4PREFILL_LFM2_ATTN_INSTS_C128: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_attn_c128.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `144` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C144: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c144.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `160` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C160: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c160.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `176` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C176: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c176.bin");
 /// Mode-1 (causal Attention + FFN) prefill instruction stream with `192` past KV chunks.
 pub const Q4PREFILL_LFM2_ATTN_INSTS_C192: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_attn_c192.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `208` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C208: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c208.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `224` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C224: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c224.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `240` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C240: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c240.bin");
 /// Mode-1 (causal Attention + FFN) prefill instruction stream with `255` past KV chunks.
 pub const Q4PREFILL_LFM2_ATTN_INSTS_C255: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_attn_c255.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `272` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C272: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c272.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `288` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C288: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c288.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `304` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C304: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c304.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `320` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C320: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c320.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `336` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C336: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c336.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `352` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C352: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c352.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `368` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C368: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c368.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `384` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C384: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c384.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `400` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C400: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c400.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `416` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C416: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c416.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `432` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C432: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c432.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `448` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C448: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c448.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `464` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C464: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c464.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `480` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C480: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c480.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `496` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C496: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c496.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `511` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C511: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c511.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `512` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C512: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c512.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `544` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C544: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c544.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `576` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C576: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c576.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `608` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C608: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c608.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `640` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C640: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c640.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `672` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C672: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c672.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `704` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C704: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c704.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `736` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C736: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c736.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `768` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C768: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c768.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `800` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C800: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c800.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `832` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C832: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c832.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `864` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C864: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c864.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `896` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C896: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c896.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `928` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C928: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c928.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `960` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C960: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c960.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `992` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C992: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c992.bin");
+/// Mode-1 (causal Attention + FFN) prefill instruction stream with `1023` past KV chunks.
+pub const Q4PREFILL_LFM2_ATTN_INSTS_C1023: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_attn_c1023.bin");
 
 /// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 causal prefill.
-pub const Q4PREFILL_LFM2_ATTN_BUCKETS: [(usize, &[u8]); 15] = [
+pub const Q4PREFILL_LFM2_ATTN_BUCKETS: [(usize, &[u8]); 56] = [
     (0, Q4PREFILL_LFM2_ATTN_INSTS_C0),
     (1, Q4PREFILL_LFM2_ATTN_INSTS_C1),
     (2, Q4PREFILL_LFM2_ATTN_INSTS_C2),
@@ -473,18 +648,80 @@ pub const Q4PREFILL_LFM2_ATTN_BUCKETS: [(usize, &[u8]); 15] = [
     (32, Q4PREFILL_LFM2_ATTN_INSTS_C32),
     (48, Q4PREFILL_LFM2_ATTN_INSTS_C48),
     (64, Q4PREFILL_LFM2_ATTN_INSTS_C64),
+    (80, Q4PREFILL_LFM2_ATTN_INSTS_C80),
     (96, Q4PREFILL_LFM2_ATTN_INSTS_C96),
+    (112, Q4PREFILL_LFM2_ATTN_INSTS_C112),
     (128, Q4PREFILL_LFM2_ATTN_INSTS_C128),
+    (144, Q4PREFILL_LFM2_ATTN_INSTS_C144),
+    (160, Q4PREFILL_LFM2_ATTN_INSTS_C160),
+    (176, Q4PREFILL_LFM2_ATTN_INSTS_C176),
     (192, Q4PREFILL_LFM2_ATTN_INSTS_C192),
+    (208, Q4PREFILL_LFM2_ATTN_INSTS_C208),
+    (224, Q4PREFILL_LFM2_ATTN_INSTS_C224),
+    (240, Q4PREFILL_LFM2_ATTN_INSTS_C240),
     (255, Q4PREFILL_LFM2_ATTN_INSTS_C255),
+    (272, Q4PREFILL_LFM2_ATTN_INSTS_C272),
+    (288, Q4PREFILL_LFM2_ATTN_INSTS_C288),
+    (304, Q4PREFILL_LFM2_ATTN_INSTS_C304),
+    (320, Q4PREFILL_LFM2_ATTN_INSTS_C320),
+    (336, Q4PREFILL_LFM2_ATTN_INSTS_C336),
+    (352, Q4PREFILL_LFM2_ATTN_INSTS_C352),
+    (368, Q4PREFILL_LFM2_ATTN_INSTS_C368),
+    (384, Q4PREFILL_LFM2_ATTN_INSTS_C384),
+    (400, Q4PREFILL_LFM2_ATTN_INSTS_C400),
+    (416, Q4PREFILL_LFM2_ATTN_INSTS_C416),
+    (432, Q4PREFILL_LFM2_ATTN_INSTS_C432),
+    (448, Q4PREFILL_LFM2_ATTN_INSTS_C448),
+    (464, Q4PREFILL_LFM2_ATTN_INSTS_C464),
+    (480, Q4PREFILL_LFM2_ATTN_INSTS_C480),
+    (496, Q4PREFILL_LFM2_ATTN_INSTS_C496),
+    (511, Q4PREFILL_LFM2_ATTN_INSTS_C511),
+    (512, Q4PREFILL_LFM2_ATTN_INSTS_C512),
+    (544, Q4PREFILL_LFM2_ATTN_INSTS_C544),
+    (576, Q4PREFILL_LFM2_ATTN_INSTS_C576),
+    (608, Q4PREFILL_LFM2_ATTN_INSTS_C608),
+    (640, Q4PREFILL_LFM2_ATTN_INSTS_C640),
+    (672, Q4PREFILL_LFM2_ATTN_INSTS_C672),
+    (704, Q4PREFILL_LFM2_ATTN_INSTS_C704),
+    (736, Q4PREFILL_LFM2_ATTN_INSTS_C736),
+    (768, Q4PREFILL_LFM2_ATTN_INSTS_C768),
+    (800, Q4PREFILL_LFM2_ATTN_INSTS_C800),
+    (832, Q4PREFILL_LFM2_ATTN_INSTS_C832),
+    (864, Q4PREFILL_LFM2_ATTN_INSTS_C864),
+    (896, Q4PREFILL_LFM2_ATTN_INSTS_C896),
+    (928, Q4PREFILL_LFM2_ATTN_INSTS_C928),
+    (960, Q4PREFILL_LFM2_ATTN_INSTS_C960),
+    (992, Q4PREFILL_LFM2_ATTN_INSTS_C992),
+    (1023, Q4PREFILL_LFM2_ATTN_INSTS_C1023),
 ];
 
-/// Mode-2 (Phase A for `>8K` prefill) instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
+lfm2_insts_buckets!(
+    /// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 Mode-6 causal prefill without FFN.
+    Q4PREFILL_LFM2_ATTN_NO_FFN_BUCKETS,
+    56,
+    "insts_lfm2_pre_attn_no_ffn",
+    [
+        0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240,
+        255, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 511, 512,
+        544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992, 1023,
+    ]
+);
+
+/// Mode-0 (ext-prefill shortconv + dense FFN, param slot 0) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
+pub const Q4PREFILL_LFM2_EXT_CONV_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_ext_conv.bin");
+/// Mode-7 (ext-prefill shortconv without FFN, param slot 0) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
+pub const Q4PREFILL_LFM2_EXT_CONV_NO_FFN_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_ext_conv_no_ffn.bin");
+/// Mode-2 (Phase A for `>32K` prefill, param slot 0) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
 pub const Q4PREFILL_LFM2_PHASE_A_INSTS: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_phase_a.bin");
-/// Mode-4 (FA partial over one full `256`-chunk KV block) instruction stream for [`Q4PREFILL_LFM2_XCLBIN`].
-pub const Q4PREFILL_LFM2_FA_PART_C256_INSTS: &[u8] =
-    include_bytes!("kernels/insts_lfm2_pre_fa_part_c256.bin");
+/// Mode-3 (first FA partial over KV block 0, param slot 1) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
+pub const Q4PREFILL_LFM2_FA_PART0_C1024_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_part0_c1024.bin");
+/// Mode-4 (FA partial over one full `1024`-chunk KV block `>=1`, param slot 2) instruction stream for [`Q4PREFILL_LFM2_EXT_XCLBIN`].
+pub const Q4PREFILL_LFM2_FA_PART_C1024_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_part_c1024.bin");
 /// Mode-5 (FA final + O + FFN) prefill instruction stream with `0` past KV chunks in final block.
 pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C0: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_fa_fin_c0.bin");
@@ -530,9 +767,39 @@ pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C192: &[u8] =
 /// Mode-5 (FA final + O + FFN) prefill instruction stream with `255` past KV chunks.
 pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C255: &[u8] =
     include_bytes!("kernels/insts_lfm2_pre_fa_fin_c255.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `320` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C320: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c320.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `384` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C384: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c384.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `448` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C448: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c448.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `511` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C511: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c511.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `512` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C512: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c512.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `576` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C576: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c576.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `640` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C640: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c640.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `768` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C768: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c768.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `896` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C896: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c896.bin");
+/// Mode-5 (FA final + O + FFN) prefill instruction stream with `1023` past KV chunks.
+pub const Q4PREFILL_LFM2_FA_FIN_INSTS_C1023: &[u8] =
+    include_bytes!("kernels/insts_lfm2_pre_fa_fin_c1023.bin");
 
-/// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>8K` Mode-5 final-block prefill.
-pub const Q4PREFILL_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 15] = [
+/// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-5 final-block prefill.
+pub const Q4PREFILL_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 25] = [
     (0, Q4PREFILL_LFM2_FA_FIN_INSTS_C0),
     (1, Q4PREFILL_LFM2_FA_FIN_INSTS_C1),
     (2, Q4PREFILL_LFM2_FA_FIN_INSTS_C2),
@@ -548,12 +815,36 @@ pub const Q4PREFILL_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 15] = [
     (128, Q4PREFILL_LFM2_FA_FIN_INSTS_C128),
     (192, Q4PREFILL_LFM2_FA_FIN_INSTS_C192),
     (255, Q4PREFILL_LFM2_FA_FIN_INSTS_C255),
+    (320, Q4PREFILL_LFM2_FA_FIN_INSTS_C320),
+    (384, Q4PREFILL_LFM2_FA_FIN_INSTS_C384),
+    (448, Q4PREFILL_LFM2_FA_FIN_INSTS_C448),
+    (511, Q4PREFILL_LFM2_FA_FIN_INSTS_C511),
+    (512, Q4PREFILL_LFM2_FA_FIN_INSTS_C512),
+    (576, Q4PREFILL_LFM2_FA_FIN_INSTS_C576),
+    (640, Q4PREFILL_LFM2_FA_FIN_INSTS_C640),
+    (768, Q4PREFILL_LFM2_FA_FIN_INSTS_C768),
+    (896, Q4PREFILL_LFM2_FA_FIN_INSTS_C896),
+    (1023, Q4PREFILL_LFM2_FA_FIN_INSTS_C1023),
 ];
+
+lfm2_insts_buckets!(
+    /// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-6 final-block prefill without FFN.
+    Q4PREFILL_LFM2_FA_FIN_NO_FFN_BUCKETS,
+    25,
+    "insts_lfm2_pre_fa_fin_no_ffn",
+    [
+        0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 255, 320, 384, 448, 511, 512, 576,
+        640, 768, 896, 1023,
+    ]
+);
 
 /// Fused B=1 Q4 LFM2 / LFM2.5 decode layer (Conv + GQA Attention + FFN).
 pub const Q4LAYER_LFM2_XCLBIN: &[u8] = include_bytes!("kernels/q4layer_lfm2.xclbin");
 /// Mode-0 (ShortConv + FFN) decode instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
 pub const Q4LAYER_LFM2_CONV_INSTS: &[u8] = include_bytes!("kernels/insts_lfm2_dec_conv.bin");
+/// Mode-5 (ShortConv without FFN) decode instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
+pub const Q4LAYER_LFM2_CONV_NO_FFN_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_conv_no_ffn.bin");
 /// Mode-1 (Attention + FFN) decode instruction stream with `0` past KV chunks.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C0: &[u8] = include_bytes!("kernels/insts_lfm2_dec_attn_c0.bin");
 /// Mode-1 (Attention + FFN) decode instruction stream with `1` past KV chunk.
@@ -567,36 +858,66 @@ pub const Q4LAYER_LFM2_ATTN_INSTS_C8: &[u8] = include_bytes!("kernels/insts_lfm2
 /// Mode-1 (Attention + FFN) decode instruction stream with `12` past KV chunks.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C12: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c12.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `16` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `16` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C16: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c16.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `24` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `18` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C18: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c18.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `24` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C24: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c24.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `32` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `32` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C32: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c32.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `48` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `34` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C34: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c34.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `48` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C48: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c48.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `64` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `64` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C64: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c64.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `96` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `66` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C66: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c66.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `96` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C96: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c96.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `128` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `128` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C128: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c128.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `192` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `130` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C130: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c130.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `192` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C192: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c192.bin");
-/// Mode-1 (Attention + FFN) decode instruction stream with `255` past KV chunks.
+/// Mode-1 (Attention + FFN) decode instruction stream with `255` past KV packets.
 pub const Q4LAYER_LFM2_ATTN_INSTS_C255: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_attn_c255.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `258` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C258: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c258.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `320` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C320: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c320.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `384` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C384: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c384.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `448` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C448: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c448.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `511` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C511: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c511.bin");
+/// Mode-1 (Attention + FFN) decode instruction stream with `512` past KV packets.
+pub const Q4LAYER_LFM2_ATTN_INSTS_C512: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_attn_c512.bin");
 
-/// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 single-token attention decode.
-pub const Q4LAYER_LFM2_KV_BUCKETS: [(usize, &[u8]); 15] = [
+/// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 single-token attention decode (`2` chunks = `64` tokens per pkt).
+pub const Q4LAYER_LFM2_KV_BUCKETS: [(usize, &[u8]); 25] = [
     (0, Q4LAYER_LFM2_ATTN_INSTS_C0),
     (1, Q4LAYER_LFM2_ATTN_INSTS_C1),
     (2, Q4LAYER_LFM2_ATTN_INSTS_C2),
@@ -604,21 +925,42 @@ pub const Q4LAYER_LFM2_KV_BUCKETS: [(usize, &[u8]); 15] = [
     (8, Q4LAYER_LFM2_ATTN_INSTS_C8),
     (12, Q4LAYER_LFM2_ATTN_INSTS_C12),
     (16, Q4LAYER_LFM2_ATTN_INSTS_C16),
+    (18, Q4LAYER_LFM2_ATTN_INSTS_C18),
     (24, Q4LAYER_LFM2_ATTN_INSTS_C24),
     (32, Q4LAYER_LFM2_ATTN_INSTS_C32),
+    (34, Q4LAYER_LFM2_ATTN_INSTS_C34),
     (48, Q4LAYER_LFM2_ATTN_INSTS_C48),
     (64, Q4LAYER_LFM2_ATTN_INSTS_C64),
+    (66, Q4LAYER_LFM2_ATTN_INSTS_C66),
     (96, Q4LAYER_LFM2_ATTN_INSTS_C96),
     (128, Q4LAYER_LFM2_ATTN_INSTS_C128),
+    (130, Q4LAYER_LFM2_ATTN_INSTS_C130),
     (192, Q4LAYER_LFM2_ATTN_INSTS_C192),
     (255, Q4LAYER_LFM2_ATTN_INSTS_C255),
+    (258, Q4LAYER_LFM2_ATTN_INSTS_C258),
+    (320, Q4LAYER_LFM2_ATTN_INSTS_C320),
+    (384, Q4LAYER_LFM2_ATTN_INSTS_C384),
+    (448, Q4LAYER_LFM2_ATTN_INSTS_C448),
+    (511, Q4LAYER_LFM2_ATTN_INSTS_C511),
+    (512, Q4LAYER_LFM2_ATTN_INSTS_C512),
 ];
 
-/// Mode-2 (Phase A for `>8K` decode) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
+lfm2_insts_buckets!(
+    /// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 Mode-6 single-token attention decode without FFN.
+    Q4LAYER_LFM2_ATTN_NO_FFN_BUCKETS,
+    25,
+    "insts_lfm2_dec_attn_no_ffn",
+    [
+        0, 1, 2, 4, 8, 12, 16, 18, 24, 32, 34, 48, 64, 66, 96, 128, 130, 192, 255, 258, 320, 384,
+        448, 511, 512,
+    ]
+);
+
+/// Mode-2 (Phase A for `>32K` decode) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
 pub const Q4LAYER_LFM2_PHASE_A_INSTS: &[u8] = include_bytes!("kernels/insts_lfm2_dec_phase_a.bin");
-/// Mode-3 (FA partial over one full `256`-chunk KV block) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
-pub const Q4LAYER_LFM2_FA_PART_C256_INSTS: &[u8] =
-    include_bytes!("kernels/insts_lfm2_dec_fa_part_c256.bin");
+/// Mode-3 (FA partial over one full `512`-packet / `1024`-chunk KV block) instruction stream for [`Q4LAYER_LFM2_XCLBIN`].
+pub const Q4LAYER_LFM2_FA_PART_C512_INSTS: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_part_c512.bin");
 /// Mode-4 (FA final + O + FFN) decode instruction stream with `0` past KV chunks in final block.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C0: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c0.bin");
@@ -637,36 +979,66 @@ pub const Q4LAYER_LFM2_FA_FIN_INSTS_C8: &[u8] =
 /// Mode-4 (FA final + O + FFN) decode instruction stream with `12` past KV chunks.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C12: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c12.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `16` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `16` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C16: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c16.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `24` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `18` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C18: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c18.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `24` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C24: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c24.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `32` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `32` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C32: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c32.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `48` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `34` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C34: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c34.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `48` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C48: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c48.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `64` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `64` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C64: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c64.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `96` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `66` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C66: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c66.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `96` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C96: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c96.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `128` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `128` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C128: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c128.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `192` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `130` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C130: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c130.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `192` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C192: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c192.bin");
-/// Mode-4 (FA final + O + FFN) decode instruction stream with `255` past KV chunks.
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `255` past KV packets.
 pub const Q4LAYER_LFM2_FA_FIN_INSTS_C255: &[u8] =
     include_bytes!("kernels/insts_lfm2_dec_fa_fin_c255.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `258` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C258: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c258.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `320` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C320: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c320.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `384` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C384: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c384.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `448` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C448: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c448.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `511` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C511: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c511.bin");
+/// Mode-4 (FA final + O + FFN) decode instruction stream with `512` past KV packets.
+pub const Q4LAYER_LFM2_FA_FIN_INSTS_C512: &[u8] =
+    include_bytes!("kernels/insts_lfm2_dec_fa_fin_c512.bin");
 
-/// Ascending `(kv_chunks, inst_bytes)` buckets for LFM2 / LFM2.5 `>8K` Mode-4 final-block decode.
-pub const Q4LAYER_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 15] = [
+/// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-4 final-block decode.
+pub const Q4LAYER_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 25] = [
     (0, Q4LAYER_LFM2_FA_FIN_INSTS_C0),
     (1, Q4LAYER_LFM2_FA_FIN_INSTS_C1),
     (2, Q4LAYER_LFM2_FA_FIN_INSTS_C2),
@@ -674,15 +1046,36 @@ pub const Q4LAYER_LFM2_FA_FIN_BUCKETS: [(usize, &[u8]); 15] = [
     (8, Q4LAYER_LFM2_FA_FIN_INSTS_C8),
     (12, Q4LAYER_LFM2_FA_FIN_INSTS_C12),
     (16, Q4LAYER_LFM2_FA_FIN_INSTS_C16),
+    (18, Q4LAYER_LFM2_FA_FIN_INSTS_C18),
     (24, Q4LAYER_LFM2_FA_FIN_INSTS_C24),
     (32, Q4LAYER_LFM2_FA_FIN_INSTS_C32),
+    (34, Q4LAYER_LFM2_FA_FIN_INSTS_C34),
     (48, Q4LAYER_LFM2_FA_FIN_INSTS_C48),
     (64, Q4LAYER_LFM2_FA_FIN_INSTS_C64),
+    (66, Q4LAYER_LFM2_FA_FIN_INSTS_C66),
     (96, Q4LAYER_LFM2_FA_FIN_INSTS_C96),
     (128, Q4LAYER_LFM2_FA_FIN_INSTS_C128),
+    (130, Q4LAYER_LFM2_FA_FIN_INSTS_C130),
     (192, Q4LAYER_LFM2_FA_FIN_INSTS_C192),
     (255, Q4LAYER_LFM2_FA_FIN_INSTS_C255),
+    (258, Q4LAYER_LFM2_FA_FIN_INSTS_C258),
+    (320, Q4LAYER_LFM2_FA_FIN_INSTS_C320),
+    (384, Q4LAYER_LFM2_FA_FIN_INSTS_C384),
+    (448, Q4LAYER_LFM2_FA_FIN_INSTS_C448),
+    (511, Q4LAYER_LFM2_FA_FIN_INSTS_C511),
+    (512, Q4LAYER_LFM2_FA_FIN_INSTS_C512),
 ];
+
+lfm2_insts_buckets!(
+    /// Ascending `(kv_pkts, inst_bytes)` buckets for LFM2 / LFM2.5 `>32K` Mode-7 final-block decode without FFN.
+    Q4LAYER_LFM2_FA_FIN_NO_FFN_BUCKETS,
+    25,
+    "insts_lfm2_dec_fa_fin_no_ffn",
+    [
+        0, 1, 2, 4, 8, 12, 16, 18, 24, 32, 34, 48, 64, 66, 96, 128, 130, 192, 255, 258, 320, 384,
+        448, 511, 512,
+    ]
+);
 
 /// Dense `bfloat16 x bfloat16 -> float32` GEMM (`128 x 256` output tile per run).
 pub const GEMM_BF16_XCLBIN: &[u8] = include_bytes!("kernels/gemm_bf16.xclbin");
@@ -934,31 +1327,33 @@ pub const LFM3_DEC_ACT_BYTES: usize = (LFM3_DEC_SLOT_FIN_NORM + 4608) * 4;
 /// Byte length of LFM3 decode `bo_yn` (`2048` floats).
 pub const LFM3_DEC_YN_BYTES: usize = LFM3_H * 4;
 
-/// Choose the smallest `(bucket_idx, chunk_cap)` whose capacity reaches `needed_chunks`.
-pub fn select_lfm3_kv_bucket(bucket_chunks: &[usize], needed_chunks: usize) -> (usize, usize) {
-    assert!(
-        !bucket_chunks.is_empty(),
-        "lfm3 bucket_chunks must be non-empty"
-    );
+/// Choose the smallest `(bucket_idx, chunk_cap)` whose capacity reaches `needed_chunks`, returning an error on empty or oversized inputs.
+pub fn try_select_lfm3_kv_bucket(
+    bucket_chunks: &[usize],
+    needed_chunks: usize,
+) -> Result<(usize, usize), String> {
+    if bucket_chunks.is_empty() {
+        return Err("lfm3 bucket_chunks must be non-empty".to_string());
+    }
     let idx = bucket_chunks
         .iter()
         .position(|&c| c >= needed_chunks)
-        .unwrap_or_else(|| {
-            panic!(
+        .ok_or_else(|| {
+            format!(
                 "lfm3 needed_chunks ({needed_chunks}) exceeds maximum bucket capacity ({})",
                 bucket_chunks.last().copied().unwrap_or(0)
             )
-        });
-    (idx, bucket_chunks[idx])
+        })?;
+    Ok((idx, bucket_chunks[idx]))
 }
 
-/// Write static pre/post RMSNorm weights and optional Q/K norm weights into LFM3 `bo_y`.
+/// Write static pre/post RMSNorm weights and optional Q/K norm weights into LFM3 decode `bo_y`.
 #[allow(clippy::too_many_arguments)]
 pub fn init_lfm3_bo_y_norms(
     buf: &mut [u8],
     slot_norm_0: usize,
     slot_norm_1: usize,
-    slot_rope_pkt: Option<usize>,
+    slot_fin_norm: Option<usize>,
     attn_norm: &[f32],
     post_attn_norm: &[f32],
     ffn_norm: &[f32],
@@ -974,14 +1369,14 @@ pub fn init_lfm3_bo_y_norms(
     write_le_f32_slice(buf, slot_norm_0 + LFM3_H, post_attn_norm);
     write_le_f32_slice(buf, slot_norm_1, ffn_norm);
     write_le_f32_slice(buf, slot_norm_1 + LFM3_H, post_ffn_norm);
-    if buf.len() >= LFM3_DEC_ACT_BYTES {
-        write_le_f32_slice(buf, LFM3_DEC_SLOT_FIN_NORM + LFM3_H, post_attn_norm);
+    if let Some(fin_slot) = slot_fin_norm {
+        write_le_f32_slice(buf, fin_slot + LFM3_H, post_attn_norm);
     }
-    if let (Some(rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
+    if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
         assert_eq!(qn.len(), LFM3_HEAD_DIM);
         assert_eq!(kn.len(), LFM3_HEAD_DIM);
-        write_le_f32_slice(buf, rope_slot + 4096, qn);
-        write_le_f32_slice(buf, rope_slot + 4224, kn);
+        write_le_f32_slice(buf, slot_norm_0 + 4240, qn);
+        write_le_f32_slice(buf, slot_norm_0 + 4368, kn);
     }
 }
 
@@ -1036,20 +1431,36 @@ pub const LFM2_D_CONV: usize = LFM2_CONV_TAPS - 1;
 pub const LFM2_KV_CHUNK_T: usize = 32;
 /// Tokens per LFM2 / LFM2.5 NPU prefill batch (`64`).
 pub const LFM2_PREFILL_CHUNK_T: usize = 64;
-/// Maximum KV chunks per LFM2 / LFM2.5 attention layer (`256`, covering `8192` tokens).
-pub const LFM2_MAX_KV_CHUNKS: usize = 256;
-/// Tokens stored in one `256`-chunk LFM2 `bo_kv` block (`8192`).
+/// Floats per LFM2 / LFM2.5 attention KV chunk (`32` tokens = `2304` f32 words).
+pub const LFM2_KV_CHUNK_F32: usize = 2304;
+/// Bytes per LFM2 / LFM2.5 attention KV chunk (`9,216` bytes).
+pub const LFM2_KV_CHUNK_BYTES: usize = LFM2_KV_CHUNK_F32 * 4;
+/// Maximum KV chunks per LFM2 / LFM2.5 attention layer (`1024`, covering `32,768` tokens).
+pub const LFM2_MAX_KV_CHUNKS: usize = 1024;
+/// Chunks packed per LFM2 decode KV packet (`2` chunks = `64` tokens).
+pub const LFM2_DEC_PKT_CHUNKS: usize = 2;
+/// Maximum decode KV packets per LFM2 `bo_kv` block (`512`, covering `1024` chunks = `32,768` tokens).
+pub const LFM2_DEC_MAX_KV_PKTS: usize = LFM2_MAX_KV_CHUNKS / LFM2_DEC_PKT_CHUNKS;
+/// Tokens covered per LFM2 decode KV packet (`64`).
+pub const LFM2_DEC_PKT_TOKENS: usize = LFM2_KV_CHUNK_T * LFM2_DEC_PKT_CHUNKS;
+/// Tokens stored in one `1024`-chunk LFM2 `bo_kv` block (`32,768`).
 pub const LFM2_BLOCK_TOKENS: usize = LFM2_MAX_KV_CHUNKS * LFM2_KV_CHUNK_T;
 /// Maximum sequence tokens supported across paged LFM2 KV blocks (`i32::MAX` kernel ABI bound,
-/// practically bounded by `cfg.max_seq_len` and host RAM for on-demand 8K KV blocks).
+/// practically bounded by `cfg.max_seq_len` and host RAM for on-demand 32K KV blocks).
 pub const LFM2_MAX_TOKENS: usize = i32::MAX as usize;
 /// Byte size of one LFM2 layer weight `bo_w` (`2056` tiles of `4608` f32 words).
 pub const LFM2_W_BYTES: usize = 2056 * Q4LAYER_TILE_F32 * 4;
-/// Byte size of one LFM2 attention layer `bo_kv` (`256 * 8 * 4608` f32 words).
-pub const LFM2_KV_BYTES: usize = LFM2_MAX_KV_CHUNKS * LFM2_N_KV_HEADS * Q4LAYER_TILE_F32 * 4;
+/// Byte size of one LFM2 attention layer `bo_kv` (`1024 * 8 * 2304` f32 words = `75,497,472` bytes).
+pub const LFM2_KV_BYTES: usize = LFM2_MAX_KV_CHUNKS * LFM2_N_KV_HEADS * LFM2_KV_CHUNK_BYTES;
 /// Byte size of one LFM2 `bo_kvo` output scratch (`8 * 4608` f32 words).
 pub const LFM2_KVO_BYTES: usize = 8 * Q4LAYER_TILE_F32 * 4;
 
+/// Float offset of `SLOT_EXT_PARAMS_0` (first `fa_part` block `0`) inside LFM2 prefill `bo_y`.
+pub const LFM2_PREFILL_SLOT_EXT_PARAMS_0: usize = 958_464;
+/// Float offset of `SLOT_EXT_PARAMS_1` (subsequent `fa_part` blocks `1..cur_blk`) inside LFM2 prefill `bo_y`.
+pub const LFM2_PREFILL_SLOT_EXT_PARAMS_1: usize = 960_768;
+/// Float offset of `SLOT_EXT_PARAMS_2` (`fa_fin` final block `cur_blk`) inside LFM2 prefill `bo_y`.
+pub const LFM2_PREFILL_SLOT_EXT_PARAMS_2: usize = 963_072;
 /// Float offset of `SLOT_NORM_0` inside LFM2 prefill `bo_y`.
 pub const LFM2_PREFILL_SLOT_NORM_0: usize = 1_146_880;
 /// Float offset of `SLOT_NORM_1` inside LFM2 prefill `bo_y`.
@@ -1074,13 +1485,11 @@ pub const LFM2_DEC_ACT_BYTES: usize = (LFM2_DEC_SLOT_ROPE_PKT + 4608) * 4;
 /// Byte length of LFM2 decode `bo_yn` (`2048` floats).
 pub const LFM2_DEC_YN_BYTES: usize = LFM2_H * 4;
 
-/// Write static pre-RMSNorm and optional Q/K norm weights into LFM2 prefill or decode `bo_y`.
-#[allow(clippy::too_many_arguments)]
+/// Write static pre-RMSNorm and optional Q/K norm weights into LFM2 decode `bo_y`.
 pub fn init_lfm2_bo_y_norms(
     buf: &mut [u8],
     slot_norm_0: usize,
     slot_norm_1: usize,
-    slot_rope_pkt: Option<usize>,
     attn_norm: &[f32],
     ffn_norm: &[f32],
     q_norm: Option<&[f32]>,
@@ -1090,11 +1499,11 @@ pub fn init_lfm2_bo_y_norms(
     assert_eq!(ffn_norm.len(), LFM2_H);
     write_le_f32_slice(buf, slot_norm_0, attn_norm);
     write_le_f32_slice(buf, slot_norm_1, ffn_norm);
-    if let (Some(rope_slot), Some(qn), Some(kn)) = (slot_rope_pkt, q_norm, k_norm) {
+    if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
         assert_eq!(qn.len(), LFM2_HEAD_DIM);
         assert_eq!(kn.len(), LFM2_HEAD_DIM);
-        write_le_f32_slice(buf, rope_slot + 4096, qn);
-        write_le_f32_slice(buf, rope_slot + 4224, kn);
+        write_le_f32_slice(buf, slot_norm_0 + 4240, qn);
+        write_le_f32_slice(buf, slot_norm_0 + 4368, kn);
     }
 }
 
@@ -1156,7 +1565,7 @@ pub fn write_lfm2_prefill_step_params(
     }
 }
 
-/// Write `g_params[8..11]` (`kv_start_chunk`, `has_fa_state`, `skip_cur_kv`) for paged `>8K` LFM2 prefill.
+/// Write `g_params[8..11]` (`kv_start_chunk`, `has_fa_state`, `skip_cur_kv`) for paged `>32K` LFM2 prefill.
 #[inline]
 pub fn write_lfm2_prefill_ext_params(
     buf: &mut [u8],
@@ -1603,6 +2012,10 @@ pub fn check_parity_thresholds(
 mod tests {
     use super::*;
 
+    fn select_lfm3_kv_bucket(bucket_chunks: &[usize], needed_chunks: usize) -> (usize, usize) {
+        try_select_lfm3_kv_bucket(bucket_chunks, needed_chunks).unwrap_or_else(|e| panic!("{e}"))
+    }
+
     #[test]
     fn try_inst_words_rejects_empty_and_unaligned_and_parses_embedded() {
         assert!(try_inst_words(&[]).is_err());
@@ -1859,10 +2272,14 @@ mod tests {
 
     #[test]
     fn lfm3_buckets_and_bo_y_helpers_match_kernel_layout() {
+        assert!(!Q4PREFILL_LFM3_XCLBIN.is_empty());
+        assert!(!Q4LAYER_LFM3_XCLBIN.is_empty());
         for table in [
             &Q4PREFILL_LFM3_ATTN_BUCKETS[..],
             &Q4PREFILL_LFM3_BIDIR_B_BUCKETS[..],
+            &Q4PREFILL_LFM3_FA_FIN_BUCKETS[..],
             &Q4LAYER_LFM3_KV_BUCKETS[..],
+            &Q4LAYER_LFM3_FA_FIN_BUCKETS[..],
         ] {
             for &(_, inst_bytes) in table {
                 assert!(!inst_words(inst_bytes).is_empty());
@@ -1871,9 +2288,31 @@ mod tests {
                 assert!(w[0].0 < w[1].0);
             }
         }
+        assert_eq!(Q4LAYER_LFM3_KV_BUCKETS.first().map(|&(c, _)| c), Some(0));
+        assert_eq!(Q4LAYER_LFM3_KV_BUCKETS.last().map(|&(c, _)| c), Some(511));
+        assert_eq!(
+            Q4PREFILL_LFM3_FA_FIN_BUCKETS.first().map(|&(c, _)| c),
+            Some(0)
+        );
+        assert_eq!(
+            Q4PREFILL_LFM3_FA_FIN_BUCKETS.last().map(|&(c, _)| c),
+            Some(255)
+        );
+        assert_eq!(
+            Q4LAYER_LFM3_FA_FIN_BUCKETS.first().map(|&(c, _)| c),
+            Some(0)
+        );
+        assert_eq!(
+            Q4LAYER_LFM3_FA_FIN_BUCKETS.last().map(|&(c, _)| c),
+            Some(255)
+        );
         assert!(!inst_words(Q4PREFILL_LFM3_CONV_INSTS).is_empty());
         assert!(!inst_words(Q4PREFILL_LFM3_BIDIR_A_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM3_FA_PART0_C256_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM3_FA_PART_C256_INSTS).is_empty());
         assert!(!inst_words(Q4LAYER_LFM3_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM3_PHASE_A_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM3_FA_PART_C256_INSTS).is_empty());
 
         let attn_buckets: Vec<usize> = Q4PREFILL_LFM3_ATTN_BUCKETS
             .iter()
@@ -1881,6 +2320,8 @@ mod tests {
             .collect();
         assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 0), (0, 0));
         assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 3), (3, 4));
+        assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 192), (13, 192));
+        assert_eq!(select_lfm3_kv_bucket(&attn_buckets, 193), (14, 255));
         assert_eq!(
             select_lfm3_kv_bucket(&attn_buckets, 255),
             (attn_buckets.len() - 1, 255)
@@ -1895,6 +2336,14 @@ mod tests {
             select_lfm3_kv_bucket(&bidir_buckets, 256),
             (bidir_buckets.len() - 1, 256)
         );
+        let empty_err = try_select_lfm3_kv_bucket(&[], 0).unwrap_err();
+        assert!(empty_err.contains("non-empty"), "{empty_err}");
+        let oob_err = try_select_lfm3_kv_bucket(&attn_buckets, 256).unwrap_err();
+        assert!(
+            oob_err.contains("exceeds maximum bucket capacity"),
+            "{oob_err}"
+        );
+        assert_eq!(try_select_lfm3_kv_bucket(&attn_buckets, 255), Ok((14, 255)));
 
         let mut bo_y = vec![0u8; LFM3_PREFILL_ACT_BYTES];
         let attn_norm = vec![1.25f32; LFM3_H];
@@ -1944,19 +2393,23 @@ mod tests {
             1e-5,
             Some(&rope_cs),
         );
+        write_lfm3_prefill_ext_params(&mut bo_y, 256, true, true);
         let p_off = (LFM3_PREFILL_SLOT_NORM_0 + 2048) * 4;
-        let read_i32 = |idx: usize| {
+        let read_pre_i32 = |idx: usize| {
             let off = p_off + idx * 4;
             i32::from_le_bytes(bo_y[off..off + 4].try_into().unwrap())
         };
-        assert_eq!(read_i32(0), 64);
-        assert_eq!(read_i32(1), 45);
-        assert_eq!(read_i32(2), 4);
-        assert_eq!(read_i32(3), 96);
-        assert_eq!(read_i32(4), 0);
-        assert_eq!(read_i32(5), 512);
-        assert_eq!(read_i32(6), 3);
-        assert_eq!(read_i32(7) as u32, 1e-5f32.to_bits());
+        assert_eq!(read_pre_i32(0), 64);
+        assert_eq!(read_pre_i32(1), 45);
+        assert_eq!(read_pre_i32(2), 4);
+        assert_eq!(read_pre_i32(3), 96);
+        assert_eq!(read_pre_i32(4), 0);
+        assert_eq!(read_pre_i32(5), 512);
+        assert_eq!(read_pre_i32(6), 3);
+        assert_eq!(read_pre_i32(7) as u32, 1e-5f32.to_bits());
+        assert_eq!(read_pre_i32(8), 256);
+        assert_eq!(read_pre_i32(9), 1);
+        assert_eq!(read_pre_i32(10), 1);
         let mut got_rope = Vec::with_capacity(rope_cs.len());
         for slot in [
             LFM3_PREFILL_SLOT_ROPE_PKT_0A,
@@ -1969,6 +2422,268 @@ mod tests {
             got_rope.extend_from_slice(&pkt);
         }
         assert_eq!(got_rope, rope_cs);
+
+        // Verify decode BO layout (`init_lfm3_bo_y_norms`, `write_lfm3_step_params`, `write_lfm3_ext_params`).
+        let mut dec_bo_y = vec![0u8; LFM3_DEC_ACT_BYTES];
+        init_lfm3_bo_y_norms(
+            &mut dec_bo_y,
+            LFM3_DEC_SLOT_NORM_0,
+            LFM3_DEC_SLOT_NORM_1,
+            Some(LFM3_DEC_SLOT_FIN_NORM),
+            &attn_norm,
+            &post_attn_norm,
+            &ffn_norm,
+            &post_ffn_norm,
+            Some(&q_norm),
+            Some(&k_norm),
+        );
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0, &mut got);
+        assert_eq!(got, attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + LFM3_H, &mut got);
+        assert_eq!(got, post_attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_1, &mut got);
+        assert_eq!(got, ffn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_1 + LFM3_H, &mut got);
+        assert_eq!(got, post_ffn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_FIN_NORM + LFM3_H, &mut got);
+        assert_eq!(got, post_attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + 4240, &mut got_qk);
+        assert_eq!(got_qk, q_norm);
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + 4368, &mut got_qk);
+        assert_eq!(got_qk, k_norm);
+        let dec_p_off = (LFM3_DEC_SLOT_NORM_0 + 4096) * 4;
+        dec_bo_y[dec_p_off..dec_p_off + 11 * 4].fill(0xAA);
+        let dec_rope: Vec<f32> = (0..LFM3_HEAD_DIM).map(|i| (i as f32) * 0.5).collect();
+        write_lfm3_step_params(
+            &mut dec_bo_y,
+            LFM3_DEC_SLOT_NORM_0,
+            Some(LFM3_DEC_SLOT_NORM_0 + 4112),
+            16385,
+            1,
+            16,
+            16385,
+            true,
+            0,
+            2,
+            1e-6,
+            Some(&dec_rope),
+        );
+        write_lfm3_ext_params(&mut dec_bo_y, LFM3_DEC_SLOT_NORM_0, 512, true, false);
+        let read_dec_i32 = |idx: usize| {
+            let off = dec_p_off + idx * 4;
+            i32::from_le_bytes(dec_bo_y[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_dec_i32(0), 16385);
+        assert_eq!(read_dec_i32(1), 1);
+        assert_eq!(read_dec_i32(2), 16);
+        assert_eq!(read_dec_i32(3), 16385);
+        assert_eq!(read_dec_i32(4), 1);
+        assert_eq!(read_dec_i32(5), 0);
+        assert_eq!(read_dec_i32(6), 2);
+        assert_eq!(read_dec_i32(7) as u32, 1e-6f32.to_bits());
+        assert_eq!(read_dec_i32(8), 512);
+        assert_eq!(read_dec_i32(9), 1);
+        assert_eq!(read_dec_i32(10), 0);
+        let mut got_dec_rope = vec![0.0f32; LFM3_HEAD_DIM];
+        read_le_f32_slice(&dec_bo_y, LFM3_DEC_SLOT_NORM_0 + 4112, &mut got_dec_rope);
+        assert_eq!(got_dec_rope, dec_rope);
+    }
+
+    #[test]
+    fn lfm2_buckets_and_bo_y_helpers_match_kernel_layout() {
+        for (table, expected_last) in [
+            (&Q4LAYER_LFM2_KV_BUCKETS[..], 512),
+            (&Q4LAYER_LFM2_FA_FIN_BUCKETS[..], 512),
+            (&Q4PREFILL_LFM2_ATTN_BUCKETS[..], 1023),
+            (&Q4PREFILL_LFM2_FA_FIN_BUCKETS[..], 1023),
+        ] {
+            for &(_, inst_bytes) in table {
+                assert!(!inst_words(inst_bytes).is_empty());
+            }
+            for w in table.windows(2) {
+                assert!(w[0].0 < w[1].0);
+            }
+            assert_eq!(table.first().map(|&(c, _)| c), Some(0));
+            assert_eq!(table.last().map(|&(c, _)| c), Some(expected_last));
+        }
+        assert!(!inst_words(Q4LAYER_LFM2_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM2_PHASE_A_INSTS).is_empty());
+        assert!(!inst_words(Q4LAYER_LFM2_FA_PART_C512_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_EXT_CONV_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_PHASE_A_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_FA_PART0_C1024_INSTS).is_empty());
+        assert!(!inst_words(Q4PREFILL_LFM2_FA_PART_C1024_INSTS).is_empty());
+
+        let caps: Vec<usize> = Q4LAYER_LFM2_KV_BUCKETS.iter().map(|&(c, _)| c).collect();
+        assert_eq!(try_select_lfm3_kv_bucket(&caps, 0), Ok((0, 0)));
+        assert_eq!(try_select_lfm3_kv_bucket(&caps, 255), Ok((18, 255)));
+        assert_eq!(try_select_lfm3_kv_bucket(&caps, 512), Ok((24, 512)));
+        assert!(try_select_lfm3_kv_bucket(&caps, 513).is_err());
+
+        let mut dec_bo_y = vec![0u8; LFM2_DEC_ACT_BYTES];
+        let attn_norm = vec![0.5f32; LFM2_H];
+        let ffn_norm = vec![-0.25f32; LFM2_H];
+        let q_norm = vec![1.5f32; LFM2_HEAD_DIM];
+        let k_norm = vec![-1.5f32; LFM2_HEAD_DIM];
+        init_lfm2_bo_y_norms(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_NORM_0,
+            LFM2_DEC_SLOT_NORM_1,
+            &attn_norm,
+            &ffn_norm,
+            Some(&q_norm),
+            Some(&k_norm),
+        );
+        let mut got = vec![0.0f32; LFM2_H];
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0, &mut got);
+        assert_eq!(got, attn_norm);
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_1, &mut got);
+        assert_eq!(got, ffn_norm);
+        let mut got_qk = vec![0.0f32; LFM2_HEAD_DIM];
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0 + 4240, &mut got_qk);
+        assert_eq!(got_qk, q_norm);
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0 + 4368, &mut got_qk);
+        assert_eq!(got_qk, k_norm);
+        let dec_rope: Vec<f32> = (0..LFM2_HEAD_DIM).map(|i| (i as f32) * 0.25).collect();
+        // Poison param slots before writing to ensure 0-reset fields overwrite prior garbage.
+        for slot in [
+            LFM2_DEC_SLOT_NORM_0 + 4096,
+            LFM2_DEC_SLOT_NORM_1 + 4096,
+            LFM2_DEC_SLOT_ROPE_PKT + 4096,
+        ] {
+            let off = slot * 4;
+            dec_bo_y[off..off + 11 * 4].fill(0xAA);
+        }
+        write_lfm3_step_params(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_NORM_0,
+            Some(LFM2_DEC_SLOT_NORM_0 + 4112),
+            8193,
+            1,
+            0,
+            8191,
+            true,
+            0,
+            2,
+            1e-5,
+            Some(&dec_rope),
+        );
+        write_lfm3_params_at(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_NORM_1 + 4096,
+            8193,
+            1,
+            LFM2_MAX_KV_CHUNKS,
+            8191,
+            true,
+            0,
+            3,
+            1e-5,
+            256,
+            true,
+            true,
+        );
+        write_lfm3_params_at(
+            &mut dec_bo_y,
+            LFM2_DEC_SLOT_ROPE_PKT + 4096,
+            8193,
+            1,
+            1,
+            8191,
+            true,
+            0,
+            4,
+            1e-5,
+            256,
+            true,
+            false,
+        );
+        let read_lfm2_dec_i32 = |slot_params: usize, idx: usize| {
+            let off = (slot_params + idx) * 4;
+            i32::from_le_bytes(dec_bo_y[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 0), 8193);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 3), 8191);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 6), 2);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_0 + 4096, 10), 0);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_1 + 4096, 8), 256);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_1 + 4096, 9), 1);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_NORM_1 + 4096, 10), 1);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_ROPE_PKT + 4096, 6), 4);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_ROPE_PKT + 4096, 9), 1);
+        assert_eq!(read_lfm2_dec_i32(LFM2_DEC_SLOT_ROPE_PKT + 4096, 10), 0);
+        let mut got_dec_rope = vec![0.0f32; LFM2_HEAD_DIM];
+        read_le_f32_slice(&dec_bo_y, LFM2_DEC_SLOT_NORM_0 + 4112, &mut got_dec_rope);
+        assert_eq!(got_dec_rope, dec_rope);
+
+        let mut pre_bo_y = vec![0u8; LFM2_PREFILL_ACT_BYTES];
+        init_lfm2_prefill_bo_y_norms(
+            &mut pre_bo_y,
+            &attn_norm,
+            &ffn_norm,
+            Some(&q_norm),
+            Some(&k_norm),
+        );
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_NORM_0, &mut got);
+        assert_eq!(got, attn_norm);
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_NORM_1, &mut got);
+        assert_eq!(got, ffn_norm);
+        for slot in [LFM2_PREFILL_SLOT_ROPE_PKT_0, LFM2_PREFILL_SLOT_ROPE_PKT_1] {
+            read_le_f32_slice(&pre_bo_y, slot + 2048, &mut got_qk);
+            assert_eq!(got_qk, q_norm);
+            read_le_f32_slice(&pre_bo_y, slot + 2112, &mut got_qk);
+            assert_eq!(got_qk, k_norm);
+        }
+        let pre_rope: Vec<f32> = (0..(LFM2_PREFILL_CHUNK_T * LFM2_HEAD_DIM))
+            .map(|i| (i as f32) * 0.0625)
+            .collect();
+        let pre_p_off = (LFM2_PREFILL_SLOT_NORM_0 + 2048) * 4;
+        pre_bo_y[pre_p_off..pre_p_off + 11 * 4].fill(0xAA);
+        write_lfm2_prefill_step_params(
+            &mut pre_bo_y,
+            128,
+            40,
+            8,
+            96,
+            true,
+            0,
+            4,
+            1e-5,
+            Some(&pre_rope),
+        );
+        let read_lfm2_pre_i32 = |buf: &[u8], idx: usize| {
+            let off = pre_p_off + idx * 4;
+            i32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+        };
+        let read_lfm2_pre_f32 = |buf: &[u8], idx: usize| {
+            let off = pre_p_off + idx * 4;
+            f32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 0), 128);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 1), 40);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 2), 8);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 3), 96);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 4), 1);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 5), 0);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 6), 4);
+        assert!((read_lfm2_pre_f32(&pre_bo_y, 7) - 1e-5).abs() < 1e-12);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 8), 0);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 9), 0);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 10), 0);
+        write_lfm2_prefill_ext_params(&mut pre_bo_y, 256, true, true);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 0), 128);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 1), 40);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 6), 4);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 8), 256);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 9), 1);
+        assert_eq!(read_lfm2_pre_i32(&pre_bo_y, 10), 1);
+        let half = LFM2_KV_CHUNK_T * LFM2_HEAD_DIM;
+        let mut sub_rope = vec![0.0f32; half];
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_ROPE_PKT_0, &mut sub_rope);
+        assert_eq!(sub_rope, &pre_rope[..half]);
+        read_le_f32_slice(&pre_bo_y, LFM2_PREFILL_SLOT_ROPE_PKT_1, &mut sub_rope);
+        assert_eq!(sub_rope, &pre_rope[half..]);
     }
 
     #[test]
@@ -2112,7 +2827,7 @@ mod tests {
             x / (1.0 + (-x).exp())
         }
 
-        fn rel_rms(got: &[f32], ref_f64: &[f64], label: &str) {
+        fn rel_rms_within(got: &[f32], ref_f64: &[f64], label: &str, max_rel: f64) {
             assert_eq!(got.len(), ref_f64.len());
             let mut err2 = 0.0f64;
             let mut ref2 = 0.0f64;
@@ -2129,7 +2844,14 @@ mod tests {
             let rel = (err2 / ref2.max(1e-12)).sqrt();
             println!("{label}: nans={nans} rel_rms={rel:.5}");
             assert_eq!(nans, 0, "{label} produced NaN/Inf");
-            assert!(rel < 0.03, "{label} rel_rms too high: {rel:.5}");
+            assert!(
+                rel < max_rel,
+                "{label} rel_rms too high: {rel:.5} (limit {max_rel:.3})"
+            );
+        }
+
+        fn rel_rms(got: &[f32], ref_f64: &[f64], label: &str) {
+            rel_rms_within(got, ref_f64, label, 0.03);
         }
 
         let dev = XdnaDevice::open(0).expect("open NPU");
@@ -2301,6 +3023,10 @@ mod tests {
 
         // --- Test 2: q4prefill_lfm3_attn Mode 1 (c0 & c1 SWA) + Mode 2/3 (bidir 2 chunks = 64 tokens) ---
         if run_attn {
+            // `q4prefill_lfm3` attention uses bf16/bfp16ebs8 intermediates (`exp2`, RoPE, Q8,
+            // `gemm_half_step`), giving ~0.038 empirical margin on synthetic inputs vs >=0.149
+            // real-fault floor.
+            const ATTN_MAX_REL_RMS: f64 = 0.045;
             let k_m1_c0 = dev
                 .load_kernel(
                     Q4PREFILL_LFM3_XCLBIN,
@@ -2531,7 +3257,7 @@ mod tests {
                     t + 1,
                 ));
             }
-            rel_rms(&yn0, &cpu0, "attn_m1_c0_swa16");
+            rel_rms_within(&yn0, &cpu0, "attn_m1_c0_swa16", ATTN_MAX_REL_RMS);
 
             // 2b: Mode 1 c1 (pos0=27, n_past=27 past tokens in chunk 0 of bo_kv)
             // Copy kvo chunk from chunk 0 (only 27 valid past tokens needed) by creating 27 past tokens from k0/v0
@@ -2595,7 +3321,7 @@ mod tests {
                     gpos + 1,
                 ));
             }
-            rel_rms(&yn1, &cpu1, "attn_m1_c1_swa32");
+            rel_rms_within(&yn1, &cpu1, "attn_m1_c1_swa32", ATTN_MAX_REL_RMS);
 
             // 2c: Bidir Phase A (Mode 2) + Phase B (Mode 3, 2 chunks = 50 tokens -> kv_ch=1 per chunk? Wait chunk1 needs kv_ch=2! Test 32 tokens cleanly with c1 or test cross-chunk with 2 chunks? Note with bidir_b_c1 we can test 32 tokens attending globally to all 32 tokens!)
             //Wait: Mode 3 with kv_ch=1 reads chunk 0 (32 tokens) from bo_kv and ignores cur_kv! Let's run Phase A on 29 tokens -> copy kvo -> bo_kv[chunk 0] -> save q_bf16 & gate -> Phase B (kv_ch=1, n_past=29, is_causal=false) -> verify bidirectional attention on all 29 tokens!
@@ -2655,7 +3381,7 @@ mod tests {
                 ));
             }
             let _ = (SLOT_Q_BF16, SLOT_ATTN_GATE, bf16::ZERO);
-            rel_rms(&yn_b, &cpu_b, "attn_bidir_global");
+            rel_rms_within(&yn_b, &cpu_b, "attn_bidir_global", ATTN_MAX_REL_RMS);
         }
     }
 
@@ -2679,7 +3405,6 @@ mod tests {
         const W_TOTAL: usize = 1992 * W_ELEMS;
         const SLOT_NORM_0: usize = 41472;
         const SLOT_NORM_1: usize = 46080;
-        const SLOT_ROPE_PKT: usize = 50688;
         const ACT_TOTAL: usize = LFM3_DEC_ACT_BYTES / 4;
         const KV_TOTAL: usize = 256 * N_KV * W_ELEMS;
         const KVO_TOTAL: usize = 8 * W_ELEMS;
@@ -2878,7 +3603,7 @@ mod tests {
             bo_kvo.sync_to_device().unwrap();
 
             let run = k_conv
-                .create_run(&[&bo_w, &bo_y, &bo_yn, &bo_kv, &bo_kvo])
+                .create_run(&[&bo_w, &bo_y, &bo_yn, &bo_kv, &bo_kvo, &bo_kv])
                 .unwrap();
             run.start().unwrap();
             run.wait(15_000).unwrap();
@@ -3091,15 +3816,15 @@ mod tests {
                 write_le_i32(yb, SLOT_NORM_0 + 4103, eps.to_bits() as i32);
                 write_le_f32_slice(yb, SLOT_NORM_1, &n1);
                 write_le_f32_slice(yb, SLOT_NORM_1 + H, &p1);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT, &r0);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4096, &qnw);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4224, &knw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4112, &r0);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4240, &qnw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4368, &knw);
             }
             bo_y.sync_to_device().unwrap();
             bo_kv.as_mut_slice().fill(0);
             bo_kv.sync_to_device().unwrap();
             let run0 = k_c0
-                .create_run(&[&bo_w, &bo_y, &bo_yn, &bo_kv, &bo_kvo])
+                .create_run(&[&bo_w, &bo_y, &bo_yn, &bo_kv, &bo_kvo, &bo_kv])
                 .unwrap();
             run0.start().unwrap();
             run0.wait(0).unwrap();
@@ -3179,9 +3904,9 @@ mod tests {
                 write_le_i32(yb, SLOT_NORM_0 + 4103, eps.to_bits() as i32);
                 write_le_f32_slice(yb, SLOT_NORM_1, &n1);
                 write_le_f32_slice(yb, SLOT_NORM_1 + H, &p1);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT, &r1);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4096, &qnw);
-                write_le_f32_slice(yb, SLOT_ROPE_PKT + 4224, &knw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4112, &r1);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4240, &qnw);
+                write_le_f32_slice(yb, SLOT_NORM_0 + 4368, &knw);
             }
             bo_y.sync_to_device().unwrap();
             bo_yn.as_mut_slice().fill(0);
@@ -3189,7 +3914,7 @@ mod tests {
             bo_kvo.as_mut_slice().fill(0);
             bo_kvo.sync_to_device().unwrap();
             let run1 = k_c1
-                .create_run(&[&bo_w, &bo_y, &bo_yn, &bo_kv, &bo_kvo])
+                .create_run(&[&bo_w, &bo_y, &bo_yn, &bo_kv, &bo_kvo, &bo_kv])
                 .unwrap();
             run1.start().unwrap();
             run1.wait(0).unwrap();

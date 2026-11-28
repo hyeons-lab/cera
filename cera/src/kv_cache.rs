@@ -290,6 +290,11 @@ impl ConvHistory {
         }
     }
 
+    #[cfg(feature = "xdna")]
+    pub(crate) fn buf_len(&self) -> usize {
+        self.buf_len
+    }
+
     /// Record a snapshot of `buffer` at sequence position `pos`.
     /// Zero heap allocation: copies into the pre-allocated flat storage.
     pub fn push(&mut self, pos: usize, buffer: &[f32]) {

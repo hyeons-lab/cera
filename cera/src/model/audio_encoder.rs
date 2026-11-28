@@ -154,6 +154,7 @@ pub struct AudioEncoderConfig {
 /// in_channels, kernel_size]` for normal conv or `[out_channels, 1,
 /// kernel_size]` for depthwise — interpretation is the forward
 /// pass's job, not the loader's).
+#[derive(Clone)]
 pub struct ConvLayerWeights {
     pub name: String,
     pub weight: Vec<f32>,
@@ -635,7 +636,10 @@ fn check_stem_layer_extent(layer: &ConvLayerWeights) -> Result<()> {
 /// `[kw, kh, in_per_group, out]`. The frequency axis is convolved by `kh` and the time axis
 /// by `kw` (`conv_stem_forward_lfm3a`), so this follows `kh`; the 5-layer stem alternates
 /// full and depthwise convolutions, the 3-layer one is stride 2 throughout.
-fn lfm3a_stem_geometry(layer_shapes: &[&[usize]], n_mel_bins: usize) -> Result<(usize, usize)> {
+pub(crate) fn lfm3a_stem_geometry(
+    layer_shapes: &[&[usize]],
+    n_mel_bins: usize,
+) -> Result<(usize, usize)> {
     stem_geometry(layer_shapes, n_mel_bins, 1)
 }
 
@@ -2523,15 +2527,14 @@ pub fn audio_encoder_forward(
 ///
 /// Followed by `(channel, time, freq) -> (time, channel * freq)` permutation and linear
 /// projection (`a.pre_encode.out` or `a.conv1d.3`) to `n_embd`.
-pub fn conv_stem_forward_lfm3a(
+/// Run only the 2D convolutional layers of the LFM3A stem and flatten the output to
+/// `[t_out, plane]` (`(time, channel * freq)`), returning `(flat_seq, t_out, plane)`.
+pub(crate) fn conv_stem_lfm3a_features(
     mel: &[f32],
     n_frames: usize,
-    weights: &ConvStemWeights,
-    config: &AudioEncoderConfig,
-) -> (Vec<f32>, usize) {
-    let n_mel_bins = config.n_mel_bins;
-    let n_embd = config.n_embd;
-
+    layers: &[ConvLayerWeights],
+    n_mel_bins: usize,
+) -> (Vec<f32>, usize, usize) {
     assert_eq!(
         mel.len(),
         n_frames * n_mel_bins,
@@ -2540,14 +2543,14 @@ pub fn conv_stem_forward_lfm3a(
         n_frames,
         n_mel_bins,
     );
-    let n_stem = weights.layers.len();
+    let n_stem = layers.len();
     assert!(
         n_stem == 5 || n_stem == 3,
         "conv_stem_forward_lfm3a: expected 5 or 3 stem conv layers; got {n_stem}",
     );
 
     if n_frames == 0 {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     }
 
     // Transpose time-major `[n_frames, n_mel_bins]` into `[n_mel_bins, n_frames]`
@@ -2565,7 +2568,7 @@ pub fn conv_stem_forward_lfm3a(
     let mut cur_h: usize = n_mel_bins;
     let mut cur_w: usize = n_frames;
 
-    for (pos, layer) in weights.layers.iter().enumerate() {
+    for (pos, layer) in layers.iter().enumerate() {
         assert_eq!(
             layer.shape.len(),
             4,
@@ -2651,10 +2654,6 @@ pub fn conv_stem_forward_lfm3a(
     let f_out = cur_h;
     let t_out = cur_w;
     let plane = cur_ch * f_out;
-    assert_eq!(weights.pre_encode_out_w.cols, plane);
-    assert_eq!(weights.pre_encode_out_w.rows, n_embd);
-    assert_eq!(weights.pre_encode_out_b.len(), n_embd);
-
     let mut flat_seq = vec![0.0f32; t_out * plane];
     for ti in 0..t_out {
         let dst_row = &mut flat_seq[ti * plane..(ti + 1) * plane];
@@ -2662,6 +2661,25 @@ pub fn conv_stem_forward_lfm3a(
             *dst = cur_data[k * t_out + ti];
         }
     }
+    (flat_seq, t_out, plane)
+}
+
+pub fn conv_stem_forward_lfm3a(
+    mel: &[f32],
+    n_frames: usize,
+    weights: &ConvStemWeights,
+    config: &AudioEncoderConfig,
+) -> (Vec<f32>, usize) {
+    let n_embd = config.n_embd;
+    let (flat_seq, t_out, plane) =
+        conv_stem_lfm3a_features(mel, n_frames, &weights.layers, config.n_mel_bins);
+    if t_out == 0 {
+        return (Vec::new(), 0);
+    }
+    assert_eq!(weights.pre_encode_out_w.cols, plane);
+    assert_eq!(weights.pre_encode_out_w.rows, n_embd);
+    assert_eq!(weights.pre_encode_out_b.len(), n_embd);
+
     let mut encoder_in = vec![0.0f32; t_out * n_embd];
     weights
         .pre_encode_out_w
@@ -2679,7 +2697,7 @@ pub fn conv_stem_forward_lfm3a(
 }
 
 /// Apply Neox-style rotary position embedding in place to a single head vector of length `d_head`.
-fn apply_rope_neox_head(head: &mut [f32], pos: usize, rope_theta: f32) {
+pub(crate) fn apply_rope_neox_head(head: &mut [f32], pos: usize, rope_theta: f32) {
     let d_head = head.len();
     let half = d_head / 2;
     if half == 0 {

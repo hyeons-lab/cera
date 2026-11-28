@@ -110,9 +110,10 @@ or you can pin one:
 | **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature; dynamic cpuset awareness |
 | **Native Metal** | `metal` | macOS, iOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
 | **Qualcomm Hexagon NPU** | `hexagon` | Android, Linux (aarch64) | FastRPC Unsigned Process Domain, shared DMA memory, repacked 32x32 Q4_0/Q8_0 matrix kernels on Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite |
+| **AMD XDNA NPU** | `npu` | Windows (opt-in `xdna` feature) | XRT runtime shim + fused mlir-aie / IRON kernels on Ryzen AI Strix Halo (XDNA2) for Llama-3.2-1B, LFM2/LFM2.5-1.2B, and LFM3 |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise. A routed-expert model too large for the DSP's mappable memory (LFM2.5-8B-A1B) skips the NPU under `auto`, since paging it is slower than the CPU; set `CERA_HEXAGON_PAGE_EXPERTS=1`, or ask for `--device hexagon`, to page it.
+`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise (AMD XDNA is opt-in via `--device npu`). A routed-expert model too large for the DSP's mappable memory (LFM2.5-8B-A1B) skips the NPU under `auto`, since paging it is slower than the CPU; set `CERA_HEXAGON_PAGE_EXPERTS=1`, or ask for `--device hexagon`, to page it.
 
 ### Qualcomm Hexagon NPU backend
 
@@ -128,6 +129,14 @@ Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Sna
   - **Multimodal Vision (ViT)**: Dispatches all 24 Vision Transformer blocks in a single batched submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector execution.
   - **Whisper Speech Recognition**: 64-token chunked Conv1D and LayerNorm dispatches adhering to Snapdragon 8 Elite's 8 MB physical VTCM ceiling, paired with FlashAttnExt autoregressive decode.
   - **Audio Synthesis & Vocoder**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D).
+
+
+### AMD XDNA NPU backend
+
+On Windows with AMD Ryzen AI Strix Halo (XDNA2 / `aie2p`), building with `--features xdna` enables the native XRT shim (`cera/src/backend/xdna/`) and compiled `mlir-aie` / IRON kernels under `--device npu` for **Llama-3.2-1B**, **LFM2 / LFM2.5-1.2B**, **LFM3-1.7B**, and bidirectional **d1-2B**. See [AMD XDNA NPU Results](docs/XDNA_PHASE0_RESULTS.md) for architecture notes, hardware verification gates, package power measurements, and full 1K–128K benchmark comparisons.
+
+- **Single-xclbin fused decode (`q4layer`, `q4layer_lfm2`, `q4layer_lfm3`)**: Chains RMSNorm, core-side Q8_0 activation quantization, RoPE, ShortConv, block online-softmax / paged >8K/32K GQA attention, and SwiGLU FFN across all layers on the AIE2P array without hardware-context switching, using `xrt::runlist` chaining and overlapped host KV/Conv maintenance.
+- **Chunked & >8K/32K paged `B=64` prefill (`q4prefill_lfm2`, `q4prefill_lfm2_ext`, `q4prefill_lfm3`)**: Batches prompt processing at 64 tokens per NPU call with `CHUNK_K=1024`, switching seamlessly into fused paged online-softmax attention past 8K/32K so prefill scales through 125K (`LFM2.5-1.2B`) and 128K (`LFM3-1.7B`).
 
 
 ### Quantization
@@ -624,6 +633,8 @@ optimal on any one. The knobs below override them.
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. Clamped to the number of pinnable cores on hosts that have any, with a warning: past that the surplus workers run unpinned and contend with pinned ones that are spin-waiting (measured 35x slower on a Tensor G4). Not clamped where nothing gets pinned anyway, i.e. hosts with no affinity or `CERA_PIN=0`. |
 | `CERA_PREFILL_THREADS=<n>` | Prefill pool width on its own, without moving decode. May reach past the performance cores up to every pinnable core, for sweeping a part where widening might pay; it does not on the parts measured so far. Subject to the same clamp rule as `CERA_THREADS`, and to `CERA_THREADS` itself, which lowers the ceiling it is clamped against. |
 | `CERA_PIN=0` | Disables worker affinity pinning, for host apps that manage thread placement themselves. Also lifts the clamps above, since with nothing pinned there is no oversubscription cliff to guard against. |
+| `CERA_SPIN=<n>` | Spin iterations before an idle worker parks (default `100000`, or `2000` on non-Windows prefill pools). On Windows while a hybrid XDNA decode model (`LFM2` or causal `LFM3`) is live and `CERA_SPIN` is unset, the prefill pool temporarily lowers this to `20000` (~30 us) so LM-head workers park between NPU token steps and avoid socket PPT contention. |
+| `CERA_NPU_HEAD_THREADS=<n>` | Worker count for the CPU `Q6_K` LM-head projection during hybrid AMD XDNA decode (`LFM2`/`LFM3`, default `(cores * 3 / 4).clamp(4, 12)` when `cores > 8`, else `cores.max(1)`). |
 | `CERA_POOL_STATS=1` | Annotates each `cera bench` run with pool fan-out health: how many dispatches wanted more than one worker, and how many of those silently ran serially because the pool was busy. The counts are exact; the work percentage mixes units across dispatch kinds, so read the counts. |
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade, useful for A/B-ing a kernel path. |
 | `CERA_ATTN_PREFETCH=<n>` | Positions ahead to prefetch KV rows in CPU f16 decode attention on aarch64 (default 16; 0, off, false disables; clamped to 1024). |
@@ -785,6 +796,17 @@ performance cores (Tensor G5, LFM2 Q4_0, warm: CPU decode matches or beats
 llama.cpp). Thread placement and count auto-detect per device; the `CERA_*`
 override knobs are documented under
 **[*CPU threading & tuning*](cera/README.md#cpu-threading--tuning)**.
+
+On Windows with **AMD Ryzen AI Strix Halo (XDNA2 / `aie2p`, Ryzen AI Max+ 395)**, `--device npu` (`--features xdna`) beats **FastFlowLM v1.0.14** across every tested context length (`1K`–`128K`) on both `LFM2.5-1.2B` and `LFM3-1.7B` prefill and decode:
+
+| Model & engine | `1K` prefill / dec | `8K` prefill / dec | `32K` prefill / dec | `64K` prefill / dec | `128K` (or `125K`) prefill / dec |
+|---|---:|---:|---:|---:|---:|
+| **`LFM2.5-1.2B` Cera (`--device npu`)** | **2640** / **56.1** tok/s | **2669** / **59.8** tok/s | **1734** / **37.6** tok/s | **1227** / **25.3** tok/s | **813** / **20.1** tok/s (`125K`) |
+| `LFM2.5-1.2B` FastFlowLM `v1.0.14` | 1356 / 44.6 tok/s | 1826 / 40.4 tok/s | 1364 / 30.5 tok/s | 961 / 22.2 tok/s | *(errors: `iter size too big`)* |
+| **`LFM3-1.7B` Cera (`--device npu`)** | **1437** / **36.9** tok/s | **1441** / **35.7** tok/s | **1052** / **22.7** tok/s | **840** / **16.2** tok/s | **600** / **10.3** tok/s (`128K`) |
+| `LFM3-1.7B` FastFlowLM `v1.0.14` | 351 / 12.5 tok/s | 404 / 11.7 tok/s | 367 / 9.9 tok/s | 354 / 8.2 tok/s | 318 / 6.2 tok/s (`128K`) |
+
+Full `1K`–`128K` tables, environment details, power/energy telemetry, and hardware parity gate results are in [`docs/XDNA_PHASE0_RESULTS.md`](docs/XDNA_PHASE0_RESULTS.md#10-long-context-lfm25--lfm3-npu-prefill-and-fastflowlm-v1014-comparison-2026-11-26).
 
 Detailed methodology, per-model tables (decode + prefill vs llama.cpp), the
 Accelerate/AMX BLAS results, and the backend optimization notes live in

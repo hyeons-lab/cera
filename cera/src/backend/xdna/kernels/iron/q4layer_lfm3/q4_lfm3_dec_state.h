@@ -27,19 +27,29 @@ struct DecState {
   alignas(64) uint8_t xq_out[64];
   alignas(64) bfloat16 xd_out[8];
   float sum_sq;
-  alignas(64) float conv_wt[7][64];
-  alignas(64) float conv_state[6][64];
-  alignas(64) float conv_bx[64];
-  alignas(64) float conv_c[64];
-  alignas(64) bfloat16 q_bf16[HEAD_DIM];
-  alignas(64) float rope_cs[HEAD_DIM];
-  alignas(64) float q_norm_w[HEAD_DIM];
-  alignas(64) float k_norm_w[HEAD_DIM];
-  alignas(64) float scores[KV_CHUNK_T];
-  alignas(64) float o_acc[HEAD_DIM];
-  float row_m;
-  float row_l;
-  float gate_sig;
+  union {
+    alignas(64) float xq_buf[4 * X_ELEMS];
+    struct {
+      alignas(64) float _xq0_ffn[X_ELEMS];
+      alignas(64) float ffn_gates_hi[3][4][16];
+    };
+    struct {
+      alignas(64) float _xq0[X_ELEMS];
+      alignas(64) float conv_wt[7][64];
+      alignas(64) float conv_state[6][64];
+      alignas(64) float conv_bx[64];
+      alignas(64) float conv_c[64];
+      alignas(64) bfloat16 q_bf16[HEAD_DIM];
+      alignas(64) float rope_cs[HEAD_DIM];
+      alignas(64) float q_norm_w[HEAD_DIM];
+      alignas(64) float k_norm_w[HEAD_DIM];
+      alignas(64) float scores[KV_CHUNK_T];
+      alignas(64) float o_acc[HEAD_DIM];
+      float row_m;
+      float row_l;
+      float gate_sig;
+    };
+  };
 };
 
 extern "C" {
@@ -50,6 +60,23 @@ extern const int32_t dec_lane_idx[16];
 aie::vector<float, 16> dec_fmul_16(aie::vector<float, 16> a, aie::vector<float, 16> b);
 aie::vector<float, 16> dec_inv_16(aie::vector<float, 16> v);
 aie::vector<float, 16> dec_exp2f_16(aie::vector<float, 16> x);
+void dec_scale_o(float alpha);
+void dec_reset_fa_state();
+
+static inline __attribute__((always_inline)) aie::vector<float, 16> fast_fmul2_16(
+    aie::vector<float, 16> a,
+    aie::vector<float, 16> b) {
+  aie::vector<bfloat16, 16> ah = aie::accum<accfloat, 16>(a).template to_vector<bfloat16>();
+  aie::vector<bfloat16, 16> bh = aie::accum<accfloat, 16>(b).template to_vector<bfloat16>();
+  aie::vector<bfloat16, 16> al = aie::accum<accfloat, 16>(
+      aie::sub(a, aie::accum<accfloat, 16>(ah).template to_vector<float>())).template to_vector<bfloat16>();
+  aie::vector<bfloat16, 16> bl = aie::accum<accfloat, 16>(
+      aie::sub(b, aie::accum<accfloat, 16>(bh).template to_vector<float>())).template to_vector<bfloat16>();
+  aie::accum<accfloat, 16> acc = aie::mul<accfloat>(ah, bh);
+  acc = aie::mac(acc, ah, bl);
+  acc = aie::mac(acc, al, bh);
+  return acc.template to_vector<float>();
+}
 
 static inline aie::vector<bfloat16, 16> dec_f32_to_bf16_16(aie::vector<float, 16> v) {
   aie::accum<accfloat, 16> a;

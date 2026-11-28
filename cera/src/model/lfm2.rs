@@ -14,7 +14,7 @@ use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 // directly too, but they now ask `transformer::batched_gemm_supports`, which takes
 // the dtype as a parameter — so on x86_64 + `blas` this import became unused. Gate
 // it to where it is actually referenced.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "xdna"))]
 use crate::tensor::DType;
 use crate::time::{Duration, Instant};
 use crate::turboquant;
@@ -553,6 +553,47 @@ const GPU_CONV_KERNEL_MAX: usize = 4;
 /// the loops).
 pub(crate) const CPU_CONV_KERNEL_MAX: usize = 16;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RepackScope {
+    None,
+    All,
+    #[cfg_attr(not(feature = "xdna"), allow(dead_code))]
+    FfnOnly,
+}
+
+impl RepackScope {
+    #[inline]
+    fn from_bool(repack: bool) -> Self {
+        if repack { Self::All } else { Self::None }
+    }
+}
+
+/// Reusable scratch buffers for grouped MoE prefill called by the XDNA hybrid
+/// LFM2-MoE path (`n <= 64`).
+#[cfg(feature = "xdna")]
+#[derive(Default)]
+pub(crate) struct XdnaMoePrefillScratch {
+    router_f32: Vec<f32>,
+    router_logits: Vec<f32>,
+    probs: Vec<f32>,
+    tok_sel: Vec<(usize, f32)>,
+    buckets: Vec<Vec<(usize, f32)>>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    gather_scales: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    gather_quants: Vec<i8>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    exp_gate: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    exp_up: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    exp_down: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    down_scales: Vec<f32>,
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+    down_quants: Vec<i8>,
+}
+
 impl LfmModel {
     /// Record a node's sum for the llama.cpp parity oracle, as llama.cpp's
     /// `llama-eval-callback` names it (`<name>-<layer>`). A no-op unless a dump
@@ -980,8 +1021,38 @@ impl LfmModel {
         gguf: &GgufFile,
         config: &ModelConfig,
         repack: bool,
+        load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
+    ) -> Result<Vec<LayerWeightRefs>> {
+        Self::resolve_all_layer_refs_with_scope(
+            gguf,
+            config,
+            RepackScope::from_bool(repack),
+            load_f32,
+        )
+    }
+
+    fn resolve_all_layer_refs_with_scope(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        scope: RepackScope,
         mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
     ) -> Result<Vec<LayerWeightRefs>> {
+        let repack_op = matches!(scope, RepackScope::All);
+        let repack_ffn = matches!(scope, RepackScope::All | RepackScope::FfnOnly);
+        let repack_experts = if matches!(scope, RepackScope::FfnOnly) {
+            config.moe.as_ref().is_some_and(|m| {
+                let n_moe_layers = m.is_moe_layer.iter().filter(|&&b| b).count();
+                let elems = n_moe_layers as u64
+                    * m.n_expert as u64
+                    * 3u64
+                    * m.expert_ff_len as u64
+                    * config.hidden_size as u64;
+                let est = (elems * 9) / 16 + (4u64 << 30);
+                crate::sysmem::fits_in_available_memory(est, 2u64 << 30).unwrap_or(true)
+            })
+        } else {
+            false
+        };
         let mut layer_refs = Vec::with_capacity(config.n_layers);
         for (i, bt) in config.block_types.iter().enumerate() {
             let is_moe = config
@@ -995,9 +1066,30 @@ impl LfmModel {
                 let n_expert = moe_cfg.n_expert;
                 let expert_refs = |suffix: &str| -> Result<Vec<WeightRef>> {
                     let name = format!("blk.{i}.{suffix}");
-                    (0..n_expert)
+                    let raw = (0..n_expert)
                         .map(|e| Self::resolve_expert_weight(gguf, &name, e))
-                        .collect()
+                        .collect::<Result<Vec<_>>>()?;
+                    if !repack_experts {
+                        return Ok(raw);
+                    }
+                    let slots = Mutex::new(vec![None; n_expert]);
+                    cpu::par_range(n_expert, 4, |start, count| {
+                        let local: Vec<WeightRef> = raw[start..start + count]
+                            .iter()
+                            .cloned()
+                            .map(|w| w.with_repack_if(gguf, true))
+                            .collect();
+                        let mut g = slots.lock().unwrap_or_else(|e| e.into_inner());
+                        for (offset, w) in local.into_iter().enumerate() {
+                            g[start + offset] = Some(w);
+                        }
+                    });
+                    Ok(slots
+                        .into_inner()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .into_iter()
+                        .map(|w| w.expect("populated expert ref"))
+                        .collect())
                 };
 
                 let exp_probs_b = load_f32(gguf, &format!("blk.{i}.exp_probs_b.bias"))?;
@@ -1023,11 +1115,11 @@ impl LfmModel {
             } else {
                 FfnRefs::Dense(DenseFfnRefs {
                     gate: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?
-                        .with_repack_if(gguf, repack),
+                        .with_repack_if(gguf, repack_ffn),
                     up: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_up.weight"))?
-                        .with_repack_if(gguf, repack),
+                        .with_repack_if(gguf, repack_ffn),
                     down: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_down.weight"))?
-                        .with_repack_if(gguf, repack),
+                        .with_repack_if(gguf, repack_ffn),
                     gate_up_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
                 })
             };
@@ -1040,14 +1132,14 @@ impl LfmModel {
                                 gguf,
                                 &format!("blk.{i}.shortconv.in_proj.weight"),
                             )?
-                            .with_repack_if(gguf, repack),
+                            .with_repack_if(gguf, repack_op),
                         ),
                         Some(
                             Self::resolve_weight(
                                 gguf,
                                 &format!("blk.{i}.shortconv.out_proj.weight"),
                             )?
-                            .with_repack_if(gguf, repack),
+                            .with_repack_if(gguf, repack_op),
                         ),
                         None,
                         None,
@@ -1060,19 +1152,19 @@ impl LfmModel {
                         None,
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_q.weight"))?
-                                .with_repack_if(gguf, repack),
+                                .with_repack_if(gguf, repack_op),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_k.weight"))?
-                                .with_repack_if(gguf, repack),
+                                .with_repack_if(gguf, repack_op),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_v.weight"))?
-                                .with_repack_if(gguf, repack),
+                                .with_repack_if(gguf, repack_op),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_output.weight"))?
-                                .with_repack_if(gguf, repack),
+                                .with_repack_if(gguf, repack_op),
                         ),
                     )
                 };
@@ -1100,9 +1192,24 @@ impl LfmModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, true, |g, name| {
+        Self::from_gguf_impl(gguf, context_size, model_id, RepackScope::All, |g, name| {
             Ok(g.get_tensor(name)?.try_to_f32_vec()?)
         })
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn from_gguf_with_id_ffn_repack(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(
+            gguf,
+            context_size,
+            model_id,
+            RepackScope::FfnOnly,
+            |g, name| Ok(g.get_tensor(name)?.try_to_f32_vec()?),
+        )
     }
 
     /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
@@ -1115,9 +1222,13 @@ impl LfmModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, false, |g, name| {
-            Ok(g.get_tensor(name)?.try_to_f32_vec()?)
-        })
+        Self::from_gguf_impl(
+            gguf,
+            context_size,
+            model_id,
+            RepackScope::None,
+            |g, name| Ok(g.get_tensor(name)?.try_to_f32_vec()?),
+        )
     }
 
     /// Load without the CPU int8 repacks (see
@@ -1136,14 +1247,14 @@ impl LfmModel {
         model_id: String,
         load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, false, load_f32)
+        Self::from_gguf_impl(gguf, context_size, model_id, RepackScope::None, load_f32)
     }
 
     fn from_gguf_impl(
         gguf: GgufFile,
         context_size: usize,
         model_id: String,
-        repack: bool,
+        repack: RepackScope,
         mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
     ) -> Result<Self> {
         let config = Self::parse_config(&gguf, context_size)?;
@@ -1253,9 +1364,9 @@ impl LfmModel {
         }
 
         let layer_refs =
-            Self::resolve_all_layer_refs_with_loader(&gguf, &config, repack, &mut load_f32)?;
-        let embd_ref =
-            Self::resolve_weight(&gguf, "token_embd.weight")?.with_dec4_if(&gguf, repack);
+            Self::resolve_all_layer_refs_with_scope(&gguf, &config, repack, &mut load_f32)?;
+        let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?
+            .with_dec4_if(&gguf, !matches!(repack, RepackScope::None));
         ensure!(
             embd_ref.k == hs,
             "token_embd.weight has k={} but hidden_size is {hs}",
@@ -2387,38 +2498,911 @@ impl LfmModel {
     }
 
     #[cfg(feature = "xdna")]
-    pub(crate) fn xdna_project_logits_into(&self, hidden: &[f32], logits: &mut [f32]) {
-        static HEAD_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max_active = *HEAD_THREADS.get_or_init(|| {
-            std::env::var("CERA_NPU_HEAD_THREADS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(0)
-        });
-        let mut normed = [0.0f32; 2048];
-        let normed_slice = if hidden.len() <= normed.len() {
-            let s = &mut normed[..hidden.len()];
-            s.copy_from_slice(hidden);
-            cpu::rmsnorm(s, &self.output_norm_weight, self.config.rms_norm_eps);
-            &normed[..hidden.len()]
+    pub(crate) fn xdna_embed_logits_refs(&self) -> (&WeightRef, &WeightRef) {
+        (&self.embd_ref, &self.logits_ref)
+    }
+
+    #[cfg(feature = "xdna")]
+    fn default_xdna_head_threads(physical_cores: Option<usize>, available: usize) -> usize {
+        let cores = physical_cores.unwrap_or(available).max(1);
+        if cores > 8 {
+            (cores * 3 / 4).clamp(4, 12)
         } else {
+            cores
+        }
+    }
+
+    #[cfg(feature = "xdna")]
+    fn xdna_head_threads_from_lookup<F>(
+        lookup: F,
+        physical_cores: Option<usize>,
+        available: usize,
+    ) -> usize
+    where
+        F: FnOnce(&str) -> Option<String>,
+    {
+        if let Some(raw) = lookup("CERA_NPU_HEAD_THREADS") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                match trimmed.parse::<usize>() {
+                    Ok(n) if n >= 1 => return n,
+                    Ok(_) => {
+                        tracing::warn!(
+                            "cera: ignoring CERA_NPU_HEAD_THREADS=0; expected positive integer >= 1"
+                        );
+                        eprintln!(
+                            "cera: ignoring CERA_NPU_HEAD_THREADS=0; expected positive integer >= 1"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "cera: ignoring invalid CERA_NPU_HEAD_THREADS={trimmed:?}; expected integer >= 1"
+                        );
+                        eprintln!(
+                            "cera: ignoring invalid CERA_NPU_HEAD_THREADS={trimmed:?}; expected integer >= 1"
+                        );
+                    }
+                }
+            }
+        }
+        Self::default_xdna_head_threads(physical_cores, available)
+    }
+
+    /// Cap the CPU Q6_K LM-head below SMT siblings while leaving physical cores free for the NPU driver.
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_head_threads() -> usize {
+        static HEAD_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *HEAD_THREADS.get_or_init(|| {
+            let lookup = |_name: &str| -> Option<String> {
+                #[cfg(not(test))]
+                {
+                    std::env::var(_name).ok()
+                }
+                #[cfg(test)]
+                {
+                    None
+                }
+            };
+            let physical = crate::backend::cpu_features::physical_core_count();
+            let available = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            Self::xdna_head_threads_from_lookup(lookup, physical, available)
+        })
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_project_logits_into_with_scratch(
+        &self,
+        hidden: &[f32],
+        logits: &mut [f32],
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) {
+        if hidden.len() != self.config.hidden_size {
             logits[..self.config.vocab_size].fill(0.0);
             return;
+        }
+        let max_active = Self::xdna_head_threads();
+        let mut stack_normed = [0.0f32; 2048];
+        let mut heap_normed: Vec<f32>;
+        let normed_slice: &mut [f32] = if hidden.len() <= stack_normed.len() {
+            let s = &mut stack_normed[..hidden.len()];
+            s.copy_from_slice(hidden);
+            s
+        } else {
+            heap_normed = hidden.to_vec();
+            &mut heap_normed[..]
         };
-        transformer::gemv_active(
+        cpu::rmsnorm(
+            normed_slice,
+            &self.output_norm_weight,
+            self.config.rms_norm_eps,
+        );
+        transformer::gemv_active_with_scratch(
             max_active,
             &self.gguf,
             &self.logits_ref,
             normed_slice,
             &mut logits[..self.config.vocab_size],
+            q8_scratch,
         );
     }
 
     #[cfg(feature = "xdna")]
-    pub(crate) fn xdna_project_logits_from_hidden(&self, hidden: &[f32]) -> Vec<f32> {
+    pub(crate) fn xdna_project_logits_from_hidden_with_scratch(
+        &self,
+        hidden: &[f32],
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) -> Vec<f32> {
         let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.xdna_project_logits_into(hidden, &mut logits);
+        self.xdna_project_logits_into_with_scratch(hidden, &mut logits, q8_scratch);
         logits
+    }
+
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_moe_refs(&self, layer: usize) -> Option<&MoeFfnRefs> {
+        match &self.layer_refs.get(layer)?.ffn {
+            FfnRefs::Moe(m) => Some(m),
+            FfnRefs::Dense(_) => None,
+        }
+    }
+
+    /// Run host dense/MoE FFN + residual for a single decoded token (`B = 1`)
+    /// after XDNA NPU has computed the Conv/Attn stage (`hidden_io` holds `H1`).
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_forward_ffn_step(
+        &self,
+        layer: usize,
+        hidden_io: &mut [f32],
+        ffn_input: &mut Vec<f32>,
+        state: &mut InferenceState,
+    ) {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let nb = hs / 32;
+        ffn_input.resize(hs, 0.0);
+        state.scratch.q8_scales.resize(nb, 0.0);
+        state.scratch.q8_quants.resize(hs, 0);
+        state.scratch.out.resize(hs, 0.0);
+        cpu::rmsnorm_and_quantize_q8_0(
+            &hidden_io[..hs],
+            &self.ffn_norm_weights[layer],
+            cfg.rms_norm_eps,
+            &mut state.scratch.q8_scales,
+            &mut state.scratch.q8_quants,
+            Some(&mut ffn_input[..hs]),
+        );
+        match &self.layer_refs[layer].ffn {
+            FfnRefs::Dense(dense) => {
+                let ffn_weights = FfnWeights {
+                    ffn_gate: &dense.gate,
+                    ffn_up: &dense.up,
+                    ffn_down: &dense.down,
+                };
+                transformer::forward_ffn_block(
+                    &self.gguf,
+                    layer,
+                    &ffn_weights,
+                    &transformer::FfnExtras::default(),
+                    hs,
+                    cfg.intermediate_size,
+                    &ffn_input[..hs],
+                    transformer::FfnActivation::Swiglu,
+                    state,
+                );
+            }
+            FfnRefs::Moe(moe) => self.forward_moe_ffn(layer, moe, hs, &ffn_input[..hs], state),
+        }
+        if let Some(norm_w) = self.xdna_lfm3_post_ffn_norm(layer) {
+            cpu::rmsnorm(&mut state.scratch.out[..hs], norm_w, cfg.rms_norm_eps);
+        }
+        cpu::add_inplace(&mut hidden_io[..hs], &state.scratch.out[..hs]);
+    }
+
+    /// Run host dense/MoE FFN + residual for `n` prefill tokens (`n <= 64`,
+    /// row-major `[n, hs]`) after XDNA NPU has computed the Conv/Attn stage.
+    #[cfg(feature = "xdna")]
+    pub(crate) fn xdna_prefill_ffn_chunk(
+        &self,
+        layer: usize,
+        hidden_io: &mut [f32],
+        n: usize,
+        moe_scratch: &mut XdnaMoePrefillScratch,
+        state: &mut InferenceState,
+    ) {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let eps = cfg.rms_norm_eps;
+        let post_ffn_norm = self.xdna_lfm3_post_ffn_norm(layer);
+        let lora = state.lora.clone();
+
+        let mut scratch = std::mem::take(&mut state.prefill_scratch);
+        scratch.ensure(n, cfg);
+        par_rmsnorm_into_rows(
+            &hidden_io[..n * hs],
+            &mut scratch.ffn_input,
+            hs,
+            n,
+            &self.ffn_norm_weights[layer],
+            eps,
+        );
+
+        match &self.layer_refs[layer].ffn {
+            FfnRefs::Dense(dense) => {
+                let is = cfg.intermediate_size;
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+                let used_gemm = self.prefill_dense_ffn_batched(
+                    layer,
+                    dense,
+                    hs,
+                    is,
+                    n,
+                    lora.as_deref(),
+                    &scratch.ffn_input,
+                    &mut scratch.ffn_out,
+                    &mut scratch.bq_scales,
+                    &mut scratch.bq_quants,
+                    &mut scratch.gate_mat,
+                    &mut scratch.up_mat,
+                    &mut scratch.gate_up_mat,
+                    &mut scratch.dq_scales,
+                    &mut scratch.dq_quants,
+                    &mut state.scratch.lora_tmp,
+                    None,
+                    None,
+                    None,
+                );
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)))]
+                let used_gemm = false;
+                if !used_gemm {
+                    self.prefill_dense_ffn_fallback(
+                        layer,
+                        dense,
+                        hs,
+                        is,
+                        n,
+                        lora.as_deref(),
+                        &scratch.ffn_input,
+                        &mut scratch.ffn_out,
+                        &mut scratch.col,
+                        &mut scratch.gate_col,
+                        &mut scratch.up_col,
+                        &mut scratch.out_col,
+                        state,
+                    );
+                }
+            }
+            FfnRefs::Moe(moe) => {
+                self.xdna_prefill_moe_ffn_grouped(
+                    layer,
+                    moe,
+                    hs,
+                    n,
+                    lora.as_deref(),
+                    moe_scratch,
+                    &mut scratch,
+                    state,
+                );
+            }
+        }
+
+        if let Some(norm_w) = post_ffn_norm {
+            par_rmsnorm_inplace_rows(&mut scratch.ffn_out, hs, n, norm_w, eps);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        if n >= 8 {
+            cpu::par_add_inplace(&mut hidden_io[..n * hs], &scratch.ffn_out[..n * hs]);
+        } else {
+            cpu::add_inplace(&mut hidden_io[..n * hs], &scratch.ffn_out[..n * hs]);
+        }
+        #[cfg(target_arch = "aarch64")]
+        cpu::add_inplace(&mut hidden_io[..n * hs], &scratch.ffn_out[..n * hs]);
+
+        state.prefill_scratch = scratch;
+    }
+
+    #[cfg(feature = "xdna")]
+    #[allow(clippy::too_many_arguments)]
+    fn xdna_prefill_moe_ffn_grouped(
+        &self,
+        layer: usize,
+        moe: &MoeFfnRefs,
+        hs: usize,
+        n: usize,
+        lora: Option<&crate::lora::LoraAdapterWeights>,
+        moe_scratch: &mut XdnaMoePrefillScratch,
+        scratch: &mut crate::kv_cache::PrefillScratch,
+        state: &mut InferenceState,
+    ) {
+        let ne = moe.n_expert;
+        let top_k = moe.n_expert_used;
+        let ff = moe.expert_ff_len;
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+        let nb_hs = hs / 32;
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+        let nb_ff = ff / 32;
+
+        moe_scratch.router_logits.resize(n * ne, 0.0);
+        moe_scratch.probs.resize(ne, 0.0);
+        if moe_scratch.buckets.len() < ne {
+            moe_scratch.buckets.resize_with(ne, Vec::new);
+        }
+        for b in &mut moe_scratch.buckets[..ne] {
+            b.clear();
+        }
+
+        if moe.router.dtype == DType::F32 && lora.is_none() {
+            let raw = self.weight_data(&moe.router);
+            moe_scratch.router_f32.clear();
+            moe_scratch.router_f32.extend(
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
+            );
+            let rf = &moe_scratch.router_f32[..ne * hs];
+            let inp = &scratch.ffn_input[..n * hs];
+            if n >= 8 {
+                cpu::par_rows_n(
+                    &mut moe_scratch.router_logits[..n * ne],
+                    ne,
+                    4,
+                    |(j, dst)| {
+                        let xj = &inp[j * hs..(j + 1) * hs];
+                        for e in 0..ne {
+                            dst[e] = cpu::dot_f32(&rf[e * hs..(e + 1) * hs], xj);
+                        }
+                    },
+                );
+            } else {
+                for j in 0..n {
+                    let xj = &inp[j * hs..(j + 1) * hs];
+                    let dst = &mut moe_scratch.router_logits[j * ne..(j + 1) * ne];
+                    for e in 0..ne {
+                        dst[e] = cpu::dot_f32(&rf[e * hs..(e + 1) * hs], xj);
+                    }
+                }
+            }
+        } else {
+            for j in 0..n {
+                let xj = &scratch.ffn_input[j * hs..(j + 1) * hs];
+                let dst = &mut moe_scratch.router_logits[j * ne..(j + 1) * ne];
+                self.gemv(&moe.router, xj, dst);
+                if let Some(l) = lora
+                    && let Some(t) = l.get(layer, crate::lora::LoraTarget::FfnGateInp)
+                {
+                    crate::lora::apply_decode(t, xj, dst, &mut state.scratch.lora_tmp);
+                }
+            }
+        }
+
+        for j in 0..n {
+            let logits = &moe_scratch.router_logits[j * ne..(j + 1) * ne];
+            for (p, &l) in moe_scratch.probs[..ne].iter_mut().zip(logits) {
+                *p = 1.0 / (1.0 + (-l).exp());
+            }
+            select_experts(
+                &moe_scratch.probs[..ne],
+                &moe.exp_probs_b,
+                top_k,
+                &mut moe_scratch.tok_sel,
+            );
+            for &(expert, weight) in &moe_scratch.tok_sel {
+                moe_scratch.buckets[expert].push((j, weight));
+            }
+        }
+
+        scratch.ffn_out[..n * hs].fill(0.0);
+
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+        let batched_ok = moe
+            .gate
+            .first()
+            .zip(moe.up.first())
+            .zip(moe.down.first())
+            .is_some_and(|((g, u), d)| {
+                transformer::batched_gemm_supports(g.dtype, g.k)
+                    && transformer::batched_gemm_supports(u.dtype, u.k)
+                    && transformer::batched_gemm_supports(d.dtype, d.k)
+            });
+
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+        if batched_ok {
+            transformer::quantize_rows(
+                &scratch.ffn_input[..n * hs],
+                hs,
+                n,
+                &mut scratch.bq_scales[..n * nb_hs],
+                &mut scratch.bq_quants[..n * hs],
+            );
+        }
+
+        for e in 0..ne {
+            let hits = &moe_scratch.buckets[e];
+            if hits.is_empty() {
+                continue;
+            }
+            #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+            if hits.len() >= 2 && batched_ok {
+                let k_e = hits.len();
+                moe_scratch.gather_scales.resize(k_e * nb_hs, 0.0);
+                moe_scratch.gather_quants.resize(k_e * hs, 0);
+                for (idx, &(tok_j, _)) in hits.iter().enumerate() {
+                    moe_scratch.gather_scales[idx * nb_hs..(idx + 1) * nb_hs]
+                        .copy_from_slice(&scratch.bq_scales[tok_j * nb_hs..(tok_j + 1) * nb_hs]);
+                    moe_scratch.gather_quants[idx * hs..(idx + 1) * hs]
+                        .copy_from_slice(&scratch.bq_quants[tok_j * hs..(tok_j + 1) * hs]);
+                }
+                moe_scratch.exp_gate.resize(k_e * ff, 0.0);
+                moe_scratch.exp_up.resize(k_e * ff, 0.0);
+                moe_scratch.exp_down.resize(k_e * hs, 0.0);
+                moe_scratch.down_scales.resize(k_e * nb_ff, 0.0);
+                moe_scratch.down_quants.resize(k_e * ff, 0);
+
+                let g_sc = &moe_scratch.gather_scales[..k_e * nb_hs];
+                let g_qu = &moe_scratch.gather_quants[..k_e * hs];
+                let fused_ok = lora.is_none()
+                    && transformer::try_repacked_gate_up_silu_rowmajor(
+                        &moe.gate[e],
+                        &moe.up[e],
+                        g_sc,
+                        g_qu,
+                        &mut moe_scratch.exp_gate[..k_e * ff],
+                        k_e,
+                        ff,
+                        hs,
+                    );
+                if !fused_ok {
+                    transformer::gemm_preq_rowmajor(
+                        &self.gguf,
+                        &moe.gate[e],
+                        g_sc,
+                        g_qu,
+                        &mut moe_scratch.exp_gate[..k_e * ff],
+                        k_e,
+                        ff,
+                        hs,
+                    );
+                    transformer::gemm_preq_rowmajor(
+                        &self.gguf,
+                        &moe.up[e],
+                        g_sc,
+                        g_qu,
+                        &mut moe_scratch.exp_up[..k_e * ff],
+                        k_e,
+                        ff,
+                        hs,
+                    );
+                    if let Some(l) = lora {
+                        if let Some(t) =
+                            l.get_expert(layer, crate::lora::LoraTarget::FfnGateExps, e)
+                        {
+                            for (idx, &(tok_j, _)) in hits.iter().enumerate() {
+                                crate::lora::apply_decode(
+                                    t,
+                                    &scratch.ffn_input[tok_j * hs..(tok_j + 1) * hs],
+                                    &mut moe_scratch.exp_gate[idx * ff..(idx + 1) * ff],
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
+                        }
+                        if let Some(t) = l.get_expert(layer, crate::lora::LoraTarget::FfnUpExps, e)
+                        {
+                            for (idx, &(tok_j, _)) in hits.iter().enumerate() {
+                                crate::lora::apply_decode(
+                                    t,
+                                    &scratch.ffn_input[tok_j * hs..(tok_j + 1) * hs],
+                                    &mut moe_scratch.exp_up[idx * ff..(idx + 1) * ff],
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
+                        }
+                    }
+                    cpu::silu_mul_inplace(
+                        &mut moe_scratch.exp_gate[..k_e * ff],
+                        &moe_scratch.exp_up[..k_e * ff],
+                    );
+                }
+
+                transformer::quantize_rows(
+                    &moe_scratch.exp_gate[..k_e * ff],
+                    ff,
+                    k_e,
+                    &mut moe_scratch.down_scales[..k_e * nb_ff],
+                    &mut moe_scratch.down_quants[..k_e * ff],
+                );
+                transformer::gemm_preq_rowmajor(
+                    &self.gguf,
+                    &moe.down[e],
+                    &moe_scratch.down_scales[..k_e * nb_ff],
+                    &moe_scratch.down_quants[..k_e * ff],
+                    &mut moe_scratch.exp_down[..k_e * hs],
+                    k_e,
+                    hs,
+                    ff,
+                );
+                if let Some(l) = lora
+                    && let Some(t) = l.get_expert(layer, crate::lora::LoraTarget::FfnDownExps, e)
+                {
+                    for idx in 0..k_e {
+                        crate::lora::apply_decode(
+                            t,
+                            &moe_scratch.exp_gate[idx * ff..(idx + 1) * ff],
+                            &mut moe_scratch.exp_down[idx * hs..(idx + 1) * hs],
+                            &mut state.scratch.lora_tmp,
+                        );
+                    }
+                }
+                for (idx, &(tok_j, weight)) in hits.iter().enumerate() {
+                    cpu::axpy_inplace(
+                        &mut scratch.ffn_out[tok_j * hs..(tok_j + 1) * hs],
+                        &moe_scratch.exp_down[idx * hs..(idx + 1) * hs],
+                        weight,
+                    );
+                }
+                continue;
+            }
+
+            for &(tok_j, weight) in hits {
+                let xj = &scratch.ffn_input[tok_j * hs..(tok_j + 1) * hs];
+                self.gemv(&moe.gate[e], xj, &mut scratch.gate_col[..ff]);
+                self.gemv(&moe.up[e], xj, &mut scratch.up_col[..ff]);
+                if let Some(l) = lora {
+                    if let Some(t) = l.get_expert(layer, crate::lora::LoraTarget::FfnGateExps, e) {
+                        crate::lora::apply_decode(
+                            t,
+                            xj,
+                            &mut scratch.gate_col[..ff],
+                            &mut state.scratch.lora_tmp,
+                        );
+                    }
+                    if let Some(t) = l.get_expert(layer, crate::lora::LoraTarget::FfnUpExps, e) {
+                        crate::lora::apply_decode(
+                            t,
+                            xj,
+                            &mut scratch.up_col[..ff],
+                            &mut state.scratch.lora_tmp,
+                        );
+                    }
+                }
+                cpu::silu_mul_inplace(&mut scratch.gate_col[..ff], &scratch.up_col[..ff]);
+                self.gemv(
+                    &moe.down[e],
+                    &scratch.gate_col[..ff],
+                    &mut scratch.out_col[..hs],
+                );
+                if let Some(l) = lora
+                    && let Some(t) = l.get_expert(layer, crate::lora::LoraTarget::FfnDownExps, e)
+                {
+                    crate::lora::apply_decode(
+                        t,
+                        &scratch.gate_col[..ff],
+                        &mut scratch.out_col[..hs],
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+                cpu::axpy_inplace(
+                    &mut scratch.ffn_out[tok_j * hs..(tok_j + 1) * hs],
+                    &scratch.out_col[..hs],
+                    weight,
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn prefill_dense_ffn_batched(
+        &self,
+        layer: usize,
+        dense: &DenseFfnRefs,
+        hs: usize,
+        is: usize,
+        n: usize,
+        lora: Option<&crate::lora::LoraAdapterWeights>,
+        ffn_input: &[f32],
+        ffn_out: &mut [f32],
+        bq_scales: &mut [f32],
+        bq_quants: &mut [i8],
+        gate_mat: &mut [f32],
+        up_mat: &mut [f32],
+        gate_up_mat: &mut [f32],
+        dq_scales: &mut [f32],
+        dq_quants: &mut [i8],
+        lora_tmp: &mut Vec<f32>,
+        mut prof_quant: Option<&mut std::time::Duration>,
+        prof_gate_up: Option<&mut std::time::Duration>,
+        prof_down: Option<&mut std::time::Duration>,
+    ) -> bool {
+        let supported = [
+            ("ffn_gate", &dense.gate),
+            ("ffn_up", &dense.up),
+            ("ffn_down", &dense.down),
+        ]
+        .into_iter()
+        .fold(true, |ok, (name, w)| {
+            if transformer::batched_gemm_supports(w.dtype, w.k) {
+                ok
+            } else {
+                transformer::warn_unbatchable(name, w.dtype);
+                false
+            }
+        });
+        if !supported {
+            return false;
+        }
+
+        #[cfg(has_blas)]
+        {
+            let _ = &mut prof_quant;
+            let t_gu = crate::time::Instant::now();
+            let mut gu_rows = vec![0.0f32; 2 * is * hs];
+            let g_data = transformer::weight_data(&self.gguf, &dense.gate);
+            let u_data = transformer::weight_data(&self.gguf, &dense.up);
+            if let (Some(dq_g), Some(dq_u)) = (
+                transformer::blas_dequantizer(dense.gate.dtype),
+                transformer::blas_dequantizer(dense.up.dtype),
+            ) {
+                dq_g(g_data, is, hs, &mut gu_rows[..is * hs]);
+                dq_u(u_data, is, hs, &mut gu_rows[is * hs..]);
+            }
+
+            crate::backend::blas::sgemm_rowmajor_nt_parallel(
+                n,
+                2 * is,
+                hs,
+                ffn_input,
+                &gu_rows,
+                &mut gate_up_mat[..2 * is * n],
+            );
+
+            if let Some(lora) = lora {
+                [
+                    (crate::lora::LoraTarget::FfnGate, 0),
+                    (crate::lora::LoraTarget::FfnUp, is),
+                ]
+                .into_iter()
+                .filter_map(|(target, off)| lora.get(layer, target).map(|t| (t, off)))
+                .for_each(|(t, off)| {
+                    ffn_input[..n * hs]
+                        .chunks_exact(hs)
+                        .zip(gate_up_mat[..2 * is * n].chunks_exact_mut(2 * is))
+                        .for_each(|(x, row)| {
+                            crate::lora::apply_decode(t, x, &mut row[off..off + is], lora_tmp)
+                        });
+                });
+            }
+
+            for j in 0..n {
+                let (g_slice, u_slice) = gate_up_mat[j * 2 * is..(j + 1) * 2 * is].split_at_mut(is);
+                cpu::silu_mul_inplace(g_slice, u_slice);
+            }
+
+            if let Some(d) = prof_gate_up {
+                *d += t_gu.elapsed();
+            }
+        }
+        #[cfg(not(has_blas))]
+        {
+            let t_gu = crate::time::Instant::now();
+            let fused_f32_ok = lora.is_none()
+                && transformer::try_repacked_f32_gate_up_silu_rowmajor(
+                    &dense.gate,
+                    &dense.up,
+                    ffn_input,
+                    &mut gate_mat[..is * n],
+                    n,
+                    is,
+                    hs,
+                );
+            if !fused_f32_ok {
+                let bq_scales = &mut bq_scales[..n * (hs / 32)];
+                let bq_quants = &mut bq_quants[..n * hs];
+                let t_q = crate::time::Instant::now();
+                transformer::quantize_rows(ffn_input, hs, n, bq_scales, bq_quants);
+                if let Some(d) = prof_quant.as_deref_mut() {
+                    *d += t_q.elapsed();
+                }
+                let t_gu_inner = crate::time::Instant::now();
+                let fused_ok = lora.is_none()
+                    && transformer::try_repacked_gate_up_silu_rowmajor(
+                        &dense.gate,
+                        &dense.up,
+                        bq_scales,
+                        bq_quants,
+                        &mut gate_mat[..is * n],
+                        n,
+                        is,
+                        hs,
+                    );
+                if !fused_ok {
+                    transformer::gemm_preq_rowmajor(
+                        &self.gguf,
+                        &dense.gate,
+                        bq_scales,
+                        bq_quants,
+                        &mut gate_mat[..is * n],
+                        n,
+                        is,
+                        hs,
+                    );
+                    transformer::gemm_preq_rowmajor(
+                        &self.gguf,
+                        &dense.up,
+                        bq_scales,
+                        bq_quants,
+                        &mut up_mat[..is * n],
+                        n,
+                        is,
+                        hs,
+                    );
+                    if let Some(lora) = lora {
+                        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                            crate::lora::apply_prefill_rowmajor(
+                                t,
+                                ffn_input,
+                                &mut gate_mat[..is * n],
+                                n,
+                                lora_tmp,
+                            );
+                        }
+                        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                            crate::lora::apply_prefill_rowmajor(
+                                t,
+                                ffn_input,
+                                &mut up_mat[..is * n],
+                                n,
+                                lora_tmp,
+                            );
+                        }
+                    }
+                    cpu::silu_mul_inplace(&mut gate_mat[..n * is], &up_mat[..n * is]);
+                }
+                if let Some(d) = prof_gate_up {
+                    *d += t_gu_inner.elapsed();
+                }
+            } else if let Some(d) = prof_gate_up {
+                *d += t_gu.elapsed();
+            }
+        }
+
+        #[cfg(has_blas)]
+        {
+            let t_d = crate::time::Instant::now();
+            let mut down_rows = vec![0.0f32; hs * is];
+            let d_data = transformer::weight_data(&self.gguf, &dense.down);
+            if let Some(dq_d) = transformer::blas_dequantizer(dense.down.dtype) {
+                dq_d(d_data, hs, is, &mut down_rows);
+            }
+
+            unsafe {
+                crate::backend::blas::sgemm_rowmajor_nt_ld_parallel(
+                    n,
+                    hs,
+                    is,
+                    gate_up_mat.as_ptr(),
+                    2 * is,
+                    down_rows.as_ptr(),
+                    is,
+                    ffn_out.as_mut_ptr(),
+                    hs,
+                );
+            }
+            if let Some(d) = prof_down {
+                *d += t_d.elapsed();
+            }
+        }
+        #[cfg(not(has_blas))]
+        {
+            let t_d = crate::time::Instant::now();
+            if transformer::try_repacked_f32_gemm_rowmajor(
+                &dense.down,
+                gate_mat,
+                &mut ffn_out[..hs * n],
+                n,
+                hs,
+                is,
+            ) {
+                if let Some(d) = prof_down {
+                    *d += t_d.elapsed();
+                }
+            } else {
+                let dq_scales = &mut dq_scales[..n * (is / 32)];
+                let dq_quants = &mut dq_quants[..n * is];
+                let t_q = crate::time::Instant::now();
+                transformer::quantize_rows(gate_mat, is, n, dq_scales, dq_quants);
+                if let Some(d) = prof_quant {
+                    *d += t_q.elapsed();
+                }
+                let t_d = crate::time::Instant::now();
+                transformer::gemm_preq_rowmajor(
+                    &self.gguf,
+                    &dense.down,
+                    dq_scales,
+                    dq_quants,
+                    &mut ffn_out[..hs * n],
+                    n,
+                    hs,
+                    is,
+                );
+                if let Some(d) = prof_down {
+                    *d += t_d.elapsed();
+                }
+            }
+        }
+
+        if let Some(lora) = lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+        {
+            #[cfg(not(has_blas))]
+            crate::lora::apply_prefill_rowmajor(t, &gate_mat[..is * n], ffn_out, n, lora_tmp);
+            #[cfg(has_blas)]
+            gate_up_mat[..2 * is * n]
+                .chunks_exact(2 * is)
+                .zip(ffn_out[..hs * n].chunks_exact_mut(hs))
+                .for_each(|(row, y)| crate::lora::apply_decode(t, &row[..is], y, lora_tmp));
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn prefill_dense_ffn_fallback(
+        &self,
+        layer: usize,
+        dense: &DenseFfnRefs,
+        hs: usize,
+        is: usize,
+        n: usize,
+        lora: Option<&crate::lora::LoraAdapterWeights>,
+        ffn_input: &[f32],
+        ffn_out: &mut [f32],
+        col: &mut [f32],
+        gate_col: &mut [f32],
+        up_col: &mut [f32],
+        out_col: &mut [f32],
+        state: &mut InferenceState,
+    ) {
+        ffn_out[..hs * n].fill(0.0);
+        for j in 0..n {
+            col.copy_from_slice(&ffn_input[j * hs..(j + 1) * hs]);
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                Self::quantize_to_scratch(col, state);
+                self.gemv_preq(
+                    &dense.gate,
+                    col,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    gate_col,
+                );
+                self.gemv_preq(
+                    &dense.up,
+                    col,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    up_col,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                self.gemv(&dense.gate, col, gate_col);
+                self.gemv(&dense.up, col, up_col);
+            }
+
+            if let Some(lora) = lora {
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                    crate::lora::apply_decode(t, col, gate_col, &mut state.scratch.lora_tmp);
+                }
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                    crate::lora::apply_decode(t, col, up_col, &mut state.scratch.lora_tmp);
+                }
+            }
+
+            cpu::silu_mul_inplace(gate_col, up_col);
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                Self::quantize_to_scratch(gate_col, state);
+                self.gemv_preq(
+                    &dense.down,
+                    gate_col,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    out_col,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            self.gemv(&dense.down, gate_col, out_col);
+
+            if let Some(lora) = lora
+                && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+            {
+                crate::lora::apply_decode(t, gate_col, out_col, &mut state.scratch.lora_tmp);
+            }
+
+            ffn_out[j * hs..(j + 1) * hs].copy_from_slice(&out_col[..hs]);
+        }
     }
 
     /// Dequantize a single row into `out` (shared
@@ -3804,7 +4788,6 @@ impl LfmModel {
         let bq_scales = &mut bq_scales[..n * hs.div_ceil(32)];
         #[allow(unused_variables)]
         let bq_quants = &mut bq_quants[..n * hs];
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         let is = cfg.intermediate_size;
 
         let profile_prefill = Self::profile_prefill_enabled();
@@ -6234,260 +7217,27 @@ impl LfmModel {
                     }
                 };
                 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
-                let used_gemm = if [
-                    ("ffn_gate", &dense.gate),
-                    ("ffn_up", &dense.up),
-                    ("ffn_down", &dense.down),
-                ]
-                .into_iter()
-                .fold(true, |ok, (name, w)| {
-                    if transformer::batched_gemm_supports(w.dtype, w.k) {
-                        ok
-                    } else {
-                        transformer::warn_unbatchable(name, w.dtype);
-                        false
-                    }
-                }) {
-                    // Gate + Up via Single-Dispatch Fused AMX GEMM (AMX Gate + Up)
-                    #[cfg(has_blas)]
-                    {
-                        let t_gu = Instant::now();
-                        let mut gu_rows = vec![0.0f32; 2 * is * hs];
-                        let g_data = transformer::weight_data(&self.gguf, &dense.gate);
-                        let u_data = transformer::weight_data(&self.gguf, &dense.up);
-                        if let (Some(dq_g), Some(dq_u)) = (
-                            transformer::blas_dequantizer(dense.gate.dtype),
-                            transformer::blas_dequantizer(dense.up.dtype),
-                        ) {
-                            dq_g(g_data, is, hs, &mut gu_rows[..is * hs]);
-                            dq_u(u_data, is, hs, &mut gu_rows[is * hs..]);
-                        }
-
-                        crate::backend::blas::sgemm_rowmajor_nt_parallel(
-                            n,
-                            2 * is,
-                            hs,
-                            ffn_input,
-                            &gu_rows,
-                            &mut gate_up_mat[..2 * is * n],
-                        );
-
-                        // LoRA on gate/up. The fused GEMM leaves each token's gate then up
-                        // in one `2 * is` row, so the deltas go on the two halves.
-                        if let Some(lora) = &lora {
-                            [
-                                (crate::lora::LoraTarget::FfnGate, 0),
-                                (crate::lora::LoraTarget::FfnUp, is),
-                            ]
-                            .into_iter()
-                            .filter_map(|(target, off)| lora.get(layer, target).map(|t| (t, off)))
-                            .for_each(|(t, off)| {
-                                ffn_input[..n * hs]
-                                    .chunks_exact(hs)
-                                    .zip(gate_up_mat[..2 * is * n].chunks_exact_mut(2 * is))
-                                    .for_each(|(x, row)| {
-                                        crate::lora::apply_decode(
-                                            t,
-                                            x,
-                                            &mut row[off..off + is],
-                                            &mut state.scratch.lora_tmp,
-                                        )
-                                    });
-                            });
-                        }
-
-                        for j in 0..n {
-                            let (g_slice, u_slice) =
-                                gate_up_mat[j * 2 * is..(j + 1) * 2 * is].split_at_mut(is);
-                            cpu::silu_mul_inplace(g_slice, u_slice);
-                        }
-
-                        if profile_prefill {
-                            t_ffn_gate_up += t_gu.elapsed();
-                        }
-                    }
-                    #[cfg(not(has_blas))]
-                    {
-                        let t_gu = Instant::now();
-                        let fused_f32_ok = lora.is_none()
-                            && transformer::try_repacked_f32_gate_up_silu_rowmajor(
-                                &dense.gate,
-                                &dense.up,
-                                ffn_input,
-                                &mut gate_mat[..is * n],
-                                n,
-                                is,
-                                hs,
-                            );
-                        if !fused_f32_ok {
-                            let t_q = Instant::now();
-                            transformer::quantize_rows(ffn_input, hs, n, bq_scales, bq_quants);
-                            if profile_prefill {
-                                t_quant += t_q.elapsed();
-                            }
-                            let t_gu_inner = Instant::now();
-                            let fused_ok = lora.is_none()
-                                && transformer::try_repacked_gate_up_silu_rowmajor(
-                                    &dense.gate,
-                                    &dense.up,
-                                    bq_scales,
-                                    bq_quants,
-                                    &mut gate_mat[..is * n],
-                                    n,
-                                    is,
-                                    hs,
-                                );
-                            if !fused_ok {
-                                transformer::gemm_preq_rowmajor(
-                                    &self.gguf,
-                                    &dense.gate,
-                                    bq_scales,
-                                    bq_quants,
-                                    &mut gate_mat[..is * n],
-                                    n,
-                                    is,
-                                    hs,
-                                );
-                                transformer::gemm_preq_rowmajor(
-                                    &self.gguf,
-                                    &dense.up,
-                                    bq_scales,
-                                    bq_quants,
-                                    &mut up_mat[..is * n],
-                                    n,
-                                    is,
-                                    hs,
-                                );
-                                if let Some(lora) = &lora {
-                                    if let Some(t) =
-                                        lora.get(layer, crate::lora::LoraTarget::FfnGate)
-                                    {
-                                        crate::lora::apply_prefill_rowmajor(
-                                            t,
-                                            ffn_input,
-                                            &mut gate_mat[..is * n],
-                                            n,
-                                            &mut state.scratch.lora_tmp,
-                                        );
-                                    }
-                                    if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp)
-                                    {
-                                        crate::lora::apply_prefill_rowmajor(
-                                            t,
-                                            ffn_input,
-                                            &mut up_mat[..is * n],
-                                            n,
-                                            &mut state.scratch.lora_tmp,
-                                        );
-                                    }
-                                }
-                                // Elementwise over the whole `[n x is]` block: one pool dispatch, not
-                                // one 9-row dispatch per token (which ran on a single worker).
-                                cpu::silu_mul_inplace(&mut gate_mat[..n * is], &up_mat[..n * is]);
-                            }
-                            if profile_prefill {
-                                t_ffn_gate_up += t_gu_inner.elapsed();
-                            }
-                        } else if profile_prefill {
-                            t_ffn_gate_up += t_gu.elapsed();
-                        }
-                    }
-
-                    // Down via batched GEMM
-                    #[cfg(has_blas)]
-                    {
-                        let t_d = Instant::now();
-                        let mut down_rows = vec![0.0f32; hs * is];
-                        let d_data = transformer::weight_data(&self.gguf, &dense.down);
-                        if let Some(dq_d) = transformer::blas_dequantizer(dense.down.dtype) {
-                            dq_d(d_data, hs, is, &mut down_rows);
-                        }
-
-                        unsafe {
-                            crate::backend::blas::sgemm_rowmajor_nt_ld_parallel(
-                                n,
-                                hs,
-                                is,
-                                gate_up_mat.as_ptr(),
-                                2 * is,
-                                down_rows.as_ptr(),
-                                is,
-                                ffn_out.as_mut_ptr(),
-                                hs,
-                            );
-                        }
-                        if profile_prefill {
-                            t_ffn_down += t_d.elapsed();
-                        }
-                    }
-                    #[cfg(not(has_blas))]
-                    {
-                        let t_d = Instant::now();
-                        if transformer::try_repacked_f32_gemm_rowmajor(
-                            &dense.down,
-                            gate_mat,
-                            &mut ffn_out[..hs * n],
-                            n,
-                            hs,
-                            is,
-                        ) {
-                            if profile_prefill {
-                                t_ffn_down += t_d.elapsed();
-                            }
-                        } else {
-                            let t_q = Instant::now();
-                            transformer::quantize_rows(gate_mat, is, n, dq_scales, dq_quants);
-                            if profile_prefill {
-                                t_quant += t_q.elapsed();
-                            }
-                            let t_d = Instant::now();
-                            transformer::gemm_preq_rowmajor(
-                                &self.gguf,
-                                &dense.down,
-                                dq_scales,
-                                dq_quants,
-                                &mut ffn_out[..hs * n],
-                                n,
-                                hs,
-                                is,
-                            );
-                            if profile_prefill {
-                                t_ffn_down += t_d.elapsed();
-                            }
-                        }
-                    }
-
-                    // LoRA on the down projection: applied to `ffn_out` BEFORE the
-                    // residual add; input is the SiLU⊙up product, in `gate_mat` `[n×is]`
-                    // (or, under BLAS, the gate half of each `gate_up_mat` row).
-                    if let Some(lora) = &lora
-                        && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
-                    {
-                        #[cfg(not(has_blas))]
-                        crate::lora::apply_prefill_rowmajor(
-                            t,
-                            &gate_mat[..is * n],
-                            ffn_out,
-                            n,
-                            &mut state.scratch.lora_tmp,
-                        );
-                        #[cfg(has_blas)]
-                        gate_up_mat[..2 * is * n]
-                            .chunks_exact(2 * is)
-                            .zip(ffn_out[..hs * n].chunks_exact_mut(hs))
-                            .for_each(|(row, y)| {
-                                crate::lora::apply_decode(
-                                    t,
-                                    &row[..is],
-                                    y,
-                                    &mut state.scratch.lora_tmp,
-                                )
-                            });
-                    }
-                    true
-                } else {
-                    false
-                };
+                let used_gemm = self.prefill_dense_ffn_batched(
+                    layer,
+                    dense,
+                    hs,
+                    is,
+                    n,
+                    lora.as_deref(),
+                    ffn_input,
+                    ffn_out,
+                    bq_scales,
+                    bq_quants,
+                    gate_mat,
+                    up_mat,
+                    gate_up_mat,
+                    dq_scales,
+                    dq_quants,
+                    &mut state.scratch.lora_tmp,
+                    profile_prefill.then_some(&mut t_quant),
+                    profile_prefill.then_some(&mut t_ffn_gate_up),
+                    profile_prefill.then_some(&mut t_ffn_down),
+                );
 
                 // Fallback: per-token GEMV. Used on x86_64-no-blas (no batched
                 // path compiled), and on any target where the FFN weights
@@ -6497,86 +7247,21 @@ impl LfmModel {
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)))]
                 let need_fallback = true;
                 if need_fallback {
-                    ffn_out.fill(0.0);
-                    for j in 0..n {
-                        col.copy_from_slice(&ffn_input[j * hs..(j + 1) * hs]);
-
-                        #[cfg(target_arch = "aarch64")]
-                        {
-                            Self::quantize_to_scratch(col, state);
-                            self.gemv_preq(
-                                &dense.gate,
-                                col,
-                                &state.scratch.q8_scales,
-                                &state.scratch.q8_quants,
-                                gate_col,
-                            );
-                            self.gemv_preq(
-                                &dense.up,
-                                col,
-                                &state.scratch.q8_scales,
-                                &state.scratch.q8_quants,
-                                up_col,
-                            );
-                        }
-                        #[cfg(not(target_arch = "aarch64"))]
-                        {
-                            self.gemv(&dense.gate, col, gate_col);
-                            self.gemv(&dense.up, col, up_col);
-                        }
-
-                        // LoRA on gate/up (per-token decode hook): this fallback loop
-                        // doesn't route through `forward_ffn_block`, so apply it here.
-                        if let Some(lora) = &lora {
-                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
-                                crate::lora::apply_decode(
-                                    t,
-                                    col,
-                                    gate_col,
-                                    &mut state.scratch.lora_tmp,
-                                );
-                            }
-                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
-                                crate::lora::apply_decode(
-                                    t,
-                                    col,
-                                    up_col,
-                                    &mut state.scratch.lora_tmp,
-                                );
-                            }
-                        }
-
-                        cpu::silu_mul_inplace(gate_col, up_col);
-
-                        #[cfg(target_arch = "aarch64")]
-                        {
-                            Self::quantize_to_scratch(gate_col, state);
-                            self.gemv_preq(
-                                &dense.down,
-                                gate_col,
-                                &state.scratch.q8_scales,
-                                &state.scratch.q8_quants,
-                                out_col,
-                            );
-                        }
-                        #[cfg(not(target_arch = "aarch64"))]
-                        self.gemv(&dense.down, gate_col, out_col);
-
-                        // LoRA on the down projection (per-token decode hook): input is
-                        // the SiLU⊙up product in `gate_col`.
-                        if let Some(lora) = &lora
-                            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
-                        {
-                            crate::lora::apply_decode(
-                                t,
-                                gate_col,
-                                out_col,
-                                &mut state.scratch.lora_tmp,
-                            );
-                        }
-
-                        ffn_out[j * hs..(j + 1) * hs].copy_from_slice(&out_col[..hs]);
-                    }
+                    self.prefill_dense_ffn_fallback(
+                        layer,
+                        dense,
+                        hs,
+                        is,
+                        n,
+                        lora.as_deref(),
+                        ffn_input,
+                        ffn_out,
+                        col,
+                        gate_col,
+                        up_col,
+                        out_col,
+                        state,
+                    );
                 }
             }
 
@@ -6847,6 +7532,18 @@ impl LfmModel {
         }
 
         self.prefill_layers_and_all_logits(hidden, n, start_pos, state)
+    }
+
+    /// Validate `tokens` and dequantize each row directly into `out[..tokens.len() * hidden_size]`.
+    pub(crate) fn embed_token_rows_into(&self, tokens: &[u32], out: &mut [f32]) -> bool {
+        let hs = self.config.hidden_size;
+        if tokens.iter().any(|&t| t as usize >= self.embd_ref.m) || out.len() < tokens.len() * hs {
+            return false;
+        }
+        for (j, &t) in tokens.iter().enumerate() {
+            self.dequantize_row_into(&self.embd_ref, t as usize, &mut out[j * hs..(j + 1) * hs]);
+        }
+        true
     }
 }
 
@@ -7519,12 +8216,9 @@ impl Model for LfmModel {
     /// with no scaling (see `forward_prefill_inner`).
     fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
         let hs = self.config.hidden_size;
-        if tokens.iter().any(|&t| t as usize >= self.embd_ref.m) {
-            return None;
-        }
         let mut rows = vec![0.0f32; tokens.len() * hs];
-        for (j, &t) in tokens.iter().enumerate() {
-            self.dequantize_row_into(&self.embd_ref, t as usize, &mut rows[j * hs..(j + 1) * hs]);
+        if !self.embed_token_rows_into(tokens, &mut rows) {
+            return None;
         }
         Some(rows)
     }
@@ -8693,5 +9387,585 @@ pub(crate) mod bidirectional_float_tests {
             .build();
         let err = LfmModel::parse_config(&all_head, 64).unwrap_err();
         assert!(err.to_string().contains("leaves no trunk"), "{err}");
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_head_threads_from_lookup_parses_bounds_and_ignores_invalid() {
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(20), 40),
+            12
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(16), 32),
+            12
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(12), 24),
+            9
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(9), 18),
+            6
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(8), 16),
+            8
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, None, 16),
+            12
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, None, 6),
+            6
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, None, 0),
+            1
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(|_| None, Some(0), 0),
+            1
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "1".to_string()),
+                Some(16),
+                32
+            ),
+            1
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| " 6 ".to_string()),
+                Some(16),
+                32
+            ),
+            6
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "OTHER_ENV").then(|| "2".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+        // Zero, empty, and non-numeric overrides fall back cleanly.
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "0".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "  ".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+        assert_eq!(
+            LfmModel::xdna_head_threads_from_lookup(
+                |k| (k == "CERA_NPU_HEAD_THREADS").then(|| "abc".to_string()),
+                Some(12),
+                24
+            ),
+            9
+        );
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_project_logits_scratch_reuse_and_oversize_guard() {
+        // Use Q8_0 `token_embd.weight` so `gemv_active_with_scratch` exercises `q8_scratch`.
+        let embd_f32: Vec<f32> = (0..(VOCAB * HS))
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+            .collect();
+        let mut embd_q8 =
+            vec![
+                0u8;
+                crate::convert::TargetQuant::compute_tensor_bytes(GGML_TYPE_Q8_0, embd_f32.len())
+            ];
+        crate::convert::quantize_tensor_data(&embd_f32, GGML_TYPE_Q8_0, &mut embd_q8).unwrap();
+        let norm_f32 = vec![1.0f32; HS];
+        let b = crate::gguf::GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_u32("lfm2.block_count", 1)
+            .kv_u32("lfm2.embedding_length", HS as u32)
+            .kv_u32("lfm2.feed_forward_length", INTER as u32)
+            .kv_u32("lfm2.attention.head_count", 4)
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0])
+            .kv_u32("lfm2.shortconv.l_cache", 3)
+            .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+            .kv_f32("lfm2.rope.freq_base", 10_000.0)
+            .kv_u32("lfm2.context_length", 64)
+            .kv_u32("lfm2.vocab_size", VOCAB as u32)
+            .tensor("token_embd.weight", &[HS, VOCAB], GGML_TYPE_Q8_0, embd_q8)
+            .tensor_f32("token_embd_norm.weight", &[HS], &norm_f32)
+            .tensor_f32("blk.0.attn_norm.weight", &[HS], &norm_f32)
+            .tensor_f32("blk.0.ffn_norm.weight", &[HS], &norm_f32)
+            .tensor_f32(
+                "blk.0.shortconv.in_proj.weight",
+                &[HS, 3 * HS],
+                &vec![0.01f32; 3 * HS * HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.out_proj.weight",
+                &[HS, HS],
+                &vec![0.01f32; HS * HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.conv.weight",
+                &[3, HS],
+                &vec![0.1f32; 3 * HS],
+            )
+            .tensor_f32(
+                "blk.0.ffn_gate.weight",
+                &[HS, INTER],
+                &vec![0.01f32; HS * INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_up.weight",
+                &[HS, INTER],
+                &vec![0.01f32; HS * INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_down.weight",
+                &[INTER, HS],
+                &vec![0.01f32; INTER * HS],
+            );
+        let model = LfmModel::from_gguf(b.build(), 64).unwrap();
+        let hidden: Vec<f32> = (0..HS).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+        let uncached = model.xdna_project_logits_from_hidden_with_scratch(&hidden, None);
+        let mut scratch = (Vec::new(), Vec::new());
+        let mut pooled = vec![-1.0f32; model.config().vocab_size];
+        model.xdna_project_logits_into_with_scratch(
+            &hidden,
+            &mut pooled,
+            Some((&mut scratch.0, &mut scratch.1)),
+        );
+        assert_eq!(pooled, uncached);
+        let q8_used = crate::backend::cpu::int8_gemm_available();
+        if q8_used {
+            assert_eq!(scratch.0.len(), HS / 32);
+            assert_eq!(scratch.1.len(), HS);
+        }
+        let cap0 = scratch.0.capacity();
+        let cap1 = scratch.1.capacity();
+
+        // Clear lengths while retaining capacity to verify `xdna_project_logits_from_hidden_with_scratch`
+        // actually repopulates and reuses `q8_scratch` without reallocating.
+        scratch.0.clear();
+        scratch.1.clear();
+        let cached = model.xdna_project_logits_from_hidden_with_scratch(
+            &hidden,
+            Some((&mut scratch.0, &mut scratch.1)),
+        );
+        assert_eq!(cached, uncached);
+        if q8_used {
+            assert_eq!(scratch.0.len(), HS / 32);
+            assert_eq!(scratch.1.len(), HS);
+        }
+        assert_eq!(scratch.0.capacity(), cap0);
+        assert_eq!(scratch.1.capacity(), cap1);
+
+        // Mismatched hidden slice (len != hidden_size) zeroes non-zero caller logits buffer without panicking.
+        let oversize = vec![1.0f32; 2049];
+        pooled.fill(7.5);
+        model.xdna_project_logits_into_with_scratch(&oversize, &mut pooled, None);
+        assert!(pooled.iter().all(|&v| v == 0.0));
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_project_logits_heap_fallback_above_2048() {
+        const BIG_HS: usize = 2560;
+        const BIG_INTER: usize = 256;
+        const BIG_VOCAB: usize = 16;
+        let embd_f32: Vec<f32> = (0..(BIG_VOCAB * BIG_HS))
+            .map(|i| (((i * 17 + 3) % 29) as f32 - 14.0) * 0.04)
+            .collect();
+        let mut embd_q8 =
+            vec![
+                0u8;
+                crate::convert::TargetQuant::compute_tensor_bytes(GGML_TYPE_Q8_0, embd_f32.len(),)
+            ];
+        crate::convert::quantize_tensor_data(&embd_f32, GGML_TYPE_Q8_0, &mut embd_q8).unwrap();
+        let norm_f32: Vec<f32> = (0..BIG_HS)
+            .map(|i| 0.8 + ((i % 11) as f32) * 0.04)
+            .collect();
+        let b = crate::gguf::GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_u32("lfm2.block_count", 1)
+            .kv_u32("lfm2.embedding_length", BIG_HS as u32)
+            .kv_u32("lfm2.feed_forward_length", BIG_INTER as u32)
+            .kv_u32("lfm2.attention.head_count", 40)
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0])
+            .kv_u32("lfm2.shortconv.l_cache", 3)
+            .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+            .kv_f32("lfm2.rope.freq_base", 10_000.0)
+            .kv_u32("lfm2.context_length", 64)
+            .kv_u32("lfm2.vocab_size", BIG_VOCAB as u32)
+            .tensor(
+                "token_embd.weight",
+                &[BIG_HS, BIG_VOCAB],
+                GGML_TYPE_Q8_0,
+                embd_q8,
+            )
+            .tensor_f32("token_embd_norm.weight", &[BIG_HS], &norm_f32)
+            .tensor_f32("blk.0.attn_norm.weight", &[BIG_HS], &norm_f32)
+            .tensor_f32("blk.0.ffn_norm.weight", &[BIG_HS], &norm_f32)
+            .tensor_f32(
+                "blk.0.shortconv.in_proj.weight",
+                &[BIG_HS, 3 * BIG_HS],
+                &vec![0.01f32; 3 * BIG_HS * BIG_HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.out_proj.weight",
+                &[BIG_HS, BIG_HS],
+                &vec![0.01f32; BIG_HS * BIG_HS],
+            )
+            .tensor_f32(
+                "blk.0.shortconv.conv.weight",
+                &[3, BIG_HS],
+                &vec![0.1f32; 3 * BIG_HS],
+            )
+            .tensor_f32(
+                "blk.0.ffn_gate.weight",
+                &[BIG_HS, BIG_INTER],
+                &vec![0.01f32; BIG_HS * BIG_INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_up.weight",
+                &[BIG_HS, BIG_INTER],
+                &vec![0.01f32; BIG_HS * BIG_INTER],
+            )
+            .tensor_f32(
+                "blk.0.ffn_down.weight",
+                &[BIG_INTER, BIG_HS],
+                &vec![0.01f32; BIG_INTER * BIG_HS],
+            );
+        let model = LfmModel::from_gguf_no_repack(b.build(), 64).unwrap();
+        let hidden: Vec<f32> = (0..BIG_HS)
+            .map(|i| (((i * 5 + 1) % 19) as f32 - 9.0) * 0.1)
+            .collect();
+        let mut scratch = (Vec::new(), Vec::new());
+        let got = model.xdna_project_logits_from_hidden_with_scratch(
+            &hidden,
+            Some((&mut scratch.0, &mut scratch.1)),
+        );
+        assert_eq!(got.len(), BIG_VOCAB);
+        assert!(got.iter().all(|v| v.is_finite()));
+        assert!(
+            got.iter().any(|&v| v.abs() > 1e-4),
+            "heap fallback for hidden.len() > 2048 produced all-zero logits: {got:?}"
+        );
+
+        let mut expected_normed = hidden.clone();
+        crate::backend::cpu::rmsnorm(&mut expected_normed, &norm_f32, 1e-5);
+        let mut want = vec![0.0f32; BIG_VOCAB];
+        transformer::gemv_active_with_scratch(
+            LfmModel::xdna_head_threads(),
+            &model.gguf,
+            &model.logits_ref,
+            &expected_normed,
+            &mut want,
+            None,
+        );
+        assert_eq!(got, want);
+    }
+
+    #[cfg(feature = "xdna")]
+    #[test]
+    fn xdna_prefill_moe_ffn_grouped_matches_forward_moe_ffn() {
+        use crate::convert::writer::GGML_TYPE_Q4_0;
+
+        const MOE_HS: usize = 128;
+        const MOE_INTER: usize = 256;
+        const MOE_EXPERT_FF: usize = 128;
+        const N_EXPERT: usize = 4;
+        const N_EXPERT_USED: usize = 2;
+
+        fn next_vals(seed: &mut u64, count: usize, scale: f32) -> Vec<f32> {
+            (0..count)
+                .map(|_| {
+                    *seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((*seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 2.0 * scale
+                })
+                .collect()
+        }
+
+        let make_q4_0_tensor = |data: &[f32]| -> Vec<u8> {
+            let mut out =
+                vec![
+                    0u8;
+                    crate::convert::TargetQuant::compute_tensor_bytes(GGML_TYPE_Q4_0, data.len(),)
+                ];
+            crate::convert::quantize_tensor_data(data, GGML_TYPE_Q4_0, &mut out).unwrap();
+            out
+        };
+
+        let build_moe_gguf = |use_q4_experts: bool, router: &[f32]| -> GgufFile {
+            let mut seed = 0x517c_c1b7_2722_0a95u64;
+            let mut b = crate::gguf::GgufBuilder::new()
+                .kv_str("general.architecture", "lfm2moe")
+                .kv_u32("lfm2moe.block_count", 2)
+                .kv_u32("lfm2moe.embedding_length", MOE_HS as u32)
+                .kv_u32("lfm2moe.feed_forward_length", MOE_INTER as u32)
+                .kv_u32("lfm2moe.leading_dense_block_count", 1)
+                .kv_u32("lfm2moe.expert_count", N_EXPERT as u32)
+                .kv_u32("lfm2moe.expert_used_count", N_EXPERT_USED as u32)
+                .kv_u32("lfm2moe.expert_feed_forward_length", MOE_EXPERT_FF as u32)
+                .kv_u32("lfm2moe.expert_gating_func", 2)
+                .kv_u32("lfm2moe.attention.head_count", 4)
+                .kv_i32_array("lfm2moe.attention.head_count_kv", vec![0, 1])
+                .kv_u32("lfm2moe.vocab_size", VOCAB as u32)
+                .kv_u32("lfm2moe.context_length", 128)
+                .kv_f32("lfm2moe.rope.freq_base", 10_000.0)
+                .kv_f32("lfm2moe.attention.layer_norm_rms_epsilon", 1e-5)
+                .kv_u32("lfm2moe.shortconv.l_cache", 3);
+
+            let norm_f32 = vec![1.0f32; MOE_HS];
+            b = b
+                .tensor_f32(
+                    "token_embd.weight",
+                    &[MOE_HS, VOCAB],
+                    &next_vals(&mut seed, VOCAB * MOE_HS, 0.3),
+                )
+                .tensor_f32("token_embd_norm.weight", &[MOE_HS], &norm_f32);
+
+            for l in 0..2 {
+                b = b
+                    .tensor_f32(format!("blk.{l}.attn_norm.weight"), &[MOE_HS], &norm_f32)
+                    .tensor_f32(format!("blk.{l}.ffn_norm.weight"), &[MOE_HS], &norm_f32);
+                if l == 0 {
+                    b = b
+                        .tensor_f32(
+                            "blk.0.shortconv.in_proj.weight",
+                            &[MOE_HS, 3 * MOE_HS],
+                            &next_vals(&mut seed, 3 * MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.shortconv.out_proj.weight",
+                            &[MOE_HS, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.shortconv.conv.weight",
+                            &[3, MOE_HS],
+                            &next_vals(&mut seed, 3 * MOE_HS, 0.2),
+                        )
+                        .tensor_f32(
+                            "blk.0.ffn_gate.weight",
+                            &[MOE_HS, MOE_INTER],
+                            &next_vals(&mut seed, MOE_INTER * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.ffn_up.weight",
+                            &[MOE_HS, MOE_INTER],
+                            &next_vals(&mut seed, MOE_INTER * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.0.ffn_down.weight",
+                            &[MOE_INTER, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_INTER, 0.1),
+                        );
+                } else {
+                    let gate_w = next_vals(&mut seed, N_EXPERT * MOE_EXPERT_FF * MOE_HS, 0.25);
+                    let up_w = next_vals(&mut seed, N_EXPERT * MOE_EXPERT_FF * MOE_HS, 0.25);
+                    let down_w = next_vals(&mut seed, N_EXPERT * MOE_HS * MOE_EXPERT_FF, 0.25);
+                    b = b
+                        .tensor_f32(
+                            "blk.1.attn_q.weight",
+                            &[MOE_HS, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_k.weight",
+                            &[MOE_HS, 32],
+                            &next_vals(&mut seed, 32 * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_v.weight",
+                            &[MOE_HS, 32],
+                            &next_vals(&mut seed, 32 * MOE_HS, 0.1),
+                        )
+                        .tensor_f32(
+                            "blk.1.attn_output.weight",
+                            &[MOE_HS, MOE_HS],
+                            &next_vals(&mut seed, MOE_HS * MOE_HS, 0.1),
+                        )
+                        .tensor_f32("blk.1.attn_q_norm.weight", &[32], &[1.0f32; 32])
+                        .tensor_f32("blk.1.attn_k_norm.weight", &[32], &[1.0f32; 32])
+                        .tensor_f32("blk.1.ffn_gate_inp.weight", &[MOE_HS, N_EXPERT], router)
+                        .tensor_f32("blk.1.exp_probs_b.bias", &[N_EXPERT], &[0.0; N_EXPERT]);
+                    if use_q4_experts {
+                        b = b
+                            .tensor(
+                                "blk.1.ffn_gate_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                GGML_TYPE_Q4_0,
+                                make_q4_0_tensor(&gate_w),
+                            )
+                            .tensor(
+                                "blk.1.ffn_up_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                GGML_TYPE_Q4_0,
+                                make_q4_0_tensor(&up_w),
+                            )
+                            .tensor(
+                                "blk.1.ffn_down_exps.weight",
+                                &[MOE_EXPERT_FF, MOE_HS, N_EXPERT],
+                                GGML_TYPE_Q4_0,
+                                make_q4_0_tensor(&down_w),
+                            );
+                    } else {
+                        b = b
+                            .tensor_f32(
+                                "blk.1.ffn_gate_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                &gate_w,
+                            )
+                            .tensor_f32(
+                                "blk.1.ffn_up_exps.weight",
+                                &[MOE_HS, MOE_EXPERT_FF, N_EXPERT],
+                                &up_w,
+                            )
+                            .tensor_f32(
+                                "blk.1.ffn_down_exps.weight",
+                                &[MOE_EXPERT_FF, MOE_HS, N_EXPERT],
+                                &down_w,
+                            );
+                    }
+                }
+            }
+            b.build()
+        };
+
+        let mut router = vec![0.0f32; N_EXPERT * MOE_HS];
+        router[0] = 2.0; // expert 0 driven by col 0
+        router[MOE_HS + 1] = 2.0; // expert 1 driven by col 1
+        router[2 * MOE_HS + 2] = 2.0; // expert 2 driven by col 2
+        router[3 * MOE_HS + 3] = -3.0; // expert 3 always cold
+
+        let n = 8usize;
+        let mut inp_seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut ffn_input = next_vals(&mut inp_seed, n * MOE_HS, 0.5);
+        for j in 0..n {
+            let row = &mut ffn_input[j * MOE_HS..(j + 1) * MOE_HS];
+            row[0] = 2.5;
+            if j + 1 < n {
+                row[1] = 2.0;
+                row[2] = -2.5;
+            } else {
+                // Single token routed to expert 2 (`k_e == 1`) alongside expert 0.
+                row[1] = -2.5;
+                row[2] = 2.0;
+            }
+            row[3] = 1.0;
+        }
+
+        let check_parity = |model: LfmModel, label: &str| {
+            let moe = model.xdna_moe_refs(1).expect("layer 1 must be MoE");
+            let mut dec_state = InferenceState::from_config(&model.config).unwrap();
+            dec_state.scratch.q8_scales.resize(MOE_HS / 32, 0.0);
+            dec_state.scratch.q8_quants.resize(MOE_HS, 0);
+            let mut want = vec![0.0f32; n * MOE_HS];
+            for j in 0..n {
+                let x = &ffn_input[j * MOE_HS..(j + 1) * MOE_HS];
+                #[cfg(target_arch = "aarch64")]
+                LfmModel::quantize_to_scratch(x, &mut dec_state);
+                model.forward_moe_ffn(1, moe, MOE_HS, x, &mut dec_state);
+                want[j * MOE_HS..(j + 1) * MOE_HS]
+                    .copy_from_slice(&dec_state.scratch.out[..MOE_HS]);
+            }
+
+            let mut pre_state = InferenceState::for_prefill(&model.config, n).unwrap();
+            let mut scratch = std::mem::take(&mut pre_state.prefill_scratch);
+            scratch.ensure(n, &model.config);
+            scratch.ffn_input[..n * MOE_HS].copy_from_slice(&ffn_input);
+            let mut moe_scratch = XdnaMoePrefillScratch::default();
+            model.xdna_prefill_moe_ffn_grouped(
+                1,
+                moe,
+                MOE_HS,
+                n,
+                None,
+                &mut moe_scratch,
+                &mut scratch,
+                &mut pre_state,
+            );
+            assert_eq!(moe_scratch.buckets[0].len(), n, "{label}: expert 0 bucket");
+            assert_eq!(
+                moe_scratch.buckets[1].len(),
+                n - 1,
+                "{label}: expert 1 bucket (`k_e >= 2`)"
+            );
+            assert_eq!(
+                moe_scratch.buckets[2].len(),
+                1,
+                "{label}: expert 2 bucket (`k_e == 1`)"
+            );
+            assert!(
+                moe_scratch.buckets[3].is_empty(),
+                "{label}: expert 3 bucket empty"
+            );
+
+            let got = &scratch.ffn_out[..n * MOE_HS];
+            for j in 0..n {
+                let g = &got[j * MOE_HS..(j + 1) * MOE_HS];
+                let w = &want[j * MOE_HS..(j + 1) * MOE_HS];
+                let dot: f64 = g.iter().zip(w).map(|(&a, &b)| a as f64 * b as f64).sum();
+                let ng: f64 = g
+                    .iter()
+                    .map(|&a| (a as f64) * (a as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                let nw: f64 = w
+                    .iter()
+                    .map(|&a| (a as f64) * (a as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    ng > 0.0 && nw > 0.0,
+                    "{label} tok {j}: degenerate zero MoE output"
+                );
+                let cos = dot / (ng * nw);
+                let max_abs = g
+                    .iter()
+                    .zip(w)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    cos > 0.999 && max_abs < 0.05,
+                    "{label} tok {j}: cos={cos:.6} max_abs={max_abs:.6}"
+                );
+            }
+        };
+
+        let repacked = LfmModel::from_gguf_with_id_ffn_repack(
+            build_moe_gguf(true, &router),
+            128,
+            String::new(),
+        )
+        .unwrap();
+        check_parity(repacked, "q4_0-ffn-repack");
+
+        let unrepacked = LfmModel::from_gguf_no_repack(build_moe_gguf(true, &router), 128).unwrap();
+        check_parity(unrepacked, "q4_0-no-repack");
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let float_exps =
+                LfmModel::from_gguf_no_repack(build_moe_gguf(false, &router), 128).unwrap();
+            check_parity(float_exps, "f32-non-batched");
+        }
     }
 }

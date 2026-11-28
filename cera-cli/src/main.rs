@@ -1229,6 +1229,26 @@ enum Command {
         cache_dir: Option<String>,
     },
 
+    /// Download a Hugging Face GGUF model repository into the local cache
+    /// without loading model weights.
+    DownloadHf {
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-24B-A2B-GGUF`).
+        hf: String,
+
+        /// Quantization label (e.g. `QAD-Q4_0`, `Q4_0`, `Q4_K_M`, `Q8_0`).
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`)
+        /// when converting a SafeTensors-only repository.
+        #[arg(long)]
+        quant_strategy: Option<String>,
+
+        /// Cache root for downloads. Default: `$HOME/.cache/cera`.
+        #[arg(long)]
+        cache_dir: Option<String>,
+    },
+
     /// Run Voice Activity Detection (VAD) using Silero VAD.
     Vad {
         /// Path to the Silero VAD `.gguf` model file.
@@ -1582,8 +1602,81 @@ fn resolve_manifest_file_for_download(
     } else if let Some(dir) = manifest_dir {
         Ok(dir.join(path))
     } else {
-        Ok(path.to_path_buf())
+        let in_store = repo.store_dir().join(path);
+        if in_store.exists() {
+            Ok(in_store)
+        } else if path.exists() {
+            Ok(path.to_path_buf())
+        } else {
+            anyhow::bail!(
+                "relative manifest file `{value}` could not be resolved without a manifest directory (checked `{}` and `{}`)",
+                in_store.display(),
+                path.display()
+            )
+        }
     }
+}
+
+/// Download every file declared in `manifest` to `repo` and print its cached path.
+fn download_manifest_files(
+    repo: &cera::bundle::BundleRepo,
+    progress: &CliDownloadProgress,
+    manifest: &cera::manifest::Manifest,
+    manifest_dir: Option<&Path>,
+    label: &str,
+) -> Result<()> {
+    for (role, value) in manifest.files_in_order() {
+        let path = resolve_manifest_file_for_download(repo, progress, value, manifest_dir)
+            .with_context(|| format!("resolving `{role}` file for `{label}`"))?;
+        eprintln!("  {role}: {}", path.display());
+    }
+    progress.finish_line();
+    Ok(())
+}
+
+fn split_bundle_quant(quant: &str) -> (&str, bool) {
+    let want_dspark = quant.to_ascii_lowercase().contains("dspark");
+    let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+    (clean_quant, want_dspark)
+}
+
+fn attach_companion_dspark(
+    manifest: &mut cera::manifest::Manifest,
+    bundle_id: &str,
+    clean_quant: &str,
+    want_dspark: bool,
+) {
+    if want_dspark
+        && manifest.files.draft_model.is_none()
+        && let Some(draft_url) =
+            cera::bundle::hf::known_companion_dspark_url(bundle_id, clean_quant)
+    {
+        manifest.files.draft_model = Some(draft_url);
+    }
+}
+
+fn resolve_bundle_pair_manifest(
+    repo: &cera::bundle::BundleRepo,
+    normalized: &str,
+    quant: &str,
+    progress: &CliDownloadProgress,
+) -> Result<(cera::manifest::Manifest, Option<PathBuf>)> {
+    let (clean_quant, want_dspark) = split_bundle_quant(quant);
+    let (mut manifest, manifest_dir) =
+        if let Some(known) = cera::bundle::known_bundle_manifest(normalized, clean_quant) {
+            (known, None)
+        } else {
+            let manifest_url = cera::bundle::leap_bundles_manifest_url(normalized, clean_quant)?;
+            let manifest_result = repo.resolve_url(&manifest_url, None);
+            progress.finish_line();
+            let manifest_path = manifest_result
+                .with_context(|| format!("downloading manifest `{manifest_url}`"))?;
+            eprintln!("  manifest: {}", manifest_path.display());
+            let manifest = cera::manifest::Manifest::from_file(&manifest_path)?;
+            (manifest, manifest_path.parent().map(Path::to_path_buf))
+        };
+    attach_companion_dspark(&mut manifest, normalized, clean_quant, want_dspark);
+    Ok((manifest, manifest_dir))
 }
 
 fn download_bundle_pair(
@@ -1592,24 +1685,23 @@ fn download_bundle_pair(
     progress: &CliDownloadProgress,
 ) -> Result<()> {
     let normalized = normalize_bundle_id(&pair.bundle_id);
-    let manifest_url = cera::bundle::leap_bundles_manifest_url(&normalized, &pair.quant)?;
+    let label = format!("{normalized}:{}", pair.quant);
     eprintln!("Resolving bundle `{normalized}` (quant `{}`)", pair.quant);
-    let manifest_result = repo.resolve_url(&manifest_url, None);
+    let (manifest, manifest_dir) =
+        resolve_bundle_pair_manifest(repo, &normalized, &pair.quant, progress)?;
+    download_manifest_files(repo, progress, &manifest, manifest_dir.as_deref(), &label)
+}
+
+fn resolve_hf_manifest_finish_progress<F>(
+    progress: &CliDownloadProgress,
+    resolve: F,
+) -> Result<cera::manifest::Manifest>
+where
+    F: FnOnce() -> std::result::Result<cera::manifest::Manifest, cera::CeraError>,
+{
+    let manifest_result = resolve();
     progress.finish_line();
-    let manifest_path =
-        manifest_result.with_context(|| format!("downloading manifest `{manifest_url}`"))?;
-    let manifest = cera::manifest::Manifest::from_file(&manifest_path)?;
-    let manifest_dir = manifest_path.parent();
-    eprintln!("  manifest: {}", manifest_path.display());
-    for (role, value) in manifest.files_in_order() {
-        let path = resolve_manifest_file_for_download(repo, progress, value, manifest_dir)
-            .with_context(|| {
-                format!("resolving `{role}` file for `{normalized}:{}`", pair.quant)
-            })?;
-        eprintln!("  {role}: {}", path.display());
-    }
-    progress.finish_line();
-    Ok(())
+    Ok(manifest_result?)
 }
 
 /// Write the chat history to `path` as a plain-text transcript:
@@ -4905,6 +4997,31 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::DownloadHf {
+            hf,
+            quant,
+            quant_strategy,
+            cache_dir,
+        } => {
+            let cache = cache_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(default_cache_dir);
+            eprintln!("Cache: {}", cache.display());
+            let progress = Arc::new(CliDownloadProgress::default());
+            let progress_dyn = progress.clone() as Arc<dyn cera::bundle::DownloadProgress>;
+            let repo = cera::bundle::BundleRepo::with_progress(cache, progress_dyn.clone());
+            eprintln!("Resolving Hugging Face model `{hf}`");
+            let manifest = resolve_hf_manifest_finish_progress(&progress, || {
+                cera::bundle::hf::inspect_and_resolve_manifest(
+                    &hf,
+                    quant.as_deref(),
+                    quant_strategy.as_deref(),
+                    Some(repo.store_dir()),
+                    Some(progress_dyn),
+                )
+            })?;
+            download_manifest_files(&repo, &progress, &manifest, None, &hf)?;
+        }
         Command::ListHf { hf, json } => {
             let spec = cera::bundle::HfSpec::parse(&hf)?;
             let info = cera::bundle::fetch_model_info(&spec)?;
@@ -7616,6 +7733,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn download_hf_parses_repo_and_flags() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "download-hf",
+            "LiquidAI/LFM2.5-24B-A2B-GGUF",
+            "--quant",
+            "QAD-Q4_0",
+            "--cache-dir",
+            "/tmp/cera-cache",
+        ])
+        .expect("download-hf should parse repo, quant, and cache-dir");
+
+        match cli.command {
+            Command::DownloadHf {
+                hf,
+                quant,
+                quant_strategy,
+                cache_dir,
+            } => {
+                assert_eq!(hf, "LiquidAI/LFM2.5-24B-A2B-GGUF");
+                assert_eq!(quant.as_deref(), Some("QAD-Q4_0"));
+                assert!(quant_strategy.is_none());
+                assert_eq!(cache_dir.as_deref(), Some("/tmp/cera-cache"));
+            }
+            _ => panic!("expected DownloadHf command"),
+        }
+    }
+
     /// `resolve_engine` with no source flags errors out before
     /// touching disk or network — fast clear failure on a misuse
     /// that clap can't catch (both `--model` and `--bundle-id`
@@ -9394,5 +9540,148 @@ mod tests {
         assert_eq!(p90, 50.0);
         assert_eq!(mean, 30.0);
         assert!((stddev - 14.1421356).abs() < 1e-4);
+    }
+
+    #[test]
+    fn resolve_manifest_file_for_download_resolves_store_dir_manifest_dir_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let stored_file = store_dir.join("cached.gguf");
+        std::fs::write(&stored_file, b"gguf").unwrap();
+
+        let repo = cera::bundle::BundleRepo::new(&store_dir);
+        let progress = super::CliDownloadProgress::default();
+
+        let abs = dir.path().join("direct.gguf");
+        assert_eq!(
+            super::resolve_manifest_file_for_download(
+                &repo,
+                &progress,
+                abs.to_str().unwrap(),
+                None,
+            )
+            .unwrap(),
+            abs
+        );
+
+        let manifest_dir = dir.path().join("bundle");
+        assert_eq!(
+            super::resolve_manifest_file_for_download(
+                &repo,
+                &progress,
+                "weights/model.gguf",
+                Some(&manifest_dir),
+            )
+            .unwrap(),
+            manifest_dir.join("weights/model.gguf")
+        );
+
+        assert_eq!(
+            super::resolve_manifest_file_for_download(&repo, &progress, "cached.gguf", None)
+                .unwrap(),
+            stored_file
+        );
+
+        assert!(std::path::Path::new("Cargo.toml").exists());
+        assert_eq!(
+            super::resolve_manifest_file_for_download(&repo, &progress, "Cargo.toml", None)
+                .unwrap(),
+            std::path::PathBuf::from("Cargo.toml")
+        );
+
+        let err = super::resolve_manifest_file_for_download(
+            &repo,
+            &progress,
+            "missing-relative-file.gguf",
+            None,
+        )
+        .expect_err("missing relative manifest file without manifest_dir must error");
+        assert!(
+            err.to_string().contains("without a manifest directory"),
+            "unexpected error: {err}"
+        );
+
+        let uri_err =
+            super::resolve_manifest_file_for_download(&repo, &progress, "file://model.gguf", None)
+                .expect_err("file:// scheme must be rejected");
+        assert!(uri_err.to_string().contains("file://"));
+    }
+
+    #[test]
+    fn bundle_pair_dspark_quant_strips_suffix_and_attaches_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = cera::bundle::BundleRepo::new(dir.path());
+        let progress = super::CliDownloadProgress::default();
+
+        // Known bundle manifest accepts `Q4_K_M+dspark` after stripping `+dspark`.
+        let (manifest, manifest_dir) = super::resolve_bundle_pair_manifest(
+            &repo,
+            "LFM2.5-VL-3B-GGUF",
+            "Q4_K_M+dspark",
+            &progress,
+        )
+        .expect("known bundle manifest should resolve with +dspark stripped");
+        assert!(manifest_dir.is_none());
+        assert!(
+            manifest.files.model.ends_with("LFM2.5-VL-3B-Q4_K_M.gguf"),
+            "unexpected model URL: {}",
+            manifest.files.model
+        );
+
+        // Companion DSpark attachment mirrors `BundleRepo::download_bundle` and preserves explicit drafts.
+        for quant in ["Q4_K_M+dspark", "Q4_K_M dspark"] {
+            let (clean, want) = super::split_bundle_quant(quant);
+            assert_eq!(clean, "Q4_K_M");
+            assert!(want);
+            let mut m = cera::bundle::known_bundle_manifest("LFM2.5-VL-3B-GGUF", clean).unwrap();
+            assert!(m.files.draft_model.is_none());
+            super::attach_companion_dspark(&mut m, "LFM2.5-1.2B-Instruct-GGUF", clean, want);
+            assert_eq!(
+                m.files.draft_model,
+                cera::bundle::hf::known_companion_dspark_url("LFM2.5-1.2B-Instruct-GGUF", "Q4_K_M")
+            );
+
+            let mut explicit =
+                cera::bundle::known_bundle_manifest("LFM2.5-VL-3B-GGUF", clean).unwrap();
+            explicit.files.draft_model = Some("explicit-draft.gguf".into());
+            super::attach_companion_dspark(&mut explicit, "LFM2.5-1.2B-Instruct-GGUF", clean, want);
+            assert_eq!(
+                explicit.files.draft_model.as_deref(),
+                Some("explicit-draft.gguf")
+            );
+        }
+
+        let (clean_plain, want_plain) = super::split_bundle_quant("Q4_K_M");
+        assert_eq!(clean_plain, "Q4_K_M");
+        assert!(!want_plain);
+        let mut plain_m =
+            cera::bundle::known_bundle_manifest("LFM2.5-VL-3B-GGUF", clean_plain).unwrap();
+        super::attach_companion_dspark(
+            &mut plain_m,
+            "LFM2.5-1.2B-Instruct-GGUF",
+            clean_plain,
+            want_plain,
+        );
+        assert!(plain_m.files.draft_model.is_none());
+    }
+
+    #[test]
+    fn download_hf_finishes_progress_line_when_resolution_errors() {
+        use cera::bundle::DownloadProgress;
+
+        let progress = super::CliDownloadProgress::default();
+        progress.on_progress("https://huggingface.co/model.safetensors", 1024, Some(2048));
+        assert!(progress.last_url.lock().unwrap().is_some());
+
+        let err = super::resolve_hf_manifest_finish_progress(&progress, || {
+            Err(cera::CeraError::Backend("boom".into()))
+        })
+        .expect_err("error should propagate");
+        assert!(err.to_string().contains("boom"));
+        assert!(
+            progress.last_url.lock().unwrap().is_none(),
+            "progress.finish_line() must clear active progress line on error"
+        );
     }
 }
