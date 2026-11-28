@@ -112,6 +112,25 @@ pub trait AudioAccelerator: Send + Sync {
         None
     }
 
+    /// Async version of [`Self::sample_audio_frame_lfm3a`] for WebGPU / browser wasm.
+    #[allow(clippy::type_complexity)]
+    fn sample_audio_frame_lfm3a_async<'a>(
+        &'a self,
+        embedding: &'a [f32],
+        temperature: f32,
+        top_k: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<i32>>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let _ = self.take_audio_error();
+            let out = self.sample_audio_frame_lfm3a(embedding, temperature, top_k);
+            if let Some(e) = self.take_audio_error() {
+                return Err(e.into());
+            }
+            Ok(out)
+        })
+    }
+
     /// Whether [`Self::detokenize_to_spectrum`] supports `lfm3a_gen` 12-codebook FSQ detokenizers.
     fn supports_lfm3a_gen_detokenizer(&self) -> bool {
         false

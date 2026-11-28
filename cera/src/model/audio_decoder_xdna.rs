@@ -59,10 +59,51 @@ struct XdnaDepthformerLayer {
     w_3: XdnaGemmWeight,
 }
 
+#[derive(Default)]
+struct Lfm3aSampleScratch {
+    codes: Vec<i32>,
+    unmasked: Vec<bool>,
+    seq: Vec<f32>,
+    tok_row: Vec<f32>,
+    norm_mat: Vec<f32>,
+    bx_padded: Vec<f32>,
+    c_gate: Vec<f32>,
+    conv_out: Vec<f32>,
+    all_q: Vec<f32>,
+    all_k: Vec<f32>,
+    all_v: Vec<f32>,
+    all_gate: Vec<f32>,
+    attn_out_mat: Vec<f32>,
+    scores: Vec<f32>,
+    cand_tokens: Vec<i32>,
+    confidences: Vec<f32>,
+    normed_row: Vec<f32>,
+    seen: Vec<bool>,
+    raw_logits_snap: Vec<f32>,
+    order: Vec<usize>,
+    remaining: Vec<usize>,
+}
+
+impl Lfm3aSampleScratch {
+    fn prepare_frame(&mut self, n_cb: usize, n_embd: usize, mask_id: i32) {
+        self.codes.resize(n_cb, mask_id);
+        self.codes.fill(mask_id);
+        self.unmasked.resize(n_cb, false);
+        self.unmasked.fill(false);
+        self.seq.resize(n_cb * n_embd, 0.0);
+        self.tok_row.resize(n_embd, 0.0);
+        self.norm_mat.resize(n_cb * n_embd, 0.0);
+        self.cand_tokens.resize(n_cb, 0);
+        self.confidences.resize(n_cb, f32::NEG_INFINITY);
+        self.normed_row.resize(n_embd, 0.0);
+    }
+}
+
 struct XdnaDfState {
     kv: Vec<(Vec<f32>, Vec<f32>)>,
     n_past: usize,
     code_history: VecDeque<Vec<i32>>,
+    lfm3a_scratch: Lfm3aSampleScratch,
 }
 
 impl XdnaDfState {
@@ -76,6 +117,7 @@ impl XdnaDfState {
             kv,
             n_past: 0,
             code_history: VecDeque::with_capacity(LFM3A_REP_PENALTY_MAX_FRAMES),
+            lfm3a_scratch: Lfm3aSampleScratch::default(),
         }
     }
 
@@ -573,35 +615,36 @@ impl XdnaDepthformer {
         let (llm_proj_buf, shared_llm_proj) = self.project_llm_input(runner, embedding, n_cb)?;
 
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut codes = vec![mask_id; n_cb];
-        let mut unmasked = vec![false; n_cb];
+        let XdnaDfState {
+            code_history,
+            lfm3a_scratch: sc,
+            ..
+        } = &mut *st;
+        sc.prepare_frame(n_cb, n_embd, mask_id);
         let unmasked_per_step = [4usize, 4, n_cb.saturating_sub(8)];
-        let mut seq = vec![0.0f32; n_cb * n_embd];
-        let mut tok_row = vec![0.0f32; n_embd];
-        let mut norm_mat = vec![0.0f32; n_cb * n_embd];
 
         for (step, &k_unmask) in unmasked_per_step.iter().enumerate() {
             // 1. Build `[n_cb, n_embd]` sequence input for this MaskGIT step.
             for j in 0..n_cb {
-                let dst = &mut seq[j * n_embd..(j + 1) * n_embd];
+                let dst = &mut sc.seq[j * n_embd..(j + 1) * n_embd];
                 if shared_llm_proj {
                     dst.copy_from_slice(&llm_proj_buf);
                 } else {
                     dst.copy_from_slice(&llm_proj_buf[j * n_embd..(j + 1) * n_embd]);
                 }
                 let cb_emb = &self.codebooks[j].embedding;
-                let tok_idx = (codes[j].max(0) as usize).min(cb_emb.rows.saturating_sub(1));
-                cb_emb.dequantize_row(tok_idx, &mut tok_row);
-                add_inplace(dst, &tok_row);
+                let tok_idx = (sc.codes[j].max(0) as usize).min(cb_emb.rows.saturating_sub(1));
+                cb_emb.dequantize_row(tok_idx, &mut sc.tok_row);
+                add_inplace(dst, &sc.tok_row);
             }
 
             // 2. Run bidirectional LFM3 depthformer stack over all `n_cb` tokens simultaneously.
             for lw in &self.layers {
                 let is_shortconv = lw.k_norm.is_empty();
-                norm_mat.copy_from_slice(&seq);
+                sc.norm_mat.copy_from_slice(&sc.seq);
                 for s in 0..n_cb {
                     rmsnorm(
-                        &mut norm_mat[s * n_embd..(s + 1) * n_embd],
+                        &mut sc.norm_mat[s * n_embd..(s + 1) * n_embd],
                         &lw.operator_norm,
                         eps,
                     );
@@ -613,26 +656,27 @@ impl XdnaDepthformer {
                     let pad_left = pad_total / 2;
                     let t_padded = n_cb + pad_total;
                     let bcx_mat =
-                        runner.matmul_f32(&norm_mat, &lw.w_qkv, n_cb, lw.qkv_rows, n_embd)?;
+                        runner.matmul_f32(&sc.norm_mat, &lw.w_qkv, n_cb, lw.qkv_rows, n_embd)?;
 
-                    let mut bx_padded = vec![0.0f32; n_embd * t_padded];
-                    let mut c_gate = vec![0.0f32; n_cb * n_embd];
+                    sc.bx_padded.resize(n_embd * t_padded, 0.0);
+                    sc.bx_padded.fill(0.0);
+                    sc.c_gate.resize(n_cb * n_embd, 0.0);
                     for s in 0..n_cb {
                         let bcx = &bcx_mat[s * 3 * n_embd..(s + 1) * 3 * n_embd];
                         let (b_part, rest) = bcx.split_at(n_embd);
                         let (c_part, x_part) = rest.split_at(n_embd);
-                        c_gate[s * n_embd..(s + 1) * n_embd].copy_from_slice(c_part);
+                        sc.c_gate[s * n_embd..(s + 1) * n_embd].copy_from_slice(c_part);
                         for ch in 0..n_embd {
-                            bx_padded[ch * t_padded + pad_left + s] = b_part[ch] * x_part[ch];
+                            sc.bx_padded[ch * t_padded + pad_left + s] = b_part[ch] * x_part[ch];
                         }
                     }
 
-                    let mut conv_out = vec![0.0f32; n_embd * n_cb];
+                    sc.conv_out.resize(n_embd * n_cb, 0.0);
                     conv1d(
-                        &bx_padded,
+                        &sc.bx_padded,
                         &lw.q_norm,
                         None,
-                        &mut conv_out,
+                        &mut sc.conv_out,
                         n_embd,
                         n_embd,
                         t_padded,
@@ -643,14 +687,15 @@ impl XdnaDepthformer {
                     );
 
                     for s in 0..n_cb {
-                        let c_row = &c_gate[s * n_embd..(s + 1) * n_embd];
-                        let y_in = &mut norm_mat[s * n_embd..(s + 1) * n_embd];
+                        let c_row = &sc.c_gate[s * n_embd..(s + 1) * n_embd];
+                        let y_in = &mut sc.norm_mat[s * n_embd..(s + 1) * n_embd];
                         for ch in 0..n_embd {
-                            y_in[ch] = conv_out[ch * n_cb + s] * c_row[ch];
+                            y_in[ch] = sc.conv_out[ch * n_cb + s] * c_row[ch];
                         }
                     }
-                    let proj = runner.matmul_f32(&norm_mat, &lw.w_o, n_cb, lw.o_rows, lw.o_cols)?;
-                    add_inplace(&mut seq, &proj);
+                    let proj =
+                        runner.matmul_f32(&sc.norm_mat, &lw.w_o, n_cb, lw.o_rows, lw.o_cols)?;
+                    add_inplace(&mut sc.seq, &proj);
                 } else {
                     let q_dim = n_head * hd;
                     let k_dim = n_kv * hd;
@@ -660,23 +705,23 @@ impl XdnaDepthformer {
                     let scale = 1.0f32 / (hd as f32).sqrt();
 
                     let qkv_mat =
-                        runner.matmul_f32(&norm_mat, &lw.w_qkv, n_cb, lw.qkv_rows, n_embd)?;
+                        runner.matmul_f32(&sc.norm_mat, &lw.w_qkv, n_cb, lw.qkv_rows, n_embd)?;
 
-                    let mut all_q = vec![0.0f32; n_cb * q_dim];
-                    let mut all_k = vec![0.0f32; n_cb * k_dim];
-                    let mut all_v = vec![0.0f32; n_cb * k_dim];
-                    let mut all_gate = vec![0.0f32; n_cb * gate_rows];
+                    sc.all_q.resize(n_cb * q_dim, 0.0);
+                    sc.all_k.resize(n_cb * k_dim, 0.0);
+                    sc.all_v.resize(n_cb * k_dim, 0.0);
+                    sc.all_gate.resize(n_cb * gate_rows, 0.0);
 
                     for s in 0..n_cb {
                         let qkv = &qkv_mat[s * lw.qkv_rows..(s + 1) * lw.qkv_rows];
-                        let q_row = &mut all_q[s * q_dim..(s + 1) * q_dim];
-                        let k_row = &mut all_k[s * k_dim..(s + 1) * k_dim];
-                        let v_row = &mut all_v[s * k_dim..(s + 1) * k_dim];
+                        let q_row = &mut sc.all_q[s * q_dim..(s + 1) * q_dim];
+                        let k_row = &mut sc.all_k[s * k_dim..(s + 1) * k_dim];
+                        let v_row = &mut sc.all_v[s * k_dim..(s + 1) * k_dim];
                         q_row.copy_from_slice(&qkv[..q_dim]);
                         k_row.copy_from_slice(&qkv[q_dim..q_dim + k_dim]);
                         v_row.copy_from_slice(&qkv[q_dim + k_dim..qkv_dim]);
                         if gate_rows > 0 {
-                            all_gate[s * gate_rows..(s + 1) * gate_rows]
+                            sc.all_gate[s * gate_rows..(s + 1) * gate_rows]
                                 .copy_from_slice(&qkv[qkv_dim..]);
                         }
                         for h in 0..n_head {
@@ -691,31 +736,33 @@ impl XdnaDepthformer {
                         }
                     }
 
-                    let mut attn_out_mat = vec![0.0f32; n_cb * q_dim];
-                    let mut scores = vec![0.0f32; n_cb];
+                    sc.attn_out_mat.resize(n_cb * q_dim, 0.0);
+                    sc.attn_out_mat.fill(0.0);
+                    sc.scores.resize(n_cb, 0.0);
                     for q_pos in 0..n_cb {
-                        let attn_out = &mut attn_out_mat[q_pos * q_dim..(q_pos + 1) * q_dim];
+                        let attn_out = &mut sc.attn_out_mat[q_pos * q_dim..(q_pos + 1) * q_dim];
                         for h in 0..n_head {
                             let kv_h = h / group_size;
-                            let qh = &all_q[q_pos * q_dim + h * hd..q_pos * q_dim + (h + 1) * hd];
+                            let qh =
+                                &sc.all_q[q_pos * q_dim + h * hd..q_pos * q_dim + (h + 1) * hd];
                             for k_pos in 0..n_cb {
-                                let kh = &all_k
+                                let kh = &sc.all_k
                                     [k_pos * k_dim + kv_h * hd..k_pos * k_dim + (kv_h + 1) * hd];
-                                scores[k_pos] = dot_f32(qh, kh) * scale;
+                                sc.scores[k_pos] = dot_f32(qh, kh) * scale;
                             }
-                            softmax_inplace(&mut scores);
+                            softmax_inplace(&mut sc.scores);
                             let out_h = &mut attn_out[h * hd..(h + 1) * hd];
                             for k_pos in 0..n_cb {
-                                let vh = &all_v
+                                let vh = &sc.all_v
                                     [k_pos * k_dim + kv_h * hd..k_pos * k_dim + (kv_h + 1) * hd];
-                                let w = scores[k_pos];
+                                let w = sc.scores[k_pos];
                                 for d in 0..hd {
                                     out_h[d] += w * vh[d];
                                 }
                             }
                         }
                         if gate_rows > 0 {
-                            let g_row = &all_gate[q_pos * gate_rows..(q_pos + 1) * gate_rows];
+                            let g_row = &sc.all_gate[q_pos * gate_rows..(q_pos + 1) * gate_rows];
                             if gate_rows == n_head {
                                 for h in 0..n_head {
                                     let g = 1.0f32 / (1.0f32 + (-g_row[h]).exp());
@@ -731,31 +778,32 @@ impl XdnaDepthformer {
                         }
                     }
                     let proj =
-                        runner.matmul_f32(&attn_out_mat, &lw.w_o, n_cb, lw.o_rows, lw.o_cols)?;
-                    add_inplace(&mut seq, &proj);
+                        runner.matmul_f32(&sc.attn_out_mat, &lw.w_o, n_cb, lw.o_rows, lw.o_cols)?;
+                    add_inplace(&mut sc.seq, &proj);
                 }
 
-                norm_mat.copy_from_slice(&seq);
+                sc.norm_mat.copy_from_slice(&sc.seq);
                 for s in 0..n_cb {
                     rmsnorm(
-                        &mut norm_mat[s * n_embd..(s + 1) * n_embd],
+                        &mut sc.norm_mat[s * n_embd..(s + 1) * n_embd],
                         &lw.ffn_norm,
                         eps,
                     );
                 }
                 let mut gate_mat =
-                    runner.matmul_f32(&norm_mat, &lw.w_1, n_cb, df_cfg.ffn_dim, n_embd)?;
-                let up_mat = runner.matmul_f32(&norm_mat, &lw.w_3, n_cb, df_cfg.ffn_dim, n_embd)?;
+                    runner.matmul_f32(&sc.norm_mat, &lw.w_1, n_cb, df_cfg.ffn_dim, n_embd)?;
+                let up_mat =
+                    runner.matmul_f32(&sc.norm_mat, &lw.w_3, n_cb, df_cfg.ffn_dim, n_embd)?;
                 silu_mul_inplace(&mut gate_mat, &up_mat);
                 let down_mat =
                     runner.matmul_f32(&gate_mat, &lw.w_2, n_cb, n_embd, df_cfg.ffn_dim)?;
-                add_inplace(&mut seq, &down_mat);
+                add_inplace(&mut sc.seq, &down_mat);
             }
 
             if self.audio_embedding_norm.len() == n_embd {
                 for s in 0..n_cb {
                     rmsnorm(
-                        &mut seq[s * n_embd..(s + 1) * n_embd],
+                        &mut sc.seq[s * n_embd..(s + 1) * n_embd],
                         &self.audio_embedding_norm,
                         eps,
                     );
@@ -764,29 +812,33 @@ impl XdnaDepthformer {
 
             // 3. Score remaining masked codebooks and sample.
             let t_step = step_temps[step];
-            let mut cand_tokens = vec![0i32; n_cb];
-            let mut confidences = vec![f32::NEG_INFINITY; n_cb];
+            sc.cand_tokens.fill(0);
+            sc.confidences.fill(f32::NEG_INFINITY);
 
             for j in 0..n_cb {
-                if unmasked[j] {
+                if sc.unmasked[j] {
                     continue;
                 }
                 let cb = &self.codebooks[j];
-                let mut normed_row = seq[j * n_embd..(j + 1) * n_embd].to_vec();
-                rmsnorm(&mut normed_row, &cb.norm, cfg.rms_norm_eps);
+                sc.normed_row
+                    .copy_from_slice(&sc.seq[j * n_embd..(j + 1) * n_embd]);
+                rmsnorm(&mut sc.normed_row, &cb.norm, cfg.rms_norm_eps);
                 let mut logits =
-                    runner.matmul_f32(&normed_row, &cb.w_to_logits, 1, cb.n_vocab, cb.n_embd)?;
+                    runner.matmul_f32(&sc.normed_row, &cb.w_to_logits, 1, cb.n_vocab, cb.n_embd)?;
 
-                if !st.code_history.is_empty() && !logits.is_empty() {
+                if !code_history.is_empty() && !logits.is_empty() {
                     let vocab_cap = logits.len().min(n_vocab);
-                    let mut seen = vec![false; vocab_cap];
-                    for past_frame in &st.code_history {
+                    if sc.seen.len() < vocab_cap {
+                        sc.seen.resize(vocab_cap, false);
+                    }
+                    sc.seen[..vocab_cap].fill(false);
+                    for past_frame in code_history.iter() {
                         if let Some(&past_code) = past_frame.get(j)
                             && past_code >= 0
                         {
                             let idx = past_code as usize;
-                            if idx < vocab_cap && !seen[idx] {
-                                seen[idx] = true;
+                            if idx < vocab_cap && !sc.seen[idx] {
+                                sc.seen[idx] = true;
                                 if logits[idx] > 0.0 {
                                     logits[idx] /= LFM3A_REP_PENALTY;
                                 } else {
@@ -819,20 +871,22 @@ impl XdnaDepthformer {
                 };
 
                 if logits.is_empty() {
-                    cand_tokens[j] = 0;
-                    confidences[j] = f32::NEG_INFINITY;
+                    sc.cand_tokens[j] = 0;
+                    sc.confidences[j] = f32::NEG_INFINITY;
                 } else if !t_step.is_finite() || t_step <= 0.0 || top_k == 1 {
                     let best = argmax(&logits);
-                    cand_tokens[j] = best as i32;
-                    confidences[j] = logits[best as usize] - log_z;
+                    sc.cand_tokens[j] = best as i32;
+                    sc.confidences[j] = logits[best as usize] - log_z;
                 } else {
-                    let raw_logits_snap = logits.clone();
+                    sc.raw_logits_snap.clear();
+                    sc.raw_logits_snap.extend_from_slice(&logits);
                     if top_k > 0 && top_k < logits.len() {
-                        let mut order: Vec<usize> = (0..logits.len()).collect();
-                        order.select_nth_unstable_by(top_k - 1, |&a, &b| {
+                        sc.order.clear();
+                        sc.order.extend(0..logits.len());
+                        sc.order.select_nth_unstable_by(top_k - 1, |&a, &b| {
                             logits[b].total_cmp(&logits[a])
                         });
-                        for &idx in &order[top_k..] {
+                        for &idx in &sc.order[top_k..] {
                             logits[idx] = f32::NEG_INFINITY;
                         }
                     }
@@ -853,31 +907,37 @@ impl XdnaDepthformer {
                     let u_conf = self.next_f32_01().clamp(1e-10, 1.0 - 1e-7);
                     let gumbel_conf = -(-u_conf.ln()).ln();
                     let anneal = 1.0 - ((step + 1) as f32 / unmasked_per_step.len() as f32);
-                    cand_tokens[j] = best_idx as i32;
-                    confidences[j] =
-                        (raw_logits_snap[best_idx] - log_z) + 0.5 * t_step * gumbel_conf * anneal;
+                    sc.cand_tokens[j] = best_idx as i32;
+                    sc.confidences[j] = (sc.raw_logits_snap[best_idx] - log_z)
+                        + 0.5 * t_step * gumbel_conf * anneal;
                 }
 
-                if step == 0 && j == 0 && cand_tokens[0] == mask_id {
-                    return Ok(vec![mask_id; n_cb]);
+                if step == 0 && j == 0 && sc.cand_tokens[0] == mask_id {
+                    sc.codes.fill(mask_id);
+                    return Ok(sc.codes.clone());
                 }
             }
 
-            let mut remaining: Vec<usize> = (0..n_cb).filter(|&j| !unmasked[j]).collect();
-            remaining.sort_by(|&a, &b| {
-                confidences[b]
-                    .total_cmp(&confidences[a])
+            sc.remaining.clear();
+            sc.remaining.extend((0..n_cb).filter(|&j| !sc.unmasked[j]));
+            sc.remaining.sort_by(|&a, &b| {
+                sc.confidences[b]
+                    .total_cmp(&sc.confidences[a])
                     .then_with(|| a.cmp(&b))
             });
-            for &j in remaining.iter().take(k_unmask) {
-                codes[j] = cand_tokens[j];
-                unmasked[j] = true;
+            for &j in sc.remaining.iter().take(k_unmask) {
+                sc.codes[j] = sc.cand_tokens[j];
+                sc.unmasked[j] = true;
             }
-            if unmasked.first().copied() == Some(true) && codes.first().copied() == Some(mask_id) {
-                return Ok(vec![mask_id; n_cb]);
+            if sc.unmasked.first().copied() == Some(true)
+                && sc.codes.first().copied() == Some(mask_id)
+            {
+                sc.codes.fill(mask_id);
+                return Ok(sc.codes.clone());
             }
         }
 
+        let codes = sc.codes.clone();
         if codes.first().copied() != Some(mask_id) {
             st.push_code_history(codes.clone());
         }
@@ -2246,6 +2306,155 @@ mod tests {
             assert_eq!(sampled.len(), 12);
             assert!((0..4).contains(&sampled[0]));
 
+            drop(xdna);
+            assert_eq!(fake::live_bo_count(), 0);
+        });
+    }
+
+    #[test]
+    fn fake_shim_lfm3a_scratch_reuse_multi_frame_and_reset() {
+        fake::with_shim(FakeConfig::default(), || {
+            let (dec_w, _) = synth_lfm3a_weights();
+            let n_cb = dec_w.decoder_config.n_codebook;
+            let n_vocab = dec_w.decoder_config.n_vocab;
+            let llm_dim = dec_w.decoder_config.n_embd;
+            let mask_id = (n_vocab - 1) as i32;
+
+            let runner = XdnaGemmRunner::open_shared().expect("open_shared");
+            let xdna = XdnaAudioDecoder::from_parts(runner.clone(), Some(&dec_w), None)
+                .expect("XdnaAudioDecoder lfm3a");
+            let df = xdna.depthformer.as_ref().expect("depthformer");
+
+            let scratch_caps = |df: &XdnaDepthformer| -> [usize; 21] {
+                let st = df.state.lock().unwrap_or_else(|e| e.into_inner());
+                let sc = &st.lfm3a_scratch;
+                [
+                    sc.codes.capacity(),
+                    sc.unmasked.capacity(),
+                    sc.seq.capacity(),
+                    sc.tok_row.capacity(),
+                    sc.norm_mat.capacity(),
+                    sc.bx_padded.capacity(),
+                    sc.c_gate.capacity(),
+                    sc.conv_out.capacity(),
+                    sc.all_q.capacity(),
+                    sc.all_k.capacity(),
+                    sc.all_v.capacity(),
+                    sc.all_gate.capacity(),
+                    sc.attn_out_mat.capacity(),
+                    sc.scores.capacity(),
+                    sc.cand_tokens.capacity(),
+                    sc.confidences.capacity(),
+                    sc.normed_row.capacity(),
+                    sc.seen.capacity(),
+                    sc.raw_logits_snap.capacity(),
+                    sc.order.capacity(),
+                    sc.remaining.capacity(),
+                ]
+            };
+
+            let embeds: Vec<Vec<f32>> = (0..4).map(|f| det_vec(llm_dim, 19 + f, 0.4)).collect();
+
+            // 1. Greedy multi-frame run (`temperature = 0.0`) + reset repeatability.
+            let mut greedy_run1 = Vec::with_capacity(embeds.len());
+            for embed in &embeds {
+                let codes = xdna
+                    .sample_audio_frame_lfm3a(embed, 0.0, 1)
+                    .expect("greedy multi-frame lfm3a");
+                assert!(xdna.take_audio_error().is_none());
+                assert_eq!(codes.len(), n_cb);
+                assert!(codes.iter().all(|&c| (0..n_vocab as i32).contains(&c)));
+                greedy_run1.push(codes);
+            }
+            assert_eq!(df.state.lock().unwrap().code_history.len(), embeds.len());
+
+            xdna.reset_depthformer();
+            assert!(df.state.lock().unwrap().code_history.is_empty());
+
+            let mut greedy_run2 = Vec::with_capacity(embeds.len());
+            for embed in &embeds {
+                let codes = xdna
+                    .sample_audio_frame_lfm3a(embed, 0.0, 1)
+                    .expect("greedy repeat lfm3a");
+                assert!(xdna.take_audio_error().is_none());
+                greedy_run2.push(codes);
+            }
+            assert_eq!(greedy_run1, greedy_run2);
+
+            // 2. Stochastic multi-frame run (`temperature > 0.0, top_k > 1`) with explicit
+            //    `push_code_history`, `reset_depthformer`, bit-for-bit RNG determinism, and
+            //    zero scratch reallocation across subsequent frame runs.
+            let seed_hist = [vec![1; n_cb], vec![2; n_cb]];
+            let run_stoch = |xdna: &XdnaAudioDecoder, df: &XdnaDepthformer| -> Vec<Vec<i32>> {
+                xdna.reset_depthformer();
+                {
+                    let mut st = df.state.lock().unwrap_or_else(|e| e.into_inner());
+                    for hist in &seed_hist {
+                        st.push_code_history(hist.clone());
+                    }
+                }
+                xdna.seed_rng(4242);
+                let mut out = Vec::with_capacity(embeds.len());
+                for embed in &embeds {
+                    let codes = xdna
+                        .sample_audio_frame_lfm3a(embed, 0.8, 4)
+                        .expect("stochastic multi-frame lfm3a");
+                    assert!(xdna.take_audio_error().is_none());
+                    assert_eq!(codes.len(), n_cb);
+                    assert!(codes.iter().all(|&c| (0..n_vocab as i32).contains(&c)));
+                    if codes[0] != mask_id {
+                        assert!(codes[1..].iter().all(|&c| c != mask_id));
+                    }
+                    out.push(codes);
+                }
+                out
+            };
+
+            let stoch_run1 = run_stoch(&xdna, df);
+            let caps_after_run1 = scratch_caps(df);
+            assert!(
+                caps_after_run1.iter().all(|&cap| cap > 0),
+                "every Lfm3aSampleScratch buffer should be populated: {caps_after_run1:?}"
+            );
+
+            let stoch_run2 = run_stoch(&xdna, df);
+            let caps_after_run2 = scratch_caps(df);
+            assert_eq!(
+                stoch_run1, stoch_run2,
+                "repeated multi-frame stochastic sampling must be bit-for-bit identical after reset"
+            );
+            assert_eq!(
+                caps_after_run1, caps_after_run2,
+                "scratch capacities must stabilize with zero reallocations on reuse"
+            );
+
+            // 3. Early `mask_id` EOS return leaves `code_history` untouched across both greedy and stochastic paths.
+            let (mut eos_dec, _) = synth_lfm3a_weights();
+            eos_dec.decoder_config.n_vocab = 1;
+            let n_embd = eos_dec.depthformer_config.n_embd;
+            for cb in &mut eos_dec.depth_embeddings {
+                cb.embedding = f32_w(1, n_embd, 240, 0.08);
+                cb.to_logits = f32_w(1, n_embd, 220, 0.01);
+            }
+            let eos_xdna =
+                XdnaAudioDecoder::from_parts(runner, Some(&eos_dec), None).expect("eos-only lfm3a");
+            let eos_df = eos_xdna.depthformer.as_ref().expect("eos depthformer");
+            assert_eq!(
+                eos_xdna
+                    .sample_audio_frame_lfm3a(&embeds[0], 0.0, 1)
+                    .unwrap(),
+                vec![0; n_cb]
+            );
+            assert_eq!(
+                eos_xdna
+                    .sample_audio_frame_lfm3a(&embeds[0], 0.8, 4)
+                    .unwrap(),
+                vec![0; n_cb]
+            );
+            assert!(eos_xdna.take_audio_error().is_none());
+            assert!(eos_df.state.lock().unwrap().code_history.is_empty());
+
+            drop(eos_xdna);
             drop(xdna);
             assert_eq!(fake::live_bo_count(), 0);
         });
