@@ -1605,10 +1605,10 @@ impl XdnaLfm3Model {
         bq_quants: &mut Vec<i8>,
         #[cfg(has_blas)] dequant_scratch: &mut Vec<f32>,
     ) {
-        let mut done = false;
         #[cfg(has_blas)]
-        if transformer::batched_gemm_supports(wref.dtype, k) && n >= 16 {
-            done = transformer::try_blas_prefill_gemm_rowmajor(
+        if transformer::batched_gemm_supports(wref.dtype, k)
+            && n >= 16
+            && transformer::try_blas_prefill_gemm_rowmajor(
                 gguf,
                 wref,
                 input,
@@ -1617,36 +1617,36 @@ impl XdnaLfm3Model {
                 m,
                 k,
                 dequant_scratch,
-            );
+            )
+        {
+            return;
         }
         #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
         if transformer::batched_gemm_supports(wref.dtype, k) && n >= 16 {
-            done = transformer::try_repacked_f32_gemm_rowmajor(wref, input, output, n, m, k);
-            if !done {
-                let nb = k / 32;
-                if bq_scales.len() < n * nb {
-                    bq_scales.resize(n * nb, 0.0);
-                }
-                if bq_quants.len() < n * k {
-                    bq_quants.resize(n * k, 0);
-                }
-                transformer::quantize_rows(input, k, n, bq_scales, bq_quants);
-                done = transformer::gemm_preq_rowmajor(
-                    gguf, wref, bq_scales, bq_quants, output, n, m, k,
-                );
+            if transformer::try_repacked_f32_gemm_rowmajor(wref, input, output, n, m, k) {
+                return;
+            }
+            let nb = k / 32;
+            if bq_scales.len() < n * nb {
+                bq_scales.resize(n * nb, 0.0);
+            }
+            if bq_quants.len() < n * k {
+                bq_quants.resize(n * k, 0);
+            }
+            transformer::quantize_rows(input, k, n, bq_scales, bq_quants);
+            if transformer::gemm_preq_rowmajor(gguf, wref, bq_scales, bq_quants, output, n, m, k) {
+                return;
             }
         }
-        if !done {
-            #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas))))]
-            let _ = (bq_scales, bq_quants);
-            for t in 0..n {
-                transformer::gemv(
-                    gguf,
-                    wref,
-                    &input[t * k..(t + 1) * k],
-                    &mut output[t * m..(t + 1) * m],
-                );
-            }
+        #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas))))]
+        let _ = (bq_scales, bq_quants);
+        for t in 0..n {
+            transformer::gemv(
+                gguf,
+                wref,
+                &input[t * k..(t + 1) * k],
+                &mut output[t * m..(t + 1) * m],
+            );
         }
     }
 
